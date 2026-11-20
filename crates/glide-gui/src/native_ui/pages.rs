@@ -1262,18 +1262,210 @@ fn client_servers_col(s: &Ui, p: Palette) -> El {
 // ---------------------------------------------------------------------------
 
 fn input_page(s: &Ui, p: Palette) -> El {
+    let caption = match s.role {
+        Role::Server => {
+            "Screen edges and cursor controls for this server. Changes apply instantly."
+        }
+        Role::Client => {
+            "Pointer speed, return edge and key remapping for this PC. Changes apply instantly."
+        }
+    };
+
     let header = col()
         .key("input-header")
         .w_full()
         .gap(2.0)
         .child(text("Input").font(ty::PAGE_TITLE).color(p.text))
+        .child(text(caption).font(ty::CAPTION).color(p.muted));
+
+    let body = match s.role {
+        Role::Server => input_server_cols(s, p),
+        Role::Client => input_client_cols(s, p),
+    };
+
+    col()
+        .key("page-input")
+        .w_full()
+        .grow(1.0)
+        .min_h(0.0)
+        .gap(14.0)
+        .child(header)
+        .child(body)
+}
+
+fn input_server_cols(s: &Ui, p: Palette) -> El {
+    let thresh = s.config.server.edge_threshold_px;
+    let dead = s.config.server.dead_corner_px;
+    let dwell = s.config.server.edge_dwell_ms;
+
+    let edge_rows = vec![
+        slider_row(
+            p,
+            "srv-thresh-row",
+            "Switch distance",
+            format!("{thresh} px"),
+            (thresh as f32 - 1.0) / (24.0 - 1.0),
+            |s, n, commit| {
+                let v = (1.0 + n * 23.0).round().clamp(1.0, 24.0) as i32;
+                s.config.server.edge_threshold_px = v;
+                if commit {
+                    s.push_config();
+                }
+            },
+        ),
+        slider_row(
+            p,
+            "srv-corner-row",
+            "Corner guard",
+            format!("{dead} px"),
+            dead as f32 / 80.0,
+            |s, n, commit| {
+                let v = (((n * 80.0) / 4.0).round() * 4.0).clamp(0.0, 80.0) as i32;
+                s.config.server.dead_corner_px = v;
+                if commit {
+                    s.push_config();
+                }
+            },
+        ),
+        slider_row(
+            p,
+            "srv-dwell-row",
+            "Edge delay",
+            format!("{dwell} ms"),
+            dwell as f32 / 200.0,
+            |s, n, commit| {
+                let v = (((n * 200.0) / 10.0).round() * 10.0).clamp(0.0, 200.0) as u64;
+                s.config.server.edge_dwell_ms = v;
+                if commit {
+                    s.push_config();
+                }
+            },
+        ),
+        setting_row(
+            p,
+            "fs-lock-row",
+            "Pause in fullscreen apps",
+            Some("Games keep the cursor"),
+            toggle(
+                p,
+                "fs-lock-toggle",
+                "Pause in fullscreen apps",
+                s.config.server.auto_lock_fullscreen,
+                |s, _| {
+                    s.config.server.auto_lock_fullscreen = !s.config.server.auto_lock_fullscreen;
+                    s.push_config();
+                },
+            ),
+        ),
+        setting_row(
+            p,
+            "srv-sync-lock-row",
+            "Sync Caps & Num Lock",
+            Some("Send keyboard light state to clients"),
+            toggle(
+                p,
+                "srv-sync-lock-toggle",
+                "Sync Caps & Num Lock",
+                s.config.server.sync_lock_keys,
+                |s, _| {
+                    s.config.server.sync_lock_keys = !s.config.server.sync_lock_keys;
+                    s.push_config();
+                },
+            ),
+        ),
+    ];
+
+    let left_col = col()
+        .key("input-server-left")
+        .w(360.0)
+        .gap(7.0)
+        .child(section_head(p, "edges-head", "Screen edges", None))
+        .child(card_rows(p, "edges-card", edge_rows));
+
+    let note_card = card(p, "client-settings-note")
         .child(
-            text("Pointer, screen edges and keyboard. Changes apply instantly.")
-                .font(ty::CAPTION)
-                .color(p.muted),
+            col()
+                .w_full()
+                .padding(14.0)
+                .gap(10.0)
+                .child(
+                    row()
+                        .w_full()
+                        .gap(10.0)
+                        .center_y()
+                        .child(
+                            el().size(28.0, 28.0)
+                                .radius(7.0)
+                                .fill(p.canvas)
+                                .border(1.0, p.line)
+                                .center()
+                                .child(icons::nav_input(p.text_2)),
+                        )
+                        .child(
+                            col()
+                                .grow(1.0)
+                                .shrink()
+                                .min_w(0.0)
+                                .gap(1.0)
+                                .child(
+                                    text("Set on each Client PC")
+                                        .w_full()
+                                        .font(ty::BODY_SEMI)
+                                        .color(p.text),
+                                )
+                                .child(
+                                    text("Per-machine tuning")
+                                        .w_full()
+                                        .font(ty::SUB)
+                                        .color(p.muted),
+                                ),
+                        ),
+                )
+                .child(
+                    text("Mouse speed, scroll speed, natural scrolling and key remapping are configured per client so each PC can feel right on its own.")
+                        .w_full()
+                        .font(ty::CAPTION)
+                        .color(p.muted)
+                        .wrap(),
+                ),
+        )
+        .child(rule(1.0, p.line).a11y_hidden())
+        .child(
+            col().w_full().px(14.0).py(10.0).child(
+                text("Open Glide’s Input tab on the client PC to adjust them.")
+                    .w_full()
+                    .font(ty::SUB)
+                    .color(p.text_2)
+                    .wrap(),
+            ),
         );
 
-    // Left column: Pointer + Screen edges
+    let right_col = col()
+        .key("input-server-right")
+        .grow(1.0)
+        .shrink()
+        .min_w(0.0)
+        .gap(7.0)
+        .child(section_head(
+            p,
+            "client-note-head",
+            "Pointer & key remapping",
+            None,
+        ))
+        .child(note_card);
+
+    row()
+        .key("input-server-cols")
+        .w_full()
+        .grow(1.0)
+        .min_h(0.0)
+        .items_start()
+        .gap(18.0)
+        .child(left_col)
+        .child(right_col)
+}
+
+fn input_client_cols(s: &Ui, p: Palette) -> El {
     let sens = s.config.client.sensitivity;
     let scroll_sp = s.config.client.scroll_speed;
     let mut pointer_rows = vec![
@@ -1325,7 +1517,7 @@ fn input_page(s: &Ui, p: Palette) -> El {
             p,
             "invert-row",
             "Natural scrolling",
-            Some("Invert wheel direction on the client"),
+            Some("Invert scroll wheel direction"),
             toggle(
                 p,
                 "invert-toggle",
@@ -1363,20 +1555,18 @@ fn input_page(s: &Ui, p: Palette) -> El {
         ));
     }
 
-    let thresh = s.config.server.edge_threshold_px;
-    let dead = s.config.server.dead_corner_px;
-    let dwell = s.config.server.edge_dwell_ms;
+    let thresh = s.config.client.edge_threshold_px;
+    let dead = s.config.client.dead_corner_px;
 
-    let edge_rows = vec![
+    let return_rows = vec![
         slider_row(
             p,
-            "thresh-row",
+            "cli-thresh-row",
             "Switch distance",
             format!("{thresh} px"),
             (thresh as f32 - 1.0) / (24.0 - 1.0),
             |s, n, commit| {
                 let v = (1.0 + n * 23.0).round().clamp(1.0, 24.0) as i32;
-                s.config.server.edge_threshold_px = v;
                 s.config.client.edge_threshold_px = v;
                 if commit {
                     s.push_config();
@@ -1385,63 +1575,30 @@ fn input_page(s: &Ui, p: Palette) -> El {
         ),
         slider_row(
             p,
-            "corner-row",
+            "cli-corner-row",
             "Corner guard",
             format!("{dead} px"),
             dead as f32 / 80.0,
             |s, n, commit| {
                 let v = (((n * 80.0) / 4.0).round() * 4.0).clamp(0.0, 80.0) as i32;
-                s.config.server.dead_corner_px = v;
                 s.config.client.dead_corner_px = v;
                 if commit {
                     s.push_config();
                 }
             },
         ),
-        slider_row(
-            p,
-            "dwell-row",
-            "Edge delay",
-            format!("{dwell} ms"),
-            dwell as f32 / 200.0,
-            |s, n, commit| {
-                let v = (((n * 200.0) / 10.0).round() * 10.0).clamp(0.0, 200.0) as u64;
-                s.config.server.edge_dwell_ms = v;
-                if commit {
-                    s.push_config();
-                }
-            },
-        ),
         setting_row(
             p,
-            "fs-lock-row",
-            "Pause in fullscreen apps",
-            Some("Games keep the cursor"),
-            toggle(
-                p,
-                "fs-lock-toggle",
-                "Pause in fullscreen apps",
-                s.config.server.auto_lock_fullscreen,
-                |s, _| {
-                    s.config.server.auto_lock_fullscreen = !s.config.server.auto_lock_fullscreen;
-                    s.push_config();
-                },
-            ),
-        ),
-        setting_row(
-            p,
-            "sync-lock-row",
+            "cli-sync-lock-row",
             "Sync Caps & Num Lock",
-            Some("Keyboard lights stay consistent"),
+            Some("Follow the server’s keyboard lights"),
             toggle(
                 p,
-                "sync-lock-toggle",
+                "cli-sync-lock-toggle",
                 "Sync Caps & Num Lock",
-                s.config.server.sync_lock_keys,
+                s.config.client.sync_lock_keys,
                 |s, _| {
-                    let next = !s.config.server.sync_lock_keys;
-                    s.config.server.sync_lock_keys = next;
-                    s.config.client.sync_lock_keys = next;
+                    s.config.client.sync_lock_keys = !s.config.client.sync_lock_keys;
                     s.push_config();
                 },
             ),
@@ -1449,7 +1606,7 @@ fn input_page(s: &Ui, p: Palette) -> El {
     ];
 
     let left_col = col()
-        .key("input-left")
+        .key("input-client-left")
         .w(360.0)
         .h_full()
         .min_h(0.0)
@@ -1465,8 +1622,8 @@ fn input_page(s: &Ui, p: Palette) -> El {
             col()
                 .w_full()
                 .gap(7.0)
-                .child(section_head(p, "edges-head", "Screen edges", None))
-                .child(card_rows(p, "edges-card", edge_rows)),
+                .child(section_head(p, "return-head", "Return edge", None))
+                .child(card_rows(p, "return-card", return_rows)),
         );
 
     // Right column: Key remapping
@@ -1617,7 +1774,7 @@ fn input_page(s: &Ui, p: Palette) -> El {
         ));
 
     let right_col = col()
-        .key("input-right")
+        .key("input-client-right")
         .grow(1.0)
         .shrink()
         .min_w(0.0)
@@ -1634,23 +1791,14 @@ fn input_page(s: &Ui, p: Palette) -> El {
                 .child(remap_add),
         );
 
-    col()
-        .key("page-input")
+    row()
+        .key("input-client-cols")
         .w_full()
         .grow(1.0)
         .min_h(0.0)
-        .gap(14.0)
-        .child(header)
-        .child(
-            row()
-                .key("input-cols")
-                .w_full()
-                .grow(1.0)
-                .min_h(0.0)
-                .gap(18.0)
-                .child(left_col)
-                .child(right_col),
-        )
+        .gap(18.0)
+        .child(left_col)
+        .child(right_col)
 }
 
 // ---------------------------------------------------------------------------

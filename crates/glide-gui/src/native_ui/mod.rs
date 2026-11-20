@@ -140,27 +140,17 @@ impl Ui {
         let autostart = is_autostart_enabled();
         let local_ips = local_ipv4_addresses();
 
-        let (doctor_display, doctor_text) = match glide_backend::run_doctor() {
-            Ok(doc) => {
-                let mut lines = vec![
-                    format!("OS       {os_label} ({os_kind:?})"),
-                    format!("Display  {}", doc.display_info),
-                    String::new(),
-                ];
-                for note in &doc.notes {
-                    lines.push(format!("• {note}"));
-                }
-                (doc.display_info, lines.join("\n"))
-            }
-            Err(_) => (
-                "Display detected".into(),
-                format!("OS       {os_label} ({os_kind:?})\n"),
-            ),
-        };
+        let doctor_display = "Detecting display…".to_owned();
+        let doctor_text =
+            format!("OS       {os_label} ({os_kind:?})\nChecking display & input extensions…");
 
         let port_str = cfg.server.bind.port().to_string();
         let server_str = cfg.client.server.clone().unwrap_or_default();
         let role = if status.mode == "client" {
+            Role::Client
+        } else if status.mode == "server" {
+            Role::Server
+        } else if cfg.last_role.as_deref() == Some("client") {
             Role::Client
         } else {
             Role::Server
@@ -320,7 +310,11 @@ impl Ui {
             }
             return;
         }
-        self.role = role;
+        if self.role != role {
+            self.role = role;
+            self.config.last_role = Some(role.as_str().to_owned());
+            self.push_config();
+        }
     }
 
     pub fn commit_text_fields(&mut self) -> bool {
@@ -373,9 +367,11 @@ impl Ui {
                 }
             });
         } else {
-            self.commit_text_fields();
-            self.push_config();
             let role = self.role;
+            self.commit_text_fields();
+            self.config.last_role = Some(role.as_str().to_owned());
+            self.config.auto_start_on_launch = true;
+            self.push_config();
             self.toast(
                 if role == Role::Server {
                     "Server started"
@@ -513,6 +509,8 @@ impl Ui {
 
     pub fn connect_discovered(&mut self, addr: String, fingerprint: String, tx: &mut Tx) {
         self.role = Role::Client;
+        self.config.last_role = Some("client".into());
+        self.config.auto_start_on_launch = true;
         self.config.client.server = Some(addr.clone());
         self.config.client.trusted_fingerprint = Some(fingerprint);
         self.server_edit = TextEdit::new(&addr);
@@ -652,7 +650,12 @@ impl Ui {
     pub fn toggle_autostart(&mut self, tx: &mut Tx) {
         let next = !self.autostart;
         self.autostart = next;
-        let args = format!("gui --minimized --auto-start {}", self.role.as_str());
+        if next {
+            self.config.last_role = Some(self.role.as_str().to_owned());
+            self.config.auto_start_on_launch = true;
+            self.push_config();
+        }
+        let args = "gui --minimized".to_owned();
         let handle = self.handle.clone();
         let _ = tx;
         self.rt.spawn_blocking(move || {
@@ -762,8 +765,9 @@ fn on_key(s: &mut Ui, ev: &KeyEvent, tx: &mut Tx) -> bool {
 
 fn on_close(s: &mut Ui, tx: &mut Tx) {
     // If no system tray is available, closing the window quits Glide cleanly instead of
-    // leaving an invisible background process.
-    if !s.tray_active {
+    // leaving an invisible background process. Read the atomic directly so an async tray
+    // registration that just finished is always observed.
+    if !s.ctrl.tray_active.load(Ordering::SeqCst) {
         s.quit_app(tx);
     }
 }
@@ -773,6 +777,7 @@ pub(crate) fn run(
     ctrl: Arc<AppController>,
     rt: tokio::runtime::Handle,
     minimized: bool,
+    launch_t0: Instant,
 ) -> Result<(), String> {
     #[cfg(target_os = "linux")]
     rune::set_app_id("Glide");
@@ -818,6 +823,27 @@ pub(crate) fn run(
         app = app.windowless();
     }
 
+    if std::env::var_os("GLIDE_BENCH_STARTUP").is_some() {
+        let mut logged = false;
+        app = app.on_frame_encoded(move |_| {
+            if !logged {
+                logged = true;
+                let total_ms = launch_t0.elapsed().as_secs_f64() * 1000.0;
+                eprintln!("glide-bench: first_frame_ms={total_ms:.1}");
+                let marks = rune::marks::marks();
+                if let Some((_, first)) = marks.first().copied() {
+                    for (name, at) in &marks {
+                        let dt = at.saturating_duration_since(first).as_secs_f64() * 1000.0;
+                        eprintln!("glide-bench: mark {name} +{dt:.1}ms");
+                    }
+                }
+                for (k, v) in rune::marks::notes() {
+                    eprintln!("glide-bench: note {k}={v}");
+                }
+            }
+        });
+    }
+
     #[cfg(target_os = "linux")]
     {
         app = app.on_window(|_| {
@@ -827,7 +853,7 @@ pub(crate) fn run(
 
     let handle = app.handle();
 
-    // Wire AppController show/quit hooks so the tray, `/api/show`, and Ctrl+C control this window.
+    // Wire AppController hooks so the tray, `/api/show`, and Ctrl+C control this window.
     {
         let show_handle = handle.clone();
         let fallback_url = ctrl.url.clone();
@@ -848,6 +874,11 @@ pub(crate) fn run(
         *ctrl.ui_quit.lock() = Some(Arc::new(move || {
             quit_handle.quit();
         }));
+
+        let tray_handle = handle.clone();
+        *ctrl.ui_tray.lock() = Some(Arc::new(move |active| {
+            tray_handle.update(move |ui, _| ui.tray_active = active);
+        }));
     }
 
     let init_ctrl = Arc::clone(&ctrl);
@@ -860,6 +891,7 @@ pub(crate) fn run(
     });
 
     if !headless_snap {
+        spawn_background_init(Arc::clone(&ctrl), &rt, handle.clone());
         spawn_runtime_bridge(Arc::clone(&ctrl), &rt, handle.clone());
         spawn_discovery_loop(Arc::clone(&ctrl), &rt, handle);
     }
@@ -869,6 +901,67 @@ pub(crate) fn run(
 
 fn dummy_init() -> Ui {
     unreachable!("App::init closure always constructs Ui")
+}
+
+/// Runs non-critical startup work (TLS identity load/generation and display diagnostics)
+/// off the UI thread so the native window opens immediately.
+fn spawn_background_init(
+    ctrl: Arc<AppController>,
+    rt: &tokio::runtime::Handle,
+    handle: AppHandle<Ui>,
+) {
+    let os_kind = glide_backend::current_os_kind();
+    let os_label_str = os_label(os_kind);
+    rt.spawn(async move {
+        // Sync tray state once in case the background tray task finished before ui_tray was wired.
+        let tray_now = ctrl.tray_active.load(Ordering::SeqCst);
+        handle.update(move |ui, _| ui.tray_active = tray_now);
+
+        let ctrl_id = Arc::clone(&ctrl);
+        let fp = tokio::task::spawn_blocking(move || ctrl_id.load_identity())
+            .await
+            .ok()
+            .flatten();
+        if let Some(fp) = fp {
+            handle.update(move |ui, _| ui.fingerprint = Some(fp));
+        }
+
+        let ctrl_doc = Arc::clone(&ctrl);
+        let doc = tokio::task::spawn_blocking(move || {
+            let res = glide_backend::run_doctor().ok();
+            if let Some(ref d) = res {
+                ctrl_doc.runtime.update(|s| {
+                    s.geometry = d.geometry.clone();
+                });
+            }
+            res
+        })
+        .await
+        .ok()
+        .flatten();
+
+        let (doctor_display, doctor_text) = match doc {
+            Some(d) => {
+                let mut lines = vec![
+                    format!("OS       {os_label_str} ({os_kind:?})"),
+                    format!("Display  {}", d.display_info),
+                    String::new(),
+                ];
+                for note in &d.notes {
+                    lines.push(format!("• {note}"));
+                }
+                (d.display_info, lines.join("\n"))
+            }
+            None => (
+                "Display detected".into(),
+                format!("OS       {os_label_str} ({os_kind:?})\n"),
+            ),
+        };
+        handle.update(move |ui, _| {
+            ui.doctor_display = doctor_display;
+            ui.doctor_text = doctor_text;
+        });
+    });
 }
 
 fn spawn_runtime_bridge(
@@ -913,10 +1006,11 @@ fn spawn_discovery_loop(
 
 async fn run_discovery(ctrl: &AppController) -> (Vec<DiscoveredPeer>, Vec<String>) {
     let port = ctrl.config.lock().client.discovery_port;
-    let my_fp = ctrl.fingerprint.lock().clone();
     let found = discover_servers(port, Duration::from_millis(2000), None, false)
         .await
         .unwrap_or_default();
+    // Read our fingerprint after discovery completes so async startup identity load has populated it.
+    let my_fp = ctrl.fingerprint.lock().clone();
     let list = found
         .into_iter()
         .filter(|s| my_fp.as_deref() != Some(s.fingerprint.as_str()))
@@ -1067,13 +1161,25 @@ const SCENES: &[(&str, SceneFn)] = &[
         s.theme = ThemePref::Light;
         scene_client_connected(s);
     }),
-    ("input-light", |s| {
+    ("input-server-light", |s| {
         s.theme = ThemePref::Light;
         s.tab = Tab::Input;
+        s.role = Role::Server;
     }),
-    ("input-dark", |s| {
+    ("input-server-dark", |s| {
         s.theme = ThemePref::Dark;
         s.tab = Tab::Input;
+        s.role = Role::Server;
+    }),
+    ("input-client-light", |s| {
+        s.theme = ThemePref::Light;
+        s.tab = Tab::Input;
+        s.role = Role::Client;
+    }),
+    ("input-client-dark", |s| {
+        s.theme = ThemePref::Dark;
+        s.tab = Tab::Input;
+        s.role = Role::Client;
         s.config.client.key_remap.push(KeyRemapRule {
             from: "CapsLock".into(),
             to: "Escape".into(),

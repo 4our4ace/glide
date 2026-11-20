@@ -51,6 +51,12 @@ pub fn compile_key_remaps(rules: &[KeyRemapRule]) -> HashMap<HidUsage, HidUsage>
 /// so the same machine can switch roles effortlessly.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct GlideConfigFile {
+    /// Last active GUI role (`"server"` or `"client"`), restored on next launch.
+    #[serde(default)]
+    pub last_role: Option<String>,
+    /// Automatically start the server or connect as client when the GUI launches.
+    #[serde(default)]
+    pub auto_start_on_launch: bool,
     #[serde(default)]
     pub server: ServerConfig,
     #[serde(default)]
@@ -213,5 +219,41 @@ impl ClientConfig {
         self.tofu_store_path
             .clone()
             .unwrap_or_else(|| default_config_dir().join("trusted_server.fp"))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn config_round_trips_last_role_and_auto_start() {
+        // Older configs without last_role / auto_start_on_launch parse cleanly.
+        let legacy: GlideConfigFile = toml::from_str(
+            r#"
+            [server]
+            edge_threshold_px = 6
+
+            [client]
+            sensitivity = 1.5
+            "#,
+        )
+        .unwrap();
+        assert_eq!(legacy.last_role, None);
+        assert!(!legacy.auto_start_on_launch);
+        assert_eq!(legacy.server.edge_threshold_px, 6);
+        assert!((legacy.client.sensitivity - 1.5).abs() < f32::EPSILON);
+
+        let mut cfg = GlideConfigFile {
+            last_role: Some("client".into()),
+            auto_start_on_launch: true,
+            ..GlideConfigFile::default()
+        };
+        cfg.client.sensitivity = 1.35;
+        let raw = toml::to_string_pretty(&cfg).unwrap();
+        let parsed: GlideConfigFile = toml::from_str(&raw).unwrap();
+        assert_eq!(parsed.last_role.as_deref(), Some("client"));
+        assert!(parsed.auto_start_on_launch);
+        assert!((parsed.client.sensitivity - 1.35).abs() < f32::EPSILON);
     }
 }

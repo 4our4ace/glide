@@ -20,9 +20,11 @@ use glide_net::tls::ServerIdentity;
 use glide_proto::{Edge, MAX_FILE_BYTES};
 use parking_lot::Mutex;
 use serde_json::json;
+use std::io::{Read, Write};
+use std::net::{SocketAddr, TcpStream as StdTcpStream};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
@@ -40,6 +42,7 @@ pub const GUI_WIDTH: u32 = 900;
 pub const GUI_HEIGHT: u32 = 640;
 
 type Hook = Arc<dyn Fn() + Send + Sync>;
+type TrayHook = Arc<dyn Fn(bool) + Send + Sync>;
 
 struct ActiveEngine {
     task: JoinHandle<()>,
@@ -53,13 +56,15 @@ struct AppController {
     engine: Mutex<Option<ActiveEngine>>,
     fingerprint: Mutex<Option<String>>,
     url: String,
-    favicon_png: Vec<u8>,
+    favicon_png: OnceLock<Vec<u8>>,
     tray_active: AtomicBool,
     quit_tx: mpsc::UnboundedSender<()>,
     /// Shows the native window (installed by `native_ui` while its event loop runs).
     ui_show: Mutex<Option<Hook>>,
     /// Quits the native window's event loop.
     ui_quit: Mutex<Option<Hook>>,
+    /// Notifies the native UI when system-tray availability changes asynchronously.
+    ui_tray: Mutex<Option<TrayHook>>,
 }
 
 impl AppController {
@@ -69,30 +74,46 @@ impl AppController {
         } else {
             GlideConfigFile::default()
         };
-        let fp = ServerIdentity::load_or_generate(&cfg.server.resolved_identity_dir())
-            .ok()
-            .map(|id| id.fingerprint);
-
-        let runtime = RuntimeState::new();
-        if let Ok(doc) = glide_backend::run_doctor() {
-            runtime.update(|s| {
-                s.geometry = doc.geometry;
-                s.fingerprint = fp.clone();
-            });
-        }
 
         Self {
             config_path,
             config: Mutex::new(cfg),
-            runtime,
+            runtime: RuntimeState::new(),
             engine: Mutex::new(None),
-            fingerprint: Mutex::new(fp),
+            fingerprint: Mutex::new(None),
             url,
-            favicon_png: render_png(64),
+            favicon_png: OnceLock::new(),
             tray_active: AtomicBool::new(false),
             quit_tx,
             ui_show: Mutex::new(None),
             ui_quit: Mutex::new(None),
+            ui_tray: Mutex::new(None),
+        }
+    }
+
+    /// Loads or generates the persistent Ed25519 TLS identity on demand (safe to call off the UI thread).
+    fn load_identity(&self) -> Option<String> {
+        if let Some(existing) = self.fingerprint.lock().clone() {
+            return Some(existing);
+        }
+        let id_dir = self.config.lock().server.resolved_identity_dir();
+        let fp = ServerIdentity::load_or_generate(&id_dir)
+            .ok()
+            .map(|id| id.fingerprint);
+        if let Some(ref f) = fp {
+            *self.fingerprint.lock() = Some(f.clone());
+            self.runtime.update(|s| {
+                s.fingerprint = Some(f.clone());
+            });
+        }
+        fp
+    }
+
+    #[cfg(target_os = "linux")]
+    fn notify_tray_changed(&self, active: bool) {
+        let hook = self.ui_tray.lock().clone();
+        if let Some(cb) = hook {
+            cb(active);
         }
     }
 
@@ -142,8 +163,16 @@ impl AppController {
     }
 
     async fn start_engine(&self, role: &str) -> Result<()> {
+        if role != "server" && role != "client" {
+            anyhow::bail!("unknown role '{role}'");
+        }
         self.stop_engine().await;
-        let cfg = self.config.lock().clone();
+        let cfg = {
+            let mut guard = self.config.lock();
+            guard.last_role = Some(role.to_owned());
+            guard.auto_start_on_launch = true;
+            guard.clone()
+        };
         let _ = cfg.save(&self.config_path);
 
         let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
@@ -197,7 +226,16 @@ impl AppController {
         }
     }
 
-    fn apply_config(&self, new_cfg: GlideConfigFile) -> Result<()> {
+    fn apply_config(&self, mut new_cfg: GlideConfigFile) -> Result<()> {
+        {
+            let prev = self.config.lock();
+            if new_cfg.last_role.is_none() {
+                new_cfg.last_role = prev.last_role.clone();
+            }
+            if !new_cfg.auto_start_on_launch && prev.auto_start_on_launch {
+                new_cfg.auto_start_on_launch = true;
+            }
+        }
         new_cfg.save(&self.config_path)?;
         let s = new_cfg.server.clone();
         let c = new_cfg.client.clone();
@@ -249,99 +287,46 @@ impl Default for GuiOptions {
 }
 
 /// If Glide is already running on `port`, ask the running instance to show/focus its window.
-async fn try_focus_existing_instance(port: u16) -> bool {
-    let Ok(Ok(mut stream)) = tokio::time::timeout(
-        Duration::from_millis(200),
-        TcpStream::connect(("127.0.0.1", port)),
-    )
-    .await
-    else {
+fn try_focus_existing_instance(port: u16) -> bool {
+    let addr = SocketAddr::from(([127, 0, 0, 1], port));
+    let Ok(mut stream) = StdTcpStream::connect_timeout(&addr, Duration::from_millis(200)) else {
         return false;
     };
+    let _ = stream.set_write_timeout(Some(Duration::from_millis(200)));
+    let _ = stream.set_read_timeout(Some(Duration::from_millis(400)));
     let req = format!(
         "POST /api/show HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
     );
-    if stream.write_all(req.as_bytes()).await.is_err() {
+    if stream.write_all(req.as_bytes()).is_err() {
         return false;
     }
     let mut resp = [0u8; 64];
-    match tokio::time::timeout(Duration::from_millis(400), stream.read(&mut resp)).await {
-        Ok(Ok(n)) if n > 0 => String::from_utf8_lossy(&resp[..n]).contains("200 OK"),
+    match stream.read(&mut resp) {
+        Ok(n) if n > 0 => String::from_utf8_lossy(&resp[..n]).contains("200 OK"),
         _ => false,
     }
 }
 
-struct Prepared {
-    ctrl: Arc<AppController>,
-    listener: TcpListener,
-    quit_rx: mpsc::UnboundedReceiver<()>,
-    #[cfg(target_os = "linux")]
-    linux_tray: glide_backend::linux_x11::tray::LinuxTrayHandle,
-}
-
-/// Binds the control port (or hands off to a running instance), builds the controller,
-/// auto-starts the engine and spawns the system tray. `None` means another instance took over.
-async fn prepare(opts: &GuiOptions) -> Result<Option<Prepared>> {
-    // Bind first: in the common case (no other instance) this succeeds immediately and we
-    // skip the single-instance probe entirely, so the window opens without delay.
-    let listener = match TcpListener::bind(("127.0.0.1", opts.port)).await {
+/// Binds the loopback control port synchronously before Tokio or GPU initialization.
+/// Returns `Ok(None)` if an existing Glide instance took over and was focused.
+fn bind_or_focus_existing(port: u16, minimized: bool) -> Result<Option<std::net::TcpListener>> {
+    // Bind first: in the common case (no other instance) this succeeds in ~50µs and we
+    // skip the single-instance probe entirely.
+    let listener = match std::net::TcpListener::bind(("127.0.0.1", port)) {
         Ok(l) => l,
         Err(_) => {
-            // Port taken: most likely Glide is already running, so just focus its window.
-            if opts.port != 0 && !opts.minimized && try_focus_existing_instance(opts.port).await {
-                info!(port = opts.port, "Focused existing Glide GUI instance");
+            if port != 0 && !minimized && try_focus_existing_instance(port) {
+                info!(port, "Focused existing Glide GUI instance");
                 return Ok(None);
             }
-            TcpListener::bind(("127.0.0.1", 0))
-                .await
+            std::net::TcpListener::bind(("127.0.0.1", 0))
                 .context("failed to bind local GUI port")?
         }
     };
-    let actual_addr = listener.local_addr()?;
-    let url = format!("http://127.0.0.1:{}", actual_addr.port());
-
-    let (quit_tx, quit_rx) = mpsc::unbounded_channel::<()>();
-    let cfg_path = opts
-        .config_path
-        .clone()
-        .unwrap_or_else(|| default_config_dir().join("glide.toml"));
-    let ctrl = Arc::new(AppController::new(cfg_path, url.clone(), quit_tx));
-
-    if let Some(ref role) = opts.auto_start_role {
-        if let Err(e) = ctrl.start_engine(role).await {
-            warn!(error = %e, "Failed auto-starting Glide engine");
-        }
-    }
-
-    // Native OS System Tray integration (Windows 11 Shell_NotifyIconW & Ubuntu/Linux StatusNotifierItem)
-    #[cfg(target_os = "windows")]
-    {
-        ctrl.tray_active.store(true, Ordering::SeqCst);
-        let tray_rx = glide_backend::windows::tray::spawn_windows_tray();
-        spawn_tray_listener(Arc::clone(&ctrl), tray_rx);
-    }
-
-    #[cfg(target_os = "linux")]
-    let linux_tray = {
-        let (handle, tray_rx) = glide_backend::linux_x11::tray::spawn_linux_tray().await;
-        ctrl.tray_active.store(handle.is_active(), Ordering::SeqCst);
-        spawn_tray_listener(Arc::clone(&ctrl), tray_rx);
-        handle
-    };
-
-    info!(
-        %url,
-        tray = ctrl.tray_active.load(Ordering::SeqCst),
-        "Glide GUI ready"
-    );
-
-    Ok(Some(Prepared {
-        ctrl,
-        listener,
-        quit_rx,
-        #[cfg(target_os = "linux")]
-        linux_tray,
-    }))
+    listener
+        .set_nonblocking(true)
+        .context("failed to configure local GUI listener")?;
+    Ok(Some(listener))
 }
 
 #[cfg(any(target_os = "windows", target_os = "linux"))]
@@ -405,36 +390,121 @@ async fn serve(
 /// Runs the Glide desktop GUI: native window on the calling (main) thread, engine, control
 /// server and tray on a Tokio runtime. Returns when the user quits.
 pub fn run_gui_blocking(opts: GuiOptions) -> Result<()> {
+    let launch_t0 = std::time::Instant::now();
     glide_backend::init_platform();
-    // Start creating the GPU device in parallel with runtime and tray setup.
-    if !opts.minimized && std::env::var_os("GLIDE_RUNE_ARGS").is_none() {
+
+    let Some(std_listener) = bind_or_focus_existing(opts.port, opts.minimized)? else {
+        return Ok(());
+    };
+
+    let headless_snap = std::env::var_os("GLIDE_RUNE_ARGS").is_some();
+
+    // Start creating the GPU device and compiling Rune's render pipeline on a worker thread
+    // immediately — BEFORE Tokio runtime, config load, and winit window creation — so they
+    // overlap instead of running back-to-back.
+    // On Windows, Rune opens immediately on its CPU boot renderer and hands off to DX12 in
+    // the background, so warming GPU up front is only needed on Linux and macOS.
+    if !opts.minimized && !headless_snap {
+        #[cfg(target_os = "linux")]
+        rune::warm_gpu(Default::default());
+        #[cfg(target_os = "macos")]
         rune::prewarm_gpu();
     }
 
+    let workers = std::thread::available_parallelism().map_or(2, |n| n.get().clamp(2, 4));
     let rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(workers)
         .enable_all()
         .thread_name("glide-rt")
         .build()
         .context("failed to start async runtime")?;
 
-    let Some(prepared) = rt.block_on(prepare(&opts))? else {
-        return Ok(());
+    let listener = {
+        let _guard = rt.enter();
+        TcpListener::from_std(std_listener).context("failed to register local GUI listener")?
     };
-    let Prepared {
-        ctrl,
-        listener,
-        quit_rx,
-        #[cfg(target_os = "linux")]
-        linux_tray,
-    } = prepared;
+    let actual_addr = listener.local_addr()?;
+    let url = format!("http://127.0.0.1:{}", actual_addr.port());
+
+    let (quit_tx, quit_rx) = mpsc::unbounded_channel::<()>();
+    let cfg_path = opts
+        .config_path
+        .clone()
+        .unwrap_or_else(|| default_config_dir().join("glide.toml"));
+    let ctrl = Arc::new(AppController::new(cfg_path, url.clone(), quit_tx));
+
+    let effective_auto_start = if headless_snap {
+        None
+    } else if let Some(role) = opts.auto_start_role {
+        if role == "server" || role == "client" {
+            ctrl.config.lock().last_role = Some(role.clone());
+        }
+        Some(role)
+    } else {
+        let cfg = ctrl.config.lock();
+        if cfg.auto_start_on_launch {
+            cfg.last_role.clone()
+        } else {
+            None
+        }
+    };
+
+    if let Some(role) = effective_auto_start {
+        let ctrl_auto = Arc::clone(&ctrl);
+        rt.spawn(async move {
+            if let Err(e) = ctrl_auto.start_engine(&role).await {
+                warn!(error = %e, "Failed auto-starting Glide engine");
+            }
+        });
+    }
+
+    // Native OS System Tray integration runs asynchronously so D-Bus / icon setup never
+    // blocks the window from appearing.
+    #[cfg(target_os = "windows")]
+    if !headless_snap {
+        ctrl.tray_active.store(true, Ordering::SeqCst);
+        let ctrl_tray = Arc::clone(&ctrl);
+        rt.spawn(async move {
+            let tray_rx = glide_backend::windows::tray::spawn_windows_tray();
+            spawn_tray_listener(ctrl_tray, tray_rx);
+        });
+    }
+
+    #[cfg(target_os = "linux")]
+    let linux_tray_slot: Arc<
+        tokio::sync::Mutex<Option<glide_backend::linux_x11::tray::LinuxTrayHandle>>,
+    > = Arc::new(tokio::sync::Mutex::new(None));
+    #[cfg(target_os = "linux")]
+    let linux_tray_task = if !headless_snap {
+        let ctrl_tray = Arc::clone(&ctrl);
+        let slot = Arc::clone(&linux_tray_slot);
+        Some(rt.spawn(async move {
+            let (handle, tray_rx) = glide_backend::linux_x11::tray::spawn_linux_tray().await;
+            let active = handle.is_active();
+            ctrl_tray.tray_active.store(active, Ordering::SeqCst);
+            ctrl_tray.notify_tray_changed(active);
+            spawn_tray_listener(ctrl_tray, tray_rx);
+            *slot.lock().await = Some(handle);
+        }))
+    } else {
+        None
+    };
+
+    info!(%url, "Glide GUI ready");
 
     let mut server = Some(rt.spawn(serve(listener, Arc::clone(&ctrl), quit_rx)));
 
-    if let Err(e) = native_ui::run(Arc::clone(&ctrl), rt.handle().clone(), opts.minimized) {
+    if let Err(e) = native_ui::run(
+        Arc::clone(&ctrl),
+        rt.handle().clone(),
+        opts.minimized,
+        launch_t0,
+    ) {
         // No display or no usable GPU: keep Glide usable through the browser fallback.
         warn!(error = %e, "Native window unavailable; using the browser fallback");
         *ctrl.ui_show.lock() = None;
         *ctrl.ui_quit.lock() = None;
+        *ctrl.ui_tray.lock() = None;
         if !opts.minimized {
             let child = launch_browser_window(&ctrl.url);
             if !ctrl.tray_active.load(Ordering::SeqCst) {
@@ -459,7 +529,14 @@ pub fn run_gui_blocking(opts: GuiOptions) -> Result<()> {
         }
         ctrl.stop_engine().await;
         #[cfg(target_os = "linux")]
-        linux_tray.shutdown().await;
+        {
+            if let Some(task) = linux_tray_task {
+                let _ = tokio::time::timeout(Duration::from_millis(300), task).await;
+            }
+            if let Some(handle) = linux_tray_slot.lock().await.take() {
+                handle.shutdown().await;
+            }
+        }
     });
     rt.shutdown_timeout(Duration::from_millis(300));
     Ok(())
@@ -703,7 +780,8 @@ async fn handle_http_conn(mut stream: TcpStream, ctrl: Arc<AppController>) -> Re
         }
 
         ("GET", "/favicon.png") | ("GET", "/favicon.ico") => {
-            write_response(&mut stream, "200 OK", "image/png", &ctrl.favicon_png).await?;
+            let png = ctrl.favicon_png.get_or_init(|| render_png(64));
+            write_response(&mut stream, "200 OK", "image/png", png).await?;
         }
 
         // Bundled UI fonts (SIL OFL 1.1) so the GUI looks identical on every OS, offline.
@@ -749,11 +827,12 @@ async fn handle_http_conn(mut stream: TcpStream, ctrl: Arc<AppController>) -> Re
 
         ("GET", "/api/state") => {
             let cfg = ctrl.config.lock().clone();
+            let fp = ctrl.load_identity();
             let doctor = glide_backend::run_doctor().ok();
             let payload = json!({
                 "config": cfg,
                 "status": ctrl.runtime.snapshot(),
-                "fingerprint": *ctrl.fingerprint.lock(),
+                "fingerprint": fp,
                 "autostart": is_autostart_enabled(),
                 "hostname": machine_hostname(),
                 "local_ips": local_ipv4_addresses(),
