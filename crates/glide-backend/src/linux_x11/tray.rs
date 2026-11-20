@@ -1,7 +1,7 @@
 //! Native Linux System Tray (Ubuntu GNOME top-right AppIndicator / KDE / XFCE / Sway)
 //! powered by pure-Rust `ksni` (StatusNotifierItem over `zbus` D-Bus — zero C libraries).
 
-use crate::icon::render_argb32_be;
+use crate::icon::render_symbolic_argb32_be;
 use crate::TrayAction;
 use ksni::menu::{MenuItem, StandardItem};
 use ksni::{Category, Icon, Status, ToolTip, Tray, TrayMethods};
@@ -106,18 +106,15 @@ impl LinuxTrayHandle {
 pub async fn spawn_linux_tray() -> (LinuxTrayHandle, mpsc::UnboundedReceiver<TrayAction>) {
     let (tx, rx) = mpsc::unbounded_channel();
 
-    let icons = vec![
-        Icon {
-            width: 32,
-            height: 32,
-            data: render_argb32_be(32),
-        },
-        Icon {
-            width: 64,
-            height: 64,
-            data: render_argb32_be(64),
-        },
-    ];
+    // White symbolic glyph: matches Ubuntu's top bar / other monochrome panel icons.
+    let icons = [16u32, 22, 24, 32, 48]
+        .into_iter()
+        .map(|size| Icon {
+            width: size as i32,
+            height: size as i32,
+            data: render_symbolic_argb32_be(size),
+        })
+        .collect();
 
     let tray = GlideLinuxTray { tx, icons };
     match tray.spawn().await {

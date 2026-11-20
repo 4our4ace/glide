@@ -51,13 +51,21 @@ install -m 0644 "$ROOT_DIR/examples/glide.toml" "$PKG_ROOT/usr/share/doc/glide/e
 cat > "$PKG_ROOT/usr/share/icons/hicolor/scalable/apps/glide.svg" <<'EOF'
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64">
   <defs>
-    <linearGradient id="g" x1="0" y1="0" x2="1" y2="1">
-      <stop offset="0%" stop-color="#3b82f6"/>
-      <stop offset="100%" stop-color="#06b6d4"/>
+    <linearGradient id="glide-g" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#3b82f6"/>
+      <stop offset="1" stop-color="#06b6d4"/>
     </linearGradient>
   </defs>
-  <rect width="64" height="64" rx="16" fill="url(#g)"/>
-  <path d="M44 33H32v-6h18v15c0 4-3 8-8 9-4 1-9 1-14-1-8-3-13-11-12-20 1-10 9-17 19-17 6 0 11 2 14 6l-5 4c-2-3-5-4-9-4-7 0-12 5-12 11 0 7 5 12 12 12 4 0 7-1 9-3v-6z" fill="#ffffff"/>
+  <rect x="2" y="2" width="60" height="60" rx="14" fill="url(#glide-g)"/>
+  <path d="M20 9V46.5L28 39.76V17Z" fill="#fff" fill-opacity=".55"/>
+  <path d="M32 21V43.88L36 52.5L42.3 49.6L36 36H47Z" fill="#fff"/>
+</svg>
+EOF
+
+cat > "$PKG_ROOT/usr/share/icons/hicolor/scalable/apps/glide-symbolic.svg" <<'EOF'
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="7.5 4.75 52 52">
+  <path d="M20 9V46.5L28 39.76V17Z" fill="#fff" fill-opacity=".55"/>
+  <path d="M32 21V43.88L36 52.5L42.3 49.6L36 36H47Z" fill="#fff"/>
 </svg>
 EOF
 
@@ -117,6 +125,7 @@ EOF
 
 chmod 0644 \
     "$PKG_ROOT/usr/share/icons/hicolor/scalable/apps/glide.svg" \
+    "$PKG_ROOT/usr/share/icons/hicolor/scalable/apps/glide-symbolic.svg" \
     "$PKG_ROOT/usr/share/applications/glide.desktop" \
     "$PKG_ROOT/usr/share/doc/glide/99-glide-uinput.rules" \
     "$PKG_ROOT/usr/lib/systemd/user/glide-client.service" \

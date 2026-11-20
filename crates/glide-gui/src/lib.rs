@@ -30,6 +30,8 @@ use tokio::task::JoinHandle;
 use tracing::{debug, info, warn};
 
 const UI_HTML: &str = include_str!("ui.html");
+const FONT_INTER: &[u8] = include_bytes!("../assets/fonts/inter.woff2");
+const FONT_MONO: &[u8] = include_bytes!("../assets/fonts/jetbrains-mono.woff2");
 pub const DEFAULT_GUI_PORT: u16 = 24802;
 pub const GUI_WIDTH: u32 = 900;
 pub const GUI_HEIGHT: u32 = 640;
@@ -616,6 +618,14 @@ async fn handle_http_conn(mut stream: TcpStream, ctrl: Arc<AppController>) -> Re
 
         ("GET", "/favicon.png") | ("GET", "/favicon.ico") => {
             write_response(&mut stream, "200 OK", "image/png", &ctrl.favicon_png).await?;
+        }
+
+        // Bundled UI fonts (SIL OFL 1.1) so the GUI looks identical on every OS, offline.
+        ("GET", "/fonts/inter.woff2") => {
+            write_response(&mut stream, "200 OK", "font/woff2", FONT_INTER).await?;
+        }
+        ("GET", "/fonts/mono.woff2") => {
+            write_response(&mut stream, "200 OK", "font/woff2", FONT_MONO).await?;
         }
 
         ("GET", "/api/events") => {

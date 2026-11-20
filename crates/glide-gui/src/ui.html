@@ -7,30 +7,51 @@
 <link rel="icon" type="image/svg+xml" href="/favicon.svg" />
 <link rel="icon" type="image/png" href="/favicon.png" />
 <style>
+  /* Bundled fonts (SIL OFL 1.1) — served from the local binary, never the internet. */
+  @font-face {
+    font-family: "GlideSans";
+    src: url("/fonts/inter.woff2") format("woff2");
+    font-weight: 100 900;
+    font-display: block;
+  }
+  @font-face {
+    font-family: "GlideMono";
+    src: url("/fonts/mono.woff2") format("woff2");
+    font-weight: 100 800;
+    font-display: block;
+  }
+
   :root {
+    color-scheme: dark;
     --bg: #0b0e14;
-    --surface: #121722;
-    --surface-2: #181f2e;
-    --surface-3: #1f283b;
-    --inset: #0d111a;
-    --border: rgba(255, 255, 255, 0.08);
-    --border-strong: rgba(255, 255, 255, 0.15);
-    --text: #f1f5f9;
-    --text-2: #cbd5e1;
-    --muted: #8896ab;
+    --bg-2: #0e121a;
+    --panel: #121721;
+    --panel-2: #171d29;
+    --panel-3: #1d2433;
+    --inset: #0c1017;
+    --line: rgba(255, 255, 255, 0.065);
+    --line-2: rgba(255, 255, 255, 0.11);
+    --line-3: rgba(255, 255, 255, 0.18);
+    --text: #eef2f8;
+    --text-2: #c3cbd8;
+    --muted: #7f8a9d;
+    --faint: #566073;
     --accent: #3b82f6;
     --cyan: #06b6d4;
-    --accent-soft: rgba(59, 130, 246, 0.16);
-    --accent-ring: rgba(59, 130, 246, 0.45);
+    --grad: linear-gradient(135deg, #3b82f6 0%, #06b6d4 100%);
+    --accent-soft: rgba(59, 130, 246, 0.14);
+    --accent-line: rgba(80, 150, 255, 0.55);
     --green: #22c55e;
-    --green-soft: rgba(34, 197, 94, 0.14);
-    --amber: #f59e0b;
-    --amber-soft: rgba(245, 158, 11, 0.15);
-    --red: #ef4444;
-    --red-soft: rgba(239, 68, 68, 0.15);
-    --radius: 12px;
-    --mono: "Cascadia Code", "JetBrains Mono", "Ubuntu Mono", ui-monospace, SFMono-Regular, Consolas, monospace;
-    --sans: "Segoe UI Variable", "Segoe UI", "Ubuntu", "Cantarell", "Noto Sans", system-ui, -apple-system, sans-serif;
+    --green-soft: rgba(34, 197, 94, 0.13);
+    --amber: #f5a524;
+    --amber-soft: rgba(245, 165, 36, 0.14);
+    --red: #f05252;
+    --red-soft: rgba(240, 82, 82, 0.13);
+    --r-lg: 14px;
+    --r-md: 10px;
+    --r-sm: 7px;
+    --sans: "GlideSans", "Segoe UI", "Ubuntu", system-ui, sans-serif;
+    --mono: "GlideMono", "Cascadia Code", "Ubuntu Mono", ui-monospace, monospace;
   }
 
   * { box-sizing: border-box; }
@@ -39,854 +60,1109 @@
     margin: 0;
     padding: 0;
     width: 100%;
-    height: 100vh;
+    height: 100%;
     overflow: hidden;
-    background:
-      radial-gradient(900px 320px at 50% -120px, rgba(59, 130, 246, 0.10), transparent 70%),
-      var(--bg);
+    background: var(--bg);
     color: var(--text);
     font-family: var(--sans);
-    font-size: 12.5px;
-    line-height: 1.38;
+    font-size: 13px;
+    line-height: 1.35;
     -webkit-font-smoothing: antialiased;
+    font-feature-settings: "cv11", "ss01";
     user-select: none;
   }
 
-  /* Custom slim scrollbars ONLY for internal scrollable lists */
-  ::-webkit-scrollbar { width: 5px; height: 5px; }
-  ::-webkit-scrollbar-track { background: transparent; }
-  ::-webkit-scrollbar-thumb { background: rgba(255, 255, 255, 0.14); border-radius: 99px; }
-  ::-webkit-scrollbar-thumb:hover { background: rgba(255, 255, 255, 0.25); }
+  input, select, textarea { user-select: text; }
 
   .app {
-    width: 100%;
-    max-width: 900px;
+    width: 100vw;
     height: 100vh;
-    margin: 0 auto;
-    padding: 10px 14px 12px;
-    display: flex;
-    flex-direction: column;
-    gap: 8px;
-    overflow: hidden;
+    min-width: 900px;
+    min-height: 640px;
+    display: grid;
+    grid-template-rows: 56px 1fr;
+    background:
+      radial-gradient(900px 420px at 28% -12%, rgba(59, 130, 246, 0.07), transparent 60%),
+      var(--bg);
   }
 
-  /* Topbar */
+  /* ---------- Header ---------- */
   .topbar {
-    flex-shrink: 0;
     display: flex;
     align-items: center;
-    justify-content: space-between;
-    gap: 10px;
-    background: var(--surface);
-    border: 1px solid var(--border);
-    border-radius: 12px;
-    padding: 8px 12px;
-    box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.04);
+    gap: 8px;
+    padding: 0 14px 0 16px;
+    border-bottom: 1px solid var(--line);
+    background: rgba(14, 18, 26, 0.75);
   }
 
-  .brand { display: flex; align-items: center; gap: 10px; min-width: 0; }
-  .logo-wrap {
-    width: 30px; height: 30px; flex-shrink: 0; border-radius: 8px;
-    box-shadow: 0 4px 14px rgba(59, 130, 246, 0.35);
-    display: grid; place-items: center;
+  .brand {
+    display: flex;
+    align-items: center;
+    gap: 9px;
+    min-width: 0;
+    width: 132px;
+    flex-shrink: 0;
   }
-  .brand-text { min-width: 0; }
+
+  .brand-mark {
+    width: 28px;
+    height: 28px;
+    border-radius: 8px;
+    background: var(--grad);
+    display: grid;
+    place-items: center;
+    color: #fff;
+    flex-shrink: 0;
+    box-shadow: 0 4px 14px -4px rgba(59, 130, 246, 0.6), inset 0 1px 0 rgba(255, 255, 255, 0.25);
+  }
+  .brand-mark svg { width: 18px; height: 18px; display: block; }
+
+  .brand-text { min-width: 0; display: flex; flex-direction: column; }
   .brand-title {
-    font-weight: 700; font-size: 14.5px; letter-spacing: -0.015em;
-    display: flex; align-items: center; gap: 7px;
-  }
-  .ver {
-    font-size: 10px; font-weight: 600; color: var(--muted);
-    background: var(--surface-2); padding: 1px 6px; border-radius: 99px;
-    border: 1px solid var(--border); font-family: var(--mono);
+    font-size: 14.5px;
+    font-weight: 650;
+    letter-spacing: -0.01em;
+    line-height: 1.1;
   }
   .brand-sub {
-    font-size: 11px; color: var(--muted);
-    white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
-  }
-
-  .top-actions { display: flex; align-items: center; gap: 7px; flex-shrink: 0; }
-
-  .rtt-box {
-    display: none; align-items: center; gap: 6px;
-    font-family: var(--mono); font-variant-numeric: tabular-nums;
-    font-size: 11px; font-weight: 600; color: #7dd3fc;
-    background: var(--inset); border: 1px solid var(--border);
-    border-radius: 99px; padding: 3px 9px; height: 28px;
-  }
-
-  .pill {
-    display: inline-flex; align-items: center; gap: 6px;
-    padding: 4px 10px; border-radius: 99px; height: 28px;
-    font-size: 11.5px; font-weight: 600;
-    background: var(--surface-2); border: 1px solid var(--border); color: var(--muted);
-    max-width: 245px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
-  }
-  .pill span#statusText {
-    overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
-  }
-  .pill.live { background: var(--green-soft); color: #86efac; border-color: rgba(34, 197, 94, 0.32); }
-  .pill.wait { background: var(--amber-soft); color: #fcd34d; border-color: rgba(245, 158, 11, 0.32); }
-  .pill.err { background: var(--red-soft); color: #fca5a5; border-color: rgba(239, 68, 68, 0.35); }
-  .dot { width: 7px; height: 7px; border-radius: 50%; background: var(--muted); flex-shrink: 0; }
-  .pill.live .dot { background: var(--green); box-shadow: 0 0 8px var(--green); }
-  .pill.wait .dot { background: var(--amber); animation: pulse 1.5s ease-in-out infinite; }
-  .pill.err .dot { background: var(--red); }
-
-  @keyframes pulse {
-    0%, 100% { opacity: 1; }
-    50% { opacity: 0.4; }
-  }
-
-  button {
-    font-family: inherit; font-size: 12px; font-weight: 600; cursor: pointer;
-    border-radius: 8px; border: 1px solid var(--border-strong);
-    background: var(--surface-2); color: var(--text);
-    padding: 5px 11px; height: 28px;
-    display: inline-flex; align-items: center; justify-content: center; gap: 5px;
-    transition: background 0.14s ease, border-color 0.14s ease, transform 0.08s ease, color 0.14s ease;
+    font-size: 10.5px;
+    color: var(--muted);
     white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    margin-top: 1px;
   }
-  button:hover { background: var(--surface-3); border-color: rgba(255, 255, 255, 0.24); }
-  button:active { transform: translateY(1px); }
-  button.primary {
-    background: linear-gradient(135deg, #3b82f6, #2563eb);
-    border-color: rgba(96, 165, 250, 0.65); color: #fff;
-    box-shadow: 0 2px 10px rgba(37, 99, 235, 0.28);
-  }
-  button.primary:hover { background: linear-gradient(135deg, #2563eb, #1d4ed8); }
-  button.danger { background: var(--red-soft); border-color: rgba(239, 68, 68, 0.45); color: #fca5a5; }
-  button.danger:hover { background: rgba(239, 68, 68, 0.26); }
-  button.locked { background: var(--amber-soft); border-color: rgba(245, 158, 11, 0.5); color: #fde68a; }
-  button.ghost { background: transparent; border-color: var(--border); color: var(--muted); }
-  button.ghost:hover { background: var(--surface-2); color: var(--text); }
-  button.quit-btn { padding: 5px 9px; color: var(--muted); border-color: var(--border); background: transparent; }
-  button.quit-btn:hover { color: #fca5a5; border-color: rgba(239, 68, 68, 0.4); background: rgba(239, 68, 68, 0.12); }
-  button.sm { padding: 3px 9px; font-size: 11.5px; height: 24px; border-radius: 7px; }
-  button.xs { padding: 2px 7px; font-size: 10.5px; height: 21px; border-radius: 6px; }
-  button:disabled { opacity: 0.45; cursor: not-allowed; }
 
-  /* Tabs Row */
-  .nav-row {
-    flex-shrink: 0;
-    display: flex; align-items: center; justify-content: space-between; gap: 10px;
-  }
   .tabs {
-    display: inline-flex; gap: 4px; background: var(--surface); padding: 4px;
-    border-radius: 10px; border: 1px solid var(--border);
+    display: flex;
+    gap: 2px;
+    padding: 3px;
+    border-radius: 10px;
+    background: var(--inset);
+    border: 1px solid var(--line);
+    margin-left: 6px;
   }
   .tab {
-    background: transparent; border: none; color: var(--muted);
-    padding: 5px 12px; height: 27px; border-radius: 7px; font-size: 12px; font-weight: 600;
+    border: 0;
+    background: transparent;
+    color: var(--muted);
+    font: inherit;
+    font-size: 12.5px;
+    font-weight: 550;
+    height: 28px;
+    padding: 0 14px;
+    border-radius: 7px;
+    cursor: pointer;
+    transition: color .15s, background .15s;
   }
-  .tab:hover { color: var(--text); background: rgba(255, 255, 255, 0.04); }
+  .tab:hover { color: var(--text-2); background: transparent; border: 0; }
   .tab.active {
-    background: var(--surface-2); color: var(--text);
-    box-shadow: inset 0 0 0 1px var(--border-strong), 0 1px 4px rgba(0, 0, 0, 0.25);
+    color: var(--text);
+    background: var(--panel-3);
+    box-shadow: 0 1px 0 rgba(255, 255, 255, 0.06) inset, 0 1px 3px rgba(0, 0, 0, 0.35);
   }
 
-  .nav-meta {
-    display: flex; align-items: center; gap: 8px; min-width: 0;
+  .spacer { flex: 1; }
+
+  .pill {
+    display: inline-flex;
+    align-items: center;
+    gap: 7px;
+    height: 30px;
+    padding: 0 11px;
+    border-radius: 999px;
+    background: var(--panel);
+    border: 1px solid var(--line-2);
+    color: var(--text-2);
+    font-size: 12px;
+    font-weight: 550;
+    max-width: 290px;
+    flex-shrink: 1;
+    min-width: 0;
   }
-  .hotkey-mini {
-    font-size: 11px; color: var(--muted); display: flex; align-items: center; gap: 6px;
+  .pill .dot {
+    width: 7px;
+    height: 7px;
+    border-radius: 50%;
+    background: var(--faint);
+    flex-shrink: 0;
+  }
+  #statusText {
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    max-width: 150px;
+  }
+  .pill.live { border-color: rgba(34, 197, 94, 0.35); color: #c9f5d9; }
+  .pill.live .dot { background: var(--green); box-shadow: 0 0 0 3px rgba(34, 197, 94, 0.18); }
+  .pill.wait { border-color: rgba(245, 165, 36, 0.35); color: #fbe3b5; }
+  .pill.wait .dot { background: var(--amber); animation: blink 1.2s ease-in-out infinite; }
+  .pill.err { border-color: rgba(240, 82, 82, 0.4); color: #fecaca; }
+  .pill.err .dot { background: var(--red); }
+
+  .rtt-box {
+    display: none;
+    align-items: center;
+    gap: 6px;
+    padding-left: 8px;
+    margin-left: 1px;
+    border-left: 1px solid var(--line-2);
+    font-family: var(--mono);
+    font-size: 11px;
+    color: var(--text-2);
     white-space: nowrap;
   }
 
-  /* Error alert banner */
-  .err-banner {
-    flex-shrink: 0;
-    display: none; align-items: center; justify-content: space-between; gap: 10px;
-    background: rgba(239, 68, 68, 0.12); border: 1px solid rgba(239, 68, 68, 0.35);
-    color: #fecaca; border-radius: 9px; padding: 5px 10px; font-size: 11.5px;
-  }
-  .err-banner.show { display: flex; }
+  @keyframes blink { 50% { opacity: .35; } }
 
-  /* Main Tab Panels */
-  .panel {
-    display: none;
-    flex: 1;
-    min-height: 0;
-    flex-direction: column;
-    gap: 10px;
+  /* ---------- Buttons ---------- */
+  button {
+    font: inherit;
+    font-size: 12.5px;
+    font-weight: 600;
+    color: var(--text);
+    background: var(--panel-2);
+    border: 1px solid var(--line-2);
+    height: 30px;
+    padding: 0 12px;
+    border-radius: 8px;
+    cursor: pointer;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    gap: 6px;
+    white-space: nowrap;
+    transition: background .15s, border-color .15s, color .15s, transform .08s, box-shadow .15s;
   }
-  .panel.active { display: flex; }
+  button:hover { background: var(--panel-3); border-color: var(--line-3); }
+  button:active { transform: translateY(0.5px); }
+  button:disabled { opacity: .45; cursor: not-allowed; }
+  button:focus-visible, input:focus-visible, select:focus-visible {
+    outline: 2px solid var(--accent-line);
+    outline-offset: 1px;
+  }
 
-  .grid-desk {
-    flex: 1; min-height: 0;
-    display: grid; grid-template-columns: 1.24fr 1fr; gap: 10px;
-    align-items: stretch;
+  button.primary {
+    background: var(--grad);
+    border-color: transparent;
+    color: #fff;
+    box-shadow: 0 6px 18px -8px rgba(59, 130, 246, 0.8), inset 0 1px 0 rgba(255, 255, 255, 0.2);
   }
-  .grid-2 {
-    flex: 1; min-height: 0;
-    display: grid; grid-template-columns: 1fr 1fr; gap: 10px;
-    align-items: stretch;
+  button.primary:hover { filter: brightness(1.08); background: var(--grad); }
+  button.danger {
+    background: var(--red-soft);
+    border-color: rgba(240, 82, 82, 0.35);
+    color: #fecaca;
   }
-  .col-stack {
-    min-height: 0;
-    display: flex; flex-direction: column; gap: 10px;
+  button.danger:hover { background: rgba(240, 82, 82, 0.22); }
+  button.ghost { background: transparent; border-color: transparent; color: var(--muted); }
+  button.ghost:hover { background: var(--panel-2); color: var(--text); border-color: var(--line); }
+  button.sm { height: 26px; padding: 0 10px; font-size: 11.5px; border-radius: 7px; }
+  button.xs { height: 22px; padding: 0 8px; font-size: 11px; border-radius: 6px; }
+  button.icon { width: 30px; padding: 0; }
+
+  #startStopBtn { min-width: 112px; }
+  #lockBtn.locked {
+    background: var(--amber-soft);
+    border-color: rgba(245, 165, 36, 0.45);
+    color: #fde7bf;
   }
+  #quitBtn:hover { color: #fecaca; border-color: rgba(240, 82, 82, 0.35); background: var(--red-soft); }
+
+  .sr { position: absolute; width: 1px; height: 1px; overflow: hidden; clip: rect(0 0 0 0); white-space: nowrap; }
+
+  /* ---------- Main / Panels ---------- */
+  main { position: relative; min-height: 0; padding: 14px 16px 16px; }
+  .panel { display: none; height: 100%; min-height: 0; }
+  .panel.active { display: grid; animation: fadeIn .18s ease-out; }
+  @keyframes fadeIn { from { opacity: 0; transform: translateY(3px); } to { opacity: 1; transform: none; } }
 
   .card {
-    background: var(--surface);
-    border: 1px solid var(--border);
-    border-radius: var(--radius);
-    padding: 11px 13px;
-    display: flex; flex-direction: column; gap: 8px;
+    background: var(--panel);
+    border: 1px solid var(--line);
+    border-radius: var(--r-lg);
+    padding: 14px 16px;
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
     min-height: 0;
-    box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.03);
   }
-  .card.grow { flex: 1; min-height: 0; }
-  .card-hdr { display: flex; align-items: center; justify-content: space-between; gap: 8px; flex-shrink: 0; }
-  .card-title { font-size: 13px; font-weight: 700; letter-spacing: -0.01em; display: flex; align-items: center; gap: 6px; }
-  .card-sub { font-size: 11px; color: var(--muted); }
-
-  /* Segmented Role Control */
-  .seg {
-    flex-shrink: 0;
-    display: grid; grid-template-columns: 1fr 1fr; gap: 5px;
-    background: var(--inset); padding: 4px; border-radius: 10px; border: 1px solid var(--border);
-  }
-  .seg button {
-    height: auto; padding: 6px 9px; border-radius: 7px;
-    background: transparent; border: 1px solid transparent; color: var(--muted);
-    display: flex; flex-direction: column; align-items: flex-start; gap: 1px;
-    text-align: left;
-  }
-  .seg button strong { font-size: 11.5px; font-weight: 700; color: inherit; }
-  .seg button span.small { font-size: 10px; font-weight: 400; color: var(--muted); }
-  .seg button:hover { background: rgba(255, 255, 255, 0.03); color: var(--text-2); }
-  .seg button.active {
-    background: var(--surface-2); border-color: rgba(59, 130, 246, 0.55); color: var(--text);
-    box-shadow: 0 2px 8px rgba(0, 0, 0, 0.25), inset 0 1px 0 rgba(255, 255, 255, 0.06);
-  }
-
-  /* Visual Desk Layout Canvas (1 square per machine!) */
-  .desk-stage {
-    flex: 1; min-height: 240px;
-    background:
-      radial-gradient(circle at 50% 50%, rgba(59, 130, 246, 0.06), transparent 65%),
-      radial-gradient(rgba(255, 255, 255, 0.055) 1px, transparent 1px);
-    background-size: 100% 100%, 16px 16px;
-    background-color: var(--inset);
-    border: 1px solid var(--border);
-    border-radius: 11px;
-    padding: 9px;
-    display: grid;
-    grid-template-columns: 128px 1fr 128px;
-    grid-template-rows: 66px 1fr 66px;
-    gap: 8px;
-    align-items: stretch;
-    justify-items: stretch;
-    position: relative;
-  }
-
-  .edge-slot {
-    border: 1px dashed rgba(255, 255, 255, 0.13);
-    border-radius: 10px;
-    background: rgba(255, 255, 255, 0.015);
-    color: var(--muted);
-    display: flex; flex-direction: column; align-items: center; justify-content: center;
-    cursor: pointer;
-    transition: border-color 0.14s ease, background 0.14s ease, transform 0.14s ease, box-shadow 0.14s ease;
-    position: relative;
-    overflow: hidden;
-    padding: 0;
-  }
-  .edge-slot:hover {
-    border-color: rgba(59, 130, 246, 0.6);
-    background: rgba(59, 130, 246, 0.08);
-    color: var(--text);
-  }
-  .edge-slot.occupied {
-    border-style: solid;
-    border-color: transparent;
-    background: transparent;
-  }
-  .edge-slot.drop-over {
-    border-style: dashed !important;
-    border-color: var(--cyan) !important;
-    background: rgba(6, 182, 212, 0.16) !important;
-    box-shadow: 0 0 0 2px rgba(6, 182, 212, 0.25);
-    transform: scale(1.02);
-  }
-  .edge-top { grid-column: 1 / -1; grid-row: 1; justify-self: center; width: 256px; }
-  .edge-left { grid-column: 1; grid-row: 2; }
-  .edge-center { grid-column: 2; grid-row: 2; display: flex; align-items: stretch; justify-content: stretch; }
-  .edge-right { grid-column: 3; grid-row: 2; }
-  .edge-bottom { grid-column: 1 / -1; grid-row: 3; justify-self: center; width: 256px; }
-
-  .slot-empty {
-    display: flex; flex-direction: column; align-items: center; justify-content: center;
-    gap: 2px; font-size: 11px; font-weight: 600; color: var(--muted);
-    pointer-events: none; padding: 4px;
-  }
-  .edge-top .slot-empty, .edge-bottom .slot-empty { flex-direction: row; gap: 6px; }
-  .slot-empty .slot-sub { font-size: 9.5px; font-weight: 500; opacity: 0.7; }
-
-  /* Single Machine Tile (1 square/card per PC) */
-  .machine-tile {
-    width: 100%; height: 100%;
-    border-radius: 10px;
-    background: linear-gradient(180deg, #1b2334, #141a28);
-    border: 1px solid var(--border-strong);
-    box-shadow: 0 4px 14px rgba(0, 0, 0, 0.3), inset 0 1px 0 rgba(255, 255, 255, 0.08);
-    display: flex; flex-direction: column; align-items: center; justify-content: center;
-    gap: 4px; padding: 7px 8px;
-    position: relative;
-    transition: border-color 0.16s ease, box-shadow 0.16s ease, transform 0.12s ease;
-    overflow: hidden;
-  }
-  .machine-tile.center-tile {
-    border-radius: 11px;
-    padding: 10px 12px;
-    cursor: pointer;
-  }
-  .machine-tile.draggable { cursor: grab; }
-  .machine-tile.draggable:active { cursor: grabbing; }
-  .machine-tile.dragging { opacity: 0.45; transform: scale(0.97); }
-  .machine-tile.selected-peer { border-color: rgba(59, 130, 246, 0.6); }
-
-  /* Active cursor focus glow */
-  .machine-tile.focused {
-    border-color: rgba(34, 197, 94, 0.78);
-    background: linear-gradient(180deg, rgba(34, 197, 94, 0.14), rgba(20, 26, 40, 0.96));
-    box-shadow:
-      0 0 0 1px rgba(34, 197, 94, 0.35),
-      0 0 22px rgba(34, 197, 94, 0.22),
-      inset 0 1px 0 rgba(255, 255, 255, 0.12);
-  }
-  .machine-tile.dimmed {
-    opacity: 0.72;
-    border-style: dashed;
-  }
-
-  /* Horizontal adaptation inside Top / Bottom edge slots */
-  .edge-top .machine-tile,
-  .edge-bottom .machine-tile {
-    flex-direction: row;
-    justify-content: space-between;
+  .card.grow { flex: 1; }
+  .card-hdr {
+    display: flex;
     align-items: center;
-    padding: 7px 11px;
-    gap: 8px;
-    text-align: left;
-  }
-  .tile-main {
-    display: flex; flex-direction: column; align-items: center; gap: 3px; min-width: 0; max-width: 100%;
-  }
-  .edge-top .tile-main,
-  .edge-bottom .tile-main {
-    align-items: flex-start;
-    flex: 1;
-    gap: 4px;
-  }
-  .edge-top .tile-top-row,
-  .edge-bottom .tile-top-row {
-    justify-content: flex-start;
-    flex-wrap: nowrap;
-  }
-  .tile-actions {
-    display: flex; align-items: center; justify-content: center; gap: 4px; flex-wrap: wrap; flex-shrink: 0;
-  }
-  .edge-top .tile-actions,
-  .edge-bottom .tile-actions {
-    flex-direction: column; align-items: flex-end; gap: 3px;
-  }
-
-  .tile-name {
-    font-size: 11.5px; font-weight: 700; color: var(--text);
-    white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 100%;
-  }
-  .center-tile .tile-name { font-size: 12.5px; }
-  .tile-top-row { display: flex; align-items: center; gap: 5px; flex-wrap: wrap; justify-content: center; }
-
-  .os-pill {
-    display: inline-flex; align-items: center; gap: 4px;
-    font-size: 10px; font-weight: 600;
-    padding: 1.5px 6px; border-radius: 99px;
-    background: rgba(255, 255, 255, 0.08); color: var(--text-2);
-    border: 1px solid rgba(255, 255, 255, 0.08);
-    white-space: nowrap; flex-shrink: 0;
-  }
-  .os-pill.win { background: rgba(59, 130, 246, 0.16); color: #93c5fd; border-color: rgba(59, 130, 246, 0.3); }
-  .os-pill.lin { background: rgba(245, 158, 11, 0.14); color: #fcd34d; border-color: rgba(245, 158, 11, 0.28); }
-  .os-pill.mac { background: rgba(148, 163, 184, 0.16); color: #e2e8f0; }
-
-  .rtt-pill {
-    font-family: var(--mono); font-variant-numeric: tabular-nums;
-    font-size: 10px; font-weight: 700;
-    padding: 1.5px 6px; border-radius: 99px;
-    background: rgba(34, 197, 94, 0.15); color: #86efac;
-    border: 1px solid rgba(34, 197, 94, 0.3);
-    white-space: nowrap; flex-shrink: 0;
-  }
-  .focus-chip {
-    display: inline-flex; align-items: center; gap: 4px;
-    font-size: 9.5px; font-weight: 700; letter-spacing: 0.03em; text-transform: uppercase;
-    color: #86efac;
-  }
-  .focus-chip .pulse-dot {
-    width: 6px; height: 6px; border-radius: 50%; background: var(--green);
-    box-shadow: 0 0 8px var(--green);
-  }
-  .role-chip {
-    font-size: 9.5px; font-weight: 700; letter-spacing: 0.03em; text-transform: uppercase;
-    color: #93c5fd; background: rgba(59, 130, 246, 0.15);
-    padding: 1px 6px; border-radius: 99px; border: 1px solid rgba(59, 130, 246, 0.25);
-  }
-
-  .stage-hint {
+    justify-content: space-between;
+    gap: 10px;
+    min-height: 22px;
     flex-shrink: 0;
-    display: flex; align-items: center; justify-content: space-between; gap: 8px;
-    font-size: 11px; color: var(--muted);
-    padding: 0 2px;
   }
+  .card-title { font-size: 13px; font-weight: 650; letter-spacing: -0.005em; }
+  .card-sub { font-size: 11px; color: var(--muted); }
+  .eyebrow {
+    font-size: 10.5px;
+    font-weight: 650;
+    letter-spacing: .07em;
+    text-transform: uppercase;
+    color: var(--muted);
+  }
+  .col { display: flex; flex-direction: column; gap: 14px; min-height: 0; }
 
-  /* Badges & Tags */
   .badge {
-    font-size: 10px; font-weight: 700; padding: 2px 7px; border-radius: 99px;
-    background: rgba(255, 255, 255, 0.07); color: var(--text-2);
-    border: 1px solid var(--border); letter-spacing: 0.02em;
+    display: inline-flex;
+    align-items: center;
+    gap: 5px;
+    height: 20px;
+    padding: 0 8px;
+    border-radius: 999px;
+    background: var(--panel-2);
+    border: 1px solid var(--line);
+    color: var(--muted);
+    font-size: 10.5px;
+    font-weight: 600;
     white-space: nowrap;
   }
-  .badge.live { background: var(--green-soft); color: #86efac; border-color: rgba(34, 197, 94, 0.3); }
-  .badge.accent { background: var(--accent-soft); color: #93c5fd; border-color: rgba(59, 130, 246, 0.3); }
+  .badge.live { color: #b8f0cc; background: var(--green-soft); border-color: rgba(34, 197, 94, 0.25); }
+  .badge.accent { color: #cfe0ff; background: var(--accent-soft); border-color: rgba(59, 130, 246, 0.3); }
 
-  /* Right column lists */
-  .ip-bar {
+  .kbd {
+    font-family: var(--mono);
+    font-size: 10.5px;
+    padding: 2px 6px;
+    border-radius: 5px;
+    background: var(--inset);
+    border: 1px solid var(--line-2);
+    border-bottom-width: 2px;
+    color: var(--text-2);
+    white-space: nowrap;
+  }
+
+  /* ---------- Inputs ---------- */
+  input[type="text"], input[type="number"], select {
+    width: 100%;
+    height: 32px;
+    padding: 0 10px;
+    border-radius: 8px;
+    background: var(--inset);
+    border: 1px solid var(--line-2);
+    color: var(--text);
+    font: inherit;
+    font-size: 12.5px;
+    transition: border-color .15s, box-shadow .15s;
+  }
+  input[type="text"]:focus, input[type="number"]:focus, select:focus {
+    outline: none;
+    border-color: var(--accent-line);
+    box-shadow: 0 0 0 3px rgba(59, 130, 246, 0.15);
+  }
+  input::placeholder { color: var(--faint); }
+  input[type="number"]::-webkit-inner-spin-button { opacity: .4; }
+  select {
+    appearance: none;
+    padding-right: 28px;
+    cursor: pointer;
+    background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='10' height='10' viewBox='0 0 24 24' fill='none' stroke='%237f8a9d' stroke-width='3' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='m6 9 6 6 6-6'/%3E%3C/svg%3E");
+    background-repeat: no-repeat;
+    background-position: right 10px center;
+  }
+  select option { background: var(--panel-2); color: var(--text); }
+  .mono { font-family: var(--mono); }
+
+  .field { display: flex; flex-direction: column; gap: 6px; flex-shrink: 0; }
+  .field-row {
+    display: flex;
+    align-items: baseline;
+    justify-content: space-between;
+    font-size: 12px;
+    color: var(--text-2);
+    font-weight: 500;
+  }
+  .val { font-family: var(--mono); font-size: 11px; color: var(--text); }
+
+  input[type="range"] {
+    -webkit-appearance: none;
+    appearance: none;
+    width: 100%;
+    height: 16px;
+    background: transparent;
+    margin: 0;
+    cursor: pointer;
+    --pct: 50%;
+  }
+  input[type="range"]::-webkit-slider-runnable-track {
+    height: 4px;
+    border-radius: 4px;
+    background: linear-gradient(90deg, #3b82f6, #06b6d4) 0 / var(--pct) 100% no-repeat, rgba(255, 255, 255, 0.09);
+  }
+  input[type="range"]::-webkit-slider-thumb {
+    -webkit-appearance: none;
+    width: 14px;
+    height: 14px;
+    margin-top: -5px;
+    border-radius: 50%;
+    background: #fff;
+    border: 0;
+    box-shadow: 0 0 0 3px rgba(59, 130, 246, 0.3), 0 2px 6px rgba(0, 0, 0, 0.5);
+    transition: box-shadow .15s;
+  }
+  input[type="range"]:hover::-webkit-slider-thumb { box-shadow: 0 0 0 5px rgba(59, 130, 246, 0.25), 0 2px 6px rgba(0, 0, 0, 0.5); }
+
+  .switch { position: relative; width: 34px; height: 20px; flex-shrink: 0; display: inline-block; }
+  .switch input { opacity: 0; width: 0; height: 0; position: absolute; }
+  .switch .slider {
+    position: absolute;
+    inset: 0;
+    border-radius: 999px;
+    background: rgba(255, 255, 255, 0.12);
+    transition: background .18s;
+    cursor: pointer;
+  }
+  .switch .slider::before {
+    content: "";
+    position: absolute;
+    width: 16px;
+    height: 16px;
+    left: 2px;
+    top: 2px;
+    border-radius: 50%;
+    background: #fff;
+    box-shadow: 0 1px 3px rgba(0, 0, 0, 0.4);
+    transition: transform .18s cubic-bezier(.3, .7, .4, 1);
+  }
+  .switch input:checked + .slider { background: var(--grad); }
+  .switch input:checked + .slider::before { transform: translateX(14px); }
+  .switch input:focus-visible + .slider { outline: 2px solid var(--accent-line); outline-offset: 2px; }
+
+  /* Hairline option rows */
+  .opts { display: flex; flex-direction: column; flex-shrink: 0; }
+  .opt {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 12px;
+    padding: 8px 0;
+    border-top: 1px solid var(--line);
+  }
+  .opt:first-child { border-top: 0; padding-top: 2px; }
+  .opt:last-child { padding-bottom: 0; }
+  .opt-label { font-size: 12.5px; font-weight: 550; color: var(--text); }
+  .opt-desc { font-size: 11px; color: var(--muted); margin-top: 1px; }
+  .opt select { width: 196px; height: 28px; font-size: 12px; }
+
+  .scroll {
+    overflow-y: auto;
+    min-height: 0;
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+  }
+  .scroll::-webkit-scrollbar { width: 6px; }
+  .scroll::-webkit-scrollbar-thumb { background: rgba(255, 255, 255, 0.1); border-radius: 6px; }
+  .scroll::-webkit-scrollbar-track { background: transparent; }
+
+  .empty {
+    flex: 1;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    text-align: center;
+    gap: 3px;
+    padding: 12px;
+    color: var(--muted);
+    font-size: 11.5px;
+  }
+  .empty strong { color: var(--text-2); font-weight: 600; font-size: 12px; }
+
+  .row-item {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    padding: 7px 8px 7px 10px;
+    border-radius: 9px;
+    background: var(--panel-2);
+    border: 1px solid var(--line);
     flex-shrink: 0;
-    display: flex; align-items: center; justify-content: space-between; gap: 8px;
-    background: var(--inset); border: 1px solid var(--border);
-    border-radius: 8px; padding: 5px 9px;
   }
-  .ip-text {
-    font-family: var(--mono); font-size: 11.5px; color: #cbd5e1;
-    white-space: nowrap; overflow: hidden; text-overflow: ellipsis; user-select: text;
+  .row-item .grow { flex: 1; min-width: 0; }
+  .row-title {
+    font-size: 12.5px;
+    font-weight: 600;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+  .row-meta {
+    font-size: 10.5px;
+    color: var(--muted);
+    font-family: var(--mono);
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    margin-top: 1px;
+  }
+  .os-ico {
+    width: 26px;
+    height: 26px;
+    border-radius: 7px;
+    display: grid;
+    place-items: center;
+    background: var(--panel-3);
+    color: var(--text-2);
+    flex-shrink: 0;
   }
 
-  .scroll-list {
-    flex: 1; min-height: 0; overflow-y: auto;
-    display: flex; flex-direction: column; gap: 6px;
-    padding-right: 2px;
+  /* ---------- Layout tab ---------- */
+  #tab-overview { grid-template-columns: 1fr 272px; gap: 14px; }
+
+  .stage-card {
+    position: relative;
+    border-radius: var(--r-lg);
+    border: 1px solid var(--line);
+    background:
+      radial-gradient(circle at 50% 46%, rgba(59, 130, 246, 0.07), transparent 58%),
+      radial-gradient(rgba(255, 255, 255, 0.045) 1px, transparent 1px) 0 0 / 18px 18px,
+      var(--bg-2);
+    overflow: hidden;
+    display: flex;
+    flex-direction: column;
+  }
+  .stage-top {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 12px 14px 0 16px;
+  }
+  .stage-foot {
+    padding: 0 16px 13px;
+    text-align: center;
+    font-size: 11.5px;
+    color: var(--muted);
   }
 
-  .device {
-    display: flex; align-items: center; justify-content: space-between; gap: 8px;
-    background: var(--surface-2); border: 1px solid var(--border);
-    border-radius: 9px; padding: 7px 10px; flex-shrink: 0;
+  .desk {
+    flex: 1;
+    display: grid;
+    grid-template-columns: 132px 180px 132px;
+    grid-template-rows: 104px 136px 104px;
+    gap: 14px 16px;
+    place-content: center;
   }
-  .device:hover { border-color: var(--border-strong); }
-  .dev-name { font-weight: 700; font-size: 12px; display: flex; align-items: center; gap: 6px; }
-  .dev-meta { font-family: var(--mono); font-size: 10.5px; color: var(--muted); }
+  .edge-top { grid-area: 1 / 2; align-self: end; }
+  .edge-left { grid-area: 2 / 1; align-self: center; }
+  .edge-center { grid-area: 2 / 2; align-self: center; }
+  .edge-right { grid-area: 2 / 3; align-self: center; }
+  .edge-bottom { grid-area: 3 / 2; align-self: start; }
+
+  .edge-slot, .edge-center { display: flex; justify-content: center; }
+  .edge-top .mon, .edge-bottom .mon { width: 132px; }
+  #activeTargetBadge { visibility: hidden; }
+  #activeTargetBadge.on { visibility: visible; }
+  body.preload *, body.preload *::before, body.preload *::after { transition: none !important; animation-duration: 0s !important; }
+
+  /* Monitor */
+  .mon {
+    width: 100%;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    position: relative;
+    transition: transform .18s cubic-bezier(.3, .7, .4, 1), opacity .18s;
+  }
+  .mon-screen {
+    width: 100%;
+    aspect-ratio: 16 / 10;
+    border-radius: 9px;
+    border: 1.5px solid var(--line-3);
+    background: linear-gradient(160deg, #1b2231, #141a26);
+    box-shadow: 0 10px 26px -14px rgba(0, 0, 0, 0.8), inset 0 1px 0 rgba(255, 255, 255, 0.05);
+    position: relative;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    gap: 3px;
+    padding: 6px 10px;
+    overflow: hidden;
+    transition: border-color .18s, background .18s, box-shadow .18s;
+  }
+  .mon-neck { width: 16px; height: 5px; background: rgba(255, 255, 255, 0.13); }
+  .mon-base { width: 40px; height: 3px; border-radius: 3px; background: rgba(255, 255, 255, 0.16); }
+
+  .mon-os { color: var(--text-2); display: grid; place-items: center; height: 16px; }
+  .mon-name {
+    font-size: 12.5px;
+    font-weight: 650;
+    max-width: 100%;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    letter-spacing: -0.005em;
+  }
+  .mon-sub {
+    font-size: 10.5px;
+    color: var(--muted);
+    white-space: nowrap;
+    max-width: 100%;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+  .mon-sub .mono { font-size: 10px; }
+  .mon.center .mon-name { font-size: 14px; }
+  .mon.center .mon-os svg { width: 15px; height: 15px; }
+
+  .mon.focused .mon-screen {
+    border-color: rgba(110, 170, 255, 0.85);
+    background:
+      radial-gradient(120% 90% at 0% 0%, rgba(59, 130, 246, 0.55), transparent 60%),
+      radial-gradient(120% 90% at 100% 100%, rgba(6, 182, 212, 0.45), transparent 60%),
+      #172036;
+    box-shadow: 0 0 0 4px rgba(59, 130, 246, 0.14), 0 14px 34px -14px rgba(59, 130, 246, 0.7);
+  }
+  .mon.focused .mon-sub { color: #d6e6ff; }
+  .mon.focused .mon-os { color: #fff; }
+  .mon .cursor-glyph {
+    position: absolute;
+    right: 9px;
+    bottom: 7px;
+    width: 11px;
+    height: 13px;
+    opacity: 0;
+    transition: opacity .2s;
+    filter: drop-shadow(0 1px 1px rgba(0, 0, 0, 0.5));
+  }
+  .mon.focused .cursor-glyph { opacity: 1; }
+
+  .mon.dimmed { opacity: .5; }
+  .mon.clickable .mon-screen { cursor: pointer; }
+  .mon.clickable:hover .mon-screen { border-color: var(--accent-line); }
+
+  .mon.draggable { cursor: grab; }
+  .mon.draggable:hover .mon-screen { border-color: var(--accent-line); }
+  .mon.draggable:hover { transform: translateY(-2px); }
+  .mon.dragging { opacity: .35; }
+  .mon.selected-peer .mon-screen { box-shadow: 0 0 0 2px rgba(6, 182, 212, 0.55); }
+
+  .mon .jump-peer-btn {
+    position: absolute;
+    top: 6px;
+    right: 6px;
+    height: 20px;
+    padding: 0 7px;
+    font-size: 10.5px;
+    border-radius: 6px;
+    opacity: 0;
+    transform: translateY(-2px);
+    transition: opacity .15s, transform .15s;
+  }
+  .mon:hover .jump-peer-btn { opacity: 1; transform: none; }
+
+  /* Ghost (empty) edge positions */
+  .mon.ghost .mon-screen {
+    border: 1.5px dashed rgba(255, 255, 255, 0.12);
+    background: rgba(255, 255, 255, 0.012);
+    box-shadow: none;
+    color: var(--faint);
+    font-size: 11px;
+    font-weight: 600;
+  }
+  .mon.ghost .mon-neck, .mon.ghost .mon-base { opacity: .35; }
+  .mon.ghost .ghost-label { display: flex; align-items: center; gap: 5px; }
+  .mon.ghost .ghost-hint { font-size: 10px; font-weight: 500; opacity: 0; transition: opacity .15s; }
+  .mon.ghost { opacity: .7; }
+  .mon.ghost.inert { opacity: .32; }
+  .edge-slot:not(.occupied) { cursor: pointer; }
+  .edge-slot.inert-slot { cursor: default; }
+  .edge-slot:not(.occupied):not(.inert-slot):hover .mon.ghost,
+  .desk.is-dragging .mon.ghost { opacity: 1; }
+  .edge-slot:not(.occupied):not(.inert-slot):hover .mon-screen,
+  .desk.is-dragging .edge-slot:not(.occupied) .mon-screen {
+    border-color: var(--accent-line);
+    background: rgba(59, 130, 246, 0.07);
+    color: #bcd4ff;
+  }
+  .edge-slot:not(.occupied):not(.inert-slot):hover .ghost-hint { opacity: 1; }
+  .edge-slot.drop-over .mon-screen {
+    border-style: solid !important;
+    border-color: rgba(110, 170, 255, 0.95) !important;
+    background: rgba(59, 130, 246, 0.18) !important;
+    box-shadow: 0 0 0 4px rgba(59, 130, 246, 0.15) !important;
+  }
+
+  /* Sidebar */
+  .side { display: flex; flex-direction: column; gap: 12px; min-height: 0; }
+  .seg {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 3px;
+    padding: 3px;
+    border-radius: 10px;
+    background: var(--inset);
+    border: 1px solid var(--line);
+  }
+  .seg button {
+    height: 30px;
+    border: 0;
+    background: transparent;
+    color: var(--muted);
+    border-radius: 7px;
+    font-size: 12.5px;
+  }
+  .seg button:hover { color: var(--text-2); background: transparent; }
+  .seg button.active {
+    background: var(--panel-3);
+    color: var(--text);
+    box-shadow: 0 1px 0 rgba(255, 255, 255, 0.06) inset, 0 1px 3px rgba(0, 0, 0, 0.35);
+  }
+  .role-caption { font-size: 11px; color: var(--muted); text-align: center; margin-top: -3px; }
+
+  .addr-block {
+    border-radius: 11px;
+    background: var(--inset);
+    border: 1px solid var(--line);
+    padding: 10px 10px 10px 12px;
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    flex-shrink: 0;
+  }
+  .addr-main {
+    font-family: var(--mono);
+    font-size: 16px;
+    font-weight: 600;
+    letter-spacing: -0.01em;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+  .addr-main .port { color: var(--muted); font-weight: 500; }
+  .addr-more {
+    font-family: var(--mono);
+    font-size: 10.5px;
+    color: var(--muted);
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    margin-top: 2px;
+  }
+  .addr-none { font-size: 12px; color: var(--amber); font-family: var(--sans); font-weight: 550; }
+
+  .inline-row { display: flex; align-items: center; gap: 10px; flex-shrink: 0; }
+  .port-field { display: flex; align-items: center; gap: 7px; font-size: 12px; color: var(--text-2); font-weight: 550; }
+  .port-field input { width: 76px; height: 28px; font-family: var(--mono); font-size: 12px; padding: 0 8px; }
+
+  .divider { height: 1px; background: var(--line); flex-shrink: 0; margin: 2px 0; }
 
   .edge-pills { display: grid; grid-template-columns: repeat(4, 1fr); gap: 5px; }
   .edge-pill {
-    height: 25px; font-size: 11px; font-weight: 600; border-radius: 7px;
-    background: var(--inset); border: 1px solid var(--border); color: var(--muted);
+    height: 28px;
+    padding: 0;
+    font-size: 11.5px;
+    font-weight: 600;
+    color: var(--muted);
+    background: var(--inset);
+    border-color: var(--line);
   }
-  .edge-pill.active {
-    background: var(--accent-soft); border-color: rgba(59, 130, 246, 0.6); color: #bfdbfe;
-  }
+  .edge-pill.active { color: #dbe8ff; background: var(--accent-soft); border-color: rgba(59, 130, 246, 0.45); }
 
-  /* File Drop Zone */
+  /* Radar empty state */
+  .radar { position: relative; width: 54px; height: 54px; margin-bottom: 8px; }
+  .radar::before, .radar::after, .radar span {
+    content: "";
+    position: absolute;
+    inset: 0;
+    border-radius: 50%;
+    border: 1.5px solid rgba(59, 130, 246, 0.5);
+    animation: ping 2.4s cubic-bezier(.2, .6, .3, 1) infinite;
+    opacity: 0;
+  }
+  .radar::after { animation-delay: .8s; }
+  .radar span { animation-delay: 1.6s; }
+  .radar i {
+    position: absolute;
+    left: 50%;
+    top: 50%;
+    width: 9px;
+    height: 9px;
+    margin: -4.5px 0 0 -4.5px;
+    border-radius: 50%;
+    background: var(--grad);
+    box-shadow: 0 0 12px rgba(59, 130, 246, 0.8);
+  }
+  @keyframes ping { 0% { transform: scale(.2); opacity: .9; } 100% { transform: scale(1); opacity: 0; } }
+
   .dropzone {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    height: 44px;
+    padding: 0 12px;
+    border-radius: 11px;
+    border: 1.5px dashed var(--line-3);
+    color: var(--muted);
+    font-size: 12px;
+    cursor: pointer;
     flex-shrink: 0;
-    border: 1.5px dashed var(--border-strong); border-radius: 9px;
-    padding: 10px 12px; text-align: center; color: var(--muted);
-    background: var(--inset); transition: all 0.14s ease; cursor: pointer;
-    font-size: 11.5px; display: flex; align-items: center; justify-content: center; gap: 8px;
+    transition: border-color .15s, background .15s, color .15s;
   }
-  .dropzone:hover { border-color: rgba(59, 130, 246, 0.5); color: var(--text-2); }
-  .dropzone.over { border-color: var(--accent); background: var(--accent-soft); color: var(--text); }
+  .dropzone b { color: var(--text-2); font-weight: 600; }
+  .dropzone:hover, .dropzone.over { border-color: var(--accent-line); background: var(--accent-soft); color: #cfe0ff; }
+  .dropzone .dz-ico {
+    width: 26px; height: 26px; border-radius: 7px; display: grid; place-items: center;
+    background: var(--panel-3); color: var(--text-2); flex-shrink: 0;
+  }
+  #recentFiles:empty { display: none; }
+  #recentFiles .row-item { padding: 5px 8px; }
 
-  /* Form controls & Sliders */
-  .row { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
-  .field { display: flex; flex-direction: column; gap: 3px; }
-  .field label {
-    font-size: 11.5px; color: var(--muted); font-weight: 600;
-    display: flex; justify-content: space-between; align-items: center;
-  }
-  .mono-val { font-family: var(--mono); font-variant-numeric: tabular-nums; color: #93c5fd; font-size: 11px; }
+  /* ---------- Input & System tabs ---------- */
+  #tab-tuning, #tab-system { grid-template-columns: 1fr 1fr; gap: 14px; }
+  #tab-tuning .card { padding: 12px 16px; gap: 9px; }
+  #tab-tuning .field { gap: 3px; }
+  #tab-tuning .opt { padding: 6px 0; }
+  #tab-tuning .opt:first-child { padding-top: 0; }
 
-  input[type="text"], input[type="number"], select {
-    background: var(--inset); color: var(--text); border: 1px solid var(--border-strong);
-    border-radius: 7px; padding: 5px 9px; height: 28px;
-    font-family: inherit; font-size: 12px; width: 100%; outline: none;
-    transition: border-color 0.14s ease;
-  }
-  input[type="text"]:focus, input[type="number"]:focus, select:focus {
-    border-color: var(--accent);
-  }
-  input[type="range"] {
-    width: 100%; margin: 1px 0; height: 15px; accent-color: var(--accent); cursor: pointer;
-  }
+  .sliders { display: flex; flex-direction: column; gap: 9px; flex-shrink: 0; }
 
-  .toggle-grid-2 { display: grid; grid-template-columns: 1fr 1fr; gap: 7px; }
+  .remap-add { display: grid; grid-template-columns: 1fr auto 1fr auto; gap: 6px; align-items: center; flex-shrink: 0; }
 
-  .toggle {
-    display: flex; align-items: center; justify-content: space-between; gap: 8px;
-    padding: 6px 9px; background: var(--surface-2); border: 1px solid var(--border);
-    border-radius: 8px; flex-shrink: 0;
+  .about { flex-direction: row; align-items: center; gap: 14px; }
+  .about .card-sub { line-height: 1.45; margin-top: 2px; }
+  .about-mark {
+    width: 44px; height: 44px; border-radius: 12px; flex-shrink: 0;
+    background: var(--grad); color: #fff; display: grid; place-items: center;
+    box-shadow: 0 8px 22px -8px rgba(59, 130, 246, 0.7), inset 0 1px 0 rgba(255, 255, 255, 0.25);
   }
-  .toggle-label { font-weight: 600; font-size: 11.5px; color: var(--text); }
-  .toggle-desc { font-size: 10.5px; color: var(--muted); line-height: 1.25; }
-
-  .switch { position: relative; width: 34px; height: 19px; flex-shrink: 0; }
-  .switch input { opacity: 0; width: 0; height: 0; }
-  .slider {
-    position: absolute; inset: 0; background: #2d3748; border-radius: 99px;
-    transition: .16s; cursor: pointer; border: 1px solid rgba(255, 255, 255, 0.06);
-  }
-  .slider:before {
-    content: ""; position: absolute; width: 13px; height: 13px; left: 2px; top: 2px;
-    background: #fff; border-radius: 50%; transition: .16s;
-  }
-  .switch input:checked + .slider { background: var(--accent); }
-  .switch input:checked + .slider:before { transform: translateX(15px); }
+  .about-mark svg { width: 28px; height: 28px; }
+  #doctorBox { word-break: normal; overflow-wrap: anywhere; }
+  .remap-add input { height: 30px; font-size: 12px; }
+  .remap-add .arrow { color: var(--faint); }
 
   .mono-box {
-    font-family: var(--mono); font-size: 11px; background: var(--inset);
-    border: 1px solid var(--border); border-radius: 8px; padding: 7px 9px;
-    word-break: break-all; user-select: text; color: #cbd5e1; line-height: 1.45;
+    font-family: var(--mono);
+    font-size: 11px;
+    line-height: 1.55;
+    color: var(--text-2);
+    background: var(--inset);
+    border: 1px solid var(--line);
+    border-radius: 9px;
+    padding: 9px 11px;
+    word-break: break-all;
+    user-select: text;
+    flex-shrink: 0;
   }
 
-  .list-item {
-    display: flex; align-items: center; justify-content: space-between; gap: 8px;
-    background: var(--inset); border: 1px solid var(--border);
-    border-radius: 8px; padding: 6px 9px; flex-shrink: 0;
+  .shortcut {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 10px;
+    padding: 8px 0;
+    border-top: 1px solid var(--line);
+    font-size: 12.5px;
+    color: var(--text-2);
   }
+  .shortcut:first-child { border-top: 0; padding-top: 0; }
+  .shortcut:last-child { padding-bottom: 0; }
+  .keys { display: inline-flex; gap: 3px; align-items: center; color: var(--faint); font-size: 10px; }
 
-  .kbd {
-    font-family: var(--mono); font-size: 10.5px; padding: 1.5px 5px; border-radius: 5px;
-    background: var(--surface-2); border: 1px solid var(--border-strong); color: #e2e8f0;
+  /* ---------- Overlays ---------- */
+  .err-banner {
+    position: absolute;
+    top: 8px;
+    left: 50%;
+    transform: translate(-50%, -8px);
+    width: 620px;
+    z-index: 20;
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    padding: 8px 8px 8px 12px;
+    border-radius: 10px;
+    background: #2a1417;
+    border: 1px solid rgba(240, 82, 82, 0.4);
+    color: #fecaca;
+    font-size: 12px;
+    box-shadow: 0 12px 30px -10px rgba(0, 0, 0, 0.7);
+    opacity: 0;
+    pointer-events: none;
+    transition: opacity .2s, transform .2s;
   }
+  .err-banner.show { opacity: 1; transform: translate(-50%, 0); pointer-events: auto; }
+  .err-banner #errText { flex: 1; min-width: 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .err-banner svg { flex-shrink: 0; color: var(--red); }
 
   .toast {
-    position: fixed; bottom: 14px; right: 14px; z-index: 99;
-    background: #1a2335; border: 1px solid rgba(96, 165, 250, 0.35); color: var(--text);
-    padding: 8px 13px; border-radius: 9px; font-size: 12px; font-weight: 600;
-    box-shadow: 0 10px 30px rgba(0, 0, 0, 0.5);
-    opacity: 0; transform: translateY(6px); pointer-events: none;
-    transition: opacity 0.18s ease, transform 0.18s ease;
+    position: fixed;
+    left: 50%;
+    bottom: 18px;
+    transform: translate(-50%, 10px);
+    padding: 8px 14px;
+    border-radius: 10px;
+    background: rgba(29, 36, 51, 0.96);
+    border: 1px solid var(--line-2);
+    color: var(--text);
+    font-size: 12px;
+    font-weight: 550;
+    box-shadow: 0 14px 34px -10px rgba(0, 0, 0, 0.75);
+    opacity: 0;
+    pointer-events: none;
+    transition: opacity .2s, transform .2s;
+    z-index: 30;
+    max-width: 560px;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
   }
-  .toast.show { opacity: 1; transform: translateY(0); }
-
-  .empty-state {
-    flex: 1; display: flex; flex-direction: column; align-items: center; justify-content: center;
-    text-align: center; color: var(--muted); font-size: 11.5px; padding: 10px; gap: 4px;
-  }
-
-  .shortcut-row {
-    display: flex; align-items: center; justify-content: space-between; gap: 10px;
-    padding: 6px 9px; background: var(--inset); border: 1px solid var(--border);
-    border-radius: 8px; font-size: 11.5px;
-  }
+  .toast.show { opacity: 1; transform: translate(-50%, 0); }
 </style>
 </head>
-<body>
+<body class="preload">
 <div class="app">
-  <!-- Top Bar -->
+  <!-- Header -->
   <header class="topbar">
-    <div class="brand">
-      <div class="logo-wrap" aria-hidden="true">
-        <svg width="30" height="30" viewBox="0 0 64 64">
-          <defs>
-            <linearGradient id="glideLogoGrad" x1="0" y1="0" x2="1" y2="1">
-              <stop offset="0%" stop-color="#3b82f6"/>
-              <stop offset="100%" stop-color="#06b6d4"/>
-            </linearGradient>
-          </defs>
-          <rect x="2" y="2" width="60" height="60" rx="16" fill="url(#glideLogoGrad)"/>
-          <path d="M44 33H32v-6h18v15c0 4-3 8-8 9-4 1-9 1-14-1-8-3-13-11-12-20 1-10 9-17 19-17 6 0 11 2 14 6l-5 4c-2-3-5-4-9-4-7 0-12 5-12 11 0 7 5 12 12 12 4 0 7-1 9-3v-6z" fill="#ffffff"/>
+    <div class="brand" id="brand">
+      <div class="brand-mark" aria-hidden="true" id="brandMark">
+        <svg viewBox="11 8 45 45" fill="currentColor">
+          <path d="M20 9V46.5L28 39.76V17Z" fill-opacity=".55"/>
+          <path d="M32 21V43.88L36 52.5L42.3 49.6L36 36H47Z"/>
         </svg>
       </div>
       <div class="brand-text">
-        <div class="brand-title">Glide KVM <span class="ver">v0.2</span></div>
-        <div class="brand-sub" id="osLabel">Connecting to local runtime&hellip;</div>
+        <div class="brand-title">Glide</div>
+        <div class="brand-sub" id="osLabel">Starting&hellip;</div>
       </div>
     </div>
 
-    <div class="top-actions">
-      <div class="rtt-box" id="rttBox" title="Live QUIC round-trip latency">
+    <nav class="tabs" role="tablist">
+      <button class="tab active" data-tab="overview" role="tab">Layout</button>
+      <button class="tab" data-tab="tuning" role="tab">Input</button>
+      <button class="tab" data-tab="system" role="tab">System</button>
+    </nav>
+
+    <div class="spacer"></div>
+
+    <div class="pill" id="statusPill" title="Connection status">
+      <span class="dot"></span>
+      <span id="statusText">Idle</span>
+      <span class="rtt-box" id="rttBox" title="Live round-trip latency to peer (LAN only)">
         <span id="rttVal">0.0 ms</span>
-        <svg id="rttSpark" width="46" height="14" viewBox="0 0 46 14"></svg>
-      </div>
-      <div class="pill" id="statusPill"><span class="dot"></span><span id="statusText">Idle</span></div>
-      <button id="lockBtn" title="Toggle cursor lock to active screen (Ctrl+Alt+L)">
-        <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="11" width="18" height="11" rx="2"/><path d="M7 11V7a5 5 0 0 1 10 0v4"/></svg>
-        <span id="lockBtnText">Lock</span>
-      </button>
-      <button id="startStopBtn" class="primary">Start Server</button>
-      <button id="quitBtn" class="quit-btn" title="Quit Glide completely">
-        <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M18.36 6.64a9 9 0 1 1-12.73 0"/><line x1="12" y1="2" x2="12" y2="12"/></svg>
-        <span>Quit</span>
-      </button>
+        <svg id="rttSpark" width="40" height="14" viewBox="0 0 40 14"></svg>
+      </span>
     </div>
+
+    <button id="lockBtn" class="icon" title="Lock cursor to the current screen (Ctrl+Alt+L)">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><rect x="4" y="11" width="16" height="10" rx="2.5"/><path d="M8 11V7.5a4 4 0 0 1 8 0V11"/></svg>
+      <span class="sr" id="lockBtnText">Lock</span>
+    </button>
+    <button id="startStopBtn" class="primary">Start Server</button>
+    <button id="quitBtn" class="icon" title="Quit Glide">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M18.36 6.64a9 9 0 1 1-12.73 0"/><path d="M12 2v10"/></svg>
+    </button>
   </header>
 
-  <!-- Navigation Tabs + Quick Hints -->
-  <div class="nav-row">
-    <nav class="tabs" role="tablist">
-      <button class="tab active" data-tab="overview">Desk &amp; Connection</button>
-      <button class="tab" data-tab="tuning">Feel &amp; Clipboard</button>
-      <button class="tab" data-tab="system">System &amp; Security</button>
-    </nav>
-    <div class="nav-meta">
-      <div class="hotkey-mini">
-        <span><span class="kbd">Ctrl+Alt+Arrows</span> jump</span>
-        <span>&middot;</span>
-        <span><span class="kbd">ScrollLock</span> return</span>
-      </div>
+  <main>
+    <!-- Error banner (floats, never shifts layout) -->
+    <div class="err-banner" id="errBanner" role="alert">
+      <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="9.5"/><path d="M12 7.5v5.5M12 16.5v.01"/></svg>
+      <span id="errText"></span>
+      <button class="xs ghost" id="errDismissBtn">Dismiss</button>
     </div>
-  </div>
 
-  <!-- Compact Error Alert (hidden unless last_error is present) -->
-  <div class="err-banner" id="errBanner">
-    <span id="errText" style="white-space:nowrap;overflow:hidden;text-overflow:ellipsis;"></span>
-    <button class="xs ghost" id="errDismissBtn">Dismiss</button>
-  </div>
-
-  <!-- TAB 1: Desk & Connection -->
-  <section class="panel active" id="tab-overview">
-    <div class="grid-desk">
-      <!-- Left: Role + 1-Square-Per-Machine Interactive Desk Layout -->
-      <div class="card">
-        <div class="seg">
-          <button id="roleServerBtn" class="active">
-            <strong>Server (Share Input)</strong>
-            <span class="small">Main PC controlling connected screens</span>
-          </button>
-          <button id="roleClientBtn">
-            <strong>Client (Receive Input)</strong>
-            <span class="small">Controlled over LAN by Primary</span>
-          </button>
+    <!-- TAB 1: Layout -->
+    <section class="panel active" id="tab-overview">
+      <div class="stage-card">
+        <div class="stage-top">
+          <span class="eyebrow">Arrangement</span>
+          <span class="badge accent" id="activeTargetBadge">Cursor: This PC</span>
         </div>
-
-        <div class="card-hdr">
-          <div>
-            <div class="card-title">Desk Layout</div>
-          </div>
-          <span class="badge accent" id="activeTargetBadge">Focus: Local</span>
-        </div>
-
-        <div class="desk-stage" id="deskStage">
+        <div class="desk" id="deskStage">
           <div class="edge-slot edge-top" data-edge="top"></div>
           <div class="edge-slot edge-left" data-edge="left"></div>
           <div class="edge-center" id="centerStage"></div>
           <div class="edge-slot edge-right" data-edge="right"></div>
           <div class="edge-slot edge-bottom" data-edge="bottom"></div>
         </div>
-
-        <div class="stage-hint">
-          <span id="layoutHint">Click or drag a machine to any edge to reposition live</span>
-        </div>
+        <div class="stage-foot" id="layoutHint">Drag a screen to any side to rearrange</div>
       </div>
 
-      <!-- Right: Mode-Specific Connection + File Beam -->
-      <div class="col-stack">
-        <!-- Server Network & Peers / Client Auto-Discovery Radar -->
-        <div class="card grow">
-          <div class="card-hdr">
-            <div>
-              <div class="card-title" id="connCardTitle">Server Network &amp; Peers</div>
-              <div class="card-sub" id="connCardSub">100% offline LAN QUIC &mdash; zero internet required</div>
-            </div>
-            <button class="sm" id="scanBtn" style="display:none;">Rescan</button>
+      <aside class="side">
+        <div class="card" style="gap:9px; padding:12px;">
+          <div class="seg" role="tablist" aria-label="Role">
+            <button id="roleServerBtn" class="active">
+              <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><rect x="2.5" y="4" width="19" height="13" rx="2"/><path d="M8 21h8M12 17v4"/></svg>
+              Server
+            </button>
+            <button id="roleClientBtn">
+              <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M5 3l14 8-6 1.5L10 19z"/></svg>
+              Client
+            </button>
           </div>
+          <div class="role-caption" id="roleCaption">Share this PC&rsquo;s mouse &amp; keyboard</div>
+        </div>
 
-          <!-- Server Mode View -->
-          <div id="serverConnView" style="display:flex; flex-direction:column; gap:7px; flex:1; min-height:0;">
-            <div class="ip-bar">
-              <span class="card-sub" style="flex-shrink:0;">LAN IP(s)</span>
-              <span class="ip-text" id="localIpsText">detecting&hellip;</span>
-              <button class="xs" id="copyIpBtn">Copy IP</button>
+        <div class="card grow" style="gap:10px; padding:12px;">
+          <!-- Server -->
+          <div id="serverConnView" style="display:flex; flex-direction:column; gap:10px; flex:1; min-height:0;">
+            <div class="card-hdr">
+              <span class="eyebrow">Your address</span>
+              <span class="card-sub">LAN only</span>
             </div>
-
-            <div style="display:grid; grid-template-columns: 112px 1fr; gap:7px; align-items:stretch; flex-shrink:0;">
-              <div class="field" style="background:var(--inset);border:1px solid var(--border);border-radius:8px;padding:4px 8px;justify-content:center;">
-                <label style="font-size:10.5px;">Listen Port</label>
-                <input type="number" id="serverPortInput" min="1024" max="65535" value="24800" style="height:22px;padding:2px 6px;font-family:var(--mono);font-size:11.5px;" />
-              </div>
-              <div class="toggle" style="padding:5px 9px;">
-                <div>
-                  <div class="toggle-label">LAN Auto-Discovery</div>
-                  <div class="toggle-desc">Broadcast beacon on UDP 24801</div>
-                </div>
-                <label class="switch"><input type="checkbox" id="discoveryToggle" checked><span class="slider"></span></label>
-              </div>
+            <div class="addr-block">
+              <div style="flex:1; min-width:0;" id="localIpsText"><span class="addr-none">Detecting&hellip;</span></div>
+              <button class="sm" id="copyIpBtn" title="Copy address">
+                <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="12" height="12" rx="2.5"/><path d="M5 15V5a2 2 0 0 1 2-2h8"/></svg>
+                Copy
+              </button>
             </div>
-
-            <div class="card-hdr" style="margin-top:1px;">
-              <span class="card-sub" style="font-weight:600;">Connected Peers</span>
+            <div class="inline-row" style="justify-content:space-between;">
+              <label class="port-field">Port <input type="number" id="serverPortInput" min="1024" max="65535" value="24800" /></label>
+              <label class="port-field" title="Let clients find this PC automatically (UDP 24801, local network only)">
+                Discoverable
+                <span class="switch"><input type="checkbox" id="discoveryToggle" checked><span class="slider"></span></span>
+              </label>
+            </div>
+            <div class="divider"></div>
+            <div class="card-hdr">
+              <span class="eyebrow">Clients</span>
               <span class="badge" id="peerCountBadge">0 online</span>
             </div>
-            <div class="scroll-list" id="serverPeersList">
-              <div class="empty-state">
-                <span>No clients connected yet.</span>
-                <span>Start Server, then click Connect on your Client PC.</span>
-              </div>
-            </div>
+            <div class="scroll" id="serverPeersList" style="flex:1;"></div>
           </div>
 
-          <!-- Client Mode View -->
-          <div id="clientConnView" style="display:none; flex-direction:column; gap:7px; flex:1; min-height:0;">
-            <div class="scroll-list" id="deviceList">
-              <div class="empty-state">Scanning LAN for Glide servers&hellip;</div>
+          <!-- Client -->
+          <div id="clientConnView" style="display:none; flex-direction:column; gap:10px; flex:1; min-height:0;">
+            <div class="card-hdr">
+              <span class="eyebrow" id="clientListTitle">Nearby servers</span>
+              <button class="xs ghost" id="scanBtn">Rescan</button>
             </div>
-
-            <div class="field" style="flex-shrink:0;">
-              <label><span>Direct Server IP:Port</span><span class="card-sub">blank = auto-discover</span></label>
-              <input type="text" id="manualServerInput" placeholder="Auto-discover on LAN (e.g. 192.168.1.42:24800)" />
+            <div class="scroll" id="deviceList" style="flex:1;"></div>
+            <div class="field">
+              <span class="field-row"><span>Server address</span><span class="card-sub">optional</span></span>
+              <input type="text" id="manualServerInput" class="mono" placeholder="Auto  ·  e.g. 192.168.1.42:24800" spellcheck="false" />
             </div>
-
-            <div class="field" style="flex-shrink:0;">
-              <label><span>This PC Position Relative to Server</span></label>
+            <div class="field">
+              <span class="field-row"><span>This PC sits</span><span class="card-sub">of the server</span></span>
               <div class="edge-pills" id="clientEdgePills">
-                <button class="edge-pill" data-edge="left">Left</button>
-                <button class="edge-pill" data-edge="right">Right</button>
-                <button class="edge-pill" data-edge="top">Top</button>
-                <button class="edge-pill" data-edge="bottom">Bottom</button>
+                <button class="edge-pill" data-edge="left">&larr; Left</button>
+                <button class="edge-pill" data-edge="top">&uarr; Top</button>
+                <button class="edge-pill" data-edge="bottom">&darr; Bottom</button>
+                <button class="edge-pill" data-edge="right">Right &rarr;</button>
               </div>
             </div>
           </div>
         </div>
 
-        <!-- Compact File Beam -->
-        <div class="card" style="flex-shrink:0; gap:6px; padding:10px 12px;">
-          <div class="card-hdr">
-            <div class="card-title">File Beam (QUIC)</div>
-            <span class="card-sub">Saves to Downloads/Glide</span>
-          </div>
-          <div class="dropzone" id="dropzone">
-            <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="17 8 12 3 7 8"/><line x1="12" y1="3" x2="12" y2="15"/></svg>
-            <span>Drop file(s) here or <b>click to beam</b></span>
+        <div class="card" style="gap:6px; padding:10px;">
+          <div class="dropzone" id="dropzone" title="Files are saved to Downloads/Glide on the other PC">
+            <span class="dz-ico">
+              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 15V3M7 8l5-5 5 5"/><path d="M20 15v4a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2v-4"/></svg>
+            </span>
+            <span>Drop files or <b>browse</b> to send</span>
             <input type="file" id="fileInput" style="display:none" multiple />
           </div>
-          <div id="recentFiles" class="scroll-list" style="max-height:54px;"></div>
+          <div id="recentFiles" class="scroll" style="max-height:62px; gap:4px;"></div>
         </div>
-      </div>
-    </div>
-  </section>
+      </aside>
+    </section>
 
-  <!-- TAB 2: Feel & Clipboard -->
-  <section class="panel" id="tab-tuning">
-    <div class="grid-2">
-      <!-- Left Column: Pointer Feel + Edge Switching -->
-      <div class="col-stack">
+    <!-- TAB 2: Input -->
+    <section class="panel" id="tab-tuning">
+      <div class="col">
         <div class="card">
           <div class="card-hdr">
-            <div class="card-title">Pointer &amp; Scroll Feel</div>
-            <span class="badge live">Hot-Reloads Live</span>
+            <span class="card-title">Pointer</span>
+            <span class="card-sub">Applies instantly</span>
           </div>
-
-          <div class="field">
-            <label><span>Client Mouse Sensitivity</span><span class="mono-val" id="sensVal">1.00x</span></label>
-            <input type="range" id="sensSlider" min="0.25" max="3.0" step="0.05" value="1.0" />
+          <div class="sliders">
+            <div class="field">
+              <span class="field-row"><span>Mouse speed on client</span><span class="val" id="sensVal">1.00x</span></span>
+              <input type="range" id="sensSlider" min="0.25" max="3.0" step="0.05" value="1.0" />
+            </div>
+            <div class="field">
+              <span class="field-row"><span>Scroll speed</span><span class="val" id="scrollVal">1.00x</span></span>
+              <input type="range" id="scrollSlider" min="0.25" max="4.0" step="0.05" value="1.0" />
+            </div>
           </div>
-
-          <div class="field">
-            <label><span>Scroll Wheel Speed</span><span class="mono-val" id="scrollVal">1.00x</span></label>
-            <input type="range" id="scrollSlider" min="0.25" max="4.0" step="0.05" value="1.0" />
-          </div>
-
-          <div class="toggle-grid-2">
-            <div class="toggle" title="Normalize pointer speed across mixed HiDPI displays">
-              <div>
-                <div class="toggle-label">Auto-DPI Scale</div>
-                <div class="toggle-desc">Match HiDPI</div>
-              </div>
+          <div class="opts">
+            <div class="opt">
+              <div><div class="opt-label">Match display scaling</div><div class="opt-desc">Same pointer feel across HiDPI screens</div></div>
               <label class="switch"><input type="checkbox" id="autoDpiToggle"><span class="slider"></span></label>
             </div>
-            <div class="toggle" title="Invert vertical and horizontal scroll direction on client">
-              <div>
-                <div class="toggle-label">Natural Scroll</div>
-                <div class="toggle-desc">Invert wheel</div>
-              </div>
+            <div class="opt">
+              <div><div class="opt-label">Natural scrolling</div><div class="opt-desc">Invert wheel direction on client</div></div>
               <label class="switch"><input type="checkbox" id="invertScrollToggle"><span class="slider"></span></label>
             </div>
-          </div>
-
-          <div class="row" id="linuxBackendField" style="gap:10px; margin-top:1px;">
-            <span class="card-sub" style="font-weight:600;white-space:nowrap;">Linux Input Backend</span>
-            <select id="inputBackendSelect" style="height:26px;padding:2px 8px;">
-              <option value="auto">Auto / XTest (zero setup)</option>
-              <option value="xtest">XTest (X11)</option>
-              <option value="uinput">/dev/uinput (hardware HID)</option>
-            </select>
+            <div class="opt" id="linuxBackendField">
+              <div><div class="opt-label">Input method</div><div class="opt-desc">Linux only</div></div>
+              <select id="inputBackendSelect">
+                <option value="auto">Automatic</option>
+                <option value="xtest">XTest (X11)</option>
+                <option value="uinput">uinput (virtual HID)</option>
+              </select>
+            </div>
           </div>
         </div>
 
-        <div class="card grow" style="justify-content:space-between;">
+        <div class="card grow">
           <div class="card-hdr">
-            <div class="card-title">Edge Switching &amp; Safety</div>
+            <span class="card-title">Screen edges</span>
           </div>
-
-          <div class="field">
-            <label><span>Edge Push Threshold</span><span class="mono-val" id="threshVal">4 px</span></label>
-            <input type="range" id="threshSlider" min="1" max="24" step="1" value="4" />
+          <div class="sliders">
+            <div class="field">
+              <span class="field-row"><span>Push distance to switch</span><span class="val" id="threshVal">4 px</span></span>
+              <input type="range" id="threshSlider" min="1" max="24" step="1" value="4" />
+            </div>
+            <div class="field">
+              <span class="field-row"><span>Corner guard <span class="card-sub">&nbsp;keeps close buttons safe</span></span><span class="val" id="deadCornerVal">24 px</span></span>
+              <input type="range" id="deadCornerSlider" min="0" max="80" step="4" value="24" />
+            </div>
+            <div class="field">
+              <span class="field-row"><span>Edge delay</span><span class="val" id="dwellVal">0 ms</span></span>
+              <input type="range" id="dwellSlider" min="0" max="200" step="10" value="0" />
+            </div>
           </div>
-
-          <div class="field">
-            <label><span>Dead-Corner Guard (protects close X &amp; taskbar)</span><span class="mono-val" id="deadCornerVal">24 px</span></label>
-            <input type="range" id="deadCornerSlider" min="0" max="80" step="4" value="24" />
-          </div>
-
-          <div class="field">
-            <label><span>Edge Dwell Delay</span><span class="mono-val" id="dwellVal">0 ms</span></label>
-            <input type="range" id="dwellSlider" min="0" max="200" step="10" value="0" />
-          </div>
-
-          <div class="toggle-grid-2">
-            <div class="toggle" title="Pause edge switching while a fullscreen game or app has focus">
-              <div>
-                <div class="toggle-label">Fullscreen Lock</div>
-                <div class="toggle-desc">Pause in games</div>
-              </div>
+          <div class="opts">
+            <div class="opt">
+              <div><div class="opt-label">Pause in fullscreen apps</div><div class="opt-desc">Stops games from losing the cursor</div></div>
               <label class="switch"><input type="checkbox" id="fullscreenLockToggle" checked><span class="slider"></span></label>
             </div>
-            <div class="toggle" title="Match CapsLock and NumLock LEDs when switching screens">
-              <div>
-                <div class="toggle-label">Sync Lock Keys</div>
-                <div class="toggle-desc">Caps / NumLock</div>
-              </div>
+            <div class="opt">
+              <div><div class="opt-label">Sync Caps &amp; Num Lock</div><div class="opt-desc">Keep keyboard LEDs consistent</div></div>
               <label class="switch"><input type="checkbox" id="syncLockToggle" checked><span class="slider"></span></label>
             </div>
           </div>
         </div>
       </div>
 
-      <!-- Right Column: Clipboard Sync & History + Key Remaps -->
-      <div class="col-stack">
-        <div class="card grow" style="flex:1.15;">
+      <div class="col">
+        <div class="card grow" style="flex:1.2;">
           <div class="card-hdr">
             <div>
-              <div class="card-title">Bidirectional Clipboard</div>
-              <div class="card-sub">UTF-8 text &amp; PNG/DIB screenshots (lazy &gt; 256 KB)</div>
+              <div class="card-title">Shared clipboard</div>
+              <div class="card-sub">Text and images, both directions</div>
             </div>
-            <label class="switch" title="Enable bidirectional clipboard sync"><input type="checkbox" id="clipToggle" checked><span class="slider"></span></label>
+            <label class="switch" title="Sync clipboard between PCs"><input type="checkbox" id="clipToggle" checked><span class="slider"></span></label>
           </div>
-          <div class="scroll-list" id="clipHistory">
-            <div class="empty-state">Synced clipboard items appear here with 1-click Re-send.</div>
-          </div>
+          <div class="scroll" id="clipHistory" style="flex:1;"></div>
         </div>
 
-        <div class="card grow" style="flex:0.85;">
+        <div class="card grow">
           <div class="card-hdr">
             <div>
-              <div class="card-title">Client Key Remaps</div>
-              <div class="card-sub">AltGr &amp; ISO &lt; &gt; | work natively; add overrides below</div>
+              <div class="card-title">Key remapping</div>
+              <div class="card-sub">German / ISO layouts work as-is</div>
             </div>
             <div style="display:flex; gap:4px;">
-              <button class="xs" id="addRemapEscBtn">+ Caps&rarr;Esc</button>
-              <button class="xs" id="addRemapCtrlBtn">+ Caps&rarr;Ctrl</button>
+              <button class="xs" id="addRemapEscBtn" title="Map Caps Lock to Escape">Caps&rarr;Esc</button>
+              <button class="xs" id="addRemapCtrlBtn" title="Map Caps Lock to Ctrl">Caps&rarr;Ctrl</button>
             </div>
           </div>
-          <div class="scroll-list" id="remapList"></div>
-          <div class="row" style="gap:6px; flex-shrink:0;">
-            <input type="text" id="remapFrom" list="hidKeyList" placeholder="From (e.g. CapsLock)" />
-            <span style="color:var(--muted);">&rarr;</span>
-            <input type="text" id="remapTo" list="hidKeyList" placeholder="To (e.g. Escape)" />
-            <button class="sm primary" id="addRemapBtn">Add</button>
+          <div class="scroll" id="remapList" style="flex:1;"></div>
+          <div class="remap-add">
+            <input type="text" id="remapFrom" list="hidKeyList" placeholder="From key" spellcheck="false" />
+            <span class="arrow">&rarr;</span>
+            <input type="text" id="remapTo" list="hidKeyList" placeholder="To key" spellcheck="false" />
+            <button class="sm primary" id="addRemapBtn" style="height:30px;">Add</button>
           </div>
           <datalist id="hidKeyList">
             <option value="CapsLock"></option>
@@ -906,97 +1182,86 @@
           </datalist>
         </div>
       </div>
-    </div>
-  </section>
+    </section>
 
-  <!-- TAB 3: System & Security -->
-  <section class="panel" id="tab-system">
-    <div class="grid-2">
-      <!-- Left Column: TLS Identity & OS Integration -->
-      <div class="col-stack">
+    <!-- TAB 3: System -->
+    <section class="panel" id="tab-system">
+      <div class="col">
         <div class="card">
           <div class="card-hdr">
             <div>
-              <div class="card-title">TLS 1.3 Identity &amp; Trust</div>
-              <div class="card-sub">Ed25519 SHA-256 certificate verified via Trust-On-First-Use</div>
+              <div class="card-title">Identity &amp; trust</div>
+              <div class="card-sub">Encrypted with TLS 1.3 &middot; verified by fingerprint</div>
             </div>
             <button class="sm" id="copyFpBtn">Copy</button>
           </div>
           <div class="mono-box" id="fpBox">Generating identity&hellip;</div>
-          <div class="row">
-            <span class="card-sub" id="trustStateLabel">TOFU auto-pinning active on first connect</span>
-            <button class="sm" id="resetTofuBtn">Reset Trusted Server</button>
+          <div class="inline-row" style="justify-content:space-between;">
+            <span class="card-sub" id="trustStateLabel" style="min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;">Trusts the first server it connects to</span>
+            <button class="sm" id="resetTofuBtn">Forget server</button>
           </div>
         </div>
 
-        <div class="card grow">
-          <div class="card-hdr">
-            <div>
-              <div class="card-title">OS Integration</div>
-              <div class="card-sub" id="trayStatusSub">System tray integration status</div>
-            </div>
-          </div>
-
-          <div class="toggle">
-            <div>
-              <div class="toggle-label">Start Glide Automatically on Login</div>
-              <div class="toggle-desc" id="autostartRoleDesc">Starts minimized to system tray</div>
-            </div>
-            <label class="switch"><input type="checkbox" id="autostartToggle"><span class="slider"></span></label>
-          </div>
-
-          <div class="list-item">
-            <div>
-              <div class="toggle-label">Configure Local LAN Firewall</div>
-              <div class="toggle-desc">Allow inbound UDP 24800 (QUIC) &amp; 24801 (Discovery)</div>
-            </div>
-            <button class="sm" id="firewallBtn">Configure</button>
-          </div>
-
-          <div class="list-item" id="elevatedCard">
-            <div>
-              <div class="toggle-label">Windows Elevated UAC Task <span class="badge" id="winOnlyBadge" style="margin-left:4px;">Windows</span></div>
-              <div class="toggle-desc">Allow control over UAC prompts &amp; Admin windows</div>
-            </div>
-            <button class="sm" id="elevatedBtn">Setup Task</button>
-          </div>
-        </div>
-      </div>
-
-      <!-- Right Column: Hotkeys Cheat Sheet + Live Diagnostics -->
-      <div class="col-stack">
         <div class="card">
           <div class="card-hdr">
-            <div class="card-title">Keyboard Shortcuts</div>
-            <span class="card-sub">Works globally on Server</span>
+            <div>
+              <div class="card-title">Integration</div>
+              <div class="card-sub" id="trayStatusSub">Startup, firewall &amp; permissions</div>
+            </div>
           </div>
-          <div class="shortcut-row">
-            <span>Jump cursor directly to peer on edge</span>
-            <span class="kbd">Ctrl + Alt + Arrows</span>
+          <div class="opts">
+            <div class="opt">
+              <div><div class="opt-label">Start on login</div><div class="opt-desc" id="autostartRoleDesc">Starts minimized as Server</div></div>
+              <label class="switch"><input type="checkbox" id="autostartToggle"><span class="slider"></span></label>
+            </div>
+            <div class="opt">
+              <div><div class="opt-label">Allow through firewall</div><div class="opt-desc">Local network only &middot; UDP 24800&ndash;24801</div></div>
+              <button class="sm" id="firewallBtn">Allow</button>
+            </div>
+            <div class="opt" id="elevatedCard">
+              <div><div class="opt-label">Control admin windows <span class="badge" id="winOnlyBadge" style="margin-left:4px; height:17px; font-size:10px;">Windows</span></div><div class="opt-desc">Works over UAC prompts &amp; elevated apps</div></div>
+              <button class="sm" id="elevatedBtn">Set up</button>
+            </div>
           </div>
-          <div class="shortcut-row">
-            <span>Lock / unlock cursor to current screen</span>
-            <span class="kbd">Ctrl + Alt + L</span>
+        </div>
+
+        <div class="card grow about">
+          <div class="about-mark" aria-hidden="true">
+            <svg viewBox="11 8 45 45" fill="currentColor"><path d="M20 9V46.5L28 39.76V17Z" fill-opacity=".55"/><path d="M32 21V43.88L36 52.5L42.3 49.6L36 36H47Z"/></svg>
           </div>
-          <div class="shortcut-row">
-            <span>Emergency return focus to Local PC</span>
-            <span class="kbd">ScrollLock</span>
+          <div style="min-width:0;">
+            <div class="card-title">Glide <span class="card-sub" style="font-weight:500;">v0.2</span></div>
+            <div class="card-sub">Direct PC-to-PC over your local network. No account, no cloud, no internet needed.</div>
+          </div>
+        </div>
+      </div>
+
+      <div class="col">
+        <div class="card">
+          <div class="card-hdr">
+            <span class="card-title">Shortcuts</span>
+            <span class="card-sub">Global, on the server</span>
+          </div>
+          <div class="opts">
+            <div class="shortcut"><span>Jump to the screen on that side</span><span class="keys"><span class="kbd">Ctrl</span>+<span class="kbd">Alt</span>+<span class="kbd">Arrow</span></span></div>
+            <div class="shortcut"><span>Lock cursor to current screen</span><span class="keys"><span class="kbd">Ctrl</span>+<span class="kbd">Alt</span>+<span class="kbd">L</span></span></div>
+            <div class="shortcut"><span>Bring cursor back home</span><span class="keys"><span class="kbd">Scroll Lock</span></span></div>
           </div>
         </div>
 
         <div class="card grow">
           <div class="card-hdr">
-            <div>
-              <div class="card-title">Live Diagnostics (glide doctor)</div>
-              <div class="card-sub" id="diagSummary">Checking local OS &amp; display server&hellip;</div>
+            <div style="min-width:0;">
+              <div class="card-title">Diagnostics</div>
+              <div class="card-sub" id="diagSummary" style="white-space:nowrap; overflow:hidden; text-overflow:ellipsis;">Checking display server&hellip;</div>
             </div>
-            <span class="badge" id="diagOsBadge">--</span>
+            <span class="badge" id="diagOsBadge">&ndash;</span>
           </div>
-          <div class="mono-box" id="doctorBox" style="flex:1; min-height:0; overflow-y:auto; white-space:pre-wrap;">Loading diagnostics&hellip;</div>
+          <div class="mono-box scroll" id="doctorBox" style="flex:1; white-space:pre-wrap; display:block;">Loading&hellip;</div>
         </div>
       </div>
-    </div>
-  </section>
+    </section>
+  </main>
 </div>
 
 <div class="toast" id="toast"></div>
@@ -1010,6 +1275,7 @@ const state = {
   os: 'unknown',
   hostname: 'This PC',
   trayActive: false,
+  localIps: [],
   selectedPeerName: null,
   dragging: false,
   dragPayload: null,
@@ -1030,7 +1296,7 @@ function toast(msg) {
   el.textContent = msg;
   el.classList.add('show');
   clearTimeout(window._toastTimer);
-  window._toastTimer = setTimeout(() => el.classList.remove('show'), 2600);
+  window._toastTimer = setTimeout(() => el.classList.remove('show'), 2400);
 }
 
 async function api(path, opts = {}) {
@@ -1042,6 +1308,12 @@ async function api(path, opts = {}) {
     return { ok: false, error: err && err.message ? err.message : 'Request failed' };
   }
 }
+
+const jsonPost = (path, body) => api(path, {
+  method: 'POST',
+  headers: { 'Content-Type': 'application/json' },
+  body: JSON.stringify(body),
+});
 
 let _fitApplied = false;
 function fitWindowToContent() {
@@ -1063,27 +1335,34 @@ function fitWindowToContent() {
 function formatOs(osRaw) {
   const s = String(osRaw || '').toLowerCase();
   if (s.includes('win')) return { label: 'Windows', cls: 'win' };
-  if (s.includes('wayland')) return { label: 'Linux Wayland', cls: 'lin' };
+  if (s.includes('wayland')) return { label: 'Linux (Wayland)', cls: 'lin' };
   if (s.includes('linux')) return { label: 'Linux', cls: 'lin' };
   if (s.includes('mac')) return { label: 'macOS', cls: 'mac' };
-  return { label: osRaw || 'OS', cls: '' };
+  return { label: osRaw || 'Unknown', cls: '' };
 }
 
-function osIconSvg(cls) {
+function osIconSvg(cls, size = 13) {
   if (cls === 'win') {
-    return '<svg width="10" height="10" viewBox="0 0 16 16" fill="currentColor"><path d="M1 2.5 7 1.6v5.9H1V2.5zm7-1 7-1v7H8V1.5zM1 8.5h6v5.9l-6-.9V8.5zm7 0h7v7l-7-1V8.5z"/></svg>';
+    return `<svg width="${size}" height="${size}" viewBox="0 0 16 16" fill="currentColor"><path d="M1 2.6 6.9 1.8v5.7H1V2.6zm6.9-.9L15 .7v6.8H7.9V1.7zM1 8.5h5.9v5.7L1 13.4V8.5zm6.9 0H15v6.8l-7.1-1V8.5z"/></svg>`;
   }
   if (cls === 'lin') {
-    return '<svg width="10" height="10" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6"><rect x="1.5" y="2.5" width="13" height="11" rx="2"/><path d="M4.5 6.5 6.8 8 4.5 9.5M8 9.5h3"/></svg>';
+    return `<svg width="${size}" height="${size}" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><rect x="1.5" y="2.5" width="13" height="11" rx="2.2"/><path d="M4.6 6.4 6.8 8l-2.2 1.6M8.4 9.8h3"/></svg>`;
   }
-  return '<svg width="10" height="10" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6"><rect x="2" y="2.5" width="12" height="9" rx="1.5"/><path d="M5.5 13.5h5"/></svg>';
+  return `<svg width="${size}" height="${size}" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6"><rect x="2" y="2.5" width="12" height="9" rx="1.5"/><path d="M5.5 13.5h5"/></svg>`;
 }
+
+const CURSOR_SVG = '<svg class="cursor-glyph" viewBox="0 0 11 13"><path d="M1 1v10.2l2.8-2.6 1.9 3.9 1.7-.8-1.9-3.8H9.3z" fill="#fff" stroke="#0b0e14" stroke-width="1" stroke-linejoin="round"/></svg>';
 
 function formatBytes(bytes) {
   const b = Number(bytes || 0);
   if (b < 1024) return b + ' B';
   if (b < 1024 * 1024) return (b / 1024).toFixed(1) + ' KB';
   return (b / (1024 * 1024)).toFixed(2) + ' MB';
+}
+
+function fmtRtt(v) {
+  if (v == null) return '';
+  return v < 10 ? v.toFixed(1) + ' ms' : Math.round(v) + ' ms';
 }
 
 function parseBind(bindStr) {
@@ -1093,6 +1372,19 @@ function parseBind(bindStr) {
   const host = s.slice(0, idx) || '0.0.0.0';
   const port = parseInt(s.slice(idx + 1), 10) || 24800;
   return { host, port };
+}
+
+function currentPort() {
+  const v = parseInt($('serverPortInput').value, 10);
+  if (v >= 1024 && v <= 65535) return v;
+  return parseBind(state.config && state.config.server && state.config.server.bind).port;
+}
+
+function updateRangeFill(el) {
+  const min = parseFloat(el.min) || 0;
+  const max = parseFloat(el.max) || 100;
+  const pct = ((parseFloat(el.value) - min) / (max - min)) * 100;
+  el.style.setProperty('--pct', Math.max(0, Math.min(100, pct)) + '%');
 }
 
 // Tabs
@@ -1105,52 +1397,46 @@ document.querySelectorAll('.tab').forEach(btn => {
   };
 });
 
-// Role Switch
+// Role
 function setRole(role) {
   state.role = role;
   $('roleServerBtn').classList.toggle('active', role === 'server');
   $('roleClientBtn').classList.toggle('active', role === 'client');
   $('serverConnView').style.display = role === 'server' ? 'flex' : 'none';
   $('clientConnView').style.display = role === 'client' ? 'flex' : 'none';
-  $('scanBtn').style.display = role === 'client' ? 'inline-flex' : 'none';
-  $('connCardTitle').textContent = role === 'server' ? 'Server Network & Peers' : 'LAN Auto-Discovery Radar';
-  $('connCardSub').textContent = role === 'server'
-    ? '100% offline LAN QUIC \u2014 share this IP or use auto-discovery'
-    : '100% offline \u2014 click a discovered Primary PC to connect';
+  $('roleCaption').textContent = role === 'server'
+    ? 'Share this PC\u2019s mouse & keyboard'
+    : 'Be controlled by another PC';
   $('autostartRoleDesc').textContent = role === 'server'
-    ? 'Starts minimized to tray as Primary (Server)'
-    : 'Starts minimized to tray as Secondary (Client)';
+    ? 'Starts minimized as Server'
+    : 'Starts minimized as Client';
   if (!state.running) {
-    $('startStopBtn').textContent = role === 'server' ? 'Start Server' : 'Connect Client';
+    $('startStopBtn').textContent = role === 'server' ? 'Start Server' : 'Connect';
   }
   updateLayoutHint();
   renderDeskLayout(true);
   renderClientEdgePills();
+  if (role === 'client' && !state.lastDevKey) renderDevices([]);
 }
 
-$('roleServerBtn').onclick = () => {
-  if (!state.running) setRole('server');
-  else toast('Stop active session before switching role');
-};
-$('roleClientBtn').onclick = () => {
-  if (!state.running) setRole('client');
-  else toast('Stop active session before switching role');
-};
+function guardRole(role) {
+  if (state.running) { toast('Stop the current session to switch roles'); return; }
+  setRole(role);
+}
+$('roleServerBtn').onclick = () => guardRole('server');
+$('roleClientBtn').onclick = () => guardRole('client');
 
 function updateLayoutHint() {
   const hint = $('layoutHint');
-  if (!hint) return;
+  const peers = (state.status && state.status.peers) || [];
   if (state.role === 'server') {
-    const peers = (state.status && state.status.peers) || [];
-    if (state.running && peers.length > 0) {
-      hint.textContent = 'Click or drag a machine to any edge to reposition live (double-click to jump)';
-    } else {
-      hint.textContent = 'Click or drag a machine to any edge to reposition live once connected';
-    }
+    if (!state.running) hint.textContent = 'Start the server, then connect from your other PC';
+    else if (peers.length === 0) hint.textContent = 'Waiting for a client to connect\u2026';
+    else hint.textContent = 'Drag a screen to rearrange \u00b7 double-click to jump there';
   } else {
     hint.textContent = state.running
-      ? 'Click or drag This PC to any edge to reposition live without disconnecting'
-      : 'Click or drag This PC to match where it sits relative to your Primary PC';
+      ? 'Drag This PC to another side \u2014 it moves live, no reconnect'
+      : 'Drag This PC to where it physically sits next to the server';
   }
 }
 
@@ -1164,6 +1450,8 @@ function getActivePeer() {
   return peers[0];
 }
 
+const EDGE_WORD = { left: 'left', right: 'right', top: 'top', bottom: 'bottom' };
+
 async function movePeerLive(edge, peerName) {
   if (!state.config) return;
   if (state.role === 'client') {
@@ -1172,24 +1460,19 @@ async function movePeerLive(edge, peerName) {
     renderClientEdgePills();
     renderDeskLayout(true);
     if (state.running) {
-      const res = await api('/api/move-edge', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ edge }),
-      });
+      const res = await jsonPost('/api/move-edge', { edge });
       if (res.error) toast('Failed: ' + res.error);
-      else toast('Moved This PC live to ' + edge.toUpperCase());
+      else toast('This PC moved to the ' + EDGE_WORD[edge]);
     } else {
       await pushConfig();
-      toast('Client edge set to ' + edge.toUpperCase());
+      toast('This PC is now on the ' + EDGE_WORD[edge]);
     }
     return;
   }
 
-  // Server role
   const peers = (state.status && state.status.peers) || [];
   if (!state.running || peers.length === 0) {
-    toast('Connect a client first to reposition it live on the desk');
+    toast('Connect a client first, then drag it into place');
     return;
   }
   const targetName = peerName || (getActivePeer() && getActivePeer().name);
@@ -1198,22 +1481,14 @@ async function movePeerLive(edge, peerName) {
   if (current && current.edge === edge) return;
 
   state.selectedPeerName = targetName;
-  const res = await api('/api/move-edge', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ edge, peer_name: targetName }),
-  });
+  const res = await jsonPost('/api/move-edge', { edge, peer_name: targetName });
   if (res.error) toast('Failed: ' + res.error);
-  else toast(`Moved ${targetName} live to ${edge.toUpperCase()}`);
+  else toast(`${targetName} moved to the ${EDGE_WORD[edge]}`);
 }
 
 async function switchToEdge(edge) {
   if (!state.running || state.role !== 'server') return;
-  await api('/api/switch', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify(edge ? { edge } : {}),
-  });
+  await jsonPost('/api/switch', edge ? { edge } : {});
 }
 
 function renderClientEdgePills() {
@@ -1227,12 +1502,7 @@ document.querySelectorAll('#clientEdgePills .edge-pill').forEach(btn => {
   btn.onclick = () => movePeerLive(btn.dataset.edge);
 });
 
-function edgeArrowSymbol(edge) {
-  if (edge === 'left') return '&larr;';
-  if (edge === 'right') return '&rarr;';
-  if (edge === 'top') return '&uarr;';
-  return '&darr;';
-}
+const EDGE_ARROW = { left: '\u2190', right: '\u2192', top: '\u2191', bottom: '\u2193' };
 
 function getClientServerLabel(st) {
   if (st && st.status && st.status.startsWith('Connected to ')) {
@@ -1241,10 +1511,44 @@ function getClientServerLabel(st) {
   if (st && st.active_target && st.active_target !== 'Local' && st.active_target !== 'Local (Controlling)') {
     return st.active_target;
   }
-  return 'Primary Server';
+  return 'Server';
 }
 
-// 1-Square-Per-Machine Desk Layout Renderer (flicker-free & drag-safe!)
+function friendlyTarget(st) {
+  const t = (st && st.active_target) || 'Local';
+  if (t === 'Local (Controlling)') return 'This PC';
+  if (t === 'Local') return state.role === 'server' || !state.running ? 'This PC' : getClientServerLabel(st);
+  return t;
+}
+
+function monitorHtml({ cls = '', os = null, name, sub = '', extra = '', attrs = '', center = false }) {
+  return `
+    <div class="mon ${center ? 'center' : ''} ${cls}" ${attrs}>
+      <div class="mon-screen">
+        ${extra}
+        ${os ? `<div class="mon-os">${osIconSvg(os.cls, center ? 15 : 13)}</div>` : ''}
+        <div class="mon-name">${escapeHtml(name)}</div>
+        ${sub ? `<div class="mon-sub">${sub}</div>` : ''}
+        ${CURSOR_SVG}
+      </div>
+      <div class="mon-neck"></div>
+      <div class="mon-base"></div>
+    </div>`;
+}
+
+function ghostHtml(edge, inert, hint) {
+  return `
+    <div class="mon ghost ${inert ? 'inert' : ''}">
+      <div class="mon-screen">
+        <div class="ghost-label">${EDGE_ARROW[edge]}</div>
+        <div class="ghost-hint">${hint}</div>
+      </div>
+      <div class="mon-neck"></div>
+      <div class="mon-base"></div>
+    </div>`;
+}
+
+// Arrangement renderer: one screen per machine, flicker-free & drag-safe.
 function renderDeskLayout(force = false) {
   if (state.dragging && !force) return;
 
@@ -1257,29 +1561,18 @@ function renderDeskLayout(force = false) {
   const serverLabel = state.role === 'client' ? getClientServerLabel(st) : state.hostname;
 
   const layoutKey = JSON.stringify({
-    role: state.role,
-    running: state.running,
-    hostname: state.hostname,
-    os: state.os,
-    clientEdge,
-    activeTarget,
-    selectedPeerName: state.selectedPeerName,
-    isConnectedClient,
+    role: state.role, running: state.running, hostname: state.hostname, os: state.os,
+    clientEdge, activeTarget, selectedPeerName: state.selectedPeerName, isConnectedClient, serverLabel,
     peers: peers.map(p => ({ n: p.name, e: p.edge, o: p.os })),
   });
 
   if (!force && layoutKey === state.lastLayoutKey) {
-    // Only update RTT numbers in-place so hover/drag states never flicker!
     peers.forEach(p => {
-      const rttNode = document.querySelector(`[data-rtt-peer="${CSS.escape(p.name)}"]`);
-      if (rttNode) {
-        rttNode.textContent = p.rtt_ms != null ? p.rtt_ms.toFixed(1) + ' ms' : 'online';
-      }
+      const node = document.querySelector(`[data-rtt-peer="${CSS.escape(p.name)}"]`);
+      if (node) node.textContent = p.rtt_ms != null ? fmtRtt(p.rtt_ms) : 'connected';
     });
     const selfRtt = document.querySelector('[data-rtt-self="1"]');
-    if (selfRtt) {
-      selfRtt.textContent = st.rtt_ms != null ? st.rtt_ms.toFixed(1) + ' ms' : 'online';
-    }
+    if (selfRtt) selfRtt.textContent = st.rtt_ms != null ? fmtRtt(st.rtt_ms) : (isConnectedClient ? 'connected' : 'This PC');
     return;
   }
   state.lastLayoutKey = layoutKey;
@@ -1289,72 +1582,50 @@ function renderDeskLayout(force = false) {
 
   if (state.role === 'server') {
     const localFocused = !state.running || activeTarget === 'Local';
-    centerEl.innerHTML = `
-      <div class="machine-tile center-tile ${localFocused ? 'focused' : ''}" id="centerTileBtn"
-           title="${localFocused ? 'This PC currently has cursor focus' : 'Click to return cursor focus to This PC'}">
-        <div class="tile-top-row">
-          <span class="os-pill ${myOs.cls}">${osIconSvg(myOs.cls)} ${escapeHtml(myOs.label)}</span>
-          <span class="role-chip">This PC</span>
-        </div>
-        <div class="tile-name">${escapeHtml(state.hostname)}</div>
-        ${localFocused
-          ? `<div class="focus-chip"><span class="pulse-dot"></span>${state.running ? 'Active Focus' : 'Primary Server'}</div>`
-          : `<button class="xs primary" id="returnLocalBtn">Return Here</button>`}
-      </div>`;
+    const canReturn = state.running && !localFocused;
+    centerEl.innerHTML = monitorHtml({
+      center: true,
+      cls: `${localFocused ? 'focused' : ''} ${canReturn ? 'clickable' : ''}`,
+      os: myOs,
+      name: state.hostname,
+      sub: canReturn ? 'Click to bring cursor back' : 'This PC',
+      attrs: `id="centerTileBtn" title="${canReturn ? 'Click to bring the cursor back here' : 'This PC'}"`,
+    });
     const cBtn = $('centerTileBtn');
-    if (cBtn && state.running && !localFocused) {
-      cBtn.onclick = () => switchToEdge(null);
-    }
+    if (canReturn) cBtn.onclick = () => switchToEdge(null);
   } else {
     const primaryFocused = isConnectedClient && !clientControlling;
-    centerEl.innerHTML = `
-      <div class="machine-tile center-tile ${primaryFocused ? 'focused' : (!isConnectedClient ? 'dimmed' : '')}"
-           title="Primary (Server) PC">
-        <div class="tile-top-row">
-          <span class="role-chip">Primary</span>
-        </div>
-        <div class="tile-name">${escapeHtml(serverLabel)}</div>
-        <div class="card-sub">${isConnectedClient
-          ? (primaryFocused ? '<span class="focus-chip"><span class="pulse-dot"></span>Active Focus</span>' : 'Controlling This PC')
-          : (state.running ? 'Searching LAN\u2026' : 'Server PC')}</div>
-      </div>`;
+    centerEl.innerHTML = monitorHtml({
+      center: true,
+      cls: primaryFocused ? 'focused' : (!isConnectedClient ? 'dimmed' : ''),
+      name: serverLabel,
+      sub: isConnectedClient ? 'Server' : (state.running ? 'Searching\u2026' : 'Not connected'),
+      attrs: 'title="Server PC"',
+    });
   }
 
   const peersByEdge = {};
   peers.forEach(p => { peersByEdge[p.edge] = p; });
+  const canPlaceServer = state.running && peers.length > 0;
 
   document.querySelectorAll('.edge-slot').forEach(slot => {
     const edge = slot.dataset.edge;
-    const edgeTitle = edge[0].toUpperCase() + edge.slice(1);
-    slot.classList.remove('occupied');
+    slot.classList.remove('occupied', 'inert-slot');
 
     if (state.role === 'client') {
       if (clientEdge === edge) {
         slot.classList.add('occupied');
         const selfFocused = isConnectedClient && clientControlling;
-        const rttStr = st.rtt_ms != null ? st.rtt_ms.toFixed(1) + ' ms' : (isConnectedClient ? 'online' : '');
-        slot.innerHTML = `
-          <div class="machine-tile draggable ${selfFocused ? 'focused' : ''}" draggable="true" data-drag-kind="self"
-               title="Drag or click any edge to reposition This PC">
-            <div class="tile-main">
-              <div class="tile-top-row">
-                <span class="os-pill ${myOs.cls}">${osIconSvg(myOs.cls)} ${escapeHtml(myOs.label)}</span>
-                ${rttStr ? `<span class="rtt-pill" data-rtt-self="1">${rttStr}</span>` : ''}
-              </div>
-              <div class="tile-name">${escapeHtml(state.hostname)}</div>
-            </div>
-            <div class="tile-actions">
-              ${selfFocused
-                ? '<span class="focus-chip"><span class="pulse-dot"></span>Active</span>'
-                : '<span class="role-chip">This PC</span>'}
-            </div>
-          </div>`;
+        const rttStr = st.rtt_ms != null ? fmtRtt(st.rtt_ms) : (isConnectedClient ? 'connected' : 'This PC');
+        slot.innerHTML = monitorHtml({
+          cls: `draggable ${selfFocused ? 'focused' : ''}`,
+          os: myOs,
+          name: state.hostname,
+          sub: `<span class="mono" data-rtt-self="1">${rttStr}</span>`,
+          attrs: 'draggable="true" data-drag-kind="self" title="Drag to another side"',
+        });
       } else {
-        slot.innerHTML = `
-          <div class="slot-empty">
-            <span>${edgeArrowSymbol(edge)} ${edgeTitle}</span>
-            <span class="slot-sub">Click or drop</span>
-          </div>`;
+        slot.innerHTML = ghostHtml(edge, false, 'Move here');
       }
     } else {
       const peer = peersByEdge[edge];
@@ -1362,32 +1633,20 @@ function renderDeskLayout(force = false) {
         slot.classList.add('occupied');
         const posOs = formatOs(peer.os);
         const peerFocused = activeTarget === peer.name;
-        const isSelected = getActivePeer() && getActivePeer().name === peer.name && peers.length > 1;
-        const rttText = peer.rtt_ms != null ? peer.rtt_ms.toFixed(1) + ' ms' : 'online';
-        slot.innerHTML = `
-          <div class="machine-tile draggable ${peerFocused ? 'focused' : ''} ${isSelected ? 'selected-peer' : ''}"
-               draggable="true" data-drag-kind="peer" data-peer-name="${escapeHtml(peer.name)}" data-peer-edge="${edge}"
-               title="Drag to another edge to move live, or double-click to jump cursor">
-            <div class="tile-main">
-              <div class="tile-top-row">
-                <span class="os-pill ${posOs.cls}">${osIconSvg(posOs.cls)} ${escapeHtml(posOs.label)}</span>
-                <span class="rtt-pill" data-rtt-peer="${escapeHtml(peer.name)}">${rttText}</span>
-              </div>
-              <div class="tile-name">${escapeHtml(peer.name)}</div>
-            </div>
-            <div class="tile-actions">
-              ${peerFocused
-                ? '<span class="focus-chip"><span class="pulse-dot"></span>Active</span>'
-                : `<button class="xs primary jump-peer-btn" data-edge="${edge}" title="Jump cursor to ${escapeHtml(peer.name)}">Jump &rarr;</button>`}
-            </div>
-          </div>`;
+        const ap = getActivePeer();
+        const isSelected = ap && ap.name === peer.name && peers.length > 1;
+        const rttText = peer.rtt_ms != null ? fmtRtt(peer.rtt_ms) : 'connected';
+        slot.innerHTML = monitorHtml({
+          cls: `draggable ${peerFocused ? 'focused' : ''} ${isSelected ? 'selected-peer' : ''}`,
+          os: posOs,
+          name: peer.name,
+          sub: `<span class="mono" data-rtt-peer="${escapeHtml(peer.name)}">${rttText}</span>`,
+          extra: peerFocused ? '' : `<button class="xs primary jump-peer-btn" data-edge="${edge}" title="Move cursor to ${escapeHtml(peer.name)}">Jump</button>`,
+          attrs: `draggable="true" data-drag-kind="peer" data-peer-name="${escapeHtml(peer.name)}" data-peer-edge="${edge}" title="Drag to rearrange \u00b7 double-click to jump"`,
+        });
       } else {
-        const canPlace = state.running && peers.length > 0;
-        slot.innerHTML = `
-          <div class="slot-empty">
-            <span>${edgeArrowSymbol(edge)} ${edgeTitle}</span>
-            <span class="slot-sub">${canPlace ? 'Move here' : 'Empty'}</span>
-          </div>`;
+        if (!canPlaceServer) slot.classList.add('inert-slot');
+        slot.innerHTML = ghostHtml(edge, !canPlaceServer, 'Move here');
       }
     }
   });
@@ -1396,15 +1655,12 @@ function renderDeskLayout(force = false) {
 }
 
 function bindTileHandlers() {
-  // Drag start / end on draggable tiles
-  document.querySelectorAll('.machine-tile.draggable').forEach(tile => {
+  document.querySelectorAll('.mon.draggable').forEach(tile => {
     tile.addEventListener('dragstart', (e) => {
       state.dragging = true;
-      state.dragPayload = {
-        kind: tile.dataset.dragKind,
-        peerName: tile.dataset.peerName || null,
-      };
+      state.dragPayload = { kind: tile.dataset.dragKind, peerName: tile.dataset.peerName || null };
       tile.classList.add('dragging');
+      $('deskStage').classList.add('is-dragging');
       if (e.dataTransfer) {
         e.dataTransfer.effectAllowed = 'move';
         e.dataTransfer.setData('text/plain', tile.dataset.peerName || 'self');
@@ -1412,6 +1668,7 @@ function bindTileHandlers() {
     });
     tile.addEventListener('dragend', () => {
       tile.classList.remove('dragging');
+      $('deskStage').classList.remove('is-dragging');
       document.querySelectorAll('.edge-slot').forEach(s => s.classList.remove('drop-over'));
       state.dragging = false;
       state.dragPayload = null;
@@ -1419,8 +1676,7 @@ function bindTileHandlers() {
     });
   });
 
-  // Peer tile click / double-click / Jump button
-  document.querySelectorAll('.machine-tile[data-drag-kind="peer"]').forEach(tile => {
+  document.querySelectorAll('.mon[data-drag-kind="peer"]').forEach(tile => {
     tile.addEventListener('click', (e) => {
       if (e.target.closest('.jump-peer-btn')) return;
       state.selectedPeerName = tile.dataset.peerName;
@@ -1440,37 +1696,29 @@ function bindTileHandlers() {
   });
 }
 
-// Bind Edge Slot Click + Drop handlers once
 document.querySelectorAll('.edge-slot').forEach(slot => {
-  slot.addEventListener('click', (e) => {
-    // On Server mode, clicking an occupied tile selects/jumps via tile handler, not empty-slot move
-    if (state.role === 'server' && slot.classList.contains('occupied')) return;
+  slot.addEventListener('click', () => {
+    if (slot.classList.contains('occupied')) return;
+    if (slot.classList.contains('inert-slot')) { toast('Connect a client first, then drag it into place'); return; }
     movePeerLive(slot.dataset.edge);
   });
-
   slot.addEventListener('dragover', (e) => {
     if (!state.dragging) return;
     e.preventDefault();
     if (e.dataTransfer) e.dataTransfer.dropEffect = 'move';
     slot.classList.add('drop-over');
   });
-
   slot.addEventListener('dragleave', (e) => {
-    if (!slot.contains(e.relatedTarget)) {
-      slot.classList.remove('drop-over');
-    }
+    if (!slot.contains(e.relatedTarget)) slot.classList.remove('drop-over');
   });
-
   slot.addEventListener('drop', async (e) => {
     e.preventDefault();
     slot.classList.remove('drop-over');
-    const targetEdge = slot.dataset.edge;
+    $('deskStage').classList.remove('is-dragging');
     const payload = state.dragPayload;
     state.dragging = false;
     state.dragPayload = null;
-    if (payload) {
-      await movePeerLive(targetEdge, payload.peerName);
-    }
+    if (payload) await movePeerLive(slot.dataset.edge, payload.peerName);
   });
 });
 
@@ -1479,103 +1727,94 @@ function renderSparkline(vals) {
   if (!vals || vals.length < 2) { svg.innerHTML = ''; return; }
   const max = Math.max(2, ...vals);
   const pts = vals.map((v, i) => {
-    const x = (i / (vals.length - 1)) * 46;
+    const x = (i / (vals.length - 1)) * 40;
     const y = 13 - Math.min(12, (v / max) * 12);
     return `${x.toFixed(1)},${y.toFixed(1)}`;
   }).join(' ');
-  svg.innerHTML = `<polyline fill="none" stroke="#38bdf8" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" points="${pts}" />`;
+  svg.innerHTML = `<polyline fill="none" stroke="#38bdf8" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" points="${pts}" />`;
 }
 
 function renderStatus(st) {
   if (!st) return;
   state.status = st;
   state.running = st.mode === 'server' || st.mode === 'client';
-  if (state.running && st.mode !== state.role) {
-    setRole(st.mode);
-  }
+  if (state.running && st.mode !== state.role) setRole(st.mode);
 
   const statusText = st.status || 'Idle';
   $('statusText').textContent = statusText;
-  const pill = $('statusPill');
-  pill.className = 'pill ' + (
+  $('statusPill').title = statusText;
+  $('statusPill').className = 'pill ' + (
     statusText.startsWith('Connected') ? 'live' :
     statusText.startsWith('Error') ? 'err' :
     state.running ? 'wait' : ''
   );
 
-  $('activeTargetBadge').textContent = 'Focus: ' + (st.active_target || 'Local');
+  $('activeTargetBadge').textContent = 'Cursor: ' + friendlyTarget(st);
+  $('activeTargetBadge').classList.toggle('on', state.running);
 
   const btn = $('startStopBtn');
   if (state.running) {
     btn.textContent = 'Stop';
     btn.className = 'danger';
   } else {
-    btn.textContent = state.role === 'server' ? 'Start Server' : 'Connect Client';
+    btn.textContent = state.role === 'server' ? 'Start Server' : 'Connect';
     btn.className = 'primary';
   }
 
-  const lbtn = $('lockBtn');
-  lbtn.classList.toggle('locked', !!st.locked);
+  $('lockBtn').classList.toggle('locked', !!st.locked);
   $('lockBtnText').textContent = st.locked ? 'Locked' : 'Lock';
+  $('lockBtn').title = st.locked
+    ? 'Cursor locked to this screen \u2014 click to unlock (Ctrl+Alt+L)'
+    : 'Lock cursor to the current screen (Ctrl+Alt+L)';
 
-  if (st.rtt_ms != null) {
+  if (st.rtt_ms != null && state.running) {
     $('rttBox').style.display = 'inline-flex';
-    $('rttVal').textContent = st.rtt_ms.toFixed(1) + ' ms';
+    $('rttVal').textContent = fmtRtt(st.rtt_ms);
     renderSparkline(st.rtt_history);
   } else {
     $('rttBox').style.display = 'none';
   }
 
-  if (st.fingerprint) {
-    $('fpBox').textContent = st.fingerprint;
-  }
+  if (st.fingerprint) $('fpBox').textContent = st.fingerprint;
 
-  // Error banner
   if (st.last_error && st.last_error !== state.dismissedError) {
     $('errText').textContent = st.last_error;
+    $('errText').title = st.last_error;
     $('errBanner').classList.add('show');
   } else if (!st.last_error) {
     state.dismissedError = null;
     $('errBanner').classList.remove('show');
   }
 
-  state.lastClipKey = state.lastClipKey || '';
-  state.lastFilesKey = state.lastFilesKey || '';
-  state.lastPeersKey = state.lastPeersKey || '';
-
-  // Server connected peers list (skip DOM rewrite if unchanged so hover states never flicker)
+  // Server: connected clients
   const peers = st.peers || [];
   $('peerCountBadge').textContent = peers.length + ' online';
   $('peerCountBadge').className = 'badge ' + (peers.length > 0 ? 'live' : '');
   const peersKey = JSON.stringify({
     running: state.running,
     active: st.active_target,
-    peers: peers.map(p => [p.name, p.os, p.edge, p.addr, p.rtt_ms != null ? p.rtt_ms.toFixed(1) : '']),
+    peers: peers.map(p => [p.name, p.os, p.edge, p.addr, p.rtt_ms != null ? fmtRtt(p.rtt_ms) : '']),
   });
   if (peersKey !== state.lastPeersKey) {
     state.lastPeersKey = peersKey;
-    const peersEl = $('serverPeersList');
+    const el = $('serverPeersList');
     if (peers.length === 0) {
-      peersEl.innerHTML = `<div class="empty-state">
-        <span>${state.running ? 'Listening on LAN\u2026' : 'Server is idle.'}</span>
-        <span>${state.running ? 'Open Glide on your Client PC and click Connect.' : 'Click Start Server to accept Client connections.'}</span>
-      </div>`;
+      el.innerHTML = state.running
+        ? `<div class="empty"><div class="radar"><span></span><i></i></div><strong>Waiting for clients</strong><span>Open Glide on the other PC and press Connect</span></div>`
+        : `<div class="empty"><strong>Server is off</strong><span>Press Start Server to accept clients</span></div>`;
     } else {
-      peersEl.innerHTML = peers.map(p => {
+      el.innerHTML = peers.map(p => {
         const osInfo = formatOs(p.os);
         const isFocused = st.active_target === p.name;
-        const rtt = p.rtt_ms != null ? p.rtt_ms.toFixed(1) + ' ms' : 'online';
-        return `<div class="device">
-          <div style="min-width:0;">
-            <div class="dev-name">
-              <span>${escapeHtml(p.name)}</span>
-              <span class="os-pill ${osInfo.cls}">${escapeHtml(osInfo.label)}</span>
-              <span class="badge">${escapeHtml(p.edge)}</span>
-            </div>
-            <div class="dev-meta">${escapeHtml(p.addr)} &middot; ${rtt}</div>
+        const rtt = p.rtt_ms != null ? fmtRtt(p.rtt_ms) : 'connected';
+        return `<div class="row-item">
+          <span class="os-ico">${osIconSvg(osInfo.cls)}</span>
+          <div class="grow">
+            <div class="row-title">${escapeHtml(p.name)}</div>
+            <div class="row-meta">${EDGE_ARROW[p.edge] || ''} ${escapeHtml(p.edge)} \u00b7 ${rtt}</div>
           </div>
-          <button class="sm ${isFocused ? 'primary' : ''}" onclick="${isFocused ? 'switchToEdge(null)' : `switchToEdge('${escapeHtml(p.edge)}')`}">
-            ${isFocused ? 'Local' : 'Jump &rarr;'}
+          <button class="xs ${isFocused ? '' : 'primary'}" onclick="${isFocused ? 'switchToEdge(null)' : `switchToEdge('${escapeHtml(p.edge)}')`}">
+            ${isFocused ? 'Return' : 'Jump'}
           </button>
         </div>`;
       }).join('');
@@ -1585,51 +1824,59 @@ function renderStatus(st) {
   updateLayoutHint();
   renderDeskLayout(false);
 
-  // Clipboard history (only rewrite DOM when entries change)
+  if (state.role === 'client') {
+    const ck = clientConnected() + '|' + getClientServerLabel(st);
+    if (ck !== state.lastClientKey) {
+      state.lastClientKey = ck;
+      renderDevices(state.devices || []);
+    }
+  }
+
+  // Clipboard history
   const clipEl = $('clipHistory');
   const clipHist = st.clipboard_history || [];
   const clipKey = JSON.stringify(clipHist.map(i => [i.id, i.direction, i.bytes ?? i.size_bytes ?? 0]));
   if (clipKey !== state.lastClipKey) {
     state.lastClipKey = clipKey;
     if (clipHist.length === 0) {
-      clipEl.innerHTML = '<div class="empty-state">Synced clipboard items appear here with 1-click Re-send.</div>';
+      clipEl.innerHTML = '<div class="empty"><strong>Nothing copied yet</strong><span>Copy on one PC, paste on the other. Recent items show here.</span></div>';
     } else {
       clipEl.innerHTML = clipHist.map(item => {
         const fmtRaw = item.format || item.kind || 'TextUtf8';
-        const fmtLabel = String(fmtRaw).includes('Png') ? 'PNG' : 'Text';
+        const isImg = String(fmtRaw).includes('Png') || String(fmtRaw).toLowerCase().includes('image');
         const byteCount = item.bytes ?? item.size_bytes ?? 0;
-        const dirLabel = item.direction === 'sent' ? '&uarr; Sent' : '&darr; Recv';
-        return `<div class="list-item">
-          <div style="min-width:0; flex:1;">
-            <div style="font-size:11.5px;font-weight:600;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;">${escapeHtml(item.preview)}</div>
-            <div class="card-sub">${dirLabel} &middot; ${fmtLabel} &middot; ${formatBytes(byteCount)}</div>
+        const dir = item.direction === 'sent' ? '\u2191 Sent' : '\u2193 Received';
+        const ico = isImg
+          ? '<svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="4" width="18" height="16" rx="2.5"/><circle cx="9" cy="10" r="1.8"/><path d="m21 16-5-5-9 9"/></svg>'
+          : '<svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M5 6h14M5 11h14M5 16h9"/></svg>';
+        return `<div class="row-item">
+          <span class="os-ico">${ico}</span>
+          <div class="grow">
+            <div class="row-title" style="font-weight:550;">${escapeHtml(item.preview)}</div>
+            <div class="row-meta">${dir} \u00b7 ${isImg ? 'Image' : 'Text'} \u00b7 ${formatBytes(byteCount)}</div>
           </div>
-          <button class="xs" onclick="resendClip(${Number(item.id)})">Re-send</button>
+          <button class="xs" onclick="resendClip(${Number(item.id)})" title="Send to the other PC again">Re-send</button>
         </div>`;
       }).join('');
     }
   }
 
-  // Recent files (only rewrite DOM when entries change)
+  // Recent files
   const filesEl = $('recentFiles');
   const files = st.recent_files || [];
   const filesKey = JSON.stringify(files.slice(0, 4).map(f => [f.filename, f.direction, f.bytes ?? f.size_bytes ?? 0]));
   if (filesKey !== state.lastFilesKey) {
     state.lastFilesKey = filesKey;
-    if (files.length === 0) {
-      filesEl.innerHTML = '';
-    } else {
-      filesEl.innerHTML = files.slice(0, 4).map(f => {
-        const byteCount = f.bytes ?? f.size_bytes ?? 0;
-        const dirLabel = f.direction === 'sent' ? '&uarr; Sent' : '&darr; Recv';
-        return `<div class="list-item" style="padding:4px 8px;">
-          <div style="min-width:0; flex:1;">
-            <div style="font-size:11.5px;font-weight:600;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;">${escapeHtml(f.filename)}</div>
-            <div class="card-sub">${dirLabel} &middot; ${formatBytes(byteCount)}${f.saved_path ? ' &rarr; ' + escapeHtml(f.saved_path) : ''}</div>
-          </div>
-        </div>`;
-      }).join('');
-    }
+    filesEl.innerHTML = files.slice(0, 4).map(f => {
+      const byteCount = f.bytes ?? f.size_bytes ?? 0;
+      const dir = f.direction === 'sent' ? '\u2191' : '\u2193';
+      return `<div class="row-item" title="${escapeHtml(f.saved_path || f.filename)}">
+        <div class="grow">
+          <div class="row-title" style="font-size:11.5px;">${dir} ${escapeHtml(f.filename)}</div>
+        </div>
+        <span class="row-meta" style="margin:0;">${formatBytes(byteCount)}</span>
+      </div>`;
+    }).join('');
   }
 }
 
@@ -1639,26 +1886,26 @@ $('errDismissBtn').onclick = () => {
 };
 
 window.resendClip = async (id) => {
-  const res = await api('/api/clipboard/resend', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ id }),
-  });
+  const res = await jsonPost('/api/clipboard/resend', { id });
   if (res.error) toast('Failed: ' + res.error);
-  else toast('Re-sent clipboard item to peer');
+  else toast('Sent to the other PC');
 };
+
+window.switchToEdge = switchToEdge;
 
 function renderRemaps() {
   const list = $('remapList');
   const rules = (state.config && state.config.client && state.config.client.key_remap) || [];
   if (rules.length === 0) {
-    list.innerHTML = '<div class="empty-state">No key remaps (1:1 physical USB HID passthrough).</div>';
+    list.innerHTML = '<div class="empty"><strong>No remaps</strong><span>Every key passes through exactly as pressed</span></div>';
     return;
   }
   list.innerHTML = rules.map((r, i) => `
-    <div class="list-item" style="padding:5px 8px;">
-      <div><span class="kbd">${escapeHtml(r.from)}</span> &rarr; <span class="kbd">${escapeHtml(r.to)}</span></div>
-      <button class="xs danger" onclick="removeRemap(${i})">Remove</button>
+    <div class="row-item" style="padding:5px 6px 5px 10px;">
+      <div class="grow"><span class="kbd">${escapeHtml(r.from)}</span> <span style="color:var(--faint);">&rarr;</span> <span class="kbd">${escapeHtml(r.to)}</span></div>
+      <button class="xs ghost" onclick="removeRemap(${i})" title="Remove">
+        <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round"><path d="M6 6l12 12M18 6 6 18"/></svg>
+      </button>
     </div>`).join('');
 }
 
@@ -1671,59 +1918,66 @@ window.removeRemap = async (idx) => {
 async function addRemapRule(from, to) {
   if (!state.config || !from || !to) return;
   const rules = state.config.client.key_remap || [];
-  const exists = rules.some(r => r.from.toLowerCase() === from.toLowerCase());
-  if (exists) {
-    toast(`Rule for ${from} already exists`);
+  if (rules.some(r => r.from.toLowerCase() === from.toLowerCase())) {
+    toast(`${from} is already remapped`);
     return;
   }
   rules.push({ from, to });
   state.config.client.key_remap = rules;
   renderRemaps();
   await pushConfig();
-  toast(`Remap added: ${from} \u2192 ${to}`);
+  toast(`Remapped ${from} \u2192 ${to}`);
 }
 
 $('addRemapBtn').onclick = async () => {
   const from = $('remapFrom').value.trim();
   const to = $('remapTo').value.trim();
-  if (!from || !to) { toast('Enter both From and To HID key names'); return; }
+  if (!from || !to) { toast('Pick a key on both sides'); return; }
   $('remapFrom').value = '';
   $('remapTo').value = '';
   await addRemapRule(from, to);
 };
-
 $('addRemapEscBtn').onclick = () => addRemapRule('CapsLock', 'Escape');
 $('addRemapCtrlBtn').onclick = () => addRemapRule('CapsLock', 'ControlLeft');
+
+function setTrustLabel(fp) {
+  $('trustStateLabel').textContent = fp
+    ? 'Trusted server: ' + fp.slice(0, 20) + '\u2026'
+    : 'Trusts the first server it connects to';
+}
+
+const RANGE_IDS = ['sensSlider', 'scrollSlider', 'threshSlider', 'deadCornerSlider', 'dwellSlider'];
+
+function refreshRangeLabels() {
+  $('sensVal').textContent = Number($('sensSlider').value).toFixed(2) + 'x';
+  $('scrollVal').textContent = Number($('scrollSlider').value).toFixed(2) + 'x';
+  $('threshVal').textContent = $('threshSlider').value + ' px';
+  $('deadCornerVal').textContent = $('deadCornerSlider').value + ' px';
+  $('dwellVal').textContent = $('dwellSlider').value + ' ms';
+  RANGE_IDS.forEach(id => updateRangeFill($(id)));
+}
 
 function syncFormFromConfig() {
   const c = state.config;
   if (!c) return;
   $('sensSlider').value = c.client.sensitivity;
-  $('sensVal').textContent = Number(c.client.sensitivity).toFixed(2) + 'x';
   $('scrollSlider').value = c.client.scroll_speed;
-  $('scrollVal').textContent = Number(c.client.scroll_speed).toFixed(2) + 'x';
   $('autoDpiToggle').checked = !!c.client.auto_dpi_scale;
   $('invertScrollToggle').checked = !!c.client.invert_scroll;
   $('inputBackendSelect').value = c.client.input_backend || 'auto';
 
   $('threshSlider').value = c.server.edge_threshold_px;
-  $('threshVal').textContent = c.server.edge_threshold_px + ' px';
   $('deadCornerSlider').value = c.server.dead_corner_px;
-  $('deadCornerVal').textContent = c.server.dead_corner_px + ' px';
   $('dwellSlider').value = c.server.edge_dwell_ms;
-  $('dwellVal').textContent = c.server.edge_dwell_ms + ' ms';
   $('fullscreenLockToggle').checked = !!c.server.auto_lock_fullscreen;
   $('syncLockToggle').checked = !!c.server.sync_lock_keys;
   $('clipToggle').checked = !!c.server.clipboard;
+  refreshRangeLabels();
 
-  const { port } = parseBind(c.server.bind);
-  $('serverPortInput').value = port;
+  $('serverPortInput').value = parseBind(c.server.bind).port;
   $('discoveryToggle').checked = c.server.discovery !== false;
   $('manualServerInput').value = c.client.server || '';
-
-  $('trustStateLabel').textContent = c.client.trusted_fingerprint
-    ? 'Pinned server: ' + c.client.trusted_fingerprint.slice(0, 18) + '\u2026'
-    : 'TOFU auto-pinning active on first connect';
+  setTrustLabel(c.client.trusted_fingerprint);
 
   renderRemaps();
   renderClientEdgePills();
@@ -1762,90 +2016,132 @@ async function pushConfig() {
 
   const { host } = parseBind(c.server.bind);
   const portNum = parseInt($('serverPortInput').value, 10);
-  if (portNum >= 1024 && portNum <= 65535) {
-    c.server.bind = `${host}:${portNum}`;
-  }
+  if (portNum >= 1024 && portNum <= 65535) c.server.bind = `${host}:${portNum}`;
   c.server.discovery = $('discoveryToggle').checked;
 
   const manual = $('manualServerInput').value.trim();
   c.client.server = manual ? manual : null;
 
-  await api('/api/config', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify(c),
-  });
+  await jsonPost('/api/config', c);
 }
 
-// Live debounced slider & toggle bindings
-['sensSlider', 'scrollSlider', 'threshSlider', 'deadCornerSlider', 'dwellSlider'].forEach(id => {
-  $(id).oninput = () => {
-    $('sensVal').textContent = Number($('sensSlider').value).toFixed(2) + 'x';
-    $('scrollVal').textContent = Number($('scrollSlider').value).toFixed(2) + 'x';
-    $('threshVal').textContent = $('threshSlider').value + ' px';
-    $('deadCornerVal').textContent = $('deadCornerSlider').value + ' px';
-    $('dwellVal').textContent = $('dwellSlider').value + ' ms';
-    schedulePushConfig(180);
-  };
+RANGE_IDS.forEach(id => {
+  $(id).oninput = () => { refreshRangeLabels(); schedulePushConfig(180); };
   $(id).onchange = () => pushConfig();
 });
 
 [
   'autoDpiToggle', 'invertScrollToggle', 'inputBackendSelect',
   'fullscreenLockToggle', 'syncLockToggle', 'clipToggle',
-  'discoveryToggle', 'serverPortInput', 'manualServerInput'
-].forEach(id => {
-  $(id).onchange = () => pushConfig();
-});
+  'discoveryToggle', 'manualServerInput'
+].forEach(id => { $(id).onchange = () => pushConfig(); });
+
+$('serverPortInput').onchange = () => { renderLocalIps(state.localIps); pushConfig(); };
 
 // Start / Stop / Lock / Quit
 $('startStopBtn').onclick = async () => {
-  if (state.running) {
-    await api('/api/stop', { method: 'POST' });
-    toast('Stopped Glide');
-  } else {
-    await pushConfig();
-    const res = await api('/api/start', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ role: state.role }),
-    });
-    if (res.error) toast('Error: ' + res.error);
-    else toast('Started as ' + (state.role === 'server' ? 'Server' : 'Client'));
+  const btn = $('startStopBtn');
+  btn.disabled = true;
+  try {
+    if (state.running) {
+      await api('/api/stop', { method: 'POST' });
+      toast('Stopped');
+    } else {
+      await pushConfig();
+      const res = await jsonPost('/api/start', { role: state.role });
+      if (res.error) toast('Error: ' + res.error);
+      else toast(state.role === 'server' ? 'Server started' : 'Connecting\u2026');
+    }
+  } finally {
+    setTimeout(() => { btn.disabled = false; }, 350);
   }
 };
 
-$('lockBtn').onclick = async () => {
-  await api('/api/lock', { method: 'POST' });
-};
+$('lockBtn').onclick = async () => { await api('/api/lock', { method: 'POST' }); };
 
 let _es = null;
 $('quitBtn').onclick = async () => {
-  toast('Quitting Glide KVM\u2026');
+  toast('Quitting Glide\u2026');
   if (_es) { try { _es.close(); } catch {} }
   await api('/api/quit', { method: 'POST' });
   try { window.close(); } catch {}
 };
 
-// LAN Discovery Radar & IP Copy
+// Address + discovery
 let scanning = false;
 function renderLocalIps(ips) {
+  state.localIps = ips || [];
   const el = $('localIpsText');
-  if (!el) return;
-  el.textContent = (ips && ips.length > 0) ? ips.join(', ') : 'none (check cable / LAN)';
+  if (state.localIps.length === 0) {
+    el.innerHTML = '<span class="addr-none">No network connection found</span><div class="addr-more" style="font-family:var(--sans);">Plug in a cable or join a LAN</div>';
+    return;
+  }
+  const [first, ...rest] = state.localIps;
+  el.innerHTML = `<div class="addr-main" title="${escapeHtml(first)}:${currentPort()}">${escapeHtml(first)}<span class="port">:${currentPort()}</span></div>`
+    + (rest.length ? `<div class="addr-more" title="${escapeHtml(rest.join(', '))}">also ${escapeHtml(rest.join(', '))}</div>` : '');
 }
 
 $('copyIpBtn').onclick = () => {
-  const first = ($('localIpsText').textContent || '').split(',')[0].trim();
-  const { port } = parseBind(state.config && state.config.server && state.config.server.bind);
-  if (first && !first.startsWith('none')) {
-    const addr = first + ':' + port;
-    navigator.clipboard?.writeText(addr);
-    toast('Copied ' + addr);
-  } else {
-    toast('No active LAN IP found');
+  const first = state.localIps[0];
+  if (!first) { toast('No local network address found'); return; }
+  const addr = first + ':' + currentPort();
+  try {
+    if (navigator.clipboard && window.isSecureContext) navigator.clipboard.writeText(addr);
+    else throw new Error('insecure');
+  } catch {
+    const ta = document.createElement('textarea');
+    ta.value = addr; document.body.appendChild(ta); ta.select();
+    try { document.execCommand('copy'); } catch {}
+    ta.remove();
   }
+  toast('Copied ' + addr);
 };
+
+function clientConnected() {
+  const s = state.status && state.status.status;
+  return state.role === 'client' && state.running && !!s && s.startsWith('Connected');
+}
+
+function renderDevices(devices) {
+  state.devices = devices;
+  const list = $('deviceList');
+  const connected = clientConnected();
+  $('clientListTitle').textContent = connected ? 'Connected to' : 'Nearby servers';
+  $('scanBtn').style.visibility = connected ? 'hidden' : 'visible';
+  if (connected) {
+    const st = state.status || {};
+    const addr = (state.config && state.config.client && state.config.client.server) || 'found automatically';
+    list.innerHTML = `<div class="row-item" style="border-color:rgba(34,197,94,0.28); background:linear-gradient(90deg, rgba(34,197,94,0.08), transparent 70%), var(--panel-2);">
+      <span class="os-ico" style="color:var(--green);">
+        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.6" stroke-linecap="round" stroke-linejoin="round"><path d="M5 12.5l4.5 4.5L19 7.5"/></svg>
+      </span>
+      <div class="grow">
+        <div class="row-title">${escapeHtml(getClientServerLabel(st))}</div>
+        <div class="row-meta">${escapeHtml(addr)}</div>
+      </div>
+      <span class="badge live">Live</span>
+    </div>
+    <div class="empty" style="flex:0; padding:10px 6px 0;"><span>Move your mouse past the server&rsquo;s screen edge to control this PC.</span></div>`;
+    return;
+  }
+  if (devices.length === 0) {
+    list.innerHTML = `<div class="empty"><div class="radar"><span></span><i></i></div>
+      <strong>Looking for servers\u2026</strong>
+      <span>Start Glide as Server on your main PC.<br>Works on any local network, no internet needed.</span></div>`;
+    return;
+  }
+  list.innerHTML = devices.map(d => {
+    const osInfo = formatOs(d.os);
+    return `<div class="row-item">
+      <span class="os-ico">${osIconSvg(osInfo.cls)}</span>
+      <div class="grow">
+        <div class="row-title">${escapeHtml(d.name)}</div>
+        <div class="row-meta" title="Fingerprint ${escapeHtml(d.fingerprint || '')}">${escapeHtml(d.addr)}</div>
+      </div>
+      <button class="xs primary" onclick="connectDiscovered('${escapeHtml(d.addr)}','${escapeHtml(d.fingerprint)}')">Connect</button>
+    </div>`;
+  }).join('');
+}
 
 async function scanLan(silent = false) {
   if (scanning) return;
@@ -1854,31 +2150,11 @@ async function scanLan(silent = false) {
   try {
     const res = await api('/api/discover');
     if (res.local_ips) renderLocalIps(res.local_ips);
-    const list = $('deviceList');
     const devices = res.servers || [];
     const devKey = JSON.stringify(devices.map(d => [d.name, d.os, d.addr, d.fingerprint]));
     if (devKey !== state.lastDevKey) {
       state.lastDevKey = devKey;
-      if (devices.length === 0) {
-        list.innerHTML = `<div class="empty-state">
-          <span>No Glide servers discovered yet.</span>
-          <span>Start <b>Server</b> on your main PC (check UDP 24801 firewall if hidden).</span>
-        </div>`;
-      } else {
-        list.innerHTML = devices.map(d => {
-          const osInfo = formatOs(d.os);
-          return `<div class="device">
-            <div style="min-width:0;">
-              <div class="dev-name">
-                <span>${escapeHtml(d.name)}</span>
-                <span class="os-pill ${osInfo.cls}">${escapeHtml(osInfo.label)}</span>
-              </div>
-              <div class="dev-meta">${escapeHtml(d.addr)} &middot; ${escapeHtml((d.fingerprint || '').slice(0, 16))}&hellip;</div>
-            </div>
-            <button class="sm primary" onclick="connectDiscovered('${escapeHtml(d.addr)}','${escapeHtml(d.fingerprint)}')">Connect</button>
-          </div>`;
-        }).join('');
-      }
+      renderDevices(devices);
     }
   } finally {
     scanning = false;
@@ -1893,21 +2169,17 @@ window.connectDiscovered = async (addr, fp) => {
   state.config.client.server = addr;
   state.config.client.trusted_fingerprint = fp;
   $('manualServerInput').value = addr;
-  $('trustStateLabel').textContent = 'Pinned server: ' + fp.slice(0, 18) + '\u2026';
+  setTrustLabel(fp);
   await pushConfig();
-  const res = await api('/api/start', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ role: 'client' }),
-  });
+  const res = await jsonPost('/api/start', { role: 'client' });
   if (res.error) toast('Error: ' + res.error);
   else toast('Connecting to ' + addr);
 };
 
-// File Beam Dropzone
+// File send
 const dz = $('dropzone');
 dz.onclick = () => $('fileInput').click();
-dz.ondragover = (e) => { e.preventDefault(); dz.classList.add('over'); };
+dz.ondragover = (e) => { if (state.dragging) return; e.preventDefault(); dz.classList.add('over'); };
 dz.ondragleave = () => dz.classList.remove('over');
 dz.ondrop = async (e) => {
   e.preventDefault();
@@ -1922,7 +2194,7 @@ $('fileInput').onchange = async (e) => {
 };
 
 async function sendFiles(files) {
-  if (!state.running) { toast('Start Glide first before beaming files'); return; }
+  if (!state.running) { toast('Connect first, then send files'); return; }
   for (const file of files) {
     toast('Sending ' + file.name + '\u2026');
     const buf = await file.arrayBuffer();
@@ -1932,29 +2204,26 @@ async function sendFiles(files) {
       body: buf,
     });
     if (res.error) toast('Failed: ' + res.error);
-    else toast('Beamed ' + file.name);
+    else toast('Sent ' + file.name);
   }
 }
 
-// OS Integration & Security Actions
+// System
 $('copyFpBtn').onclick = () => {
-  navigator.clipboard?.writeText($('fpBox').textContent);
-  toast('TLS Fingerprint copied');
+  const text = $('fpBox').textContent;
+  try { navigator.clipboard.writeText(text); } catch {}
+  toast('Fingerprint copied');
 };
 
 $('autostartToggle').onchange = async () => {
   const enabled = $('autostartToggle').checked;
-  const res = await api('/api/os/autostart', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ enabled, role: state.role }),
-  });
-  toast(res.message || (enabled ? 'Autostart enabled' : 'Autostart disabled'));
+  const res = await jsonPost('/api/os/autostart', { enabled, role: state.role });
+  toast(res.message || (enabled ? 'Glide will start on login' : 'Autostart off'));
 };
 
 $('firewallBtn').onclick = async () => {
   const res = await api('/api/os/firewall', { method: 'POST' });
-  toast(res.message || 'Firewall rule updated');
+  toast(res.message || 'Firewall rule added');
 };
 
 $('elevatedBtn').onclick = async () => {
@@ -1966,10 +2235,19 @@ $('resetTofuBtn').onclick = async () => {
   const res = await api('/api/trust/reset', { method: 'POST' });
   if (state.config && state.config.client) {
     state.config.client.trusted_fingerprint = null;
-    $('trustStateLabel').textContent = 'TOFU auto-pinning active on first connect';
+    setTrustLabel(null);
   }
-  toast(res.message || 'Cleared saved TOFU trust');
+  toast(res.message || 'Forgot trusted server');
 };
+
+// Optional deep links: #tab=overview|tuning|system & #role=server|client
+function applyHash() {
+  const h = new URLSearchParams(location.hash.slice(1));
+  const tab = h.get('tab');
+  if (tab) { const b = document.querySelector(`.tab[data-tab="${CSS.escape(tab)}"]`); if (b) b.click(); }
+  const role = h.get('role');
+  if ((role === 'server' || role === 'client') && !state.running) setRole(role);
+}
 
 // Bootstrap
 async function init() {
@@ -1980,17 +2258,17 @@ async function init() {
   state.trayActive = !!data.tray_active;
 
   const osInfo = formatOs(state.os);
-  $('osLabel').textContent = `${state.hostname} (${osInfo.label}) \u00b7 LAN QUIC`;
+  $('osLabel').textContent = `${state.hostname} \u00b7 ${osInfo.label}`;
+  $('brand').title = `${state.hostname} \u00b7 ${osInfo.label} \u00b7 Glide v0.2`;
   $('autostartToggle').checked = !!data.autostart;
   renderLocalIps(data.local_ips || []);
 
-  // System Tray awareness on Quit tooltip & System tab
   if (state.trayActive) {
-    $('quitBtn').title = 'Quit Glide completely (closing window minimizes to tray)';
-    $('trayStatusSub').textContent = 'System tray active (closing window minimizes to tray)';
+    $('quitBtn').title = 'Quit Glide (closing the window keeps it in the tray)';
+    $('trayStatusSub').textContent = 'Closing the window keeps Glide in the tray';
   } else {
-    $('quitBtn').title = 'Quit Glide completely';
-    $('trayStatusSub').textContent = 'Configure OS startup, firewall & elevation';
+    $('quitBtn').title = 'Quit Glide';
+    $('trayStatusSub').textContent = 'Startup, firewall & permissions';
   }
 
   const isWin = state.os.toLowerCase().includes('win');
@@ -1998,17 +2276,18 @@ async function init() {
     $('linuxBackendField').style.display = 'none';
     $('winOnlyBadge').style.display = 'none';
   } else {
-    $('winOnlyBadge').textContent = 'Windows-only';
+    $('winOnlyBadge').textContent = 'Windows only';
     $('elevatedBtn').disabled = true;
-    $('elevatedCard').style.opacity = '0.68';
+    $('elevatedCard').style.opacity = '0.55';
   }
 
   if (data.doctor) {
     $('diagOsBadge').textContent = osInfo.label;
     $('diagSummary').textContent = data.doctor.display_info || 'Display detected';
     const lines = [
-      `OS: ${osInfo.label} (${state.os})`,
-      `Display: ${data.doctor.display_info}`,
+      `OS       ${osInfo.label} (${state.os})`,
+      `Display  ${data.doctor.display_info}`,
+      '',
       ...(data.doctor.notes || []).map(n => '\u2022 ' + n),
     ];
     $('doctorBox').textContent = lines.join('\n');
@@ -2019,21 +2298,19 @@ async function init() {
   setRole(state.role);
   syncFormFromConfig();
   renderStatus(data.status);
+  applyHash();
   fitWindowToContent();
+  requestAnimationFrame(() => requestAnimationFrame(() => document.body.classList.remove('preload')));
 
-  // Real-time SSE telemetry stream
   _es = new EventSource('/api/events');
   _es.onmessage = (ev) => {
     try { renderStatus(JSON.parse(ev.data)); } catch {}
   };
 
-  // Auto-poll LAN discovery radar every 4.5s when idle or searching as client
   scanLan(true);
   setInterval(() => {
     const connected = state.status && state.status.status && state.status.status.startsWith('Connected');
-    if (!state.running || (state.role === 'client' && !connected)) {
-      scanLan(true);
-    }
+    if (!state.running || (state.role === 'client' && !connected)) scanLan(true);
   }, 4500);
 }
 
