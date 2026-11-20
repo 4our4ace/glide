@@ -1,77 +1,192 @@
-# Glide v0.3
+<div align="center">
 
-**Ultra-low-latency, native cross-platform software KVM over QUIC — with a truly native, GPU-rendered Rust GUI on Windows 11 and Ubuntu X11.**
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="assets/readme/glide-logo-dark.svg">
+  <source media="(prefers-color-scheme: light)" srcset="assets/readme/glide-logo-light.svg">
+  <img alt="Glide" src="assets/readme/glide-logo-light.svg" height="58">
+</picture>
 
-Zero browser or WebView dependency. Zero missing Windows DLLs. Zero IP fiddling.
+### One mouse and keyboard across all your PCs.
+
+Move your cursor off the edge of one screen and straight onto the next.<br>
+Share your clipboard, paste screenshots, and drop files across your desk — directly over your local network.
+
+**No account. No cloud. No internet required.**
+
+<p>
+  <a href="https://github.com/4our4ace/glide/releases"><img alt="Version 0.3.0" src="https://img.shields.io/badge/version-v0.3.0-2563eb?style=for-the-badge"></a>
+  <img alt="Platforms: Windows 11 & Linux" src="https://img.shields.io/badge/platforms-Windows%2011%20%7C%20Linux%20X11-0f172a?style=for-the-badge">
+  <img alt="License: MIT or Apache-2.0" src="https://img.shields.io/badge/license-MIT%20%2F%20Apache--2.0-16a34a?style=for-the-badge">
+</p>
+
+<br>
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="assets/readme/devices-dark.png">
+  <source media="(prefers-color-scheme: light)" srcset="assets/readme/devices-light.png">
+  <img alt="Glide Devices screen showing connected Windows and Linux PCs" src="assets/readme/devices-light.png" width="840">
+</picture>
+
+</div>
 
 ---
 
-## Highlights
+## Why Glide?
 
-- **Truly Native GPU-Rendered GUI + System Tray:** Identical, flat, modern UI rendered directly in Rust (Rune / wgpu / winit) on Windows 11 and Ubuntu X11 — zero Chrome or WebView2 dependency. Includes a drag-and-drop screen map, LocalSend-style LAN auto-discovery, live RTT sparkline, instant sensitivity/scroll/dead-corner sliders, clipboard history with one-click re-send, key remapping editor, drag-and-drop file beaming, and native system tray support (Windows taskbar & Ubuntu StatusNotifierItem).
-- **Zero TCP head-of-line blocking (3-lane QUIC / TLS 1.3):**
-  - Unreliable QUIC datagrams for raw relative mouse deltas & hi-res scroll (1000Hz coalescing, flushed before clicks/keys)
-  - Reliable ordered control stream for physical USB HID scancodes, mouse buttons, lock-key sync, and transitions
-  - Independent unidirectional QUIC bulk streams for clipboard & file transfers
-- **German / EU ISO & AltGr native:** Transmits raw USB HID Usage IDs (`HidUsage`), filters Windows' synthetic fake `Left Ctrl` (`0x21D`) before `AltGr`, and maps ISO `< > |` (`KEY_102ND`), `#/'`, umlauts (`ä ö ü ß`), dead keys (`^` `´` `` ` ``), F13–F24, and media keys losslessly.
-- **Universal Bidirectional Clipboard:** UTF-8 text (`\r\n` ↔ `\n` normalized) + universal screenshot images (`PNG` **and** automatic Windows `CF_DIB`/`CF_DIBV5` ↔ `PNG` conversion so `Win+Shift+S`, Snipping Tool, Paint, Chrome, and Ubuntu Flameshot all paste seamlessly) + lazy on-demand fetching for payloads > 256 KB.
-- **Instant File Drop (QUIC):** Drag any file onto the Glide GUI window (or click browse) to beam it at full LAN speed into the peer's `Downloads/Glide/` folder (SHA-256 verified).
-- **Anti-accident ergonomics & hotkeys:**
-  - Clean cursor hiding & corner parking on both Windows and Ubuntu X11 (`XFixesHideCursor` + corner park, automatically re-shown if you move a local mouse/touchpad) so no ghost cursor sits idly on the screen edge
-  - Dead-corner guard (24 px default) so clicking close `X` or Show Desktop never jumps screens
-  - Fullscreen game/app auto-lock + manual cursor lock (`Ctrl + Alt + L`)
-  - Direct keyboard jumps (`Ctrl + Alt + Arrows`) with **per-screen cursor memory**
-  - `ScrollLock` unconditional escape failsafe + automatic `release_all()` on leave/disconnect
-  - Optional Linux `/dev/uinput` hardware-native HID backend for native `libinput` acceleration & true high-res smooth scrolling (`REL_WHEEL_HI_RES`).
+**Glide** is a fast, native software KVM for Windows and Linux. Put two computers next to each other, open Glide on both, and they feel like one seamless multi-monitor workstation.
+
+- **Effortless screen switching** — Drag your PCs into place on the visual screen map and slide your mouse naturally from monitor to monitor. Your cursor hides cleanly on the idle PC so no ghost pointer lingers at the edge.
+- **Built for real desks & gaming** — A gentle corner guard keeps you from slipping onto another PC when clicking a close button or taskbar, and fullscreen games automatically lock your cursor in place.
+- **Shared clipboard, including screenshots** — Copy text, code, or screenshots (`Win+Shift+S`, Snipping Tool, browsers, Flameshot) on one PC and paste straight onto the other. Includes a quick clipboard history with one-click re-send and a privacy **Hide** cover whenever you want it.
+- **Built-in file drop** — Drag any file onto Glide to send it straight to your other PC's `Downloads/Glide` folder at full local network speed — no USB drives, no cloud uploads, no extra apps.
+- **Zero setup, private by default** — Glide automatically discovers your other PCs on the same Wi-Fi or Ethernet network and encrypts everything directly between them. It remembers your last role (Server or Client) and reconnects automatically next time you launch it.
+- **Truly native & lightweight** — One clean native app with no browser engine, no Electron bloat, and zero runtime DLLs to install on Windows.
+- **International keyboard friendly** — German and European ISO layouts (`ä ö ü ß`, `AltGr`, `< > |`, dead keys) work cleanly out of the box, alongside synced Caps Lock / Num Lock keyboard lights.
 
 ---
 
-## Quick Start (30 Seconds)
+## Shared Clipboard & Instant File Drop
 
-### 1. Ubuntu 22.04 (X11)
+Copy on Windows, paste on Linux — or the other way around. Need to move a build, log, or screenshot over? Just drop it straight into the window and it lands in `Downloads/Glide` on the other machine.
+
+<div align="center">
+  <img alt="Glide Clipboard and File Drop screen" src="assets/readme/clipboard-light.png" width="800">
+</div>
+
+---
+
+## Tuned to Each Machine
+
+Different monitor sizes, mice, or keyboard habits? Adjust pointer speed, scroll speed, natural scrolling, corner guard, and custom key remaps (like `Caps Lock → Escape`) per PC — every change takes effect immediately.
+
+<div align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="assets/readme/input-dark.png">
+    <source media="(prefers-color-scheme: light)" srcset="assets/readme/input-light.png">
+    <img alt="Glide Input settings showing pointer sliders and key remapping" src="assets/readme/input-light.png" width="800">
+  </picture>
+</div>
+
+---
+
+## Getting Started
+
+Grab the latest build from [Releases](https://github.com/4our4ace/glide/releases) (or [build from source](#building-from-source)).
+
+### Windows 11
+
+Download and double-click **`glide-windows-x86_64.exe`**.
+
+> [!NOTE]
+> Glide is completely standalone on Windows — no installer, no Visual C++ Redistributable, and no extra DLLs required.
+
+1. Click **Start Server** on the PC with your mouse and keyboard.
+2. If Windows Firewall pops up, allow access on **Private networks**.
+
+### Ubuntu / Debian Linux (X11)
+
+Install the `.deb` package:
 
 ```bash
 sudo apt install ./glide_0.3.0_amd64.deb
 ```
 
-Then open **Glide KVM** from your Ubuntu application launcher (or run `glide` in a terminal). Standard Ubuntu desktop libraries (`libvulkan1`, `mesa-vulkan-drivers`, `libxkbcommon-x11-0`, `libwayland-client0`) are already preinstalled on desktop Ubuntu and declared as package dependencies.
+1. Open **Glide** from your application launcher (or run `glide`).
+2. Switch to **Client** — your Windows PC appears automatically under **Nearby servers**.
+3. Drag **This PC** to the side it sits on and click **Connect**.
 
-### 2. Windows 11
+> [!TIP]
+> After your first connection, Glide remembers each PC's role and connects automatically whenever you open it.
 
-Double-click **`glide-windows-x86_64.exe`** (standalone static-CRT executable — zero extra DLLs needed, uses Direct3D 12 with automatic WARP fallback).
+---
 
-- Click **Start Server** on Windows 11 (if Windows Firewall prompts, allow **Private networks** — or click **Allow** under *Allow through firewall* in the *System* tab).
-- On Ubuntu, your Windows PC appears automatically under **Nearby servers** — drag **This PC** to the side it sits on and click **Connect**!
+## Keyboard Shortcuts
 
-### Prefer the CLI / Headless Mode?
+| Shortcut | Action |
+| --- | --- |
+| `Ctrl + Alt + Arrow` | Jump directly to the PC on that side |
+| `Ctrl + Alt + L` | Lock or unlock the cursor to the current screen |
+| `Scroll Lock` | Emergency escape — bring your cursor straight back home |
 
-Both machines support full CLI & daemon operation too:
+---
+
+## FAQ
+
+### Does Glide need an account or internet connection?
+No. Glide talks directly between your PCs over your local network (Wi-Fi or Ethernet) with end-to-end encryption enabled automatically.
+
+### Does copying screenshots work between Windows and Linux?
+Yes. Screenshots from Windows `Win+Shift+S`, Snipping Tool, Paint, browsers, and Linux tools like Flameshot convert and paste cleanly in both directions.
+
+### Will my mouse accidentally leave a fullscreen game?
+No. Glide automatically detects fullscreen windows and locks your cursor to the current screen. You can also toggle manual lock anytime with `Ctrl + Alt + L` or the **Lock** button.
+
+### Does the live latency graph add any lag?
+Not at all. It only reads the connection's built-in timing locally and never sends extra ping traffic.
+
+### Which operating systems are supported?
+Currently **Windows 11** and **Linux (X11)** (tested on Ubuntu 22.04+).
+
+---
+
+## For Power Users & Developers
+
+<details>
+<summary><strong>CLI / Headless Mode</strong></summary>
+
+<br>
+
+Glide also runs cleanly from the terminal or as a background service:
 
 ```powershell
-# Windows 11 Primary
+# Windows primary (server)
 .\glide-windows-x86_64.exe server
 ```
 
 ```bash
-# Ubuntu 22.04 Client (auto-discovers server on LAN!)
+# Linux client (auto-discovers the server on your LAN)
 glide client --edge right
 
-# Optional hardware-native /dev/uinput mode (after installing 99-glide-uinput.rules)
+# Optional Linux /dev/uinput backend for native libinput acceleration & hi-res scroll
 glide client --edge right --backend uinput
 
-# Diagnostics & LAN scan
-glide doctor
+# LAN discovery & system check
 glide discover
+glide doctor
 ```
 
----
+</details>
 
-## Building From Source
+<details>
+<summary><strong>Building From Source</strong></summary>
 
-Requires Rust (stable).
+<br>
 
-- **Linux:** `./scripts/build-linux.sh` (or `./scripts/build-deb.sh` to build the `.deb`)
+Requires Rust (stable, 1.80+).
+
+- **Linux:** `./scripts/build-linux.sh` (or `./scripts/build-deb.sh` to build the `.deb` package)
 - **Windows:** `.\scripts\build-windows.ps1`
 - **Tests:** `cargo test --workspace`
 
-See [`ARCHITECTURE.md`](ARCHITECTURE.md) and [`TO-DO.md`](TO-DO.md).
+</details>
+
+<details>
+<summary><strong>Under the Hood</strong></summary>
+
+<br>
+
+Glide is written in Rust with a GPU-rendered native UI (`wgpu` / `winit` via Rune) and a 3-lane QUIC + TLS 1.3 transport:
+
+- **Unreliable QUIC datagrams** for raw relative mouse deltas and high-resolution scroll (zero TCP head-of-line blocking)
+- **Reliable ordered control stream** for physical USB HID scancodes, clicks, lock-key sync, and screen transitions
+- **Independent bulk streams** for clipboard sync and SHA-256 verified file transfers
+
+For full protocol and design details, see [`ARCHITECTURE.md`](ARCHITECTURE.md) and [`TO-DO.md`](TO-DO.md).
+
+</details>
+
+---
+
+## License
+
+Dual-licensed under **MIT** or **Apache-2.0**.
