@@ -38,7 +38,7 @@ pub fn root_view(s: &Ui, p: Palette) -> El {
         Tab::Devices => devices_page(s, p),
         Tab::Input => input_page(s, p),
         Tab::Clipboard => clipboard_page(s, p),
-        Tab::System => system_page(s, p),
+        Tab::Settings => settings_page(s, p),
     };
     main_col = main_col.child(page);
 
@@ -117,8 +117,8 @@ fn sidebar(s: &Ui, p: Palette) -> El {
         .px(6.0)
         .pb(18.0)
         .gap(10.0)
-        .center_y()
-        .child(icons::glide_mark(28.0, 7.0, p.accent))
+        .items_start()
+        .child(el().pt(2.0).child(icons::glide_mark(30.0, 7.5, p.accent)))
         .child(
             col()
                 .grow(1.0)
@@ -127,7 +127,13 @@ fn sidebar(s: &Ui, p: Palette) -> El {
                 .gap(1.0)
                 .child(text("Glide").font(ty::BRAND_TITLE).color(p.text))
                 .child(
-                    text(format!("{} · {}", s.hostname, s.os_label))
+                    text(s.hostname.clone())
+                        .font(ty::BRAND_SUB)
+                        .color(p.text_2)
+                        .truncate(),
+                )
+                .child(
+                    text(s.os_label)
                         .font(ty::BRAND_SUB)
                         .color(p.muted)
                         .truncate(),
@@ -139,7 +145,7 @@ fn sidebar(s: &Ui, p: Palette) -> El {
         (Tab::Devices, "Devices", icons::nav_devices),
         (Tab::Input, "Input", icons::nav_input),
         (Tab::Clipboard, "Clipboard & Files", icons::nav_clipboard),
-        (Tab::System, "System", icons::nav_system),
+        (Tab::Settings, "Settings", icons::nav_system),
     ];
 
     let mut nav = col().key("nav").w_full().gap(2.0);
@@ -247,7 +253,7 @@ fn sidebar(s: &Ui, p: Palette) -> El {
         } else {
             BtnKind::Primary
         },
-        34.0,
+        36.0,
         14.0,
         false,
         |s, tx| s.toggle_start_stop(tx),
@@ -255,7 +261,7 @@ fn sidebar(s: &Ui, p: Palette) -> El {
     .w_full();
 
     let locked = s.status.locked;
-    let lock_color = if locked { p.amber } else { p.text_2 };
+    let lock_color = if locked { p.amber } else { p.text };
     let lock_btn = row()
         .key("lock-btn")
         .role("button")
@@ -265,24 +271,25 @@ fn sidebar(s: &Ui, p: Palette) -> El {
             "Lock cursor"
         })
         .grow(1.0)
-        .h(28.0)
+        .h(36.0)
         .gap(6.0)
         .center()
-        .radius(6.0)
+        .radius(7.0)
         .fill(if locked {
-            p.amber.alpha(0.12)
+            p.amber.alpha(0.14)
         } else {
-            Color::TRANSPARENT
+            p.surface
         })
+        .border(1.0, if locked { p.amber } else { p.line_2 })
         .hover(p.hover)
         .press(p.press)
         .cursor(Cursor::Pointer)
         .focusable(true)
         .on_press(|s: &mut Ui| s.toggle_lock())
-        .child(icons::lock_icon(locked, lock_color))
+        .child(icons::lock_icon(locked, 14.5, lock_color))
         .child(
             text(if locked { "Locked" } else { "Lock" })
-                .font(ty::SUB_MED)
+                .font(ty::LABEL)
                 .color(lock_color)
                 .a11y_hidden(),
         );
@@ -292,23 +299,25 @@ fn sidebar(s: &Ui, p: Palette) -> El {
         .role("button")
         .label("Quit Glide")
         .grow(1.0)
-        .h(28.0)
+        .h(36.0)
         .gap(6.0)
         .center()
-        .radius(6.0)
+        .radius(7.0)
+        .fill(p.surface)
+        .border(1.0, p.line_2)
         .hover(p.hover)
         .press(p.press)
         .cursor(Cursor::Pointer)
         .focusable(true)
         .on_press_tx(|s: &mut Ui, tx| s.quit_app(tx))
-        .child(icons::power_icon(p.muted))
-        .child(text("Quit").font(ty::SUB_MED).color(p.text_2).a11y_hidden());
+        .child(icons::power_icon(14.5, p.text_2))
+        .child(text("Quit").font(ty::LABEL).color(p.text).a11y_hidden());
 
     foot = foot.child(action_btn).child(
         row()
             .key("foot-actions")
             .w_full()
-            .gap(6.0)
+            .gap(8.0)
             .child(lock_btn)
             .child(quit_btn),
     );
@@ -1817,31 +1826,127 @@ fn clipboard_page(s: &Ui, p: Palette) -> El {
                 .color(p.muted),
         );
 
-    // Left: Shared clipboard toggle + History
+    // Left: Shared clipboard + Save history toggles + History
+    let history_on = s.config.clipboard_history;
+    let history_hidden = s.config.hide_clipboard_history;
+
     let clip_toggle_card = card_rows(
         p,
         "clip-toggle-card",
-        vec![setting_row(
-            p,
-            "clip-toggle-row",
-            "Shared clipboard",
-            Some("Sync between both PCs"),
-            toggle(
+        vec![
+            setting_row(
                 p,
-                "clip-toggle",
+                "clip-toggle-row",
                 "Shared clipboard",
-                s.config.server.clipboard,
-                |s, _| {
-                    let next = !s.config.server.clipboard;
-                    s.config.server.clipboard = next;
-                    s.config.client.clipboard = next;
-                    s.push_config();
-                },
+                Some("Sync between both PCs"),
+                toggle(
+                    p,
+                    "clip-toggle",
+                    "Shared clipboard",
+                    s.config.server.clipboard,
+                    |s, _| {
+                        let next = !s.config.server.clipboard;
+                        s.config.server.clipboard = next;
+                        s.config.client.clipboard = next;
+                        s.push_config();
+                    },
+                ),
             ),
-        )],
+            setting_row(
+                p,
+                "clip-hist-toggle-row",
+                "Save history",
+                Some("Keep recent items to re-send"),
+                toggle(
+                    p,
+                    "clip-hist-toggle",
+                    "Save clipboard history",
+                    history_on,
+                    |s, tx| s.toggle_clipboard_history(tx),
+                ),
+            ),
+        ],
     );
 
-    let history_body = if s.status.clipboard_history.is_empty() {
+    let history_actions = if history_on && !history_hidden {
+        let mut actions = row().gap(6.0).center_y();
+        if !s.status.clipboard_history.is_empty() {
+            actions = actions.child(xs_button(
+                p,
+                "clip-clear-btn",
+                "Clear",
+                BtnKind::Ghost,
+                false,
+                |s, tx| s.clear_clipboard_history(tx),
+            ));
+        }
+        actions = actions.child(xs_button(
+            p,
+            "clip-hide-btn",
+            "Hide",
+            BtnKind::Default,
+            false,
+            |s, _| s.toggle_hide_clipboard_history(),
+        ));
+        Some(actions)
+    } else {
+        None
+    };
+
+    let history_body = if !history_on {
+        empty_box(
+            p,
+            "clip-hist-off",
+            None,
+            "History is off",
+            "Clipboard sync still works without keeping a list.",
+        )
+    } else if history_hidden {
+        col()
+            .key("clip-hidden")
+            .w_full()
+            .grow(1.0)
+            .px(16.0)
+            .py(18.0)
+            .gap(10.0)
+            .center()
+            .child(
+                el().size(34.0, 34.0)
+                    .radius(8.0)
+                    .fill(p.canvas)
+                    .border(1.0, p.line)
+                    .center()
+                    .child(icons::eye_off_icon(17.0, p.muted)),
+            )
+            .child(
+                col()
+                    .w_full()
+                    .gap(3.0)
+                    .center()
+                    .child(
+                        text("History hidden")
+                            .font(ty::BODY_MED)
+                            .color(p.text_2)
+                            .align(Align::Center),
+                    )
+                    .child(
+                        text("Click Show to view recent clipboard items")
+                            .w_full()
+                            .font(ty::SUB)
+                            .color(p.muted)
+                            .wrap()
+                            .align(Align::Center),
+                    ),
+            )
+            .child(xs_button(
+                p,
+                "clip-reveal-btn",
+                "Show",
+                BtnKind::Default,
+                false,
+                |s, _| s.toggle_hide_clipboard_history(),
+            ))
+    } else if s.status.clipboard_history.is_empty() {
         empty_box(
             p,
             "clip-empty",
@@ -1947,7 +2052,7 @@ fn clipboard_page(s: &Ui, p: Palette) -> El {
                 .grow(1.0)
                 .min_h(0.0)
                 .gap(7.0)
-                .child(section_head(p, "hist-head", "History", None))
+                .child(section_head(p, "hist-head", "History", history_actions))
                 .child(
                     card(p, "hist-card")
                         .grow(1.0)
@@ -2149,254 +2254,38 @@ fn clipboard_page(s: &Ui, p: Palette) -> El {
 }
 
 // ---------------------------------------------------------------------------
-// Page 4: System
+// Page 4: Settings
 // ---------------------------------------------------------------------------
 
-fn system_page(s: &Ui, p: Palette) -> El {
+fn settings_page(s: &Ui, p: Palette) -> El {
     let header = col()
-        .key("sys-header")
+        .key("settings-header")
         .w_full()
         .gap(2.0)
-        .child(text("System").font(ty::PAGE_TITLE).color(p.text))
+        .child(text("Settings").font(ty::PAGE_TITLE).color(p.text))
         .child(
-            text("Security, startup and diagnostics.")
+            text("Appearance, startup and shortcuts.")
                 .font(ty::CAPTION)
                 .color(p.muted),
         );
-
-    // Left: Identity + Integration + Version footer
-    let fp_text = s
-        .status
-        .fingerprint
-        .as_deref()
-        .or(s.fingerprint.as_deref())
-        .unwrap_or("Not generated yet");
-
-    let trust_label = match s.config.client.trusted_fingerprint.as_deref() {
-        Some(fp) => {
-            let short: String = fp.chars().take(18).collect();
-            format!("Trusted server: {short}…")
-        }
-        None => "Trusts the first server it sees".into(),
-    };
-
-    let identity_card = card_rows(
-        p,
-        "identity-card",
-        vec![
-            row()
-                .key("fp-row")
-                .w_full()
-                .padding(12.0)
-                .gap(10.0)
-                .items_start()
-                .child(
-                    col()
-                        .key("fp-box")
-                        .grow(1.0)
-                        .shrink()
-                        .min_w(0.0)
-                        .px(10.0)
-                        .py(8.0)
-                        .radius(8.0)
-                        .fill(p.canvas)
-                        .border(1.0, p.line)
-                        .child(
-                            text(fp_text.to_owned())
-                                .w_full()
-                                .shrink()
-                                .min_w(0.0)
-                                .font(ty::MONO_SM)
-                                .color(p.text_2)
-                                .wrap_anywhere(),
-                        ),
-                )
-                .child(xs_button(
-                    p,
-                    "copy-fp-btn",
-                    "Copy",
-                    BtnKind::Default,
-                    false,
-                    |s, tx| {
-                        s.copy_fingerprint(tx);
-                    },
-                )),
-            row()
-                .key("trust-row")
-                .w_full()
-                .min_h(40.0)
-                .px(12.0)
-                .py(7.0)
-                .gap(8.0)
-                .center_y()
-                .justify_between()
-                .child(
-                    text(trust_label)
-                        .font(ty::SUB)
-                        .color(p.muted)
-                        .grow(1.0)
-                        .shrink()
-                        .truncate(),
-                )
-                .child(xs_button(
-                    p,
-                    "forget-btn",
-                    "Forget server",
-                    BtnKind::Default,
-                    false,
-                    |s, tx| s.reset_trust(tx),
-                )),
-        ],
-    );
 
     let autostart_desc = match s.role {
         Role::Server => "Starts minimized as Server",
         Role::Client => "Starts minimized as Client",
     };
 
-    let integration_sub = if s.tray_active {
-        "Closing keeps Glide in the tray"
+    let general_sub = if s.tray_active {
+        Some(
+            text("Closing keeps Glide in the tray")
+                .font(ty::SUB)
+                .color(p.faint),
+        )
     } else {
-        "Startup, firewall & permissions"
+        None
     };
 
-    let elevated_row = {
-        let mut r = setting_row(
-            p,
-            "elevated-row",
-            "Control admin windows",
-            Some(if s.is_windows {
-                "Let Glide control UAC / admin apps"
-            } else {
-                "Only needed on Windows"
-            }),
-            xs_button(
-                p,
-                "elevated-btn",
-                "Set up",
-                BtnKind::Default,
-                !s.is_windows,
-                |s, tx| s.run_elevated(tx),
-            ),
-        );
-        if !s.is_windows {
-            r = r.opacity(0.55);
-        }
-        r
-    };
-
-    let integration_card = card_rows(
-        p,
-        "integration-card",
-        vec![
-            setting_row(
-                p,
-                "autostart-row",
-                "Start on login",
-                Some(autostart_desc),
-                toggle(
-                    p,
-                    "autostart-toggle",
-                    "Start on login",
-                    s.autostart,
-                    |s, tx| {
-                        s.toggle_autostart(tx);
-                    },
-                ),
-            ),
-            setting_row(
-                p,
-                "firewall-row",
-                "Allow through firewall",
-                Some("Local network only · UDP 24800–24801"),
-                xs_button(
-                    p,
-                    "firewall-btn",
-                    "Allow",
-                    BtnKind::Default,
-                    false,
-                    |s, tx| {
-                        s.run_firewall(tx);
-                    },
-                ),
-            ),
-            elevated_row,
-        ],
-    );
-
-    let version_foot = row()
-        .key("version-foot")
-        .w_full()
-        .pt(2.0)
-        .gap(10.0)
-        .center_y()
-        .child(icons::glide_mark(24.0, 6.0, p.accent))
-        .child(
-            col()
-                .grow(1.0)
-                .shrink()
-                .min_w(0.0)
-                .gap(1.0)
-                .child(
-                    row()
-                        .gap(5.0)
-                        .center_y()
-                        .child(
-                            text(format!("Glide v{APP_VERSION}"))
-                                .font(ty::SUB_MED)
-                                .color(p.text),
-                        )
-                        .child(text("· Direct PC-to-PC.").font(ty::SUB).color(p.muted)),
-                )
-                .child(
-                    text("No account, no cloud, no internet.")
-                        .font(ty::SUB)
-                        .color(p.muted),
-                ),
-        );
-
-    let left_col = col()
-        .key("sys-left")
-        .grow(1.0)
-        .shrink()
-        .min_w(0.0)
-        .h_full()
-        .gap(14.0)
-        .child(
-            col()
-                .w_full()
-                .gap(7.0)
-                .child(section_head(
-                    p,
-                    "id-head",
-                    "Identity",
-                    Some(
-                        text("TLS 1.3 · fingerprint verified")
-                            .font(ty::SUB)
-                            .color(p.faint),
-                    ),
-                ))
-                .child(identity_card),
-        )
-        .child(
-            col()
-                .w_full()
-                .gap(7.0)
-                .child(section_head(
-                    p,
-                    "int-head",
-                    "Integration",
-                    Some(text(integration_sub).font(ty::SUB).color(p.faint)),
-                ))
-                .child(integration_card),
-        )
-        .child(version_foot);
-
-    // Right: Appearance + Shortcuts + Diagnostics
-    let appearance_card = card_rows(
-        p,
-        "appearance-card",
-        vec![setting_row(
+    let mut general_rows = vec![
+        setting_row(
             p,
             "theme-row",
             "Theme",
@@ -2416,9 +2305,237 @@ fn system_page(s: &Ui, p: Palette) -> El {
                     pref.save();
                 },
             ),
+        ),
+        setting_row(
+            p,
+            "autostart-row",
+            "Start on login",
+            Some(autostart_desc),
+            toggle(
+                p,
+                "autostart-toggle",
+                "Start on login",
+                s.autostart,
+                |s, tx| {
+                    s.toggle_autostart(tx);
+                },
+            ),
+        ),
+    ];
+
+    if s.is_windows {
+        general_rows.push(setting_row(
+            p,
+            "elevated-row",
+            "Control admin windows",
+            Some("Let Glide control UAC / admin apps"),
+            xs_button(
+                p,
+                "elevated-btn",
+                "Set up",
+                BtnKind::Default,
+                false,
+                |s, tx| s.run_elevated(tx),
+            ),
+        ));
+    }
+
+    let general_card = card_rows(p, "general-card", general_rows);
+
+    let advanced_toggle_card = card_rows(
+        p,
+        "advanced-toggle-card",
+        vec![setting_row(
+            p,
+            "advanced-row",
+            "Show advanced settings",
+            Some("Security fingerprint, firewall & diagnostics"),
+            toggle(
+                p,
+                "advanced-toggle",
+                "Show advanced settings",
+                s.show_advanced,
+                |s, _| {
+                    s.show_advanced = !s.show_advanced;
+                },
+            ),
         )],
     );
 
+    let version_foot = row()
+        .key("version-foot")
+        .w_full()
+        .pt(2.0)
+        .gap(10.0)
+        .center_y()
+        .child(icons::glide_mark(24.0, 6.0, p.accent))
+        .child(
+            col()
+                .grow(1.0)
+                .shrink()
+                .min_w(0.0)
+                .gap(1.0)
+                .child(
+                    text(format!("Glide v{APP_VERSION}"))
+                        .font(ty::SUB_MED)
+                        .color(p.text),
+                )
+                .child(
+                    text("No account, no cloud, no internet.")
+                        .font(ty::SUB)
+                        .color(p.muted),
+                ),
+        );
+
+    let mut left_inner = col()
+        .key("settings-left-inner")
+        .w_full()
+        .gap(14.0)
+        .child(
+            col()
+                .w_full()
+                .gap(7.0)
+                .child(section_head(p, "gen-head", "General", general_sub))
+                .child(general_card),
+        )
+        .child(
+            col()
+                .w_full()
+                .gap(7.0)
+                .child(section_head(p, "adv-head", "Advanced", None))
+                .child(advanced_toggle_card),
+        );
+
+    if s.show_advanced {
+        let fp_text = s
+            .status
+            .fingerprint
+            .as_deref()
+            .or(s.fingerprint.as_deref())
+            .unwrap_or("Not generated yet");
+
+        let trust_label = match s.config.client.trusted_fingerprint.as_deref() {
+            Some(fp) => {
+                let short: String = fp.chars().take(18).collect();
+                format!("Trusted server: {short}…")
+            }
+            None => "Trusts the first server it sees".into(),
+        };
+
+        let security_card = card_rows(
+            p,
+            "security-card",
+            vec![
+                row()
+                    .key("fp-row")
+                    .w_full()
+                    .padding(12.0)
+                    .gap(10.0)
+                    .items_start()
+                    .child(
+                        col()
+                            .key("fp-box")
+                            .grow(1.0)
+                            .shrink()
+                            .min_w(0.0)
+                            .px(10.0)
+                            .py(8.0)
+                            .radius(8.0)
+                            .fill(p.canvas)
+                            .border(1.0, p.line)
+                            .child(
+                                text(fp_text.to_owned())
+                                    .w_full()
+                                    .shrink()
+                                    .min_w(0.0)
+                                    .font(ty::MONO_SM)
+                                    .color(p.text_2)
+                                    .wrap_anywhere(),
+                            ),
+                    )
+                    .child(xs_button(
+                        p,
+                        "copy-fp-btn",
+                        "Copy",
+                        BtnKind::Default,
+                        false,
+                        |s, tx| {
+                            s.copy_fingerprint(tx);
+                        },
+                    )),
+                row()
+                    .key("trust-row")
+                    .w_full()
+                    .min_h(40.0)
+                    .px(12.0)
+                    .py(7.0)
+                    .gap(8.0)
+                    .center_y()
+                    .justify_between()
+                    .child(
+                        text(trust_label)
+                            .font(ty::SUB)
+                            .color(p.muted)
+                            .grow(1.0)
+                            .shrink()
+                            .truncate(),
+                    )
+                    .child(xs_button(
+                        p,
+                        "forget-btn",
+                        "Forget server",
+                        BtnKind::Default,
+                        false,
+                        |s, tx| s.reset_trust(tx),
+                    )),
+                setting_row(
+                    p,
+                    "firewall-row",
+                    "Allow through firewall",
+                    Some("Local network only · UDP 24800–24801"),
+                    xs_button(
+                        p,
+                        "firewall-btn",
+                        "Allow",
+                        BtnKind::Default,
+                        false,
+                        |s, tx| {
+                            s.run_firewall(tx);
+                        },
+                    ),
+                ),
+            ],
+        );
+
+        left_inner = left_inner.child(
+            col()
+                .w_full()
+                .gap(7.0)
+                .child(section_head(
+                    p,
+                    "sec-head",
+                    "Security & firewall",
+                    Some(text("TLS 1.3 · fingerprint").font(ty::SUB).color(p.faint)),
+                ))
+                .child(security_card),
+        );
+    }
+
+    left_inner = left_inner.child(version_foot);
+
+    let left_col = col()
+        .key("settings-left")
+        .grow(1.0)
+        .shrink()
+        .min_w(0.0)
+        .h_full()
+        .min_h(0.0)
+        .scroll(ScrollSpec {
+            stick_bottom: false,
+        })
+        .child(left_inner);
+
+    // Right: Shortcuts (+ Diagnostics when Advanced is enabled)
     let plus = || text("+").font(ty::SUB).color(p.faint);
     let shortcuts_card = card_rows(
         p,
@@ -2462,59 +2579,14 @@ fn system_page(s: &Ui, p: Palette) -> El {
         ],
     );
 
-    let diag_title = format!("Diagnostics · {}", s.doctor_display);
-    let diag_head = row()
-        .key("diag-head")
-        .w_full()
-        .h(24.0)
-        .gap(8.0)
-        .center_y()
-        .justify_between()
-        .child(
-            text(diag_title)
-                .font(ty::SECTION)
-                .color(p.muted)
-                .grow(1.0)
-                .shrink()
-                .truncate(),
-        )
-        .child(badge(p, "diag-os", s.os_label, false, false));
-
-    let diag_card = col()
-        .key("diag-card")
-        .w_full()
-        .grow(1.0)
-        .min_h(0.0)
-        .radius(10.0)
-        .fill(p.canvas)
-        .border(1.0, p.line)
-        .padding(11.0)
-        .scroll(ScrollSpec {
-            stick_bottom: false,
-        })
-        .child(
-            text(s.doctor_text.clone())
-                .w_full()
-                .font(ty::MONO_SM)
-                .color(p.text_2)
-                .wrap(),
-        );
-
-    let right_col = col()
-        .key("sys-right")
+    let mut right_col = col()
+        .key("settings-right")
         .grow(1.0)
         .shrink()
         .min_w(0.0)
         .h_full()
         .min_h(0.0)
         .gap(14.0)
-        .child(
-            col()
-                .w_full()
-                .gap(7.0)
-                .child(section_head(p, "app-head", "Appearance", None))
-                .child(appearance_card),
-        )
         .child(
             col()
                 .w_full()
@@ -2526,8 +2598,48 @@ fn system_page(s: &Ui, p: Palette) -> El {
                     Some(text("On the server").font(ty::SUB).color(p.faint)),
                 ))
                 .child(shortcuts_card),
-        )
-        .child(
+        );
+
+    if s.show_advanced {
+        let diag_title = format!("Diagnostics · {}", s.doctor_display);
+        let diag_head = row()
+            .key("diag-head")
+            .w_full()
+            .h(24.0)
+            .gap(8.0)
+            .center_y()
+            .justify_between()
+            .child(
+                text(diag_title)
+                    .font(ty::SECTION)
+                    .color(p.muted)
+                    .grow(1.0)
+                    .shrink()
+                    .truncate(),
+            )
+            .child(badge(p, "diag-os", s.os_label, false, false));
+
+        let diag_card = col()
+            .key("diag-card")
+            .w_full()
+            .grow(1.0)
+            .min_h(0.0)
+            .radius(10.0)
+            .fill(p.canvas)
+            .border(1.0, p.line)
+            .padding(11.0)
+            .scroll(ScrollSpec {
+                stick_bottom: false,
+            })
+            .child(
+                text(s.doctor_text.clone())
+                    .w_full()
+                    .font(ty::MONO_SM)
+                    .color(p.text_2)
+                    .wrap(),
+            );
+
+        right_col = right_col.child(
             col()
                 .w_full()
                 .grow(1.0)
@@ -2536,9 +2648,10 @@ fn system_page(s: &Ui, p: Palette) -> El {
                 .child(diag_head)
                 .child(diag_card),
         );
+    }
 
     col()
-        .key("page-system")
+        .key("page-settings")
         .w_full()
         .grow(1.0)
         .min_h(0.0)
@@ -2546,7 +2659,7 @@ fn system_page(s: &Ui, p: Palette) -> El {
         .child(header)
         .child(
             row()
-                .key("sys-cols")
+                .key("settings-cols")
                 .w_full()
                 .grow(1.0)
                 .min_h(0.0)

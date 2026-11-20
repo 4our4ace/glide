@@ -122,6 +122,7 @@ pub struct RuntimeState {
     inner: Arc<RwLock<StatusSnapshot>>,
     clip_ring: Arc<RwLock<VecDeque<ClipboardHistoryEntry>>>,
     next_clip_id: Arc<std::sync::atomic::AtomicUsize>,
+    record_history: Arc<std::sync::atomic::AtomicBool>,
     updates_tx: broadcast::Sender<()>,
 }
 
@@ -138,8 +139,24 @@ impl RuntimeState {
             inner: Arc::new(RwLock::new(StatusSnapshot::default())),
             clip_ring: Arc::new(RwLock::new(VecDeque::with_capacity(8))),
             next_clip_id: Arc::new(std::sync::atomic::AtomicUsize::new(1)),
+            record_history: Arc::new(std::sync::atomic::AtomicBool::new(true)),
             updates_tx,
         }
+    }
+
+    pub fn set_record_history(&self, enabled: bool) {
+        self.record_history
+            .store(enabled, std::sync::atomic::Ordering::Relaxed);
+        if !enabled {
+            self.clear_clipboard_history();
+        }
+    }
+
+    pub fn clear_clipboard_history(&self) {
+        self.clip_ring.write().clear();
+        self.update(|s| {
+            s.clipboard_history.clear();
+        });
     }
 
     pub fn subscribe(&self) -> broadcast::Receiver<()> {
@@ -169,6 +186,12 @@ impl RuntimeState {
     }
 
     pub fn record_clipboard(&self, direction: &str, payload: &ClipboardPayload) {
+        if !self
+            .record_history
+            .load(std::sync::atomic::Ordering::Relaxed)
+        {
+            return;
+        }
         let id = self
             .next_clip_id
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);

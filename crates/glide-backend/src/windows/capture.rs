@@ -62,6 +62,7 @@ struct HookState {
     remote_mode: AtomicBool,
     locked: AtomicBool,
     auto_lock_fullscreen: AtomicBool,
+    sync_lock_keys: AtomicBool,
     edge_threshold_px: AtomicI32,
     dead_corner_px: AtomicI32,
     edge_dwell_ms: AtomicU64,
@@ -170,6 +171,10 @@ impl CaptureControl for WindowsCaptureControl {
             .auto_lock_fullscreen
             .store(auto_lock_fullscreen, Ordering::Relaxed);
         self.state.locked.store(locked, Ordering::Relaxed);
+    }
+
+    fn set_sync_lock_keys(&self, enabled: bool) {
+        self.state.sync_lock_keys.store(enabled, Ordering::Relaxed);
     }
 
     fn enter_remote(&self) -> Result<()> {
@@ -355,6 +360,13 @@ unsafe extern "system" fn keyboard_ll_proc(code: i32, wparam: WPARAM, lparam: LP
 
                     if remote {
                         let _ = state.tx.send(CaptureEvent::Key { usage, pressed });
+                        // Keep the physical keyboard's CapsLock / NumLock LED and Windows'
+                        // toggle state in sync with the client when lock-key sync is enabled.
+                        if state.sync_lock_keys.load(Ordering::Relaxed)
+                            && (kb.vkCode == VK_CAPITAL as u32 || kb.vkCode == VK_NUMLOCK_CODE)
+                        {
+                            return false;
+                        }
                         return true;
                     }
 
@@ -656,6 +668,7 @@ pub fn start_windows_capture(config: CaptureConfig) -> Result<CaptureHandle> {
         dead_corner_px: AtomicI32::new(config.dead_corner_px.max(0)),
         edge_dwell_ms: AtomicU64::new(config.edge_dwell_ms),
         auto_lock_fullscreen: AtomicBool::new(config.auto_lock_fullscreen),
+        sync_lock_keys: AtomicBool::new(config.sync_lock_keys),
         config,
         tx,
         active_edges: Mutex::new(Vec::new()),

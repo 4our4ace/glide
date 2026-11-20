@@ -47,9 +47,13 @@ pub fn compile_key_remaps(rules: &[KeyRemapRule]) -> HashMap<HidUsage, HidUsage>
     map
 }
 
+fn default_true() -> bool {
+    true
+}
+
 /// Top-level `glide.toml` file supporting both `[server]` and `[client]` sections
 /// so the same machine can switch roles effortlessly.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GlideConfigFile {
     /// Last active GUI role (`"server"` or `"client"`), restored on next launch.
     #[serde(default)]
@@ -57,10 +61,29 @@ pub struct GlideConfigFile {
     /// Automatically start the server or connect as client when the GUI launches.
     #[serde(default)]
     pub auto_start_on_launch: bool,
+    /// Keep an in-memory history of recently synced clipboard items (on by default).
+    #[serde(default = "default_true")]
+    pub clipboard_history: bool,
+    /// Hide clipboard history entries behind a privacy cover until explicitly revealed.
+    #[serde(default)]
+    pub hide_clipboard_history: bool,
     #[serde(default)]
     pub server: ServerConfig,
     #[serde(default)]
     pub client: ClientConfig,
+}
+
+impl Default for GlideConfigFile {
+    fn default() -> Self {
+        Self {
+            last_role: None,
+            auto_start_on_launch: false,
+            clipboard_history: true,
+            hide_clipboard_history: false,
+            server: ServerConfig::default(),
+            client: ClientConfig::default(),
+        }
+    }
 }
 
 impl GlideConfigFile {
@@ -241,12 +264,16 @@ mod tests {
         .unwrap();
         assert_eq!(legacy.last_role, None);
         assert!(!legacy.auto_start_on_launch);
+        assert!(legacy.clipboard_history);
+        assert!(!legacy.hide_clipboard_history);
         assert_eq!(legacy.server.edge_threshold_px, 6);
         assert!((legacy.client.sensitivity - 1.5).abs() < f32::EPSILON);
 
         let mut cfg = GlideConfigFile {
             last_role: Some("client".into()),
             auto_start_on_launch: true,
+            clipboard_history: false,
+            hide_clipboard_history: true,
             ..GlideConfigFile::default()
         };
         cfg.client.sensitivity = 1.35;
@@ -254,6 +281,8 @@ mod tests {
         let parsed: GlideConfigFile = toml::from_str(&raw).unwrap();
         assert_eq!(parsed.last_role.as_deref(), Some("client"));
         assert!(parsed.auto_start_on_launch);
+        assert!(!parsed.clipboard_history);
+        assert!(parsed.hide_clipboard_history);
         assert!((parsed.client.sensitivity - 1.35).abs() < f32::EPSILON);
     }
 }

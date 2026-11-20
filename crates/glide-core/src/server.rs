@@ -308,6 +308,7 @@ pub async fn run_server_with_backends(
                             auto_lock_fullscreen,
                             locked,
                         );
+                        capture_ctrl.set_sync_lock_keys(sync_lock_keys);
                         sync_runtime_peers(&runtime, &peers, active_remote, locked);
                     }
                     RuntimeCommand::ToggleLock => {
@@ -993,6 +994,7 @@ pub async fn run_native_server_with_runtime(
         edge_dwell_ms: config.edge_dwell_ms,
         auto_lock_fullscreen: config.auto_lock_fullscreen,
         enable_hotkeys: config.enable_hotkeys,
+        sync_lock_keys: config.sync_lock_keys,
     })?;
 
     let clipboard = if config.clipboard {

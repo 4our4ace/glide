@@ -64,6 +64,8 @@ pub struct CaptureConfig {
     pub auto_lock_fullscreen: bool,
     /// Enable `Ctrl + Alt + Arrow` direct screen switching and `Ctrl + Alt + L` cursor lock toggle.
     pub enable_hotkeys: bool,
+    /// Keep the server's local CapsLock / NumLock state & keyboard LEDs in sync while controlling a client.
+    pub sync_lock_keys: bool,
 }
 
 impl Default for CaptureConfig {
@@ -75,6 +77,7 @@ impl Default for CaptureConfig {
             edge_dwell_ms: 0,
             auto_lock_fullscreen: true,
             enable_hotkeys: true,
+            sync_lock_keys: true,
         }
     }
 }
@@ -114,6 +117,8 @@ pub trait CaptureControl: Send + Sync {
         auto_lock_fullscreen: bool,
         locked: bool,
     );
+    /// Updates whether CapsLock / NumLock keys should also toggle local OS state & LEDs in remote mode.
+    fn set_sync_lock_keys(&self, _enabled: bool) {}
     /// Enters remote mode: suppresses/grabs local input and parks/hides cursor cleanly.
     fn enter_remote(&self) -> Result<()>;
     /// Leaves remote mode: releases grab and warps cursor to `return_edge` at `normalized_pos`.

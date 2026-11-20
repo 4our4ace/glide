@@ -143,6 +143,12 @@ static RING_ARC: Icon = Icon {
     body: r#"<path d="M10 3A7 7 0 0 1 16.8 11.8" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/>"#,
 };
 
+static EYE_OFF: Icon = Icon {
+    name: "eye-off",
+    view: 24.0,
+    body: r#"<path d="M10.6 5.1A9.8 9.8 0 0 1 12 5C17 5 20.8 8.3 22 12A13.6 13.6 0 0 1 19.3 16.3M14.1 14.1A3 3 0 0 1 9.9 9.9M6.6 6.6A13.5 13.5 0 0 0 2 12C3.2 15.7 7 19 12 19A9.7 9.7 0 0 0 16.4 18M3 3L21 21" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/>"#,
+};
+
 /// Glide's split-pointer SVG emblem inside an accent rounded square.
 pub fn glide_mark(size: f32, radius: f32, bg: Color) -> El {
     el().size(size, size)
@@ -168,21 +174,26 @@ pub fn nav_clipboard(color: Color) -> El {
     icon(&NAV_CLIPBOARD, 16.0).color(color).a11y_hidden()
 }
 
-/// Nav: System (sliders).
+/// Nav: Settings (sliders).
 pub fn nav_system(color: Color) -> El {
     icon(&NAV_SYSTEM, 16.0).color(color).a11y_hidden()
 }
 
 /// Lock icon (padlock).
-pub fn lock_icon(locked: bool, color: Color) -> El {
-    icon(if locked { &LOCK_CLOSED } else { &LOCK_OPEN }, 13.0)
+pub fn lock_icon(locked: bool, size: f32, color: Color) -> El {
+    icon(if locked { &LOCK_CLOSED } else { &LOCK_OPEN }, size)
         .color(color)
         .a11y_hidden()
 }
 
 /// Power / Quit icon.
-pub fn power_icon(color: Color) -> El {
-    icon(&POWER, 13.0).color(color).a11y_hidden()
+pub fn power_icon(size: f32, color: Color) -> El {
+    icon(&POWER, size).color(color).a11y_hidden()
+}
+
+/// Privacy eye-off icon for hidden clipboard history.
+pub fn eye_off_icon(size: f32, color: Color) -> El {
+    icon(&EYE_OFF, size).color(color).a11y_hidden()
 }
 
 /// OS icon (Windows 4 panes, Linux terminal, or generic display).

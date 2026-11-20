@@ -41,7 +41,7 @@ pub enum Tab {
     Devices,
     Input,
     Clipboard,
-    System,
+    Settings,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -111,6 +111,7 @@ pub struct Ui {
     pub selected_peer_name: Option<String>,
     pub discovered: Vec<DiscoveredPeer>,
     pub scanning: bool,
+    pub show_advanced: bool,
 
     // Editable text fields + last committed snapshots
     pub port_edit: TextEdit,
@@ -178,6 +179,7 @@ impl Ui {
             selected_peer_name: None,
             discovered: Vec::new(),
             scanning: false,
+            show_advanced: false,
             port_edit: TextEdit::new(&port_str),
             server_edit: TextEdit::new(&server_str),
             remap_from: TextEdit::default(),
@@ -580,6 +582,34 @@ impl Ui {
         } else {
             self.toast("Connect first to re-send", tx);
         }
+    }
+
+    pub fn toggle_clipboard_history(&mut self, tx: &mut Tx) {
+        let next = !self.config.clipboard_history;
+        self.config.clipboard_history = next;
+        if !next {
+            self.status.clipboard_history.clear();
+        }
+        self.push_config();
+        self.toast(
+            if next {
+                "Clipboard history on"
+            } else {
+                "Clipboard history off & cleared"
+            },
+            tx,
+        );
+    }
+
+    pub fn toggle_hide_clipboard_history(&mut self) {
+        self.config.hide_clipboard_history = !self.config.hide_clipboard_history;
+        self.push_config();
+    }
+
+    pub fn clear_clipboard_history(&mut self, tx: &mut Tx) {
+        self.ctrl.runtime.clear_clipboard_history();
+        self.status.clipboard_history.clear();
+        self.toast("Clipboard history cleared", tx);
     }
 
     pub fn send_file_paths(&mut self, paths: Vec<PathBuf>, tx: &mut Tx) {
@@ -1056,7 +1086,7 @@ fn parse_os_str(raw: &str) -> OsKind {
 fn scene_live_server(s: &mut Ui) {
     s.tab = Tab::Devices;
     s.role = Role::Server;
-    s.hostname = "workstation".into();
+    s.hostname = "gaming-workstation".into();
     s.os_kind = OsKind::Windows;
     s.os_label = "Windows";
     s.local_ips = vec!["192.168.1.42".into()];
@@ -1197,15 +1227,46 @@ const SCENES: &[(&str, SceneFn)] = &[
         s.theme = ThemePref::Light;
         scene_clipboard_filled(s);
     }),
-    ("system-light", |s| {
-        s.theme = ThemePref::Light;
-        s.tab = Tab::System;
-        s.doctor_display = "DISPLAY=:0 (screen 0)".into();
-        s.doctor_text = "OS       Linux (LinuxX11)\nDisplay  DISPLAY=:0 (screen 0)\n\n• Native X11 session detected.\n• XTest extension: OK (v2.2)\n• XInput2 extension: OK (v2.2)\n• XFixes extension: OK (v5.0)".into();
-    }),
-    ("system-dark", |s| {
+    ("clipboard-hidden", |s| {
         s.theme = ThemePref::Dark;
-        s.tab = Tab::System;
+        scene_clipboard_filled(s);
+        s.config.hide_clipboard_history = true;
+    }),
+    ("clipboard-off", |s| {
+        s.theme = ThemePref::Light;
+        s.tab = Tab::Clipboard;
+        s.config.clipboard_history = false;
+    }),
+    ("settings-light", |s| {
+        s.theme = ThemePref::Light;
+        s.tab = Tab::Settings;
+        s.is_windows = false;
+        s.os_label = "Linux";
+        s.show_advanced = false;
+    }),
+    ("settings-dark", |s| {
+        s.theme = ThemePref::Dark;
+        s.tab = Tab::Settings;
+        s.is_windows = false;
+        s.os_label = "Linux";
+        s.show_advanced = false;
+    }),
+    ("settings-windows-light", |s| {
+        s.theme = ThemePref::Light;
+        s.tab = Tab::Settings;
+        s.is_windows = true;
+        s.os_kind = OsKind::Windows;
+        s.os_label = "Windows";
+        s.hostname = "gaming-workstation".into();
+        s.show_advanced = false;
+    }),
+    ("settings-advanced-light", |s| {
+        s.theme = ThemePref::Light;
+        s.tab = Tab::Settings;
+        s.is_windows = false;
+        s.os_label = "Linux";
+        s.show_advanced = true;
+        s.fingerprint = Some("ab:cd:ef:01:23:45:67:89:ab:cd:ef:01:23:45:67:89:ab:cd:ef:01:23:45:67:89:ab:cd:ef:01:23:45:67:89".into());
         s.doctor_display = "DISPLAY=:0 (screen 0)".into();
         s.doctor_text = "OS       Linux (LinuxX11)\nDisplay  DISPLAY=:0 (screen 0)\n\n• Native X11 session detected.\n• XTest extension: OK (v2.2)\n• XInput2 extension: OK (v2.2)\n• XFixes extension: OK (v5.0)".into();
     }),

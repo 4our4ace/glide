@@ -75,10 +75,13 @@ impl AppController {
             GlideConfigFile::default()
         };
 
+        let runtime = RuntimeState::new();
+        runtime.set_record_history(cfg.clipboard_history);
+
         Self {
             config_path,
             config: Mutex::new(cfg),
-            runtime: RuntimeState::new(),
+            runtime,
             engine: Mutex::new(None),
             fingerprint: Mutex::new(None),
             url,
@@ -237,6 +240,7 @@ impl AppController {
             }
         }
         new_cfg.save(&self.config_path)?;
+        self.runtime.set_record_history(new_cfg.clipboard_history);
         let s = new_cfg.server.clone();
         let c = new_cfg.client.clone();
         *self.config.lock() = new_cfg;
