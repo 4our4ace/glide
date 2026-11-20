@@ -2,7 +2,7 @@
 set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
-VERSION="0.3.0"
+VERSION="${GLIDE_VERSION:-$(awk -F'"' '/^version =/{print $2; exit}' "$ROOT_DIR/Cargo.toml")}"
 ARCH="amd64"
 BIN_PATH="${1:-$ROOT_DIR/target/release/glide}"
 OUT_DIR="$ROOT_DIR/dist"
