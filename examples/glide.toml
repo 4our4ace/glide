@@ -1,0 +1,52 @@
+# Glide configuration file (place at ~/.config/glide/glide.toml on Linux
+# or %APPDATA%\glide\config\glide.toml on Windows, or pass --config <path>).
+#
+# Both [server] and [client] sections can live in the same file so you can
+# switch which machine is primary anytime without rewriting configs.
+
+[server]
+# Shown during LocalSend-style LAN auto-discovery (defaults to real hostname)
+# name = "my-workstation"
+
+# UDP bind address for QUIC transport
+bind = "0.0.0.0:24800"
+
+# Broadcast presence on LAN so clients connect without typing an IP
+discovery = true
+discovery_port = 24801
+
+# Local escape key that immediately snaps control back to this server
+escape_key = "ScrollLock"
+
+# Pixels to push past an outer monitor edge before switching to a client
+edge_threshold_px = 4
+
+# Bidirectional UTF-8 text and PNG image clipboard sync
+clipboard = true
+
+# High-polling-rate mouse coalescing window in microseconds (1000 = 1000Hz max; 0 = immediate)
+motion_coalesce_us = 1000
+
+[client]
+# Explicit server IP:port is OPTIONAL. Leave commented out for LAN auto-discovery!
+# server = "192.168.1.42:24800"
+
+# Optional server hostname filter if multiple Glide servers run on your LAN
+# server_name = "DESKTOP-WIN11"
+
+# Which edge of the SERVER this client sits on: "left", "right", "top", or "bottom"
+edge = "right"
+
+discovery_port = 24801
+
+# Optional pinned SHA-256 fingerprint (omit to use automatic Trust-On-First-Use)
+# trusted_fingerprint = "aa:bb:cc:..."
+
+# Mouse sensitivity multiplier for fine-tuning cross-OS pointer feel (1.0 = raw 1:1)
+sensitivity = 1.0
+
+# Pixels to push past the return edge to hand control back to the server
+edge_threshold_px = 4
+
+# Bidirectional clipboard sync
+clipboard = true

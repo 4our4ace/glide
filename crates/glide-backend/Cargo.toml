@@ -1,0 +1,25 @@
+[package]
+name = "glide-backend"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+bytes.workspace = true
+glide-hid.workspace = true
+glide-net.workspace = true
+glide-proto.workspace = true
+parking_lot.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+
+[target.'cfg(target_os = "linux")'.dependencies]
+x11rb.workspace = true
+
+[target.'cfg(target_os = "windows")'.dependencies]
+windows-sys.workspace = true
+
+[lints]
+workspace = true
