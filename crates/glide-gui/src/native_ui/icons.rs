@@ -1,308 +1,241 @@
-//! Vector icons and sparkline shapes rendered directly by Rune's GPU canvas.
+//! Crisp analytically anti-aliased SVG icons & brand mark via `rune::Icon`,
+//! plus the dynamic latency sparkline canvas.
 
 use glide_proto::{Edge, OsKind};
-use rune::{canvas, el, Color, El, LineCap, Path, Shape};
+use rune::{canvas, el, icon, Color, El, Icon, Shape};
 
-/// Rounded rectangle closed polyline in arbitrary viewBox coordinates.
-fn rounded_rect(x: f32, y: f32, w: f32, h: f32, r: f32) -> Path {
-    let r = r.min(w * 0.5).min(h * 0.5);
-    Path::new()
-        .move_to([x + r, y])
-        .line_to([x + w - r, y])
-        .quad_to([x + w, y], [x + w, y + r])
-        .line_to([x + w, y + h - r])
-        .quad_to([x + w, y + h], [x + w - r, y + h])
-        .line_to([x + r, y + h])
-        .quad_to([x, y + h], [x, y + h - r])
-        .line_to([x, y + r])
-        .quad_to([x, y], [x + r, y])
-        .close()
-}
+static GLIDE_MARK: Icon = Icon {
+    name: "glide-mark",
+    view: 64.0,
+    body: r#"<path d="M20 9V46.5L28 39.76V17Z" fill="currentColor" fill-opacity="0.58"/><path d="M32 21V43.88L36 52.5L42.3 49.6L36 36H47Z" fill="currentColor"/>"#,
+};
 
-/// Circle approximated cleanly with 4 quadratic/cubic curves (or 16-segment polyline).
-fn circle_pts(cx: f32, cy: f32, r: f32, segs: usize) -> Vec<[f32; 2]> {
-    (0..segs)
-        .map(|i| {
-            let a = (i as f32 / segs as f32) * std::f32::consts::TAU;
-            [cx + r * a.cos(), cy + r * a.sin()]
-        })
-        .collect()
-}
+static NAV_DEVICES: Icon = Icon {
+    name: "nav-devices",
+    view: 24.0,
+    body: r#"<rect x="2.5" y="4" width="19" height="13" rx="2.2" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linejoin="round"/><path d="M8 20.5H16M12 17V20.5" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round"/>"#,
+};
 
-/// Glide's split-pointer emblem inside an accent rounded square.
+static NAV_INPUT: Icon = Icon {
+    name: "nav-input",
+    view: 24.0,
+    body: r#"<rect x="6" y="2.5" width="12" height="19" rx="6" fill="none" stroke="currentColor" stroke-width="1.7"/><path d="M12 6.5V10.2" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round"/>"#,
+};
+
+static NAV_CLIPBOARD: Icon = Icon {
+    name: "nav-clipboard",
+    view: 24.0,
+    body: r#"<rect x="5" y="5" width="14" height="16" rx="2.2" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linejoin="round"/><rect x="9" y="2.5" width="6" height="4.2" rx="1.2" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linejoin="round"/>"#,
+};
+
+static NAV_SYSTEM: Icon = Icon {
+    name: "nav-system",
+    view: 24.0,
+    body: r#"<path d="M3.5 7H20.5M3.5 12H20.5M3.5 17H20.5" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/><circle cx="8.5" cy="7" r="2.1" fill="currentColor"/><circle cx="15.5" cy="12" r="2.1" fill="currentColor"/><circle cx="10.5" cy="17" r="2.1" fill="currentColor"/>"#,
+};
+
+static LOCK_CLOSED: Icon = Icon {
+    name: "lock-closed",
+    view: 24.0,
+    body: r#"<rect x="5" y="11" width="14" height="9.5" rx="2" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linejoin="round"/><path d="M8 11V7.5A4 4 0 0 1 16 7.5V11" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/>"#,
+};
+
+static LOCK_OPEN: Icon = Icon {
+    name: "lock-open",
+    view: 24.0,
+    body: r#"<rect x="5" y="11" width="14" height="9.5" rx="2" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linejoin="round"/><path d="M8 11V7.5A4 4 0 0 1 15.6 5.8" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/>"#,
+};
+
+static POWER: Icon = Icon {
+    name: "power",
+    view: 24.0,
+    body: r#"<path d="M12 3.2V11.2" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/><path d="M16.6 6.8A7.2 7.2 0 1 1 7.4 6.8" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/>"#,
+};
+
+static OS_WINDOWS: Icon = Icon {
+    name: "os-windows",
+    view: 16.0,
+    body: r#"<path d="M1.5 2.9L6.8 2.2V7.3H1.5V2.9ZM7.8 2.1L14.5 1.2V7.3H7.8V2.1ZM1.5 8.7H6.8V13.8L1.5 13.1V8.7ZM7.8 8.7H14.5V14.8L7.8 13.9V8.7Z" fill="currentColor"/>"#,
+};
+
+static OS_LINUX: Icon = Icon {
+    name: "os-linux",
+    view: 16.0,
+    body: r#"<rect x="1.5" y="2.5" width="13" height="11" rx="2" fill="none" stroke="currentColor" stroke-width="1.45" stroke-linejoin="round"/><path d="M4.6 6.2L6.9 8L4.6 9.8M8.4 9.8H11.4" fill="none" stroke="currentColor" stroke-width="1.45" stroke-linecap="round" stroke-linejoin="round"/>"#,
+};
+
+static OS_GENERIC: Icon = Icon {
+    name: "os-generic",
+    view: 16.0,
+    body: r#"<rect x="2" y="2.5" width="12" height="9" rx="1.6" fill="none" stroke="currentColor" stroke-width="1.45"/><path d="M5.4 13.6H10.6" fill="none" stroke="currentColor" stroke-width="1.45" stroke-linecap="round"/>"#,
+};
+
+static ARROW_LEFT: Icon = Icon {
+    name: "arrow-left",
+    view: 16.0,
+    body: r#"<path d="M13 8H3M7.2 4L3 8L7.2 12" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/>"#,
+};
+
+static ARROW_RIGHT: Icon = Icon {
+    name: "arrow-right",
+    view: 16.0,
+    body: r#"<path d="M3 8H13M8.8 4L13 8L8.8 12" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/>"#,
+};
+
+static ARROW_UP: Icon = Icon {
+    name: "arrow-up",
+    view: 16.0,
+    body: r#"<path d="M8 13V3M4 7.2L8 3L12 7.2" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/>"#,
+};
+
+static ARROW_DOWN: Icon = Icon {
+    name: "arrow-down",
+    view: 16.0,
+    body: r#"<path d="M8 3V13M4 8.8L8 13L12 8.8" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/>"#,
+};
+
+/// Crisp sleek vector mouse pointer SVG for the active monitor in the screen map.
+static CURSOR_POINTER: Icon = Icon {
+    name: "cursor-pointer",
+    view: 24.0,
+    body: r#"<path d="M4.5 3.5L19.5 10.6L12.7 12.7L10.6 19.5L4.5 3.5Z" fill="currentColor" stroke="currentColor" stroke-width="1.5" stroke-linejoin="round"/>"#,
+};
+
+static UPLOAD: Icon = Icon {
+    name: "upload",
+    view: 24.0,
+    body: r#"<path d="M12 15.5V5M7.5 9.5L12 5L16.5 9.5M4.5 16V19H19.5V16" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/>"#,
+};
+
+static CHECK: Icon = Icon {
+    name: "check",
+    view: 24.0,
+    body: r#"<path d="M5 12.5L9.8 17.3L19 7.2" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"/>"#,
+};
+
+static CLOSE: Icon = Icon {
+    name: "close",
+    view: 16.0,
+    body: r#"<path d="M4 4L12 12M12 4L4 12" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round"/>"#,
+};
+
+static TEXT_CLIP: Icon = Icon {
+    name: "text-clip",
+    view: 24.0,
+    body: r#"<path d="M5 7H19M5 12H19M5 17H14" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/>"#,
+};
+
+static IMAGE_CLIP: Icon = Icon {
+    name: "image-clip",
+    view: 24.0,
+    body: r#"<rect x="3.5" y="4.5" width="17" height="15" rx="2.4" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linejoin="round"/><circle cx="9" cy="10" r="1.7" fill="currentColor"/><path d="M6 19L14.5 11.5L20 16.5" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"/>"#,
+};
+
+static RING_TRACK: Icon = Icon {
+    name: "ring-track",
+    view: 20.0,
+    body: r#"<circle cx="10" cy="10" r="7" fill="none" stroke="currentColor" stroke-width="1.8"/>"#,
+};
+
+static RING_ARC: Icon = Icon {
+    name: "ring-arc",
+    view: 20.0,
+    body: r#"<path d="M10 3A7 7 0 0 1 16.8 11.8" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/>"#,
+};
+
+/// Glide's split-pointer SVG emblem inside an accent rounded square.
 pub fn glide_mark(size: f32, radius: f32, bg: Color) -> El {
-    // Matches `glide_backend::icon::GLIDE_ICON_SVG` geometry in 64x64 space.
-    let left_half = vec![[20.0, 9.0], [20.0, 46.5], [28.0, 39.76], [28.0, 17.0]];
-    let right_half = vec![
-        [32.0, 21.0],
-        [32.0, 43.88],
-        [36.0, 52.5],
-        [42.3, 49.6],
-        [36.0, 36.0],
-        [47.0, 36.0],
-    ];
-    let shape = Shape::new()
-        .view_box(64.0, 64.0)
-        .fill(left_half, Color::WHITE.alpha(0.58))
-        .fill(right_half, Color::WHITE);
-
     el().size(size, size)
         .radius(radius)
         .fill(bg)
         .center()
-        .child(canvas(shape).size(size, size))
+        .child(icon(&GLIDE_MARK, size).color(Color::WHITE))
         .a11y_hidden()
 }
 
 /// Nav: Devices (monitor).
 pub fn nav_devices(color: Color) -> El {
-    let s = Shape::new()
-        .view_box(24.0, 24.0)
-        .stroke_path(
-            &rounded_rect(2.5, 4.0, 19.0, 13.0, 2.2),
-            1.6,
-            LineCap::Round,
-            color,
-        )
-        .line([8.0, 20.5], [16.0, 20.5], 1.6, LineCap::Round, color)
-        .line([12.0, 17.0], [12.0, 20.5], 1.6, LineCap::Round, color);
-    canvas(s).size(16.0, 16.0).a11y_hidden()
+    icon(&NAV_DEVICES, 16.0).color(color).a11y_hidden()
 }
 
 /// Nav: Input (mouse).
 pub fn nav_input(color: Color) -> El {
-    let s = Shape::new()
-        .view_box(24.0, 24.0)
-        .stroke_path(
-            &rounded_rect(6.0, 2.5, 12.0, 19.0, 6.0),
-            1.6,
-            LineCap::Round,
-            color,
-        )
-        .line([12.0, 6.5], [12.0, 10.2], 1.6, LineCap::Round, color);
-    canvas(s).size(16.0, 16.0).a11y_hidden()
+    icon(&NAV_INPUT, 16.0).color(color).a11y_hidden()
 }
 
 /// Nav: Clipboard & Files.
 pub fn nav_clipboard(color: Color) -> El {
-    let s = Shape::new()
-        .view_box(24.0, 24.0)
-        .stroke_path(
-            &rounded_rect(5.0, 5.0, 14.0, 16.0, 2.2),
-            1.6,
-            LineCap::Round,
-            color,
-        )
-        .stroke_path(
-            &rounded_rect(9.0, 2.5, 6.0, 4.2, 1.2),
-            1.5,
-            LineCap::Round,
-            color,
-        );
-    canvas(s).size(16.0, 16.0).a11y_hidden()
+    icon(&NAV_CLIPBOARD, 16.0).color(color).a11y_hidden()
 }
 
 /// Nav: System (sliders).
 pub fn nav_system(color: Color) -> El {
-    let mut s = Shape::new()
-        .view_box(24.0, 24.0)
-        .line([3.5, 7.0], [20.5, 7.0], 1.55, LineCap::Round, color)
-        .line([3.5, 12.0], [20.5, 12.0], 1.55, LineCap::Round, color)
-        .line([3.5, 17.0], [20.5, 17.0], 1.55, LineCap::Round, color);
-    for (cx, cy) in [(8.5, 7.0), (15.5, 12.0), (10.5, 17.0)] {
-        s = s.fill(circle_pts(cx, cy, 2.1, 12), color);
-    }
-    canvas(s).size(16.0, 16.0).a11y_hidden()
+    icon(&NAV_SYSTEM, 16.0).color(color).a11y_hidden()
 }
 
 /// Lock icon (padlock).
 pub fn lock_icon(locked: bool, color: Color) -> El {
-    let shackle = if locked {
-        Path::new()
-            .move_to([8.0, 11.0])
-            .line_to([8.0, 7.5])
-            .quad_to([8.0, 4.0], [12.0, 4.0])
-            .quad_to([16.0, 4.0], [16.0, 7.5])
-            .line_to([16.0, 11.0])
-    } else {
-        Path::new()
-            .move_to([8.0, 11.0])
-            .line_to([8.0, 7.5])
-            .quad_to([8.0, 4.0], [12.0, 4.0])
-            .quad_to([15.5, 4.0], [16.0, 6.5])
-    };
-    let s = Shape::new()
-        .view_box(24.0, 24.0)
-        .stroke_path(
-            &rounded_rect(5.0, 11.0, 14.0, 9.5, 2.0),
-            1.7,
-            LineCap::Round,
-            color,
-        )
-        .stroke_path(&shackle, 1.7, LineCap::Round, color);
-    canvas(s).size(13.0, 13.0).a11y_hidden()
+    icon(if locked { &LOCK_CLOSED } else { &LOCK_OPEN }, 13.0)
+        .color(color)
+        .a11y_hidden()
 }
 
 /// Power / Quit icon.
 pub fn power_icon(color: Color) -> El {
-    let arc: Vec<[f32; 2]> = (0..=16)
-        .map(|i| {
-            // 280-degree open arc leaving the top gap for the power stem
-            let deg = -50.0 + (i as f32 / 16.0) * 280.0;
-            let rad = deg.to_radians();
-            [12.0 + 7.2 * rad.cos(), 13.0 + 7.2 * rad.sin()]
-        })
-        .collect();
-    let s = Shape::new()
-        .view_box(24.0, 24.0)
-        .line([12.0, 3.2], [12.0, 11.0], 1.7, LineCap::Round, color)
-        .stroke(arc, 1.7, color);
-    canvas(s).size(13.0, 13.0).a11y_hidden()
+    icon(&POWER, 13.0).color(color).a11y_hidden()
 }
 
-/// OS icon (14x14 by default): Windows 4 panes, Linux terminal, or generic display.
+/// OS icon (Windows 4 panes, Linux terminal, or generic display).
 pub fn os_icon(os: OsKind, size: f32, color: Color) -> El {
-    let s = match os {
-        OsKind::Windows => Shape::new()
-            .view_box(16.0, 16.0)
-            .fill(vec![[1.6, 2.8], [6.8, 2.1], [6.8, 7.3], [1.6, 7.3]], color)
-            .fill(
-                vec![[7.8, 2.0], [14.4, 1.1], [14.4, 7.3], [7.8, 7.3]],
-                color,
-            )
-            .fill(
-                vec![[1.6, 8.5], [6.8, 8.5], [6.8, 13.7], [1.6, 13.0]],
-                color,
-            )
-            .fill(
-                vec![[7.8, 8.5], [14.4, 8.5], [14.4, 14.7], [7.8, 13.8]],
-                color,
-            ),
-        OsKind::LinuxX11 | OsKind::LinuxWayland => Shape::new()
-            .view_box(16.0, 16.0)
-            .stroke_path(
-                &rounded_rect(1.6, 2.6, 12.8, 10.8, 2.0),
-                1.4,
-                LineCap::Round,
-                color,
-            )
-            .stroke(vec![[4.6, 6.2], [6.9, 8.0], [4.6, 9.8]], 1.4, color)
-            .line([8.4, 9.8], [11.4, 9.8], 1.4, LineCap::Round, color),
-        _ => Shape::new()
-            .view_box(16.0, 16.0)
-            .stroke_path(
-                &rounded_rect(2.0, 2.6, 12.0, 8.8, 1.6),
-                1.4,
-                LineCap::Round,
-                color,
-            )
-            .line([5.4, 13.6], [10.6, 13.6], 1.4, LineCap::Round, color),
+    let glyph = match os {
+        OsKind::Windows => &OS_WINDOWS,
+        OsKind::LinuxX11 | OsKind::LinuxWayland => &OS_LINUX,
+        _ => &OS_GENERIC,
     };
-    canvas(s).size(size, size).a11y_hidden()
+    icon(glyph, size).color(color).a11y_hidden()
 }
 
-/// Crisp directional arrow drawn as vector strokes (Inter subset lacks ← and →).
+/// Crisp directional arrow SVG (Inter subset lacks ← and →).
 pub fn arrow_icon(edge: Edge, size: f32, color: Color) -> El {
-    let (shaft, head) = match edge {
-        Edge::Left => (
-            ([13.0, 8.0], [3.0, 8.0]),
-            vec![[7.2, 4.0], [3.0, 8.0], [7.2, 12.0]],
-        ),
-        Edge::Right => (
-            ([3.0, 8.0], [13.0, 8.0]),
-            vec![[8.8, 4.0], [13.0, 8.0], [8.8, 12.0]],
-        ),
-        Edge::Top => (
-            ([8.0, 13.0], [8.0, 3.0]),
-            vec![[4.0, 7.2], [8.0, 3.0], [12.0, 7.2]],
-        ),
-        Edge::Bottom => (
-            ([8.0, 3.0], [8.0, 13.0]),
-            vec![[4.0, 8.8], [8.0, 13.0], [12.0, 8.8]],
-        ),
+    let glyph = match edge {
+        Edge::Left => &ARROW_LEFT,
+        Edge::Right => &ARROW_RIGHT,
+        Edge::Top => &ARROW_UP,
+        Edge::Bottom => &ARROW_DOWN,
     };
-    let s = Shape::new()
-        .view_box(16.0, 16.0)
-        .line(shaft.0, shaft.1, 1.45, LineCap::Round, color)
-        .stroke(head, 1.45, color);
-    canvas(s).size(size, size).a11y_hidden()
+    icon(glyph, size).color(color).a11y_hidden()
 }
 
-/// Pointer glyph shown in the bottom-right corner of the active desk monitor.
+/// Sleek vector pointer SVG shown in the bottom-right corner of the active desk monitor.
 pub fn cursor_glyph() -> El {
-    let outline = rune::color::hex("#1e3a8a").unwrap_or(Color::BLACK);
-    let pts = vec![
-        [1.2, 1.2],
-        [1.2, 11.0],
-        [4.0, 8.4],
-        [5.9, 12.2],
-        [7.5, 11.4],
-        [5.6, 7.6],
-        [9.4, 7.6],
-    ];
-    let s = Shape::new()
-        .view_box(11.0, 13.5)
-        .fill(pts.clone(), Color::WHITE)
-        .stroke_with(pts, true, 0.9, LineCap::Round, outline);
-    canvas(s).size(11.0, 13.5).a11y_hidden()
+    icon(&CURSOR_POINTER, 15.0)
+        .color(Color::WHITE.alpha(0.95))
+        .a11y_hidden()
 }
 
 /// Upload icon for the Send Files dropzone.
 pub fn upload_icon(color: Color) -> El {
-    let s = Shape::new()
-        .view_box(24.0, 24.0)
-        .line([12.0, 15.5], [12.0, 5.0], 1.75, LineCap::Round, color)
-        .stroke(vec![[7.5, 9.5], [12.0, 5.0], [16.5, 9.5]], 1.75, color)
-        .stroke(
-            vec![[4.5, 16.0], [4.5, 19.0], [19.5, 19.0], [19.5, 16.0]],
-            1.75,
-            color,
-        );
-    canvas(s).size(16.0, 16.0).a11y_hidden()
+    icon(&UPLOAD, 16.0).color(color).a11y_hidden()
 }
 
 /// Checkmark icon for Connected badge.
 pub fn check_icon(color: Color) -> El {
-    let s = Shape::new().view_box(24.0, 24.0).stroke(
-        vec![[5.0, 12.5], [9.8, 17.3], [19.0, 7.2]],
-        2.2,
-        color,
-    );
-    canvas(s).size(14.0, 14.0).a11y_hidden()
+    icon(&CHECK, 14.0).color(color).a11y_hidden()
 }
 
 /// Small close '×' icon.
 pub fn close_icon(size: f32, color: Color) -> El {
-    let s = Shape::new()
-        .view_box(16.0, 16.0)
-        .line([4.0, 4.0], [12.0, 12.0], 1.7, LineCap::Round, color)
-        .line([12.0, 4.0], [4.0, 12.0], 1.7, LineCap::Round, color);
-    canvas(s).size(size, size).a11y_hidden()
+    icon(&CLOSE, size).color(color).a11y_hidden()
 }
 
 /// Text clipboard entry icon.
 pub fn text_clip_icon(color: Color) -> El {
-    let s = Shape::new()
-        .view_box(24.0, 24.0)
-        .line([5.0, 7.0], [19.0, 7.0], 1.7, LineCap::Round, color)
-        .line([5.0, 12.0], [19.0, 12.0], 1.7, LineCap::Round, color)
-        .line([5.0, 17.0], [14.0, 17.0], 1.7, LineCap::Round, color);
-    canvas(s).size(14.0, 14.0).a11y_hidden()
+    icon(&TEXT_CLIP, 14.0).color(color).a11y_hidden()
 }
 
 /// Image clipboard entry icon.
 pub fn image_clip_icon(color: Color) -> El {
-    let s = Shape::new()
-        .view_box(24.0, 24.0)
-        .stroke_path(
-            &rounded_rect(3.5, 4.5, 17.0, 15.0, 2.4),
-            1.6,
-            LineCap::Round,
-            color,
-        )
-        .fill(circle_pts(9.0, 10.0, 1.7, 10), color)
-        .stroke(vec![[6.0, 19.0], [14.5, 11.5], [20.0, 16.5]], 1.6, color);
-    canvas(s).size(14.0, 14.0).a11y_hidden()
+    icon(&IMAGE_CLIP, 14.0).color(color).a11y_hidden()
 }
 
 /// Transfer direction arrow (up = sent, down = received).
@@ -312,19 +245,10 @@ pub fn transfer_icon(sent: bool, color: Color) -> El {
 
 /// Subtle ring indicator for waiting/scanning states (static, zero idle redraw cost).
 pub fn waiting_ring(color: Color, accent: Color) -> El {
-    let full = circle_pts(10.0, 10.0, 7.0, 24);
-    let arc: Vec<[f32; 2]> = (0..=8)
-        .map(|i| {
-            let deg = -90.0 + (i as f32 / 8.0) * 105.0;
-            let rad = deg.to_radians();
-            [10.0 + 7.0 * rad.cos(), 10.0 + 7.0 * rad.sin()]
-        })
-        .collect();
-    let s = Shape::new()
-        .view_box(20.0, 20.0)
-        .stroke_with(full, true, 1.8, LineCap::Round, color)
-        .stroke(arc, 1.8, accent);
-    canvas(s).size(18.0, 18.0).a11y_hidden()
+    el().size(18.0, 18.0)
+        .child(icon(&RING_TRACK, 18.0).absolute(0.0, 0.0).color(color))
+        .child(icon(&RING_ARC, 18.0).absolute(0.0, 0.0).color(accent))
+        .a11y_hidden()
 }
 
 /// Latency sparkline in the sidebar (60x16).

@@ -112,14 +112,57 @@ pub fn active_ipv4_interfaces() -> Vec<LocalIpv4Iface> {
     out
 }
 
-/// Convenience helper returning all active local IPv4 addresses (for display in GUI/CLI).
+fn is_virtual_iface_name(name: &str) -> bool {
+    let n = name.to_ascii_lowercase();
+    n.contains("vethernet")
+        || n.contains("wsl")
+        || n.contains("hyper-v")
+        || n.contains("vmware")
+        || n.contains("virtualbox")
+        || n.contains("vbox")
+        || n.starts_with("docker")
+        || n.starts_with("br-")
+        || n.starts_with("veth")
+        || n.starts_with("virbr")
+        || n.starts_with("tailscale")
+        || n.starts_with("wg")
+        || n.starts_with("tun")
+        || n.starts_with("tap")
+        || n.starts_with("zt")
+}
+
+fn lan_priority(iface: &LocalIpv4Iface) -> (u8, String) {
+    let octets = iface.ip.octets();
+    let virt = is_virtual_iface_name(&iface.name);
+    let tier = if !virt && octets[0] == 192 && octets[1] == 168 {
+        0
+    } else if !virt && octets[0] == 10 {
+        1
+    } else if !virt && octets[0] == 172 && (16..=31).contains(&octets[1]) {
+        2
+    } else if !virt && octets[0] == 169 && octets[1] == 254 {
+        3
+    } else if !virt {
+        4
+    } else {
+        5
+    };
+    (tier, iface.ip.to_string())
+}
+
+/// Convenience helper returning active local IPv4 addresses ordered with physical LAN IPs first.
 pub fn local_ipv4_addresses() -> Vec<String> {
-    let mut ips: Vec<String> = active_ipv4_interfaces()
+    let mut ranked: Vec<(u8, String)> = active_ipv4_interfaces()
         .into_iter()
-        .map(|i| i.ip.to_string())
+        .map(|i| lan_priority(&i))
         .collect();
-    ips.sort();
-    ips.dedup();
+    ranked.sort();
+    let mut ips: Vec<String> = Vec::with_capacity(ranked.len());
+    for (_, ip) in ranked {
+        if !ips.contains(&ip) {
+            ips.push(ip);
+        }
+    }
     ips
 }
 

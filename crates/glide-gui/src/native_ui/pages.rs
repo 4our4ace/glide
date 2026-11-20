@@ -364,15 +364,7 @@ fn devices_page(s: &Ui, p: Palette) -> El {
         .key("hint-bar")
         .w_full()
         .center_y()
-        .justify_between()
-        .child(text(s.layout_hint()).font(ty::CAPTION).color(p.muted))
-        .child(badge(
-            p,
-            "cursor-badge",
-            format!("Cursor: {}", s.friendly_target()),
-            false,
-            s.is_running(),
-        ));
+        .child(text(s.layout_hint()).font(ty::CAPTION).color(p.muted));
 
     let bottom = match s.role {
         Role::Server => row()
@@ -803,10 +795,12 @@ fn monitor_tile(
     }
 
     if focused {
-        body = body.child(
-            el().absolute(w - 20.0, h - 22.0)
-                .child(icons::cursor_glyph()),
-        );
+        let (cx, cy) = if compact {
+            (w - 22.0, h - 20.0)
+        } else {
+            (w - 24.0, h - 23.0)
+        };
+        body = body.child(el().absolute(cx, cy).child(icons::cursor_glyph()));
     }
     body
 }
@@ -867,18 +861,9 @@ fn ghost_slot(
 fn server_connection_col(s: &Ui, p: Palette) -> El {
     let addr_display = if let Some(first) = s.local_ips.first() {
         let port = s.current_port();
-        let mut r = row()
-            .gap(4.0)
+        row()
             .center_y()
-            .child(text(format!("{first}:{port}")).font(ty::MONO).color(p.text));
-        if s.local_ips.len() > 1 {
-            r = r.child(
-                text(format!("+{}", s.local_ips.len() - 1))
-                    .font(ty::BADGE)
-                    .color(p.muted),
-            );
-        }
-        r
+            .child(text(format!("{first}:{port}")).font(ty::MONO).color(p.text))
     } else {
         row().child(
             text("No network connection")
@@ -958,18 +943,7 @@ fn server_connection_col(s: &Ui, p: Palette) -> El {
 
 fn server_clients_col(s: &Ui, p: Palette) -> El {
     let count = s.status.peers.len();
-    let head = section_head(
-        p,
-        "clients-head",
-        "Clients",
-        Some(badge(
-            p,
-            "peer-count",
-            format!("{count} online"),
-            count > 0,
-            false,
-        )),
-    );
+    let head = section_head(p, "clients-head", "Clients", None);
 
     let body = if s.status.peers.is_empty() {
         if s.is_running() {

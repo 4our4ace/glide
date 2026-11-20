@@ -226,21 +226,6 @@ impl Ui {
         "Server".into()
     }
 
-    pub fn friendly_target(&self) -> String {
-        let t = self.status.active_target.as_str();
-        if t.is_empty() || t == "Local" {
-            if self.role == Role::Server || !self.is_running() {
-                "This PC".into()
-            } else {
-                self.client_server_label()
-            }
-        } else if t == "Local (Controlling)" {
-            "This PC".into()
-        } else {
-            t.to_owned()
-        }
-    }
-
     pub fn sidebar_status_text(&self) -> String {
         let raw = if self.status.status.is_empty() {
             "Idle"
