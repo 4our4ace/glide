@@ -9,6 +9,8 @@
 pub mod capture;
 pub mod clipboard;
 pub mod inject;
+pub mod tray;
+pub mod window_brand;
 
 use crate::geometry::{DesktopGeometry, MonitorRect};
 use crate::DoctorReport;

@@ -6,6 +6,7 @@
 
 use anyhow::{Context, Result};
 use bytes::Bytes;
+use glide_backend::icon::{render_png, GLIDE_ICON_SVG};
 use glide_backend::os_integration::{
     configure_elevated_task, configure_firewall, is_autostart_enabled, set_autostart,
 };
@@ -13,12 +14,13 @@ use glide_core::client::run_native_client_with_runtime;
 use glide_core::config::{default_config_dir, GlideConfigFile};
 use glide_core::runtime::{RuntimeCommand, RuntimeState};
 use glide_core::server::run_native_server_with_runtime;
-use glide_net::discovery::{discover_servers, machine_hostname};
+use glide_net::discovery::{discover_servers, local_ipv4_addresses, machine_hostname};
 use glide_net::tls::ServerIdentity;
 use glide_proto::{Edge, MAX_FILE_BYTES};
 use parking_lot::Mutex;
 use serde_json::json;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -29,6 +31,8 @@ use tracing::{debug, info, warn};
 
 const UI_HTML: &str = include_str!("ui.html");
 pub const DEFAULT_GUI_PORT: u16 = 24802;
+pub const GUI_WIDTH: u32 = 900;
+pub const GUI_HEIGHT: u32 = 640;
 
 struct ActiveEngine {
     task: JoinHandle<()>,
@@ -41,12 +45,14 @@ struct AppController {
     runtime: RuntimeState,
     engine: Mutex<Option<ActiveEngine>>,
     fingerprint: Mutex<Option<String>>,
-    #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
     url: String,
+    favicon_png: Vec<u8>,
+    tray_active: AtomicBool,
+    quit_tx: mpsc::UnboundedSender<()>,
 }
 
 impl AppController {
-    fn new(config_path: PathBuf, url: String) -> Self {
+    fn new(config_path: PathBuf, url: String, quit_tx: mpsc::UnboundedSender<()>) -> Self {
         let cfg = if config_path.exists() {
             GlideConfigFile::load(&config_path).unwrap_or_default()
         } else {
@@ -71,12 +77,26 @@ impl AppController {
             engine: Mutex::new(None),
             fingerprint: Mutex::new(fp),
             url,
+            favicon_png: render_png(64),
+            tray_active: AtomicBool::new(false),
+            quit_tx,
         }
     }
 
-    fn stop_engine(&self) {
-        if let Some(active) = self.engine.lock().take() {
-            active.task.abort();
+    async fn stop_engine(&self) {
+        let active = self.engine.lock().take();
+        if let Some(active) = active {
+            let _ = active.cmd_tx.send(RuntimeCommand::Shutdown);
+            // Wait up to 400ms for sockets (UDP 24800/24801) and hooks to release cleanly
+            let mut task = active.task;
+            if tokio::time::timeout(Duration::from_millis(400), &mut task)
+                .await
+                .is_err()
+            {
+                task.abort();
+                let _ = task.await;
+            }
+            tokio::time::sleep(Duration::from_millis(30)).await;
         }
         self.runtime.update(|s| {
             s.mode = "stopped".into();
@@ -89,8 +109,8 @@ impl AppController {
         });
     }
 
-    fn start_engine(&self, role: &str) -> Result<()> {
-        self.stop_engine();
+    async fn start_engine(&self, role: &str) -> Result<()> {
+        self.stop_engine().await;
         let cfg = self.config.lock().clone();
         let _ = cfg.save(&self.config_path);
 
@@ -196,9 +216,38 @@ impl Default for GuiOptions {
     }
 }
 
-/// Launches the Glide desktop GUI (embedded loopback app server + frameless window + Windows tray).
+/// If Glide is already running on `port`, ask the running instance to show/focus its window.
+async fn try_focus_existing_instance(port: u16) -> bool {
+    let Ok(Ok(mut stream)) = tokio::time::timeout(
+        Duration::from_millis(200),
+        TcpStream::connect(("127.0.0.1", port)),
+    )
+    .await
+    else {
+        return false;
+    };
+    let req = format!(
+        "POST /api/show HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+    );
+    if stream.write_all(req.as_bytes()).await.is_err() {
+        return false;
+    }
+    let mut resp = [0u8; 64];
+    match tokio::time::timeout(Duration::from_millis(400), stream.read(&mut resp)).await {
+        Ok(Ok(n)) if n > 0 => String::from_utf8_lossy(&resp[..n]).contains("200 OK"),
+        _ => false,
+    }
+}
+
+/// Launches the Glide desktop GUI (embedded loopback app server + branded window + native OS tray).
 pub async fn run_gui(opts: GuiOptions) -> Result<()> {
     glide_backend::init_platform();
+
+    // Single-instance check: clicking Glide again simply focuses/re-opens the existing window.
+    if opts.port != 0 && !opts.minimized && try_focus_existing_instance(opts.port).await {
+        info!(port = opts.port, "Focused existing Glide GUI instance");
+        return Ok(());
+    }
 
     let listener = match TcpListener::bind(("127.0.0.1", opts.port)).await {
         Ok(l) => l,
@@ -209,40 +258,37 @@ pub async fn run_gui(opts: GuiOptions) -> Result<()> {
     let actual_addr = listener.local_addr()?;
     let url = format!("http://127.0.0.1:{}", actual_addr.port());
 
+    let (quit_tx, mut quit_rx) = mpsc::unbounded_channel::<()>();
     let cfg_path = opts
         .config_path
         .unwrap_or_else(|| default_config_dir().join("glide.toml"));
-    let ctrl = Arc::new(AppController::new(cfg_path, url.clone()));
+    let ctrl = Arc::new(AppController::new(cfg_path, url.clone(), quit_tx.clone()));
 
     if let Some(ref role) = opts.auto_start_role {
-        if let Err(e) = ctrl.start_engine(role) {
+        if let Err(e) = ctrl.start_engine(role).await {
             warn!(error = %e, "Failed auto-starting Glide engine");
         }
     }
 
-    info!(%url, "Glide GUI ready");
-
-    if !opts.minimized {
-        open_app_window(&url);
-    }
-
-    // Native Windows 11 System Tray integration (zero extra deps!)
-    let (quit_tx, mut quit_rx) = mpsc::unbounded_channel::<()>();
+    // Native OS System Tray integration (Windows 11 Shell_NotifyIconW & Ubuntu/Linux StatusNotifierItem)
     #[cfg(target_os = "windows")]
     {
+        ctrl.tray_active.store(true, Ordering::SeqCst);
         let mut tray_rx = glide_backend::windows::tray::spawn_windows_tray();
         let tray_ctrl = Arc::clone(&ctrl);
         let tray_quit = quit_tx.clone();
         tokio::spawn(async move {
-            use glide_backend::windows::tray::TrayAction;
+            use glide_backend::TrayAction;
             while let Some(act) = tray_rx.recv().await {
                 match act {
-                    TrayAction::OpenUi => open_app_window(&tray_ctrl.url),
+                    TrayAction::OpenUi => {
+                        let _ = open_app_window(&tray_ctrl.url);
+                    }
                     TrayAction::ToggleLock => {
                         tray_ctrl.send_cmd(RuntimeCommand::ToggleLock);
                     }
                     TrayAction::Quit => {
-                        tray_ctrl.stop_engine();
+                        tray_ctrl.stop_engine().await;
                         let _ = tray_quit.send(());
                         break;
                     }
@@ -250,7 +296,54 @@ pub async fn run_gui(opts: GuiOptions) -> Result<()> {
             }
         });
     }
-    let _ = quit_tx;
+
+    #[cfg(target_os = "linux")]
+    let linux_tray_handle = {
+        let (handle, mut tray_rx) = glide_backend::linux_x11::tray::spawn_linux_tray().await;
+        ctrl.tray_active.store(handle.is_active(), Ordering::SeqCst);
+        let tray_ctrl = Arc::clone(&ctrl);
+        let tray_quit = quit_tx.clone();
+        tokio::spawn(async move {
+            use glide_backend::TrayAction;
+            while let Some(act) = tray_rx.recv().await {
+                match act {
+                    TrayAction::OpenUi => {
+                        let _ = open_app_window(&tray_ctrl.url);
+                    }
+                    TrayAction::ToggleLock => {
+                        tray_ctrl.send_cmd(RuntimeCommand::ToggleLock);
+                    }
+                    TrayAction::Quit => {
+                        tray_ctrl.stop_engine().await;
+                        let _ = tray_quit.send(());
+                        break;
+                    }
+                }
+            }
+        });
+        handle
+    };
+
+    info!(
+        %url,
+        tray = ctrl.tray_active.load(Ordering::SeqCst),
+        "Glide GUI ready"
+    );
+
+    if !opts.minimized {
+        let child = open_app_window(&url);
+        // If no system tray is available on this desktop (e.g. minimal Linux WM without AppIndicators),
+        // exit cleanly when the user closes the window so Glide never leaves an invisible orphan process.
+        if !ctrl.tray_active.load(Ordering::SeqCst) {
+            if let Some(mut child) = child {
+                let no_tray_quit = quit_tx.clone();
+                std::thread::spawn(move || {
+                    let _ = child.wait();
+                    let _ = no_tray_quit.send(());
+                });
+            }
+        }
+    }
 
     loop {
         tokio::select! {
@@ -268,7 +361,7 @@ pub async fn run_gui(opts: GuiOptions) -> Result<()> {
                 }
             }
             _ = quit_rx.recv() => {
-                info!("Exiting Glide GUI from system tray");
+                info!("Exiting Glide GUI");
                 break;
             }
             _ = tokio::signal::ctrl_c() => {
@@ -278,17 +371,31 @@ pub async fn run_gui(opts: GuiOptions) -> Result<()> {
         }
     }
 
-    ctrl.stop_engine();
+    ctrl.stop_engine().await;
+    #[cfg(target_os = "linux")]
+    linux_tray_handle.shutdown().await;
     Ok(())
 }
 
-/// Opens the GUI in a clean frameless desktop app window (`--app=...`) with browser fallback.
-pub fn open_app_window(url: &str) {
+/// Opens (or raises) the Glide desktop app window with a dedicated isolated profile,
+/// dark frame, fixed content dimensions, and native X11 `WM_CLASS`/`_NET_WM_ICON` branding on Linux.
+pub fn open_app_window(url: &str) -> Option<std::process::Child> {
+    #[cfg(target_os = "linux")]
+    if glide_backend::linux_x11::window_brand::focus_existing_glide_window() {
+        return None;
+    }
+
+    let profile_dir = default_config_dir().join("ui-profile");
+    let _ = std::fs::create_dir_all(&profile_dir);
+    let profile_arg = format!("--user-data-dir={}", profile_dir.display());
+    let app_arg = format!("--app={url}");
+    let size_arg = format!("--window-size={GUI_WIDTH},{GUI_HEIGHT}");
+
     #[cfg(target_os = "windows")]
     {
+        use std::os::windows::process::CommandExt;
         use std::process::Command;
-        let app_arg = format!("--app={url}");
-        let size_arg = "--window-size=1020,760";
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
         let candidates = [
             "msedge",
             r"C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe",
@@ -297,35 +404,69 @@ pub fn open_app_window(url: &str) {
             r"C:\Program Files\Google\Chrome\Application\chrome.exe",
         ];
         for bin in candidates {
-            if Command::new(bin).args([&app_arg, size_arg]).spawn().is_ok() {
-                return;
+            if let Ok(child) = Command::new(bin)
+                .creation_flags(CREATE_NO_WINDOW)
+                .args([
+                    &app_arg,
+                    &size_arg,
+                    &profile_arg,
+                    "--force-dark-mode",
+                    "--no-first-run",
+                    "--no-default-browser-check",
+                    "--disable-extensions",
+                ])
+                .spawn()
+            {
+                return Some(child);
             }
         }
-        let _ = Command::new("cmd").args(["/C", "start", "", url]).spawn();
+        Command::new("cmd")
+            .creation_flags(CREATE_NO_WINDOW)
+            .args(["/C", "start", "", url])
+            .spawn()
+            .ok()
     }
 
     #[cfg(target_os = "linux")]
     {
         use std::process::Command;
-        let app_arg = format!("--app={url}");
-        let size_arg = "--window-size=1020,760";
         for bin in [
             "google-chrome",
+            "google-chrome-stable",
             "chromium-browser",
             "chromium",
             "brave-browser",
             "microsoft-edge",
+            "vivaldi",
         ] {
-            if Command::new(bin).args([&app_arg, size_arg]).spawn().is_ok() {
-                return;
+            if let Ok(child) = Command::new(bin)
+                .args([
+                    &app_arg,
+                    &size_arg,
+                    &profile_arg,
+                    "--class=Glide",
+                    "--name=Glide",
+                    "--force-dark-mode",
+                    "--no-first-run",
+                    "--no-default-browser-check",
+                    "--disable-extensions",
+                    "--disable-infobars",
+                    "--disable-features=TranslateUI",
+                ])
+                .spawn()
+            {
+                glide_backend::linux_x11::window_brand::spawn_x11_window_brander(
+                    GUI_WIDTH, GUI_HEIGHT,
+                );
+                return Some(child);
             }
         }
-        let _ = Command::new("xdg-open").arg(url).spawn();
+        Command::new("xdg-open").arg(url).spawn().ok()
     }
 
     #[cfg(target_os = "macos")]
     {
-        let _ = std::process::Command::new("open").arg(url).spawn();
+        std::process::Command::new("open").arg(url).spawn().ok()
     }
 }
 
@@ -463,6 +604,20 @@ async fn handle_http_conn(mut stream: TcpStream, ctrl: Arc<AppController>) -> Re
             .await?;
         }
 
+        ("GET", "/favicon.svg") => {
+            write_response(
+                &mut stream,
+                "200 OK",
+                "image/svg+xml",
+                GLIDE_ICON_SVG.as_bytes(),
+            )
+            .await?;
+        }
+
+        ("GET", "/favicon.png") | ("GET", "/favicon.ico") => {
+            write_response(&mut stream, "200 OK", "image/png", &ctrl.favicon_png).await?;
+        }
+
         ("GET", "/api/events") => {
             let hdr = "HTTP/1.1 200 OK\r\n\
                        Content-Type: text/event-stream\r\n\
@@ -505,7 +660,9 @@ async fn handle_http_conn(mut stream: TcpStream, ctrl: Arc<AppController>) -> Re
                 "fingerprint": *ctrl.fingerprint.lock(),
                 "autostart": is_autostart_enabled(),
                 "hostname": machine_hostname(),
+                "local_ips": local_ipv4_addresses(),
                 "os": format!("{:?}", glide_backend::current_os_kind()),
+                "tray_active": ctrl.tray_active.load(Ordering::SeqCst),
                 "doctor": doctor,
             });
             write_response(
@@ -519,21 +676,24 @@ async fn handle_http_conn(mut stream: TcpStream, ctrl: Arc<AppController>) -> Re
 
         ("GET", "/api/discover") => {
             let port = ctrl.config.lock().client.discovery_port;
-            let found = discover_servers(port, Duration::from_millis(1400), None, false)
+            let my_fp = ctrl.fingerprint.lock().clone();
+            let found = discover_servers(port, Duration::from_millis(2200), None, false)
                 .await
                 .unwrap_or_default();
             let list: Vec<_> = found
                 .into_iter()
+                .filter(|s| my_fp.as_deref() != Some(s.fingerprint.as_str()))
                 .map(|s| {
                     json!({
                         "name": s.name,
                         "os": s.os,
                         "addr": s.addr.to_string(),
                         "fingerprint": s.fingerprint,
+                        "ips": s.all_ips,
                     })
                 })
                 .collect();
-            let body = json!({ "servers": list }).to_string();
+            let body = json!({ "servers": list, "local_ips": local_ipv4_addresses() }).to_string();
             write_response(&mut stream, "200 OK", "application/json", body.as_bytes()).await?;
         }
 
@@ -569,7 +729,7 @@ async fn handle_http_conn(mut stream: TcpStream, ctrl: Arc<AppController>) -> Re
         ("POST", "/api/start") => {
             let req: serde_json::Value = serde_json::from_slice(&body).unwrap_or_default();
             let role = req["role"].as_str().unwrap_or("server");
-            match ctrl.start_engine(role) {
+            match ctrl.start_engine(role).await {
                 Ok(()) => {
                     write_response(&mut stream, "200 OK", "application/json", br#"{"ok":true}"#)
                         .await?
@@ -588,13 +748,43 @@ async fn handle_http_conn(mut stream: TcpStream, ctrl: Arc<AppController>) -> Re
         }
 
         ("POST", "/api/stop") => {
-            ctrl.stop_engine();
+            ctrl.stop_engine().await;
             write_response(&mut stream, "200 OK", "application/json", br#"{"ok":true}"#).await?;
         }
 
         ("POST", "/api/lock") => {
             ctrl.send_cmd(RuntimeCommand::ToggleLock);
             write_response(&mut stream, "200 OK", "application/json", br#"{"ok":true}"#).await?;
+        }
+
+        ("POST", "/api/move-edge") => {
+            let req: serde_json::Value = serde_json::from_slice(&body).unwrap_or_default();
+            let edge = match req["edge"].as_str() {
+                Some("left") => Some(Edge::Left),
+                Some("right") => Some(Edge::Right),
+                Some("top") => Some(Edge::Top),
+                Some("bottom") => Some(Edge::Bottom),
+                _ => None,
+            };
+            let peer_name = req["peer_name"].as_str().map(str::to_string);
+            if let Some(edge) = edge {
+                {
+                    let mut cfg = ctrl.config.lock();
+                    cfg.client.edge = edge;
+                    let _ = cfg.save(&ctrl.config_path);
+                }
+                ctrl.send_cmd(RuntimeCommand::MovePeerEdge { peer_name, edge });
+                write_response(&mut stream, "200 OK", "application/json", br#"{"ok":true}"#)
+                    .await?;
+            } else {
+                write_response(
+                    &mut stream,
+                    "400 Bad Request",
+                    "application/json",
+                    br#"{"error":"invalid edge"}"#,
+                )
+                .await?;
+            }
         }
 
         ("POST", "/api/switch") => {
@@ -714,6 +904,16 @@ async fn handle_http_conn(mut stream: TcpStream, ctrl: Arc<AppController>) -> Re
             .await?;
         }
 
+        ("POST", "/api/show") => {
+            let _ = open_app_window(&ctrl.url);
+            write_response(&mut stream, "200 OK", "application/json", br#"{"ok":true}"#).await?;
+        }
+
+        ("POST", "/api/quit") => {
+            write_response(&mut stream, "200 OK", "application/json", br#"{"ok":true}"#).await?;
+            let _ = ctrl.quit_tx.send(());
+        }
+
         _ => {
             write_response(&mut stream, "404 Not Found", "text/plain", b"not found").await?;
         }
@@ -732,7 +932,8 @@ mod tests {
         let addr = listener.local_addr().unwrap();
         let url = format!("http://127.0.0.1:{}", addr.port());
         let tmp_cfg = std::env::temp_dir().join("glide-gui-test.toml");
-        let ctrl = Arc::new(AppController::new(tmp_cfg, url));
+        let (quit_tx, _quit_rx) = mpsc::unbounded_channel();
+        let ctrl = Arc::new(AppController::new(tmp_cfg, url, quit_tx));
 
         let srv_ctrl = Arc::clone(&ctrl);
         let srv = tokio::spawn(async move {

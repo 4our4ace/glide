@@ -23,7 +23,7 @@ use glide_proto::{
 };
 use std::collections::HashMap;
 use std::net::SocketAddr;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 use tokio::net::lookup_host;
 use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
@@ -32,11 +32,16 @@ use tracing::{debug, info, warn};
 /// or by auto-discovering a running Glide server on the local network.
 async fn resolve_server_addr(config: &ClientConfig) -> Result<(SocketAddr, Option<String>)> {
     if let Some(ref raw) = config.server {
-        let with_port = if raw.contains(':') {
-            raw.clone()
+        let trimmed = raw.trim();
+        let with_port = if trimmed.contains(':') {
+            trimmed.to_string()
         } else {
-            format!("{raw}:{DEFAULT_QUIC_PORT}")
+            format!("{trimmed}:{DEFAULT_QUIC_PORT}")
         };
+        // Fast offline-safe path: parse literal IPv4/IPv6 directly without ever touching OS DNS!
+        if let Ok(addr) = with_port.parse::<SocketAddr>() {
+            return Ok((addr, None));
+        }
         let mut addrs = lookup_host(&with_port)
             .await
             .with_context(|| format!("failed to resolve server address '{with_port}'"))?;
@@ -151,15 +156,14 @@ pub async fn run_client_session(
         });
     }
 
-    let return_edge = config.edge.opposite();
+    let mut return_edge = config.edge.opposite();
     let mut key_remaps = compile_key_remaps(&config.key_remap);
     let mut focused = false;
     let mut last_seq: Option<u32> = None;
     let mut pending_offer_hash: Option<[u8; 32]> = None;
     let mut local_clip_cache: HashMap<[u8; 32], ClipboardPayload> = HashMap::new();
 
-    let start_time = Instant::now();
-    let mut ping_interval = tokio::time::interval(Duration::from_secs(2));
+    let mut ping_interval = tokio::time::interval(Duration::from_millis(500));
     ping_interval.tick().await;
 
     let conn = session.conn;
@@ -176,8 +180,10 @@ pub async fn run_client_session(
 
         tokio::select! {
             _ = ping_interval.tick() => {
-                let ts_us = start_time.elapsed().as_micros() as u64;
-                let _ = ctrl_send.send(&ControlMessage::Ping { ts_us }).await;
+                if let Some(rt) = runtime {
+                    let rtt_ms = conn.rtt().as_secs_f32() * 1000.0;
+                    rt.record_rtt(rtt_ms);
+                }
             }
 
             cmd = async {
@@ -235,6 +241,20 @@ pub async fn run_client_session(
                                     });
                                 }
                             }
+                        }
+                        RuntimeCommand::MovePeerEdge { edge, .. } => {
+                            config.edge = edge;
+                            return_edge = edge.opposite();
+                            let _ = ctrl_send
+                                .send(&ControlMessage::SetEdge {
+                                    edge_on_server: edge,
+                                })
+                                .await;
+                            info!(?edge, "Client moved its own edge live");
+                        }
+                        RuntimeCommand::Shutdown => {
+                            info!("Client received graceful shutdown command");
+                            break Ok(());
                         }
                         _ => {}
                     }
@@ -370,6 +390,11 @@ pub async fn run_client_session(
                             let _ = injector.sync_lock_state(lock_state);
                         }
                     }
+                    ControlMessage::SetEdge { edge_on_server } => {
+                        config.edge = edge_on_server;
+                        return_edge = edge_on_server.opposite();
+                        info!(edge = ?edge_on_server, "Server repositioned this client edge live");
+                    }
                     ControlMessage::Key { usage, pressed } => {
                         if focused {
                             let mapped = key_remaps
@@ -411,13 +436,7 @@ pub async fn run_client_session(
                     ControlMessage::Ping { ts_us } => {
                         let _ = ctrl_send.send(&ControlMessage::Pong { ts_us }).await;
                     }
-                    ControlMessage::Pong { ts_us } => {
-                        let now_us = start_time.elapsed().as_micros() as u64;
-                        let rtt_ms = (now_us.saturating_sub(ts_us) as f32) / 1000.0;
-                        if let Some(rt) = runtime {
-                            rt.record_rtt(rtt_ms);
-                        }
-                    }
+                    ControlMessage::Pong { .. } => {}
                     _ => {}
                 }
             }
@@ -557,7 +576,7 @@ pub async fn run_native_client_with_runtime(
                 {
                     Ok(()) => {
                         info!("Session ended cleanly");
-                        backoff = Duration::from_millis(500);
+                        return Ok(());
                     }
                     Err(e) => {
                         warn!(error = %e, "Disconnected from server; reconnecting shortly...");

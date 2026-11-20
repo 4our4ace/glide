@@ -104,11 +104,16 @@ pub enum RuntimeCommand {
     ToggleLock,
     SwitchToEdge(Edge),
     ReturnLocal,
+    MovePeerEdge {
+        peer_name: Option<String>,
+        edge: Edge,
+    },
     SendFile {
         filename: String,
         data: Bytes,
     },
     ResendClipboard(usize),
+    Shutdown,
 }
 
 /// Thread-safe handle for updating and subscribing to live runtime telemetry.

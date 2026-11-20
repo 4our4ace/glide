@@ -29,7 +29,7 @@ use glide_proto::{
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
 
@@ -64,6 +64,20 @@ enum PeerEvent {
     },
 }
 
+struct AbortOnDrop(tokio::task::JoinHandle<()>);
+impl Drop for AbortOnDrop {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
+struct EndpointCloseOnDrop(GlideServerEndpoint);
+impl Drop for EndpointCloseOnDrop {
+    fn drop(&mut self) {
+        self.0.close();
+    }
+}
+
 /// Runs the Glide server with pre-constructed OS (or mock) backends, optional live GUI state,
 /// and optional runtime command channel.
 pub async fn run_server_with_backends(
@@ -75,6 +89,7 @@ pub async fn run_server_with_backends(
     runtime: Option<RuntimeState>,
     mut cmd_rx: Option<mpsc::UnboundedReceiver<RuntimeCommand>>,
 ) -> Result<()> {
+    let _endpoint_guard = EndpointCloseOnDrop(endpoint.clone());
     let local_addr: SocketAddr = endpoint.local_addr();
     let fingerprint = endpoint.fingerprint().to_string();
     let geom = capture.control.desktop_geometry();
@@ -100,7 +115,7 @@ pub async fn run_server_with_backends(
         "Glide server listening"
     );
 
-    let _beacon = if config.discovery {
+    let _beacon_guard = if config.discovery {
         match spawn_server_beacon(
             config.discovery_port,
             config.name.clone(),
@@ -113,7 +128,7 @@ pub async fn run_server_with_backends(
                     port = config.discovery_port,
                     "LAN auto-discovery enabled (clients can connect without an IP)"
                 );
-                Some(h)
+                Some(AbortOnDrop(h))
             }
             Err(e) => {
                 warn!(error = %e, "LAN auto-discovery failed to bind; static IP mode still active");
@@ -128,7 +143,7 @@ pub async fn run_server_with_backends(
 
     let server_name = config.name.clone();
     let accept_tx = peer_tx.clone();
-    let accept_handle = tokio::spawn(async move {
+    let _accept_guard = AbortOnDrop(tokio::spawn(async move {
         loop {
             match endpoint.accept().await {
                 Ok(session) => {
@@ -148,7 +163,7 @@ pub async fn run_server_with_backends(
                 }
             }
         }
-    });
+    }));
 
     let mut peers: HashMap<u64, ConnectedPeer> = HashMap::new();
     let mut edge_to_peer: HashMap<Edge, u64> = HashMap::new();
@@ -166,8 +181,7 @@ pub async fn run_server_with_backends(
     let coalesce_sleep = tokio::time::sleep(Duration::from_secs(86_400));
     tokio::pin!(coalesce_sleep);
 
-    let start_time = Instant::now();
-    let mut ping_interval = tokio::time::interval(Duration::from_secs(2));
+    let mut ping_interval = tokio::time::interval(Duration::from_millis(500));
     ping_interval.tick().await;
 
     let mut capture_events = capture.events;
@@ -246,9 +260,20 @@ pub async fn run_server_with_backends(
             }
 
             _ = ping_interval.tick() => {
-                let ts_us = start_time.elapsed().as_micros() as u64;
-                for peer in peers.values() {
-                    let _ = peer.ctrl_tx.send(ControlMessage::Ping { ts_us });
+                if !peers.is_empty() {
+                    let mut best_rtt: Option<f32> = None;
+                    for peer in peers.values_mut() {
+                        let rtt_ms = peer.conn.rtt().as_secs_f32() * 1000.0;
+                        peer.rtt_ms = Some(rtt_ms);
+                        best_rtt = Some(match best_rtt {
+                            Some(cur) => cur.min(rtt_ms),
+                            None => rtt_ms,
+                        });
+                    }
+                    if let (Some(ref rt), Some(ms)) = (&runtime, best_rtt) {
+                        rt.record_rtt(ms);
+                    }
+                    sync_runtime_peers(&runtime, &peers, active_remote, locked);
                 }
             }
 
@@ -367,6 +392,55 @@ pub async fn run_server_with_backends(
                                 }
                             }
                         }
+                    }
+                    RuntimeCommand::MovePeerEdge { peer_name, edge } => {
+                        let target_id = if let Some(ref name) = peer_name {
+                            peers
+                                .iter()
+                                .find(|(_, p)| p.name == *name)
+                                .map(|(&id, _)| id)
+                        } else {
+                            peers.keys().next().copied()
+                        };
+                        if let Some(pid) = target_id {
+                            if let Some(old_e) = peers.get(&pid).map(|p| p.edge) {
+                                if old_e != edge {
+                                    if let Some(other_id) = edge_to_peer.remove(&edge) {
+                                        if other_id != pid {
+                                            edge_to_peer.insert(old_e, other_id);
+                                            if let Some(other) = peers.get_mut(&other_id) {
+                                                other.edge = old_e;
+                                                let _ = other.ctrl_tx.send(
+                                                    ControlMessage::SetEdge {
+                                                        edge_on_server: old_e,
+                                                    },
+                                                );
+                                            }
+                                        }
+                                    } else {
+                                        edge_to_peer.remove(&old_e);
+                                    }
+                                    edge_to_peer.insert(edge, pid);
+                                    if let Some(peer) = peers.get_mut(&pid) {
+                                        peer.edge = edge;
+                                        let _ = peer.ctrl_tx.send(ControlMessage::SetEdge {
+                                            edge_on_server: edge,
+                                        });
+                                        info!(peer = %peer.name, ?edge, "Repositioned client edge live");
+                                    }
+                                    if active_remote == Some(pid) {
+                                        active_edge = Some(edge);
+                                    }
+                                    let edges: Vec<Edge> = edge_to_peer.keys().copied().collect();
+                                    capture_ctrl.set_active_edges(&edges);
+                                    sync_runtime_peers(&runtime, &peers, active_remote, locked);
+                                }
+                            }
+                        }
+                    }
+                    RuntimeCommand::Shutdown => {
+                        info!("Received graceful shutdown command for Glide server");
+                        break;
                     }
                     RuntimeCommand::UpdateClientTuning { .. } => {}
                 }
@@ -636,22 +710,45 @@ pub async fn run_server_with_backends(
                                     }
                                 }
                             }
+                            ControlMessage::SetEdge { edge_on_server } => {
+                                if let Some(old_e) = peers.get(&peer_id).map(|p| p.edge) {
+                                    if old_e != edge_on_server {
+                                        if let Some(other_id) = edge_to_peer.remove(&edge_on_server) {
+                                            if other_id != peer_id {
+                                                edge_to_peer.insert(old_e, other_id);
+                                                if let Some(other) = peers.get_mut(&other_id) {
+                                                    other.edge = old_e;
+                                                    let _ = other.ctrl_tx.send(
+                                                        ControlMessage::SetEdge {
+                                                            edge_on_server: old_e,
+                                                        },
+                                                    );
+                                                }
+                                            }
+                                        } else {
+                                            edge_to_peer.remove(&old_e);
+                                        }
+                                        edge_to_peer.insert(edge_on_server, peer_id);
+                                        if let Some(peer) = peers.get_mut(&peer_id) {
+                                            peer.edge = edge_on_server;
+                                            info!(peer = %peer.name, edge = ?edge_on_server, "Client updated its own edge live");
+                                        }
+                                        if active_remote == Some(peer_id) {
+                                            active_edge = Some(edge_on_server);
+                                        }
+                                        let edges: Vec<Edge> =
+                                            edge_to_peer.keys().copied().collect();
+                                        capture_ctrl.set_active_edges(&edges);
+                                        sync_runtime_peers(&runtime, &peers, active_remote, locked);
+                                    }
+                                }
+                            }
                             ControlMessage::Ping { ts_us } => {
                                 if let Some(peer) = peers.get(&peer_id) {
                                     let _ = peer.ctrl_tx.send(ControlMessage::Pong { ts_us });
                                 }
                             }
-                            ControlMessage::Pong { ts_us } => {
-                                let now_us = start_time.elapsed().as_micros() as u64;
-                                let rtt_ms = (now_us.saturating_sub(ts_us) as f32) / 1000.0;
-                                if let Some(peer) = peers.get_mut(&peer_id) {
-                                    peer.rtt_ms = Some(rtt_ms);
-                                }
-                                if let Some(ref rt) = runtime {
-                                    rt.record_rtt(rtt_ms);
-                                }
-                                sync_runtime_peers(&runtime, &peers, active_remote, locked);
-                            }
+                            ControlMessage::Pong { .. } => {}
                             _ => {}
                         }
                     }
@@ -764,7 +861,9 @@ pub async fn run_server_with_backends(
         }
     }
 
-    accept_handle.abort();
+    drop(_accept_guard);
+    drop(_beacon_guard);
+    drop(_endpoint_guard);
     if let Some(ref rt) = runtime {
         rt.update(|s| {
             s.mode = "stopped".into();

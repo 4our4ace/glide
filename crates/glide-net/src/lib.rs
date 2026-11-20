@@ -22,21 +22,52 @@ use std::sync::Arc;
 use std::time::Duration;
 use tls::{ensure_crypto_provider, FingerprintVerifier, ServerIdentity, TrustMode, ALPN_GLIDE_V1};
 
-/// Builds a QUIC `TransportConfig` tuned for interactive sub-millisecond LAN input.
+/// Builds a QUIC `TransportConfig` tuned for interactive sub-millisecond LAN/Wi-Fi input.
+///
+/// - `initial_rtt(5ms)` avoids Quinn's default 333ms WAN RTT assumption.
+/// - `keep_alive_interval(120ms)` prevents laptop Wi-Fi NICs from entering 802.11 Power Save
+///   Mode (DTIM sleep), which otherwise causes 150-200ms wakeup spikes!
+/// - `mtu_discovery_config(None)` avoids transient probe stalls on LANs.
 fn build_transport_config() -> TransportConfig {
     let mut transport = TransportConfig::default();
-    transport.keep_alive_interval(Some(Duration::from_millis(750)));
+    transport.initial_rtt(Duration::from_millis(5));
+    transport.keep_alive_interval(Some(Duration::from_millis(120)));
+    transport.mtu_discovery_config(None);
     if let Ok(timeout) = IdleTimeout::try_from(Duration::from_secs(4)) {
         transport.max_idle_timeout(Some(timeout));
     }
-    transport.datagram_receive_buffer_size(Some(64 * 1024));
-    transport.datagram_send_buffer_size(64 * 1024);
+    transport.datagram_receive_buffer_size(Some(128 * 1024));
+    transport.datagram_send_buffer_size(128 * 1024);
     transport.max_concurrent_bidi_streams(4u32.into());
     transport.max_concurrent_uni_streams(32u32.into());
     transport
 }
 
+/// Binds a UDP socket configured with DSCP EF (`0xB8` -> Wi-Fi WMM `AC_VO` low-latency queue)
+/// and generous kernel buffers so input datagrams bypass router/Wi-Fi background queues.
+fn bind_low_latency_udp(bind_addr: SocketAddr) -> Result<std::net::UdpSocket> {
+    use socket2::{Domain, Protocol, Socket, Type};
+    let domain = if bind_addr.is_ipv6() {
+        Domain::IPV6
+    } else {
+        Domain::IPV4
+    };
+    let sock = Socket::new(domain, Type::DGRAM, Some(Protocol::UDP))
+        .context("failed to create QUIC UDP socket")?;
+    let _ = sock.set_recv_buffer_size(256 * 1024);
+    let _ = sock.set_send_buffer_size(256 * 1024);
+    if bind_addr.is_ipv4() {
+        // DSCP 46 (Expedited Forwarding) = TOS 0xB8 -> Wi-Fi WMM AC_VO low-latency priority
+        let _ = sock.set_tos(0xB8);
+    }
+    sock.set_nonblocking(true)?;
+    sock.bind(&bind_addr.into())
+        .with_context(|| format!("failed to bind QUIC UDP socket on {bind_addr}"))?;
+    Ok(sock.into())
+}
+
 /// QUIC server listener bound to a local UDP address.
+#[derive(Clone)]
 pub struct GlideServerEndpoint {
     endpoint: Endpoint,
     local_addr: SocketAddr,
@@ -61,8 +92,14 @@ impl GlideServerEndpoint {
         let mut server_config = quinn::ServerConfig::with_crypto(Arc::new(quic_crypto));
         server_config.transport_config(Arc::new(build_transport_config()));
 
-        let endpoint = Endpoint::server(server_config, bind_addr)
-            .with_context(|| format!("failed to bind QUIC UDP socket on {bind_addr}"))?;
+        let udp = bind_low_latency_udp(bind_addr)?;
+        let endpoint = Endpoint::new(
+            quinn::EndpointConfig::default(),
+            Some(server_config),
+            udp,
+            Arc::new(quinn::TokioRuntime),
+        )
+        .with_context(|| format!("failed to initialize QUIC endpoint on {bind_addr}"))?;
         let local_addr = endpoint.local_addr()?;
 
         Ok(Self {
@@ -78,6 +115,11 @@ impl GlideServerEndpoint {
 
     pub fn fingerprint(&self) -> &str {
         &self.fingerprint
+    }
+
+    /// Gracefully closes the QUIC listener and active connections, releasing the UDP port immediately.
+    pub fn close(&self) {
+        self.endpoint.close(0u32.into(), b"server stopped");
     }
 
     /// Accepts the next incoming QUIC connection and opens the control bidirectional stream.
@@ -118,7 +160,14 @@ pub async fn connect_client(server_addr: SocketAddr, trust: TrustMode) -> Result
         "0.0.0.0:0".parse().unwrap()
     };
 
-    let mut endpoint = Endpoint::client(bind_addr).context("failed to bind QUIC client socket")?;
+    let udp = bind_low_latency_udp(bind_addr)?;
+    let mut endpoint = Endpoint::new(
+        quinn::EndpointConfig::default(),
+        None,
+        udp,
+        Arc::new(quinn::TokioRuntime),
+    )
+    .context("failed to bind QUIC client socket")?;
     endpoint.set_default_client_config(client_config);
 
     let conn = endpoint
@@ -472,5 +521,20 @@ mod tests {
         assert!(got_clip && got_file);
 
         server_task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn server_endpoint_close_allows_immediate_rebind() {
+        let identity = ServerIdentity::generate_ephemeral().unwrap();
+        let ep1 = GlideServerEndpoint::bind("127.0.0.1:0".parse().unwrap(), &identity).unwrap();
+        let addr = ep1.local_addr();
+        ep1.close();
+        drop(ep1);
+        tokio::time::sleep(Duration::from_millis(20)).await;
+
+        let ep2 = GlideServerEndpoint::bind(addr, &identity)
+            .expect("re-binding same UDP addr after close() must succeed");
+        assert_eq!(ep2.local_addr(), addr);
+        ep2.close();
     }
 }

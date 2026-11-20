@@ -1,15 +1,22 @@
-//! Zero-config LAN auto-discovery (LocalSend-style UDP multicast + broadcast).
+//! Zero-config, offline-first LAN & direct-link auto-discovery.
 //!
-//! Servers announce their real machine hostname, QUIC port, OS, and TLS fingerprint
-//! on multicast `239.255.71.76:24801` and broadcast `255.255.255.255:24801`, and
-//! reply immediately to active client probes so clients connect without typing IPs.
+//! Designed to work reliably even when Wi-Fi / internet is completely down
+//! (e.g. Ethernet LAN, USB-Ethernet tether, or direct link-local `169.254.x.x` cable)
+//! and on multi-homed Windows 11 / Ubuntu machines (with WSL2, Hyper-V, Docker, VPNs):
+//!
+//! - Enumerates EVERY active non-loopback IPv4 network interface (re-refreshed periodically).
+//! - Sends & listens using per-interface sockets bound to each NIC's local IPv4 address:
+//!   1. Subnet-directed broadcast (e.g. `192.168.178.255`, `169.254.255.255`)
+//!   2. IPv4 Multicast (`239.255.71.76`) with `IP_MULTICAST_IF` explicitly set per NIC
+//!   3. Global limited broadcast (`255.255.255.255`)
+//! - Zero external DNS, zero internet, zero mDNS/Avahi/Bonjour daemon required.
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use socket2::{Domain, Protocol, Socket, Type};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::net::UdpSocket;
 use tokio::task::JoinHandle;
 use tracing::{debug, trace, warn};
@@ -21,6 +28,14 @@ pub const DEFAULT_DISCOVERY_PORT: u16 = 24801;
 const MAGIC_BEACON: &str = "GLIDE_BEACON_V1";
 const MAGIC_PROBE: &[u8] = b"GLIDE_DISCOVER_V1";
 
+/// Active local IPv4 interface with its computed subnet broadcast address.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct LocalIpv4Iface {
+    pub name: String,
+    pub ip: Ipv4Addr,
+    pub broadcast: Ipv4Addr,
+}
+
 /// Beacon packet broadcast by running Glide servers.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ServerBeacon {
@@ -29,15 +44,18 @@ pub struct ServerBeacon {
     pub quic_port: u16,
     pub fingerprint: String,
     pub os: String,
+    #[serde(default)]
+    pub ips: Vec<String>,
 }
 
-/// A discovered Glide server on the local network.
+/// A discovered Glide server on the local network or direct link.
 #[derive(Debug, Clone)]
 pub struct DiscoveredServer {
     pub addr: SocketAddr,
     pub name: String,
     pub fingerprint: String,
     pub os: String,
+    pub all_ips: Vec<String>,
 }
 
 /// Returns the machine's real hostname (no goofy aliases).
@@ -63,9 +81,52 @@ pub fn machine_hostname() -> String {
     "glide-host".to_string()
 }
 
-fn bind_discovery_socket(port: u16, join_multicast: bool) -> Result<UdpSocket> {
+/// Enumerates all active non-loopback IPv4 interfaces (including link-local `169.254.x.x`
+/// for direct Ethernet/USB cables with no router or Wi-Fi!).
+pub fn active_ipv4_interfaces() -> Vec<LocalIpv4Iface> {
+    let mut out = Vec::new();
+    let Ok(ifaces) = if_addrs::get_if_addrs() else {
+        return out;
+    };
+    for iface in ifaces {
+        if iface.is_loopback() {
+            continue;
+        }
+        if let if_addrs::IfAddr::V4(v4) = iface.addr {
+            let ip = v4.ip;
+            if ip.is_unspecified() || ip.is_loopback() {
+                continue;
+            }
+            let broadcast = v4.broadcast.unwrap_or_else(|| {
+                let ip_u = u32::from(ip);
+                let mask_u = u32::from(v4.netmask);
+                Ipv4Addr::from((ip_u & mask_u) | !mask_u)
+            });
+            out.push(LocalIpv4Iface {
+                name: iface.name,
+                ip,
+                broadcast,
+            });
+        }
+    }
+    out
+}
+
+/// Convenience helper returning all active local IPv4 addresses (for display in GUI/CLI).
+pub fn local_ipv4_addresses() -> Vec<String> {
+    let mut ips: Vec<String> = active_ipv4_interfaces()
+        .into_iter()
+        .map(|i| i.ip.to_string())
+        .collect();
+    ips.sort();
+    ips.dedup();
+    ips
+}
+
+/// Binds a listener UDP socket on `0.0.0.0:port` and joins multicast on EVERY active IPv4 NIC.
+fn bind_listener_socket(port: u16) -> Result<(UdpSocket, HashSet<Ipv4Addr>)> {
     let sock = Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::UDP))
-        .context("failed to create discovery UDP socket")?;
+        .context("failed to create discovery listener socket")?;
     sock.set_reuse_address(true)?;
     #[cfg(unix)]
     {
@@ -78,19 +139,65 @@ fn bind_discovery_socket(port: u16, join_multicast: bool) -> Result<UdpSocket> {
     sock.bind(&bind_addr.into())
         .with_context(|| format!("failed to bind discovery UDP socket on {bind_addr}"))?;
 
-    if join_multicast {
-        if let Err(e) = sock.join_multicast_v4(&DISCOVERY_MULTICAST_ADDR, &Ipv4Addr::UNSPECIFIED) {
-            debug!(error = %e, "Could not join multicast group (broadcast fallback still active)");
+    let mut joined = HashSet::new();
+    let _ = sock.set_multicast_loop_v4(true);
+    for iface in active_ipv4_interfaces() {
+        if sock
+            .join_multicast_v4(&DISCOVERY_MULTICAST_ADDR, &iface.ip)
+            .is_ok()
+        {
+            joined.insert(iface.ip);
         }
-        let _ = sock.set_multicast_loop_v4(true);
     }
+    // Also attempt default join as safety fallback
+    let _ = sock.join_multicast_v4(&DISCOVERY_MULTICAST_ADDR, &Ipv4Addr::UNSPECIFIED);
 
     let std_sock: std::net::UdpSocket = sock.into();
-    UdpSocket::from_std(std_sock).context("failed to convert discovery socket to tokio UdpSocket")
+    let tokio_sock = UdpSocket::from_std(std_sock)?;
+    Ok((tokio_sock, joined))
 }
 
-/// Spawns the server-side LAN discovery responder (replies immediately to probes and
-/// periodically broadcasts presence every 1.5s).
+/// Sends a UDP packet out of EVERY active non-loopback IPv4 interface using an explicit
+/// interface-bound ephemeral socket (subnet broadcast + multicast + limited broadcast),
+/// plus loopback for single-machine testing. Works even with zero Wi-Fi / no default gateway!
+fn blast_on_all_interfaces(payload: &[u8], port: u16, include_loopback: bool) {
+    let ifaces = active_ipv4_interfaces();
+    let mcast_dest = SocketAddrV4::new(DISCOVERY_MULTICAST_ADDR, port);
+    let bcast_dest = SocketAddrV4::new(Ipv4Addr::BROADCAST, port);
+
+    for iface in &ifaces {
+        let Ok(sock) = Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::UDP)) else {
+            continue;
+        };
+        let _ = sock.set_broadcast(true);
+        let _ = sock.set_multicast_if_v4(&iface.ip);
+        let _ = sock.set_multicast_ttl_v4(2);
+        let _ = sock.set_multicast_loop_v4(true);
+        if sock.bind(&SocketAddrV4::new(iface.ip, 0).into()).is_err() {
+            continue;
+        }
+        let std_sock: std::net::UdpSocket = sock.into();
+        // 1. Subnet-directed broadcast (most reliable across Windows Firewall & Fritz!Box / home routers & direct cables!)
+        let subnet_bcast = SocketAddrV4::new(iface.broadcast, port);
+        let _ = std_sock.send_to(payload, subnet_bcast);
+        // 2. Multicast explicitly routed out THIS NIC
+        let _ = std_sock.send_to(payload, mcast_dest);
+        // 3. Global broadcast explicitly routed out THIS NIC
+        let _ = std_sock.send_to(payload, bcast_dest);
+    }
+
+    if include_loopback {
+        if let Ok(sock) = std::net::UdpSocket::bind("127.0.0.1:0") {
+            let _ = sock.send_to(payload, SocketAddrV4::new(Ipv4Addr::LOCALHOST, port));
+        }
+    }
+}
+
+/// Spawns the server-side LAN discovery responder.
+///
+/// - Broadcasts beacons every 500 ms across EVERY active IPv4 interface (Ethernet, Wi-Fi, link-local)
+/// - Replies immediately to active `GLIDE_DISCOVER_V1` probes
+/// - Periodically re-scans interfaces every 3 s so newly plugged cables / dropped Wi-Fi recover automatically!
 pub fn spawn_server_beacon(
     discovery_port: u16,
     name: String,
@@ -98,35 +205,52 @@ pub fn spawn_server_beacon(
     fingerprint: String,
     os: String,
 ) -> Result<JoinHandle<()>> {
-    let socket = bind_discovery_socket(discovery_port, true)?;
-    let beacon = ServerBeacon {
-        magic: MAGIC_BEACON.into(),
-        name,
-        quic_port,
-        fingerprint,
-        os,
-    };
-    let payload = serde_json::to_vec(&beacon).context("failed to serialize server beacon")?;
-    let multicast_dest =
-        SocketAddr::V4(SocketAddrV4::new(DISCOVERY_MULTICAST_ADDR, discovery_port));
-    let broadcast_dest = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::BROADCAST, discovery_port));
+    let (socket, mut joined_ifaces) = bind_listener_socket(discovery_port)?;
 
     let handle = tokio::spawn(async move {
         let mut buf = [0u8; 1024];
-        let mut interval = tokio::time::interval(Duration::from_millis(1500));
+        let mut beacon_tick = tokio::time::interval(Duration::from_millis(500));
+        let mut last_iface_refresh = Instant::now();
+
+        let make_payload = |ips: Vec<String>| -> Vec<u8> {
+            let beacon = ServerBeacon {
+                magic: MAGIC_BEACON.into(),
+                name: name.clone(),
+                quic_port,
+                fingerprint: fingerprint.clone(),
+                os: os.clone(),
+                ips,
+            };
+            serde_json::to_vec(&beacon).unwrap_or_default()
+        };
+
+        let mut cached_payload = make_payload(local_ipv4_addresses());
 
         loop {
             tokio::select! {
-                _ = interval.tick() => {
-                    let _ = socket.send_to(&payload, multicast_dest).await;
-                    let _ = socket.send_to(&payload, broadcast_dest).await;
+                _ = beacon_tick.tick() => {
+                    if last_iface_refresh.elapsed() >= Duration::from_secs(3) {
+                        last_iface_refresh = Instant::now();
+                        let current = active_ipv4_interfaces();
+                        for iface in &current {
+                            if !joined_ifaces.contains(&iface.ip)
+                                && socket.join_multicast_v4(DISCOVERY_MULTICAST_ADDR, iface.ip).is_ok()
+                            {
+                                debug!(ip = %iface.ip, iface = %iface.name, "Joined discovery multicast on new interface");
+                                joined_ifaces.insert(iface.ip);
+                            }
+                        }
+                        cached_payload = make_payload(local_ipv4_addresses());
+                    }
+                    blast_on_all_interfaces(&cached_payload, discovery_port, true);
                 }
                 recv = socket.recv_from(&mut buf) => {
                     match recv {
                         Ok((n, src)) => {
                             if &buf[..n] == MAGIC_PROBE {
-                                trace!(%src, "Received LAN discovery probe; replying with beacon");
-                                let _ = socket.send_to(&payload, src).await;
+                                trace!(%src, "Received LAN discovery probe; replying directly + broadcasting");
+                                let _ = socket.send_to(&cached_payload, src).await;
+                                blast_on_all_interfaces(&cached_payload, discovery_port, false);
                             }
                         }
                         Err(e) => {
@@ -142,32 +266,29 @@ pub fn spawn_server_beacon(
     Ok(handle)
 }
 
-/// Actively probes the local network for running Glide servers for up to `timeout`.
-/// If `stop_on_first` is true, returns as soon as a matching server responds!
+/// Actively probes EVERY local IPv4 interface AND listens for unsolicited server beacons
+/// for up to `timeout`. Works even when Windows Firewall drops inbound probes!
 pub async fn discover_servers(
     discovery_port: u16,
     timeout: Duration,
     name_filter: Option<&str>,
     stop_on_first: bool,
 ) -> Result<Vec<DiscoveredServer>> {
-    // Bind an ephemeral port for probe/reply AND optionally listen on discovery_port for unsolicited beacons.
-    let probe_sock = bind_discovery_socket(0, false)?;
-    let beacon_sock = bind_discovery_socket(discovery_port, true).ok();
+    // Ephemeral probe socket for unicast replies
+    let probe_sock = UdpSocket::bind("0.0.0.0:0").await?;
+    let _ = probe_sock.set_broadcast(true);
 
-    let multicast_dest =
-        SocketAddr::V4(SocketAddrV4::new(DISCOVERY_MULTICAST_ADDR, discovery_port));
-    let broadcast_dest = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::BROADCAST, discovery_port));
-    let loopback_dest = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, discovery_port));
+    // Passive listener on discovery_port (joins multicast on all NICs to catch periodic 500ms beacons!)
+    let beacon_sock = bind_listener_socket(discovery_port).ok().map(|(s, _)| s);
 
-    // Send immediate probes (multicast + broadcast + localhost for single-machine testing).
-    let _ = probe_sock.send_to(MAGIC_PROBE, multicast_dest).await;
-    let _ = probe_sock.send_to(MAGIC_PROBE, broadcast_dest).await;
-    let _ = probe_sock.send_to(MAGIC_PROBE, loopback_dest).await;
+    // Send probes out of EVERY interface AND from probe_sock so server unicast replies reach probe_sock
+    blast_on_all_interfaces(MAGIC_PROBE, discovery_port, true);
+    let _ = send_probe_from_socket(&probe_sock, discovery_port).await;
 
     let mut found: HashMap<String, DiscoveredServer> = HashMap::new();
     let deadline = tokio::time::Instant::now() + timeout;
     let mut probe_retry = tokio::time::interval(Duration::from_millis(400));
-    probe_retry.tick().await; // consume immediate tick
+    probe_retry.tick().await;
 
     let mut buf_a = [0u8; 2048];
     let mut buf_b = [0u8; 2048];
@@ -182,8 +303,8 @@ pub async fn discover_servers(
         let packet = tokio::select! {
             _ = tokio::time::sleep(remaining) => break,
             _ = probe_retry.tick() => {
-                let _ = probe_sock.send_to(MAGIC_PROBE, multicast_dest).await;
-                let _ = probe_sock.send_to(MAGIC_PROBE, broadcast_dest).await;
+                blast_on_all_interfaces(MAGIC_PROBE, discovery_port, true);
+                let _ = send_probe_from_socket(&probe_sock, discovery_port).await;
                 continue;
             }
             res = probe_sock.recv_from(&mut buf_a) => {
@@ -210,18 +331,29 @@ pub async fn discover_servers(
                     }
                 }
                 let addr = SocketAddr::new(src.ip(), beacon.quic_port);
-                let key = format!("{}:{}", beacon.fingerprint, addr);
-                found.insert(
-                    key,
-                    DiscoveredServer {
-                        addr,
-                        name: beacon.name,
-                        fingerprint: beacon.fingerprint,
-                        os: beacon.os,
-                    },
-                );
+                // Deduplicate by fingerprint, preferring non-loopback over loopback!
+                let key = beacon.fingerprint.clone();
+                let should_replace = match found.get(&key) {
+                    None => true,
+                    Some(existing) => existing.addr.ip().is_loopback() && !addr.ip().is_loopback(),
+                };
+                if should_replace {
+                    found.insert(
+                        key,
+                        DiscoveredServer {
+                            addr,
+                            name: beacon.name,
+                            fingerprint: beacon.fingerprint,
+                            os: beacon.os,
+                            all_ips: beacon.ips,
+                        },
+                    );
+                }
                 if stop_on_first && !found.is_empty() {
-                    break;
+                    // Wait a tiny moment if we only saw loopback so a real LAN packet can win
+                    if !found.values().all(|s| s.addr.ip().is_loopback()) {
+                        break;
+                    }
                 }
             }
         }
@@ -230,6 +362,22 @@ pub async fn discover_servers(
     let mut list: Vec<DiscoveredServer> = found.into_values().collect();
     list.sort_by(|a, b| a.name.cmp(&b.name).then_with(|| a.addr.cmp(&b.addr)));
     Ok(list)
+}
+
+async fn send_probe_from_socket(sock: &UdpSocket, port: u16) -> Result<()> {
+    let mcast = SocketAddrV4::new(DISCOVERY_MULTICAST_ADDR, port);
+    let bcast = SocketAddrV4::new(Ipv4Addr::BROADCAST, port);
+    let _ = sock.send_to(MAGIC_PROBE, mcast).await;
+    let _ = sock.send_to(MAGIC_PROBE, bcast).await;
+    for iface in active_ipv4_interfaces() {
+        let _ = sock
+            .send_to(MAGIC_PROBE, SocketAddrV4::new(iface.broadcast, port))
+            .await;
+    }
+    let _ = sock
+        .send_to(MAGIC_PROBE, SocketAddrV4::new(Ipv4Addr::LOCALHOST, port))
+        .await;
+    Ok(())
 }
 
 #[cfg(test)]
@@ -248,7 +396,7 @@ mod tests {
         )
         .unwrap();
 
-        tokio::time::sleep(Duration::from_millis(50)).await;
+        tokio::time::sleep(Duration::from_millis(80)).await;
         let servers = discover_servers(port, Duration::from_secs(2), None, true)
             .await
             .unwrap();

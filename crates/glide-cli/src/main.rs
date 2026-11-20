@@ -1,7 +1,9 @@
+#![cfg_attr(target_os = "windows", windows_subsystem = "windows")]
 //! Glide CLI & Desktop App Launcher — Ultra-low-latency cross-platform software KVM.
 //!
 //! Running `glide` with no arguments (e.g. double-clicking `glide.exe` on Windows or
-//! clicking "Glide KVM" in Ubuntu's application launcher) opens the modern desktop GUI.
+//! clicking "Glide KVM" in Ubuntu's application launcher) opens the modern desktop GUI
+//! with zero background console window.
 
 use anyhow::Result;
 use clap::{Parser, Subcommand, ValueEnum};
@@ -259,8 +261,23 @@ fn init_logging(verbose: bool) {
         .init();
 }
 
+#[cfg(target_os = "windows")]
+fn attach_parent_console_if_cli() {
+    let args: Vec<String> = std::env::args().collect();
+    if args.len() > 1 && !args[1].eq_ignore_ascii_case("gui") {
+        unsafe {
+            windows_sys::Win32::System::Console::AttachConsole(
+                windows_sys::Win32::System::Console::ATTACH_PARENT_PROCESS,
+            );
+        }
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
+    #[cfg(target_os = "windows")]
+    attach_parent_console_if_cli();
+
     glide_backend::init_platform();
     let cli = Cli::parse();
     init_logging(cli.verbose);

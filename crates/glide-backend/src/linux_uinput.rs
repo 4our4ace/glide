@@ -68,6 +68,7 @@ struct UinputSetup {
 }
 
 #[repr(C)]
+#[allow(deprecated)]
 struct InputEvent {
     tv_sec: libc::time_t,
     tv_usec: libc::suseconds_t,

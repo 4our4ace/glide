@@ -263,6 +263,8 @@ pub enum ControlMessage {
     ReleaseAll,
     /// Synchronize CapsLock / NumLock state.
     LockSync { lock_state: LockState },
+    /// Live edge repositioning (either Server -> Client or Client -> Server) without reconnecting.
+    SetEdge { edge_on_server: Edge },
     /// Lazy clipboard offer for large payloads (> 256 KiB).
     ClipboardOffer {
         format: ClipboardFormat,
@@ -387,6 +389,10 @@ impl ControlMessage {
             Self::LockSync { lock_state } => {
                 buf.put_u8(0x34);
                 buf.put_u8(lock_state.to_u8());
+            }
+            Self::SetEdge { edge_on_server } => {
+                buf.put_u8(0x35);
+                buf.put_u8(*edge_on_server as u8);
             }
             Self::ClipboardOffer {
                 format,
@@ -574,6 +580,17 @@ impl ControlMessage {
                 }
                 Ok(Self::LockSync {
                     lock_state: LockState::from_u8(data.get_u8()),
+                })
+            }
+            0x35 => {
+                if data.is_empty() {
+                    return Err(ProtoError::Truncated {
+                        expected: 1,
+                        actual: 0,
+                    });
+                }
+                Ok(Self::SetEdge {
+                    edge_on_server: Edge::from_u8(data.get_u8())?,
                 })
             }
             0x38 => {
@@ -784,6 +801,9 @@ mod tests {
                 byte_len: 1_500_000,
             },
             ControlMessage::ClipboardRequest { sha256: [0x11; 32] },
+            ControlMessage::SetEdge {
+                edge_on_server: Edge::Top,
+            },
             ControlMessage::Ping { ts_us: 123_456_789 },
             ControlMessage::Pong { ts_us: 123_456_789 },
         ];

@@ -6,8 +6,17 @@
 
 pub mod dib_png;
 pub mod geometry;
+pub mod icon;
 pub mod mock;
 pub mod os_integration;
+
+/// User actions emitted by the native OS system tray (Windows 11 & Linux StatusNotifierItem).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TrayAction {
+    OpenUi,
+    ToggleLock,
+    Quit,
+}
 
 #[cfg(target_os = "linux")]
 pub mod linux_uinput;

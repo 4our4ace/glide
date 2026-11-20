@@ -3,480 +3,1000 @@
 <head>
 <meta charset="utf-8" />
 <meta name="viewport" content="width=device-width,initial-scale=1" />
-<title>Glide — Software KVM</title>
+<title>Glide KVM</title>
+<link rel="icon" type="image/svg+xml" href="/favicon.svg" />
+<link rel="icon" type="image/png" href="/favicon.png" />
 <style>
   :root {
-    --bg: #0c0f14;
-    --surface: #131822;
-    --surface-2: #19202d;
+    --bg: #0b0e14;
+    --surface: #121722;
+    --surface-2: #181f2e;
+    --surface-3: #1f283b;
+    --inset: #0d111a;
     --border: rgba(255, 255, 255, 0.08);
-    --border-strong: rgba(255, 255, 255, 0.16);
-    --text: #eef2f8;
-    --muted: #8b97ad;
+    --border-strong: rgba(255, 255, 255, 0.15);
+    --text: #f1f5f9;
+    --text-2: #cbd5e1;
+    --muted: #8896ab;
     --accent: #3b82f6;
+    --cyan: #06b6d4;
     --accent-soft: rgba(59, 130, 246, 0.16);
+    --accent-ring: rgba(59, 130, 246, 0.45);
     --green: #22c55e;
-    --green-soft: rgba(34, 197, 94, 0.15);
+    --green-soft: rgba(34, 197, 94, 0.14);
     --amber: #f59e0b;
     --amber-soft: rgba(245, 158, 11, 0.15);
     --red: #ef4444;
     --red-soft: rgba(239, 68, 68, 0.15);
     --radius: 12px;
-    --mono: ui-monospace, "Cascadia Code", "JetBrains Mono", Consolas, monospace;
-    --sans: "Inter", "Segoe UI Variable", "Segoe UI", system-ui, -apple-system, sans-serif;
+    --mono: "Cascadia Code", "JetBrains Mono", "Ubuntu Mono", ui-monospace, SFMono-Regular, Consolas, monospace;
+    --sans: "Segoe UI Variable", "Segoe UI", "Ubuntu", "Cantarell", "Noto Sans", system-ui, -apple-system, sans-serif;
   }
+
   * { box-sizing: border-box; }
+
   html, body {
-    margin: 0; padding: 0; height: 100%;
-    background: var(--bg); color: var(--text);
-    font-family: var(--sans); font-size: 13.5px; line-height: 1.45;
+    margin: 0;
+    padding: 0;
+    width: 100%;
+    height: 100vh;
+    overflow: hidden;
+    background:
+      radial-gradient(900px 320px at 50% -120px, rgba(59, 130, 246, 0.10), transparent 70%),
+      var(--bg);
+    color: var(--text);
+    font-family: var(--sans);
+    font-size: 12.5px;
+    line-height: 1.38;
     -webkit-font-smoothing: antialiased;
     user-select: none;
   }
-  .app {
-    max-width: 980px; margin: 0 auto; padding: 18px 20px 32px;
-    display: flex; flex-direction: column; gap: 16px;
-  }
-  /* Header */
-  .topbar {
-    display: flex; align-items: center; justify-content: space-between; gap: 12px;
-    background: var(--surface); border: 1px solid var(--border);
-    border-radius: 14px; padding: 12px 16px;
-  }
-  .brand { display: flex; align-items: center; gap: 11px; }
-  .logo {
-    width: 34px; height: 34px; border-radius: 10px;
-    background: linear-gradient(135deg, #3b82f6, #06b6d4);
-    display: grid; place-items: center; font-weight: 800; color: #fff; font-size: 16px;
-    box-shadow: 0 4px 16px rgba(59, 130, 246, 0.35);
-  }
-  .brand-title { font-weight: 700; font-size: 15.5px; letter-spacing: -0.01em; display: flex; align-items: center; gap: 8px; }
-  .ver { font-size: 11px; font-weight: 600; color: var(--muted); background: var(--surface-2); padding: 2px 7px; border-radius: 99px; border: 1px solid var(--border); }
-  .brand-sub { font-size: 12px; color: var(--muted); }
-  .top-actions { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
-  .pill {
-    display: inline-flex; align-items: center; gap: 7px;
-    padding: 6px 11px; border-radius: 99px; font-size: 12px; font-weight: 600;
-    background: var(--surface-2); border: 1px solid var(--border); color: var(--muted);
-  }
-  .pill.live { background: var(--green-soft); color: #86efac; border-color: rgba(34,197,94,0.3); }
-  .pill.wait { background: var(--amber-soft); color: #fcd34d; border-color: rgba(245,158,11,0.3); }
-  .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--muted); }
-  .pill.live .dot { background: var(--green); box-shadow: 0 0 8px var(--green); }
-  .pill.wait .dot { background: var(--amber); }
-  .rtt-box { display: inline-flex; align-items: center; gap: 6px; font-family: var(--mono); font-size: 11.5px; color: #93c5fd; background: var(--surface-2); border: 1px solid var(--border); border-radius: 99px; padding: 4px 10px; }
-  button {
-    font-family: inherit; font-size: 13px; font-weight: 600; cursor: pointer;
-    border-radius: 10px; border: 1px solid var(--border-strong);
-    background: var(--surface-2); color: var(--text); padding: 7px 13px;
-    transition: all 0.14s ease;
-  }
-  button:hover { background: #232c3d; border-color: rgba(255,255,255,0.24); }
-  button:active { transform: translateY(1px); }
-  button.primary { background: var(--accent); border-color: #60a5fa; color: #fff; }
-  button.primary:hover { background: #2563eb; }
-  button.danger { background: var(--red-soft); border-color: rgba(239,68,68,0.45); color: #fca5a5; }
-  button.danger:hover { background: rgba(239,68,68,0.28); }
-  button.locked { background: var(--amber-soft); border-color: rgba(245,158,11,0.5); color: #fde68a; }
-  button.sm { padding: 5px 10px; font-size: 12px; border-radius: 8px; }
 
-  /* Tabs */
+  /* Custom slim scrollbars ONLY for internal scrollable lists */
+  ::-webkit-scrollbar { width: 5px; height: 5px; }
+  ::-webkit-scrollbar-track { background: transparent; }
+  ::-webkit-scrollbar-thumb { background: rgba(255, 255, 255, 0.14); border-radius: 99px; }
+  ::-webkit-scrollbar-thumb:hover { background: rgba(255, 255, 255, 0.25); }
+
+  .app {
+    width: 100%;
+    max-width: 900px;
+    height: 100vh;
+    margin: 0 auto;
+    padding: 10px 14px 12px;
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+    overflow: hidden;
+  }
+
+  /* Topbar */
+  .topbar {
+    flex-shrink: 0;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 10px;
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 12px;
+    padding: 8px 12px;
+    box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.04);
+  }
+
+  .brand { display: flex; align-items: center; gap: 10px; min-width: 0; }
+  .logo-wrap {
+    width: 30px; height: 30px; flex-shrink: 0; border-radius: 8px;
+    box-shadow: 0 4px 14px rgba(59, 130, 246, 0.35);
+    display: grid; place-items: center;
+  }
+  .brand-text { min-width: 0; }
+  .brand-title {
+    font-weight: 700; font-size: 14.5px; letter-spacing: -0.015em;
+    display: flex; align-items: center; gap: 7px;
+  }
+  .ver {
+    font-size: 10px; font-weight: 600; color: var(--muted);
+    background: var(--surface-2); padding: 1px 6px; border-radius: 99px;
+    border: 1px solid var(--border); font-family: var(--mono);
+  }
+  .brand-sub {
+    font-size: 11px; color: var(--muted);
+    white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+  }
+
+  .top-actions { display: flex; align-items: center; gap: 7px; flex-shrink: 0; }
+
+  .rtt-box {
+    display: none; align-items: center; gap: 6px;
+    font-family: var(--mono); font-variant-numeric: tabular-nums;
+    font-size: 11px; font-weight: 600; color: #7dd3fc;
+    background: var(--inset); border: 1px solid var(--border);
+    border-radius: 99px; padding: 3px 9px; height: 28px;
+  }
+
+  .pill {
+    display: inline-flex; align-items: center; gap: 6px;
+    padding: 4px 10px; border-radius: 99px; height: 28px;
+    font-size: 11.5px; font-weight: 600;
+    background: var(--surface-2); border: 1px solid var(--border); color: var(--muted);
+    max-width: 245px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+  }
+  .pill span#statusText {
+    overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  }
+  .pill.live { background: var(--green-soft); color: #86efac; border-color: rgba(34, 197, 94, 0.32); }
+  .pill.wait { background: var(--amber-soft); color: #fcd34d; border-color: rgba(245, 158, 11, 0.32); }
+  .pill.err { background: var(--red-soft); color: #fca5a5; border-color: rgba(239, 68, 68, 0.35); }
+  .dot { width: 7px; height: 7px; border-radius: 50%; background: var(--muted); flex-shrink: 0; }
+  .pill.live .dot { background: var(--green); box-shadow: 0 0 8px var(--green); }
+  .pill.wait .dot { background: var(--amber); animation: pulse 1.5s ease-in-out infinite; }
+  .pill.err .dot { background: var(--red); }
+
+  @keyframes pulse {
+    0%, 100% { opacity: 1; }
+    50% { opacity: 0.4; }
+  }
+
+  button {
+    font-family: inherit; font-size: 12px; font-weight: 600; cursor: pointer;
+    border-radius: 8px; border: 1px solid var(--border-strong);
+    background: var(--surface-2); color: var(--text);
+    padding: 5px 11px; height: 28px;
+    display: inline-flex; align-items: center; justify-content: center; gap: 5px;
+    transition: background 0.14s ease, border-color 0.14s ease, transform 0.08s ease, color 0.14s ease;
+    white-space: nowrap;
+  }
+  button:hover { background: var(--surface-3); border-color: rgba(255, 255, 255, 0.24); }
+  button:active { transform: translateY(1px); }
+  button.primary {
+    background: linear-gradient(135deg, #3b82f6, #2563eb);
+    border-color: rgba(96, 165, 250, 0.65); color: #fff;
+    box-shadow: 0 2px 10px rgba(37, 99, 235, 0.28);
+  }
+  button.primary:hover { background: linear-gradient(135deg, #2563eb, #1d4ed8); }
+  button.danger { background: var(--red-soft); border-color: rgba(239, 68, 68, 0.45); color: #fca5a5; }
+  button.danger:hover { background: rgba(239, 68, 68, 0.26); }
+  button.locked { background: var(--amber-soft); border-color: rgba(245, 158, 11, 0.5); color: #fde68a; }
+  button.ghost { background: transparent; border-color: var(--border); color: var(--muted); }
+  button.ghost:hover { background: var(--surface-2); color: var(--text); }
+  button.quit-btn { padding: 5px 9px; color: var(--muted); border-color: var(--border); background: transparent; }
+  button.quit-btn:hover { color: #fca5a5; border-color: rgba(239, 68, 68, 0.4); background: rgba(239, 68, 68, 0.12); }
+  button.sm { padding: 3px 9px; font-size: 11.5px; height: 24px; border-radius: 7px; }
+  button.xs { padding: 2px 7px; font-size: 10.5px; height: 21px; border-radius: 6px; }
+  button:disabled { opacity: 0.45; cursor: not-allowed; }
+
+  /* Tabs Row */
+  .nav-row {
+    flex-shrink: 0;
+    display: flex; align-items: center; justify-content: space-between; gap: 10px;
+  }
   .tabs {
-    display: flex; gap: 6px; background: var(--surface); padding: 5px;
-    border-radius: 12px; border: 1px solid var(--border); width: fit-content;
+    display: inline-flex; gap: 4px; background: var(--surface); padding: 4px;
+    border-radius: 10px; border: 1px solid var(--border);
   }
   .tab {
     background: transparent; border: none; color: var(--muted);
-    padding: 7px 14px; border-radius: 8px; font-size: 13px; font-weight: 600;
+    padding: 5px 12px; height: 27px; border-radius: 7px; font-size: 12px; font-weight: 600;
   }
-  .tab:hover { color: var(--text); background: rgba(255,255,255,0.04); }
-  .tab.active { background: var(--surface-2); color: var(--text); box-shadow: inset 0 0 0 1px var(--border-strong); }
+  .tab:hover { color: var(--text); background: rgba(255, 255, 255, 0.04); }
+  .tab.active {
+    background: var(--surface-2); color: var(--text);
+    box-shadow: inset 0 0 0 1px var(--border-strong), 0 1px 4px rgba(0, 0, 0, 0.25);
+  }
 
-  .panel { display: none; flex-direction: column; gap: 14px; }
+  .nav-meta {
+    display: flex; align-items: center; gap: 8px; min-width: 0;
+  }
+  .hotkey-mini {
+    font-size: 11px; color: var(--muted); display: flex; align-items: center; gap: 6px;
+    white-space: nowrap;
+  }
+
+  /* Error alert banner */
+  .err-banner {
+    flex-shrink: 0;
+    display: none; align-items: center; justify-content: space-between; gap: 10px;
+    background: rgba(239, 68, 68, 0.12); border: 1px solid rgba(239, 68, 68, 0.35);
+    color: #fecaca; border-radius: 9px; padding: 5px 10px; font-size: 11.5px;
+  }
+  .err-banner.show { display: flex; }
+
+  /* Main Tab Panels */
+  .panel {
+    display: none;
+    flex: 1;
+    min-height: 0;
+    flex-direction: column;
+    gap: 10px;
+  }
   .panel.active { display: flex; }
 
-  .grid-2 { display: grid; grid-template-columns: 1.15fr 1fr; gap: 14px; }
-  @media (max-width: 780px) { .grid-2 { grid-template-columns: 1fr; } }
+  .grid-desk {
+    flex: 1; min-height: 0;
+    display: grid; grid-template-columns: 1.24fr 1fr; gap: 10px;
+    align-items: stretch;
+  }
+  .grid-2 {
+    flex: 1; min-height: 0;
+    display: grid; grid-template-columns: 1fr 1fr; gap: 10px;
+    align-items: stretch;
+  }
+  .col-stack {
+    min-height: 0;
+    display: flex; flex-direction: column; gap: 10px;
+  }
 
   .card {
-    background: var(--surface); border: 1px solid var(--border);
-    border-radius: var(--radius); padding: 16px;
-    display: flex; flex-direction: column; gap: 12px;
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    padding: 11px 13px;
+    display: flex; flex-direction: column; gap: 8px;
+    min-height: 0;
+    box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.03);
   }
-  .card-hdr { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
-  .card-title { font-size: 13.5px; font-weight: 700; letter-spacing: -0.01em; }
-  .card-sub { font-size: 12px; color: var(--muted); }
+  .card.grow { flex: 1; min-height: 0; }
+  .card-hdr { display: flex; align-items: center; justify-content: space-between; gap: 8px; flex-shrink: 0; }
+  .card-title { font-size: 13px; font-weight: 700; letter-spacing: -0.01em; display: flex; align-items: center; gap: 6px; }
+  .card-sub { font-size: 11px; color: var(--muted); }
 
-  /* Segmented role selector */
+  /* Segmented Role Control */
   .seg {
-    display: grid; grid-template-columns: 1fr 1fr; gap: 6px;
-    background: var(--bg); padding: 4px; border-radius: 10px; border: 1px solid var(--border);
+    flex-shrink: 0;
+    display: grid; grid-template-columns: 1fr 1fr; gap: 5px;
+    background: var(--inset); padding: 4px; border-radius: 10px; border: 1px solid var(--border);
   }
   .seg button {
+    height: auto; padding: 6px 9px; border-radius: 7px;
     background: transparent; border: 1px solid transparent; color: var(--muted);
-    padding: 8px 10px; border-radius: 8px; display: flex; flex-direction: column; align-items: flex-start; gap: 2px;
+    display: flex; flex-direction: column; align-items: flex-start; gap: 1px;
+    text-align: left;
   }
-  .seg button span.small { font-size: 11px; font-weight: 400; color: var(--muted); }
+  .seg button strong { font-size: 11.5px; font-weight: 700; color: inherit; }
+  .seg button span.small { font-size: 10px; font-weight: 400; color: var(--muted); }
+  .seg button:hover { background: rgba(255, 255, 255, 0.03); color: var(--text-2); }
   .seg button.active {
-    background: var(--surface-2); border-color: rgba(59,130,246,0.55); color: var(--text);
+    background: var(--surface-2); border-color: rgba(59, 130, 246, 0.55); color: var(--text);
+    box-shadow: 0 2px 8px rgba(0, 0, 0, 0.25), inset 0 1px 0 rgba(255, 255, 255, 0.06);
   }
 
-  /* Interactive Edge Map */
-  .edge-stage {
+  /* Visual Desk Layout Canvas (1 square per machine!) */
+  .desk-stage {
+    flex: 1; min-height: 240px;
+    background:
+      radial-gradient(circle at 50% 50%, rgba(59, 130, 246, 0.06), transparent 65%),
+      radial-gradient(rgba(255, 255, 255, 0.055) 1px, transparent 1px);
+    background-size: 100% 100%, 16px 16px;
+    background-color: var(--inset);
+    border: 1px solid var(--border);
+    border-radius: 11px;
+    padding: 9px;
     display: grid;
-    grid-template-columns: 78px 1fr 78px;
-    grid-template-rows: 42px 150px 42px;
-    gap: 8px; align-items: stretch; justify-items: stretch;
+    grid-template-columns: 128px 1fr 128px;
+    grid-template-rows: 66px 1fr 66px;
+    gap: 8px;
+    align-items: stretch;
+    justify-items: stretch;
+    position: relative;
   }
+
   .edge-slot {
-    border: 1px dashed var(--border-strong); border-radius: 10px;
-    background: rgba(255,255,255,0.02); color: var(--muted);
+    border: 1px dashed rgba(255, 255, 255, 0.13);
+    border-radius: 10px;
+    background: rgba(255, 255, 255, 0.015);
+    color: var(--muted);
     display: flex; flex-direction: column; align-items: center; justify-content: center;
-    font-size: 11.5px; font-weight: 600; cursor: pointer; transition: all 0.14s ease;
-    padding: 4px; text-align: center;
+    cursor: pointer;
+    transition: border-color 0.14s ease, background 0.14s ease, transform 0.14s ease, box-shadow 0.14s ease;
+    position: relative;
+    overflow: hidden;
+    padding: 0;
   }
-  .edge-slot:hover { border-color: var(--accent); color: var(--text); background: var(--accent-soft); }
-  .edge-slot.selected {
-    border-style: solid; border-color: var(--accent);
-    background: var(--accent-soft); color: #bfdbfe;
+  .edge-slot:hover {
+    border-color: rgba(59, 130, 246, 0.6);
+    background: rgba(59, 130, 246, 0.08);
+    color: var(--text);
   }
-  .edge-slot.connected {
-    border-style: solid; border-color: var(--green);
-    background: var(--green-soft); color: #bbf7d0;
+  .edge-slot.occupied {
+    border-style: solid;
+    border-color: transparent;
+    background: transparent;
   }
-  .edge-top { grid-column: 2; grid-row: 1; }
+  .edge-slot.drop-over {
+    border-style: dashed !important;
+    border-color: var(--cyan) !important;
+    background: rgba(6, 182, 212, 0.16) !important;
+    box-shadow: 0 0 0 2px rgba(6, 182, 212, 0.25);
+    transform: scale(1.02);
+  }
+  .edge-top { grid-column: 1 / -1; grid-row: 1; justify-self: center; width: 256px; }
   .edge-left { grid-column: 1; grid-row: 2; }
-  .edge-center {
-    grid-column: 2; grid-row: 2;
-    background: var(--bg); border: 1px solid var(--border); border-radius: 10px;
-    position: relative; overflow: hidden; display: flex; align-items: center; justify-content: center;
-  }
+  .edge-center { grid-column: 2; grid-row: 2; display: flex; align-items: stretch; justify-content: stretch; }
   .edge-right { grid-column: 3; grid-row: 2; }
-  .edge-bottom { grid-column: 2; grid-row: 3; }
+  .edge-bottom { grid-column: 1 / -1; grid-row: 3; justify-self: center; width: 256px; }
 
-  /* Devices radar */
-  .device-list { display: flex; flex-direction: column; gap: 8px; }
-  .device {
-    display: flex; align-items: center; justify-content: space-between; gap: 10px;
-    background: var(--surface-2); border: 1px solid var(--border);
-    border-radius: 10px; padding: 10px 12px;
+  .slot-empty {
+    display: flex; flex-direction: column; align-items: center; justify-content: center;
+    gap: 2px; font-size: 11px; font-weight: 600; color: var(--muted);
+    pointer-events: none; padding: 4px;
   }
-  .dev-name { font-weight: 700; font-size: 13px; display: flex; align-items: center; gap: 7px; }
+  .edge-top .slot-empty, .edge-bottom .slot-empty { flex-direction: row; gap: 6px; }
+  .slot-empty .slot-sub { font-size: 9.5px; font-weight: 500; opacity: 0.7; }
+
+  /* Single Machine Tile (1 square/card per PC) */
+  .machine-tile {
+    width: 100%; height: 100%;
+    border-radius: 10px;
+    background: linear-gradient(180deg, #1b2334, #141a28);
+    border: 1px solid var(--border-strong);
+    box-shadow: 0 4px 14px rgba(0, 0, 0, 0.3), inset 0 1px 0 rgba(255, 255, 255, 0.08);
+    display: flex; flex-direction: column; align-items: center; justify-content: center;
+    gap: 4px; padding: 7px 8px;
+    position: relative;
+    transition: border-color 0.16s ease, box-shadow 0.16s ease, transform 0.12s ease;
+    overflow: hidden;
+  }
+  .machine-tile.center-tile {
+    border-radius: 11px;
+    padding: 10px 12px;
+    cursor: pointer;
+  }
+  .machine-tile.draggable { cursor: grab; }
+  .machine-tile.draggable:active { cursor: grabbing; }
+  .machine-tile.dragging { opacity: 0.45; transform: scale(0.97); }
+  .machine-tile.selected-peer { border-color: rgba(59, 130, 246, 0.6); }
+
+  /* Active cursor focus glow */
+  .machine-tile.focused {
+    border-color: rgba(34, 197, 94, 0.78);
+    background: linear-gradient(180deg, rgba(34, 197, 94, 0.14), rgba(20, 26, 40, 0.96));
+    box-shadow:
+      0 0 0 1px rgba(34, 197, 94, 0.35),
+      0 0 22px rgba(34, 197, 94, 0.22),
+      inset 0 1px 0 rgba(255, 255, 255, 0.12);
+  }
+  .machine-tile.dimmed {
+    opacity: 0.72;
+    border-style: dashed;
+  }
+
+  /* Horizontal adaptation inside Top / Bottom edge slots */
+  .edge-top .machine-tile,
+  .edge-bottom .machine-tile {
+    flex-direction: row;
+    justify-content: space-between;
+    align-items: center;
+    padding: 7px 11px;
+    gap: 8px;
+    text-align: left;
+  }
+  .tile-main {
+    display: flex; flex-direction: column; align-items: center; gap: 3px; min-width: 0; max-width: 100%;
+  }
+  .edge-top .tile-main,
+  .edge-bottom .tile-main {
+    align-items: flex-start;
+    flex: 1;
+    gap: 4px;
+  }
+  .edge-top .tile-top-row,
+  .edge-bottom .tile-top-row {
+    justify-content: flex-start;
+    flex-wrap: nowrap;
+  }
+  .tile-actions {
+    display: flex; align-items: center; justify-content: center; gap: 4px; flex-wrap: wrap; flex-shrink: 0;
+  }
+  .edge-top .tile-actions,
+  .edge-bottom .tile-actions {
+    flex-direction: column; align-items: flex-end; gap: 3px;
+  }
+
+  .tile-name {
+    font-size: 11.5px; font-weight: 700; color: var(--text);
+    white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 100%;
+  }
+  .center-tile .tile-name { font-size: 12.5px; }
+  .tile-top-row { display: flex; align-items: center; gap: 5px; flex-wrap: wrap; justify-content: center; }
+
+  .os-pill {
+    display: inline-flex; align-items: center; gap: 4px;
+    font-size: 10px; font-weight: 600;
+    padding: 1.5px 6px; border-radius: 99px;
+    background: rgba(255, 255, 255, 0.08); color: var(--text-2);
+    border: 1px solid rgba(255, 255, 255, 0.08);
+    white-space: nowrap; flex-shrink: 0;
+  }
+  .os-pill.win { background: rgba(59, 130, 246, 0.16); color: #93c5fd; border-color: rgba(59, 130, 246, 0.3); }
+  .os-pill.lin { background: rgba(245, 158, 11, 0.14); color: #fcd34d; border-color: rgba(245, 158, 11, 0.28); }
+  .os-pill.mac { background: rgba(148, 163, 184, 0.16); color: #e2e8f0; }
+
+  .rtt-pill {
+    font-family: var(--mono); font-variant-numeric: tabular-nums;
+    font-size: 10px; font-weight: 700;
+    padding: 1.5px 6px; border-radius: 99px;
+    background: rgba(34, 197, 94, 0.15); color: #86efac;
+    border: 1px solid rgba(34, 197, 94, 0.3);
+    white-space: nowrap; flex-shrink: 0;
+  }
+  .focus-chip {
+    display: inline-flex; align-items: center; gap: 4px;
+    font-size: 9.5px; font-weight: 700; letter-spacing: 0.03em; text-transform: uppercase;
+    color: #86efac;
+  }
+  .focus-chip .pulse-dot {
+    width: 6px; height: 6px; border-radius: 50%; background: var(--green);
+    box-shadow: 0 0 8px var(--green);
+  }
+  .role-chip {
+    font-size: 9.5px; font-weight: 700; letter-spacing: 0.03em; text-transform: uppercase;
+    color: #93c5fd; background: rgba(59, 130, 246, 0.15);
+    padding: 1px 6px; border-radius: 99px; border: 1px solid rgba(59, 130, 246, 0.25);
+  }
+
+  .stage-hint {
+    flex-shrink: 0;
+    display: flex; align-items: center; justify-content: space-between; gap: 8px;
+    font-size: 11px; color: var(--muted);
+    padding: 0 2px;
+  }
+
+  /* Badges & Tags */
   .badge {
-    font-size: 10.5px; font-weight: 600; padding: 2px 7px; border-radius: 99px;
-    background: rgba(255,255,255,0.07); color: var(--muted); text-transform: uppercase;
+    font-size: 10px; font-weight: 700; padding: 2px 7px; border-radius: 99px;
+    background: rgba(255, 255, 255, 0.07); color: var(--text-2);
+    border: 1px solid var(--border); letter-spacing: 0.02em;
+    white-space: nowrap;
   }
-  .dev-meta { font-family: var(--mono); font-size: 11px; color: var(--muted); }
+  .badge.live { background: var(--green-soft); color: #86efac; border-color: rgba(34, 197, 94, 0.3); }
+  .badge.accent { background: var(--accent-soft); color: #93c5fd; border-color: rgba(59, 130, 246, 0.3); }
 
-  /* Drop zone */
-  .dropzone {
-    border: 1.5px dashed var(--border-strong); border-radius: 10px;
-    padding: 18px 14px; text-align: center; color: var(--muted);
-    background: rgba(255,255,255,0.015); transition: all 0.14s ease; cursor: pointer;
+  /* Right column lists */
+  .ip-bar {
+    flex-shrink: 0;
+    display: flex; align-items: center; justify-content: space-between; gap: 8px;
+    background: var(--inset); border: 1px solid var(--border);
+    border-radius: 8px; padding: 5px 9px;
   }
+  .ip-text {
+    font-family: var(--mono); font-size: 11.5px; color: #cbd5e1;
+    white-space: nowrap; overflow: hidden; text-overflow: ellipsis; user-select: text;
+  }
+
+  .scroll-list {
+    flex: 1; min-height: 0; overflow-y: auto;
+    display: flex; flex-direction: column; gap: 6px;
+    padding-right: 2px;
+  }
+
+  .device {
+    display: flex; align-items: center; justify-content: space-between; gap: 8px;
+    background: var(--surface-2); border: 1px solid var(--border);
+    border-radius: 9px; padding: 7px 10px; flex-shrink: 0;
+  }
+  .device:hover { border-color: var(--border-strong); }
+  .dev-name { font-weight: 700; font-size: 12px; display: flex; align-items: center; gap: 6px; }
+  .dev-meta { font-family: var(--mono); font-size: 10.5px; color: var(--muted); }
+
+  .edge-pills { display: grid; grid-template-columns: repeat(4, 1fr); gap: 5px; }
+  .edge-pill {
+    height: 25px; font-size: 11px; font-weight: 600; border-radius: 7px;
+    background: var(--inset); border: 1px solid var(--border); color: var(--muted);
+  }
+  .edge-pill.active {
+    background: var(--accent-soft); border-color: rgba(59, 130, 246, 0.6); color: #bfdbfe;
+  }
+
+  /* File Drop Zone */
+  .dropzone {
+    flex-shrink: 0;
+    border: 1.5px dashed var(--border-strong); border-radius: 9px;
+    padding: 10px 12px; text-align: center; color: var(--muted);
+    background: var(--inset); transition: all 0.14s ease; cursor: pointer;
+    font-size: 11.5px; display: flex; align-items: center; justify-content: center; gap: 8px;
+  }
+  .dropzone:hover { border-color: rgba(59, 130, 246, 0.5); color: var(--text-2); }
   .dropzone.over { border-color: var(--accent); background: var(--accent-soft); color: var(--text); }
 
-  /* Form controls */
-  .row { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
-  .field { display: flex; flex-direction: column; gap: 5px; }
-  .field label { font-size: 12px; color: var(--muted); font-weight: 600; display: flex; justify-content: space-between; }
+  /* Form controls & Sliders */
+  .row { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
+  .field { display: flex; flex-direction: column; gap: 3px; }
+  .field label {
+    font-size: 11.5px; color: var(--muted); font-weight: 600;
+    display: flex; justify-content: space-between; align-items: center;
+  }
+  .mono-val { font-family: var(--mono); font-variant-numeric: tabular-nums; color: #93c5fd; font-size: 11px; }
+
   input[type="text"], input[type="number"], select {
-    background: var(--bg); color: var(--text); border: 1px solid var(--border-strong);
-    border-radius: 8px; padding: 7px 10px; font-family: inherit; font-size: 13px; width: 100%;
+    background: var(--inset); color: var(--text); border: 1px solid var(--border-strong);
+    border-radius: 7px; padding: 5px 9px; height: 28px;
+    font-family: inherit; font-size: 12px; width: 100%; outline: none;
+    transition: border-color 0.14s ease;
   }
-  input[type="range"] { width: 100%; accent-color: var(--accent); cursor: pointer; }
+  input[type="text"]:focus, input[type="number"]:focus, select:focus {
+    border-color: var(--accent);
+  }
+  input[type="range"] {
+    width: 100%; margin: 1px 0; height: 15px; accent-color: var(--accent); cursor: pointer;
+  }
+
+  .toggle-grid-2 { display: grid; grid-template-columns: 1fr 1fr; gap: 7px; }
+
   .toggle {
-    display: flex; align-items: center; justify-content: space-between; gap: 12px;
-    padding: 8px 10px; background: var(--surface-2); border: 1px solid var(--border); border-radius: 9px;
+    display: flex; align-items: center; justify-content: space-between; gap: 8px;
+    padding: 6px 9px; background: var(--surface-2); border: 1px solid var(--border);
+    border-radius: 8px; flex-shrink: 0;
   }
-  .toggle-label { font-weight: 600; font-size: 12.5px; }
-  .toggle-desc { font-size: 11.5px; color: var(--muted); }
-  .switch {
-    position: relative; width: 38px; height: 22px; flex-shrink: 0;
-  }
+  .toggle-label { font-weight: 600; font-size: 11.5px; color: var(--text); }
+  .toggle-desc { font-size: 10.5px; color: var(--muted); line-height: 1.25; }
+
+  .switch { position: relative; width: 34px; height: 19px; flex-shrink: 0; }
   .switch input { opacity: 0; width: 0; height: 0; }
   .slider {
-    position: absolute; inset: 0; background: #2d3748; border-radius: 99px; transition: .16s; cursor: pointer;
+    position: absolute; inset: 0; background: #2d3748; border-radius: 99px;
+    transition: .16s; cursor: pointer; border: 1px solid rgba(255, 255, 255, 0.06);
   }
   .slider:before {
-    content: ""; position: absolute; width: 16px; height: 16px; left: 3px; top: 3px;
+    content: ""; position: absolute; width: 13px; height: 13px; left: 2px; top: 2px;
     background: #fff; border-radius: 50%; transition: .16s;
   }
   .switch input:checked + .slider { background: var(--accent); }
-  .switch input:checked + .slider:before { transform: translateX(16px); }
+  .switch input:checked + .slider:before { transform: translateX(15px); }
 
   .mono-box {
-    font-family: var(--mono); font-size: 11.5px; background: var(--bg);
-    border: 1px solid var(--border); border-radius: 8px; padding: 8px 10px;
-    word-break: break-all; user-select: text; color: #cbd5e1;
+    font-family: var(--mono); font-size: 11px; background: var(--inset);
+    border: 1px solid var(--border); border-radius: 8px; padding: 7px 9px;
+    word-break: break-all; user-select: text; color: #cbd5e1; line-height: 1.45;
   }
-  .toast {
-    position: fixed; bottom: 18px; right: 18px; z-index: 99;
-    background: #1e293b; border: 1px solid var(--border-strong); color: var(--text);
-    padding: 10px 14px; border-radius: 10px; font-size: 12.5px; font-weight: 600;
-    box-shadow: 0 10px 30px rgba(0,0,0,0.45); opacity: 0; pointer-events: none; transition: opacity .18s;
-  }
-  .toast.show { opacity: 1; }
-  .kbd {
-    font-family: var(--mono); font-size: 11px; padding: 2px 6px; border-radius: 5px;
-    background: var(--bg); border: 1px solid var(--border-strong); color: #cbd5e1;
-  }
+
   .list-item {
+    display: flex; align-items: center; justify-content: space-between; gap: 8px;
+    background: var(--inset); border: 1px solid var(--border);
+    border-radius: 8px; padding: 6px 9px; flex-shrink: 0;
+  }
+
+  .kbd {
+    font-family: var(--mono); font-size: 10.5px; padding: 1.5px 5px; border-radius: 5px;
+    background: var(--surface-2); border: 1px solid var(--border-strong); color: #e2e8f0;
+  }
+
+  .toast {
+    position: fixed; bottom: 14px; right: 14px; z-index: 99;
+    background: #1a2335; border: 1px solid rgba(96, 165, 250, 0.35); color: var(--text);
+    padding: 8px 13px; border-radius: 9px; font-size: 12px; font-weight: 600;
+    box-shadow: 0 10px 30px rgba(0, 0, 0, 0.5);
+    opacity: 0; transform: translateY(6px); pointer-events: none;
+    transition: opacity 0.18s ease, transform 0.18s ease;
+  }
+  .toast.show { opacity: 1; transform: translateY(0); }
+
+  .empty-state {
+    flex: 1; display: flex; flex-direction: column; align-items: center; justify-content: center;
+    text-align: center; color: var(--muted); font-size: 11.5px; padding: 10px; gap: 4px;
+  }
+
+  .shortcut-row {
     display: flex; align-items: center; justify-content: space-between; gap: 10px;
-    background: var(--bg); border: 1px solid var(--border); border-radius: 8px; padding: 8px 10px;
+    padding: 6px 9px; background: var(--inset); border: 1px solid var(--border);
+    border-radius: 8px; font-size: 11.5px;
   }
 </style>
 </head>
 <body>
 <div class="app">
   <!-- Top Bar -->
-  <div class="topbar">
+  <header class="topbar">
     <div class="brand">
-      <div class="logo">G</div>
-      <div>
-        <div class="brand-title">Glide <span class="ver">v0.2</span></div>
-        <div class="brand-sub" id="osLabel">Software KVM over QUIC</div>
+      <div class="logo-wrap" aria-hidden="true">
+        <svg width="30" height="30" viewBox="0 0 64 64">
+          <defs>
+            <linearGradient id="glideLogoGrad" x1="0" y1="0" x2="1" y2="1">
+              <stop offset="0%" stop-color="#3b82f6"/>
+              <stop offset="100%" stop-color="#06b6d4"/>
+            </linearGradient>
+          </defs>
+          <rect x="2" y="2" width="60" height="60" rx="16" fill="url(#glideLogoGrad)"/>
+          <path d="M44 33H32v-6h18v15c0 4-3 8-8 9-4 1-9 1-14-1-8-3-13-11-12-20 1-10 9-17 19-17 6 0 11 2 14 6l-5 4c-2-3-5-4-9-4-7 0-12 5-12 11 0 7 5 12 12 12 4 0 7-1 9-3v-6z" fill="#ffffff"/>
+        </svg>
+      </div>
+      <div class="brand-text">
+        <div class="brand-title">Glide KVM <span class="ver">v0.2</span></div>
+        <div class="brand-sub" id="osLabel">Connecting to local runtime&hellip;</div>
       </div>
     </div>
+
     <div class="top-actions">
-      <div class="rtt-box" id="rttBox" style="display:none;">
+      <div class="rtt-box" id="rttBox" title="Live QUIC round-trip latency">
         <span id="rttVal">0.0 ms</span>
-        <svg id="rttSpark" width="54" height="16" viewBox="0 0 54 16"></svg>
+        <svg id="rttSpark" width="46" height="14" viewBox="0 0 46 14"></svg>
       </div>
       <div class="pill" id="statusPill"><span class="dot"></span><span id="statusText">Idle</span></div>
-      <button id="lockBtn" title="Ctrl+Alt+L">Lock Cursor</button>
-      <button id="startStopBtn" class="primary">Start</button>
+      <button id="lockBtn" title="Toggle cursor lock to active screen (Ctrl+Alt+L)">
+        <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="11" width="18" height="11" rx="2"/><path d="M7 11V7a5 5 0 0 1 10 0v4"/></svg>
+        <span id="lockBtnText">Lock</span>
+      </button>
+      <button id="startStopBtn" class="primary">Start Server</button>
+      <button id="quitBtn" class="quit-btn" title="Quit Glide completely">
+        <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M18.36 6.64a9 9 0 1 1-12.73 0"/><line x1="12" y1="2" x2="12" y2="12"/></svg>
+        <span>Quit</span>
+      </button>
+    </div>
+  </header>
+
+  <!-- Navigation Tabs + Quick Hints -->
+  <div class="nav-row">
+    <nav class="tabs" role="tablist">
+      <button class="tab active" data-tab="overview">Desk &amp; Connection</button>
+      <button class="tab" data-tab="tuning">Feel &amp; Clipboard</button>
+      <button class="tab" data-tab="system">System &amp; Security</button>
+    </nav>
+    <div class="nav-meta">
+      <div class="hotkey-mini">
+        <span><span class="kbd">Ctrl+Alt+Arrows</span> jump</span>
+        <span>&middot;</span>
+        <span><span class="kbd">ScrollLock</span> return</span>
+      </div>
     </div>
   </div>
 
-  <!-- Navigation Tabs -->
-  <div class="tabs">
-    <button class="tab active" data-tab="overview">Overview &amp; Layout</button>
-    <button class="tab" data-tab="tuning">Feel &amp; Input</button>
-    <button class="tab" data-tab="system">Clipboard &amp; System</button>
+  <!-- Compact Error Alert (hidden unless last_error is present) -->
+  <div class="err-banner" id="errBanner">
+    <span id="errText" style="white-space:nowrap;overflow:hidden;text-overflow:ellipsis;"></span>
+    <button class="xs ghost" id="errDismissBtn">Dismiss</button>
   </div>
 
-  <!-- TAB 1: Overview & Layout -->
-  <div class="panel active" id="tab-overview">
-    <div class="grid-2">
-      <!-- Role + Interactive Edge Layout -->
+  <!-- TAB 1: Desk & Connection -->
+  <section class="panel active" id="tab-overview">
+    <div class="grid-desk">
+      <!-- Left: Role + 1-Square-Per-Machine Interactive Desk Layout -->
       <div class="card">
-        <div class="card-hdr">
-          <div>
-            <div class="card-title">Role &amp; Screen Arrangement</div>
-            <div class="card-sub" id="layoutHint">Choose whether this machine shares or receives input</div>
-          </div>
-          <span class="badge" id="activeTargetBadge">Focus: Local</span>
-        </div>
-
         <div class="seg">
           <button id="roleServerBtn" class="active">
-            <strong>Primary (Server)</strong>
-            <span class="small">Physical mouse &amp; keyboard here</span>
+            <strong>Server (Share Input)</strong>
+            <span class="small">Main PC controlling connected screens</span>
           </button>
           <button id="roleClientBtn">
-            <strong>Secondary (Client)</strong>
-            <span class="small">Controlled by Primary over LAN</span>
+            <strong>Client (Receive Input)</strong>
+            <span class="small">Controlled over LAN by Primary</span>
           </button>
         </div>
 
-        <div class="edge-stage">
-          <div class="edge-slot edge-top" data-edge="top">Top</div>
-          <div class="edge-slot edge-left" data-edge="left">Left</div>
-          <div class="edge-center" id="monitorCanvas">
-            <span class="card-sub">Detecting monitors...</span>
-          </div>
-          <div class="edge-slot edge-right" data-edge="right">Right</div>
-          <div class="edge-slot edge-bottom" data-edge="bottom">Bottom</div>
-        </div>
-
-        <div class="row" id="serverQuickBar">
-          <span class="card-sub">Hotkeys: <span class="kbd">ScrollLock</span> escape &middot; <span class="kbd">Ctrl+Alt+Arrows</span> jump &middot; <span class="kbd">Ctrl+Alt+L</span> lock</span>
-        </div>
-      </div>
-
-      <!-- LAN Radar + File Beam -->
-      <div style="display:flex; flex-direction:column; gap:14px;">
-        <div class="card">
-          <div class="card-hdr">
-            <div>
-              <div class="card-title">LAN Auto-Discovery</div>
-              <div class="card-sub">LocalSend-style zero-IP detection on your network</div>
-            </div>
-            <button class="sm" id="scanBtn">Scan LAN</button>
-          </div>
-          <div class="device-list" id="deviceList">
-            <div class="card-sub">Click <b>Scan LAN</b> or start <b>Primary (Server)</b> on your main PC.</div>
-          </div>
-          <div id="clientManualAddr" class="field" style="display:none; margin-top:4px;">
-            <label>Optional Manual Server IP:Port (leave empty for auto-discovery)</label>
-            <input type="text" id="manualServerInput" placeholder="Auto-discover on LAN (e.g. 192.168.1.42:24800)" />
-          </div>
-        </div>
-
-        <div class="card">
-          <div class="card-hdr">
-            <div>
-              <div class="card-title">Instant File Drop (QUIC)</div>
-              <div class="card-sub">Drop any file to send directly to the peer's Downloads/Glide folder</div>
-            </div>
-          </div>
-          <div class="dropzone" id="dropzone">
-            Drop files here or <b>click to choose</b>
-            <input type="file" id="fileInput" style="display:none" multiple />
-          </div>
-          <div id="recentFiles" style="display:flex; flex-direction:column; gap:6px;"></div>
-        </div>
-      </div>
-    </div>
-  </div>
-
-  <!-- TAB 2: Feel & Input -->
-  <div class="panel" id="tab-tuning">
-    <div class="grid-2">
-      <div class="card">
-        <div class="card-title">Mouse &amp; Scroll Feel (Hot-Reloads Live)</div>
-
-        <div class="field">
-          <label><span>Client Mouse Sensitivity</span><span class="mono" id="sensVal">1.00x</span></label>
-          <input type="range" id="sensSlider" min="0.25" max="3.0" step="0.05" value="1.0" />
-        </div>
-
-        <div class="field">
-          <label><span>Scroll Speed</span><span class="mono" id="scrollVal">1.00x</span></label>
-          <input type="range" id="scrollSlider" min="0.25" max="3.0" step="0.05" value="1.0" />
-        </div>
-
-        <div class="toggle">
-          <div>
-            <div class="toggle-label">Auto-DPI Scale Matching</div>
-            <div class="toggle-desc">Automatically normalize pointer speed across mixed HiDPI displays</div>
-          </div>
-          <label class="switch"><input type="checkbox" id="autoDpiToggle"><span class="slider"></span></label>
-        </div>
-
-        <div class="toggle">
-          <div>
-            <div class="toggle-label">Natural (Inverted) Scroll</div>
-            <div class="toggle-desc">Invert vertical &amp; horizontal scroll wheel direction on client</div>
-          </div>
-          <label class="switch"><input type="checkbox" id="invertScrollToggle"><span class="slider"></span></label>
-        </div>
-
-        <div class="field" id="linuxBackendField">
-          <label>Linux Client Input Injection Backend</label>
-          <select id="inputBackendSelect">
-            <option value="auto">Auto / XTest (zero setup, works immediately)</option>
-            <option value="uinput">/dev/uinput Hardware-Native HID (native libinput accel + hi-res scroll)</option>
-          </select>
-        </div>
-      </div>
-
-      <div class="card">
-        <div class="card-title">Edge Switching, Safety &amp; Keyboard</div>
-
-        <div class="field">
-          <label><span>Edge Push Threshold</span><span id="threshVal">4 px</span></label>
-          <input type="range" id="threshSlider" min="1" max="24" step="1" value="4" />
-        </div>
-
-        <div class="field">
-          <label><span>Dead-Corner Guard (protects close X &amp; taskbar)</span><span id="deadCornerVal">24 px</span></label>
-          <input type="range" id="deadCornerSlider" min="0" max="80" step="4" value="24" />
-        </div>
-
-        <div class="field">
-          <label><span>Edge Dwell Delay</span><span id="dwellVal">0 ms</span></label>
-          <input type="range" id="dwellSlider" min="0" max="200" step="10" value="0" />
-        </div>
-
-        <div class="toggle">
-          <div>
-            <div class="toggle-label">Auto-Lock Fullscreen Apps &amp; Games</div>
-            <div class="toggle-desc">Pause edge switching while a fullscreen window has focus</div>
-          </div>
-          <label class="switch"><input type="checkbox" id="fullscreenLockToggle" checked><span class="slider"></span></label>
-        </div>
-
-        <div class="toggle">
-          <div>
-            <div class="toggle-label">Sync CapsLock &amp; NumLock</div>
-            <div class="toggle-desc">Match lock key LEDs automatically when entering a screen</div>
-          </div>
-          <label class="switch"><input type="checkbox" id="syncLockToggle" checked><span class="slider"></span></label>
-        </div>
-      </div>
-    </div>
-
-    <!-- Key Remapping -->
-    <div class="card">
-      <div class="card-hdr">
-        <div>
-          <div class="card-title">Per-Client Physical Key Remapping</div>
-          <div class="card-sub">German AltGr &amp; ISO &lt; &gt; | work natively out of the box — add custom remaps below if desired</div>
-        </div>
-        <button class="sm" id="addRemapPresetBtn">+ CapsLock &rarr; Ctrl</button>
-      </div>
-      <div id="remapList" style="display:flex; flex-direction:column; gap:6px;"></div>
-      <div class="row" style="gap:8px;">
-        <input type="text" id="remapFrom" placeholder="From HID key (e.g. CapsLock, MetaLeft)" />
-        <input type="text" id="remapTo" placeholder="To HID key (e.g. ControlLeft, AltLeft)" />
-        <button class="sm primary" id="addRemapBtn">Add Rule</button>
-      </div>
-    </div>
-  </div>
-
-  <!-- TAB 3: Clipboard & System -->
-  <div class="panel" id="tab-system">
-    <div class="grid-2">
-      <div class="card">
         <div class="card-hdr">
           <div>
-            <div class="card-title">Bidirectional Clipboard &amp; History</div>
-            <div class="card-sub">UTF-8 text + PNG/CF_DIB screenshots (lazy transfer &gt; 256 KB)</div>
+            <div class="card-title">Desk Layout</div>
           </div>
+          <span class="badge accent" id="activeTargetBadge">Focus: Local</span>
         </div>
-        <div class="toggle">
-          <div>
-            <div class="toggle-label">Enable Clipboard Sync</div>
-            <div class="toggle-desc">Sync text &amp; screenshots over independent QUIC streams</div>
-          </div>
-          <label class="switch"><input type="checkbox" id="clipToggle" checked><span class="slider"></span></label>
+
+        <div class="desk-stage" id="deskStage">
+          <div class="edge-slot edge-top" data-edge="top"></div>
+          <div class="edge-slot edge-left" data-edge="left"></div>
+          <div class="edge-center" id="centerStage"></div>
+          <div class="edge-slot edge-right" data-edge="right"></div>
+          <div class="edge-slot edge-bottom" data-edge="bottom"></div>
         </div>
-        <div id="clipHistory" style="display:flex; flex-direction:column; gap:6px;">
-          <div class="card-sub">Synced clipboard items will appear here with one-click re-send.</div>
+
+        <div class="stage-hint">
+          <span id="layoutHint">Click or drag a machine to any edge to reposition live</span>
         </div>
       </div>
 
-      <div class="card">
-        <div class="card-title">Security, OS Integration &amp; Diagnostics</div>
-
-        <div class="field">
-          <label><span>TLS 1.3 Ed25519 Fingerprint</span><button class="sm" id="copyFpBtn">Copy</button></label>
-          <div class="mono-box" id="fpBox">Start server or run init to generate identity</div>
-        </div>
-
-        <div class="toggle">
-          <div>
-            <div class="toggle-label">Start Glide Automatically on Login</div>
-            <div class="toggle-desc">Windows Registry Run key / Ubuntu XDG autostart</div>
+      <!-- Right: Mode-Specific Connection + File Beam -->
+      <div class="col-stack">
+        <!-- Server Network & Peers / Client Auto-Discovery Radar -->
+        <div class="card grow">
+          <div class="card-hdr">
+            <div>
+              <div class="card-title" id="connCardTitle">Server Network &amp; Peers</div>
+              <div class="card-sub" id="connCardSub">100% offline LAN QUIC &mdash; zero internet required</div>
+            </div>
+            <button class="sm" id="scanBtn" style="display:none;">Rescan</button>
           </div>
-          <label class="switch"><input type="checkbox" id="autostartToggle"><span class="slider"></span></label>
+
+          <!-- Server Mode View -->
+          <div id="serverConnView" style="display:flex; flex-direction:column; gap:7px; flex:1; min-height:0;">
+            <div class="ip-bar">
+              <span class="card-sub" style="flex-shrink:0;">LAN IP(s)</span>
+              <span class="ip-text" id="localIpsText">detecting&hellip;</span>
+              <button class="xs" id="copyIpBtn">Copy IP</button>
+            </div>
+
+            <div style="display:grid; grid-template-columns: 112px 1fr; gap:7px; align-items:stretch; flex-shrink:0;">
+              <div class="field" style="background:var(--inset);border:1px solid var(--border);border-radius:8px;padding:4px 8px;justify-content:center;">
+                <label style="font-size:10.5px;">Listen Port</label>
+                <input type="number" id="serverPortInput" min="1024" max="65535" value="24800" style="height:22px;padding:2px 6px;font-family:var(--mono);font-size:11.5px;" />
+              </div>
+              <div class="toggle" style="padding:5px 9px;">
+                <div>
+                  <div class="toggle-label">LAN Auto-Discovery</div>
+                  <div class="toggle-desc">Broadcast beacon on UDP 24801</div>
+                </div>
+                <label class="switch"><input type="checkbox" id="discoveryToggle" checked><span class="slider"></span></label>
+              </div>
+            </div>
+
+            <div class="card-hdr" style="margin-top:1px;">
+              <span class="card-sub" style="font-weight:600;">Connected Peers</span>
+              <span class="badge" id="peerCountBadge">0 online</span>
+            </div>
+            <div class="scroll-list" id="serverPeersList">
+              <div class="empty-state">
+                <span>No clients connected yet.</span>
+                <span>Start Server, then click Connect on your Client PC.</span>
+              </div>
+            </div>
+          </div>
+
+          <!-- Client Mode View -->
+          <div id="clientConnView" style="display:none; flex-direction:column; gap:7px; flex:1; min-height:0;">
+            <div class="scroll-list" id="deviceList">
+              <div class="empty-state">Scanning LAN for Glide servers&hellip;</div>
+            </div>
+
+            <div class="field" style="flex-shrink:0;">
+              <label><span>Direct Server IP:Port</span><span class="card-sub">blank = auto-discover</span></label>
+              <input type="text" id="manualServerInput" placeholder="Auto-discover on LAN (e.g. 192.168.1.42:24800)" />
+            </div>
+
+            <div class="field" style="flex-shrink:0;">
+              <label><span>This PC Position Relative to Server</span></label>
+              <div class="edge-pills" id="clientEdgePills">
+                <button class="edge-pill" data-edge="left">Left</button>
+                <button class="edge-pill" data-edge="right">Right</button>
+                <button class="edge-pill" data-edge="top">Top</button>
+                <button class="edge-pill" data-edge="bottom">Bottom</button>
+              </div>
+            </div>
+          </div>
         </div>
 
-        <div class="row" style="flex-wrap:wrap;">
-          <button class="sm" id="firewallBtn">Configure Firewall (UDP 24800/24801)</button>
-          <button class="sm" id="elevatedBtn">Windows Elevated Task (UAC)</button>
-          <button class="sm" id="resetTofuBtn">Reset Saved TOFU Trust</button>
-        </div>
-
-        <div class="field">
-          <label>Diagnostics (glide doctor)</label>
-          <div class="mono-box" id="doctorBox" style="max-height:130px; overflow:auto; white-space:pre-wrap;">Loading...</div>
+        <!-- Compact File Beam -->
+        <div class="card" style="flex-shrink:0; gap:6px; padding:10px 12px;">
+          <div class="card-hdr">
+            <div class="card-title">File Beam (QUIC)</div>
+            <span class="card-sub">Saves to Downloads/Glide</span>
+          </div>
+          <div class="dropzone" id="dropzone">
+            <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="17 8 12 3 7 8"/><line x1="12" y1="3" x2="12" y2="15"/></svg>
+            <span>Drop file(s) here or <b>click to beam</b></span>
+            <input type="file" id="fileInput" style="display:none" multiple />
+          </div>
+          <div id="recentFiles" class="scroll-list" style="max-height:54px;"></div>
         </div>
       </div>
     </div>
-  </div>
+  </section>
+
+  <!-- TAB 2: Feel & Clipboard -->
+  <section class="panel" id="tab-tuning">
+    <div class="grid-2">
+      <!-- Left Column: Pointer Feel + Edge Switching -->
+      <div class="col-stack">
+        <div class="card">
+          <div class="card-hdr">
+            <div class="card-title">Pointer &amp; Scroll Feel</div>
+            <span class="badge live">Hot-Reloads Live</span>
+          </div>
+
+          <div class="field">
+            <label><span>Client Mouse Sensitivity</span><span class="mono-val" id="sensVal">1.00x</span></label>
+            <input type="range" id="sensSlider" min="0.25" max="3.0" step="0.05" value="1.0" />
+          </div>
+
+          <div class="field">
+            <label><span>Scroll Wheel Speed</span><span class="mono-val" id="scrollVal">1.00x</span></label>
+            <input type="range" id="scrollSlider" min="0.25" max="4.0" step="0.05" value="1.0" />
+          </div>
+
+          <div class="toggle-grid-2">
+            <div class="toggle" title="Normalize pointer speed across mixed HiDPI displays">
+              <div>
+                <div class="toggle-label">Auto-DPI Scale</div>
+                <div class="toggle-desc">Match HiDPI</div>
+              </div>
+              <label class="switch"><input type="checkbox" id="autoDpiToggle"><span class="slider"></span></label>
+            </div>
+            <div class="toggle" title="Invert vertical and horizontal scroll direction on client">
+              <div>
+                <div class="toggle-label">Natural Scroll</div>
+                <div class="toggle-desc">Invert wheel</div>
+              </div>
+              <label class="switch"><input type="checkbox" id="invertScrollToggle"><span class="slider"></span></label>
+            </div>
+          </div>
+
+          <div class="row" id="linuxBackendField" style="gap:10px; margin-top:1px;">
+            <span class="card-sub" style="font-weight:600;white-space:nowrap;">Linux Input Backend</span>
+            <select id="inputBackendSelect" style="height:26px;padding:2px 8px;">
+              <option value="auto">Auto / XTest (zero setup)</option>
+              <option value="xtest">XTest (X11)</option>
+              <option value="uinput">/dev/uinput (hardware HID)</option>
+            </select>
+          </div>
+        </div>
+
+        <div class="card grow" style="justify-content:space-between;">
+          <div class="card-hdr">
+            <div class="card-title">Edge Switching &amp; Safety</div>
+          </div>
+
+          <div class="field">
+            <label><span>Edge Push Threshold</span><span class="mono-val" id="threshVal">4 px</span></label>
+            <input type="range" id="threshSlider" min="1" max="24" step="1" value="4" />
+          </div>
+
+          <div class="field">
+            <label><span>Dead-Corner Guard (protects close X &amp; taskbar)</span><span class="mono-val" id="deadCornerVal">24 px</span></label>
+            <input type="range" id="deadCornerSlider" min="0" max="80" step="4" value="24" />
+          </div>
+
+          <div class="field">
+            <label><span>Edge Dwell Delay</span><span class="mono-val" id="dwellVal">0 ms</span></label>
+            <input type="range" id="dwellSlider" min="0" max="200" step="10" value="0" />
+          </div>
+
+          <div class="toggle-grid-2">
+            <div class="toggle" title="Pause edge switching while a fullscreen game or app has focus">
+              <div>
+                <div class="toggle-label">Fullscreen Lock</div>
+                <div class="toggle-desc">Pause in games</div>
+              </div>
+              <label class="switch"><input type="checkbox" id="fullscreenLockToggle" checked><span class="slider"></span></label>
+            </div>
+            <div class="toggle" title="Match CapsLock and NumLock LEDs when switching screens">
+              <div>
+                <div class="toggle-label">Sync Lock Keys</div>
+                <div class="toggle-desc">Caps / NumLock</div>
+              </div>
+              <label class="switch"><input type="checkbox" id="syncLockToggle" checked><span class="slider"></span></label>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <!-- Right Column: Clipboard Sync & History + Key Remaps -->
+      <div class="col-stack">
+        <div class="card grow" style="flex:1.15;">
+          <div class="card-hdr">
+            <div>
+              <div class="card-title">Bidirectional Clipboard</div>
+              <div class="card-sub">UTF-8 text &amp; PNG/DIB screenshots (lazy &gt; 256 KB)</div>
+            </div>
+            <label class="switch" title="Enable bidirectional clipboard sync"><input type="checkbox" id="clipToggle" checked><span class="slider"></span></label>
+          </div>
+          <div class="scroll-list" id="clipHistory">
+            <div class="empty-state">Synced clipboard items appear here with 1-click Re-send.</div>
+          </div>
+        </div>
+
+        <div class="card grow" style="flex:0.85;">
+          <div class="card-hdr">
+            <div>
+              <div class="card-title">Client Key Remaps</div>
+              <div class="card-sub">AltGr &amp; ISO &lt; &gt; | work natively; add overrides below</div>
+            </div>
+            <div style="display:flex; gap:4px;">
+              <button class="xs" id="addRemapEscBtn">+ Caps&rarr;Esc</button>
+              <button class="xs" id="addRemapCtrlBtn">+ Caps&rarr;Ctrl</button>
+            </div>
+          </div>
+          <div class="scroll-list" id="remapList"></div>
+          <div class="row" style="gap:6px; flex-shrink:0;">
+            <input type="text" id="remapFrom" list="hidKeyList" placeholder="From (e.g. CapsLock)" />
+            <span style="color:var(--muted);">&rarr;</span>
+            <input type="text" id="remapTo" list="hidKeyList" placeholder="To (e.g. Escape)" />
+            <button class="sm primary" id="addRemapBtn">Add</button>
+          </div>
+          <datalist id="hidKeyList">
+            <option value="CapsLock"></option>
+            <option value="Escape"></option>
+            <option value="ControlLeft"></option>
+            <option value="ControlRight"></option>
+            <option value="MetaLeft"></option>
+            <option value="MetaRight"></option>
+            <option value="AltLeft"></option>
+            <option value="AltRight"></option>
+            <option value="ShiftLeft"></option>
+            <option value="ShiftRight"></option>
+            <option value="Tab"></option>
+            <option value="Backspace"></option>
+            <option value="Delete"></option>
+            <option value="IsoBackslash"></option>
+          </datalist>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- TAB 3: System & Security -->
+  <section class="panel" id="tab-system">
+    <div class="grid-2">
+      <!-- Left Column: TLS Identity & OS Integration -->
+      <div class="col-stack">
+        <div class="card">
+          <div class="card-hdr">
+            <div>
+              <div class="card-title">TLS 1.3 Identity &amp; Trust</div>
+              <div class="card-sub">Ed25519 SHA-256 certificate verified via Trust-On-First-Use</div>
+            </div>
+            <button class="sm" id="copyFpBtn">Copy</button>
+          </div>
+          <div class="mono-box" id="fpBox">Generating identity&hellip;</div>
+          <div class="row">
+            <span class="card-sub" id="trustStateLabel">TOFU auto-pinning active on first connect</span>
+            <button class="sm" id="resetTofuBtn">Reset Trusted Server</button>
+          </div>
+        </div>
+
+        <div class="card grow">
+          <div class="card-hdr">
+            <div>
+              <div class="card-title">OS Integration</div>
+              <div class="card-sub" id="trayStatusSub">System tray integration status</div>
+            </div>
+          </div>
+
+          <div class="toggle">
+            <div>
+              <div class="toggle-label">Start Glide Automatically on Login</div>
+              <div class="toggle-desc" id="autostartRoleDesc">Starts minimized to system tray</div>
+            </div>
+            <label class="switch"><input type="checkbox" id="autostartToggle"><span class="slider"></span></label>
+          </div>
+
+          <div class="list-item">
+            <div>
+              <div class="toggle-label">Configure Local LAN Firewall</div>
+              <div class="toggle-desc">Allow inbound UDP 24800 (QUIC) &amp; 24801 (Discovery)</div>
+            </div>
+            <button class="sm" id="firewallBtn">Configure</button>
+          </div>
+
+          <div class="list-item" id="elevatedCard">
+            <div>
+              <div class="toggle-label">Windows Elevated UAC Task <span class="badge" id="winOnlyBadge" style="margin-left:4px;">Windows</span></div>
+              <div class="toggle-desc">Allow control over UAC prompts &amp; Admin windows</div>
+            </div>
+            <button class="sm" id="elevatedBtn">Setup Task</button>
+          </div>
+        </div>
+      </div>
+
+      <!-- Right Column: Hotkeys Cheat Sheet + Live Diagnostics -->
+      <div class="col-stack">
+        <div class="card">
+          <div class="card-hdr">
+            <div class="card-title">Keyboard Shortcuts</div>
+            <span class="card-sub">Works globally on Server</span>
+          </div>
+          <div class="shortcut-row">
+            <span>Jump cursor directly to peer on edge</span>
+            <span class="kbd">Ctrl + Alt + Arrows</span>
+          </div>
+          <div class="shortcut-row">
+            <span>Lock / unlock cursor to current screen</span>
+            <span class="kbd">Ctrl + Alt + L</span>
+          </div>
+          <div class="shortcut-row">
+            <span>Emergency return focus to Local PC</span>
+            <span class="kbd">ScrollLock</span>
+          </div>
+        </div>
+
+        <div class="card grow">
+          <div class="card-hdr">
+            <div>
+              <div class="card-title">Live Diagnostics (glide doctor)</div>
+              <div class="card-sub" id="diagSummary">Checking local OS &amp; display server&hellip;</div>
+            </div>
+            <span class="badge" id="diagOsBadge">--</span>
+          </div>
+          <div class="mono-box" id="doctorBox" style="flex:1; min-height:0; overflow-y:auto; white-space:pre-wrap;">Loading diagnostics&hellip;</div>
+        </div>
+      </div>
+    </div>
+  </section>
 </div>
 
 <div class="toast" id="toast"></div>
@@ -488,9 +1008,22 @@ const state = {
   config: null,
   status: null,
   os: 'unknown',
+  hostname: 'This PC',
+  trayActive: false,
+  selectedPeerName: null,
+  dragging: false,
+  dragPayload: null,
+  lastLayoutKey: '',
+  dismissedError: null,
 };
 
 const $ = (id) => document.getElementById(id);
+
+function escapeHtml(s) {
+  return String(s ?? '').replace(/[&<>"']/g, c => ({
+    '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'
+  }[c]));
+}
 
 function toast(msg) {
   const el = $('toast');
@@ -501,9 +1034,65 @@ function toast(msg) {
 }
 
 async function api(path, opts = {}) {
-  const res = await fetch(path, opts);
-  const text = await res.text();
-  try { return JSON.parse(text); } catch { return { ok: res.ok, message: text }; }
+  try {
+    const res = await fetch(path, opts);
+    const text = await res.text();
+    try { return JSON.parse(text); } catch { return { ok: res.ok, message: text }; }
+  } catch (err) {
+    return { ok: false, error: err && err.message ? err.message : 'Request failed' };
+  }
+}
+
+let _fitApplied = false;
+function fitWindowToContent() {
+  if (_fitApplied) return;
+  _fitApplied = true;
+  requestAnimationFrame(() => {
+    if (!window.outerWidth || !window.innerWidth) return;
+    const chromeW = Math.max(0, window.outerWidth - window.innerWidth);
+    const chromeH = Math.max(0, window.outerHeight - window.innerHeight);
+    if (chromeW >= 80 || chromeH >= 110) return;
+    const targetW = Math.min(window.screen.availWidth - 20, 900 + chromeW);
+    const targetH = Math.min(window.screen.availHeight - 40, 640 + chromeH);
+    if (Math.abs(window.innerWidth - 900) > 4 || Math.abs(window.innerHeight - 640) > 4) {
+      try { window.resizeTo(targetW, targetH); } catch {}
+    }
+  });
+}
+
+function formatOs(osRaw) {
+  const s = String(osRaw || '').toLowerCase();
+  if (s.includes('win')) return { label: 'Windows', cls: 'win' };
+  if (s.includes('wayland')) return { label: 'Linux Wayland', cls: 'lin' };
+  if (s.includes('linux')) return { label: 'Linux', cls: 'lin' };
+  if (s.includes('mac')) return { label: 'macOS', cls: 'mac' };
+  return { label: osRaw || 'OS', cls: '' };
+}
+
+function osIconSvg(cls) {
+  if (cls === 'win') {
+    return '<svg width="10" height="10" viewBox="0 0 16 16" fill="currentColor"><path d="M1 2.5 7 1.6v5.9H1V2.5zm7-1 7-1v7H8V1.5zM1 8.5h6v5.9l-6-.9V8.5zm7 0h7v7l-7-1V8.5z"/></svg>';
+  }
+  if (cls === 'lin') {
+    return '<svg width="10" height="10" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6"><rect x="1.5" y="2.5" width="13" height="11" rx="2"/><path d="M4.5 6.5 6.8 8 4.5 9.5M8 9.5h3"/></svg>';
+  }
+  return '<svg width="10" height="10" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6"><rect x="2" y="2.5" width="12" height="9" rx="1.5"/><path d="M5.5 13.5h5"/></svg>';
+}
+
+function formatBytes(bytes) {
+  const b = Number(bytes || 0);
+  if (b < 1024) return b + ' B';
+  if (b < 1024 * 1024) return (b / 1024).toFixed(1) + ' KB';
+  return (b / (1024 * 1024)).toFixed(2) + ' MB';
+}
+
+function parseBind(bindStr) {
+  const s = String(bindStr || '0.0.0.0:24800').trim();
+  const idx = s.lastIndexOf(':');
+  if (idx === -1) return { host: '0.0.0.0', port: parseInt(s, 10) || 24800 };
+  const host = s.slice(0, idx) || '0.0.0.0';
+  const port = parseInt(s.slice(idx + 1), 10) || 24800;
+  return { host, port };
 }
 
 // Tabs
@@ -516,120 +1105,401 @@ document.querySelectorAll('.tab').forEach(btn => {
   };
 });
 
+// Role Switch
 function setRole(role) {
   state.role = role;
   $('roleServerBtn').classList.toggle('active', role === 'server');
   $('roleClientBtn').classList.toggle('active', role === 'client');
-  $('clientManualAddr').style.display = role === 'client' ? 'flex' : 'none';
-  $('layoutHint').textContent = role === 'server'
-    ? 'Click a connected edge to jump focus, or start Primary to accept LAN clients'
-    : 'Click which edge of your Primary machine THIS computer sits on';
-  renderEdgeSlots();
+  $('serverConnView').style.display = role === 'server' ? 'flex' : 'none';
+  $('clientConnView').style.display = role === 'client' ? 'flex' : 'none';
+  $('scanBtn').style.display = role === 'client' ? 'inline-flex' : 'none';
+  $('connCardTitle').textContent = role === 'server' ? 'Server Network & Peers' : 'LAN Auto-Discovery Radar';
+  $('connCardSub').textContent = role === 'server'
+    ? '100% offline LAN QUIC \u2014 share this IP or use auto-discovery'
+    : '100% offline \u2014 click a discovered Primary PC to connect';
+  $('autostartRoleDesc').textContent = role === 'server'
+    ? 'Starts minimized to tray as Primary (Server)'
+    : 'Starts minimized to tray as Secondary (Client)';
+  if (!state.running) {
+    $('startStopBtn').textContent = role === 'server' ? 'Start Server' : 'Connect Client';
+  }
+  updateLayoutHint();
+  renderDeskLayout(true);
+  renderClientEdgePills();
 }
 
-$('roleServerBtn').onclick = () => { if (!state.running) setRole('server'); else toast('Stop active session before switching role'); };
-$('roleClientBtn').onclick = () => { if (!state.running) setRole('client'); else toast('Stop active session before switching role'); };
+$('roleServerBtn').onclick = () => {
+  if (!state.running) setRole('server');
+  else toast('Stop active session before switching role');
+};
+$('roleClientBtn').onclick = () => {
+  if (!state.running) setRole('client');
+  else toast('Stop active session before switching role');
+};
 
-// Edge slot clicks
-document.querySelectorAll('.edge-slot').forEach(el => {
-  el.onclick = async () => {
-    const edge = el.dataset.edge;
-    if (state.role === 'client') {
-      state.config.client.edge = edge;
-      renderEdgeSlots();
+function updateLayoutHint() {
+  const hint = $('layoutHint');
+  if (!hint) return;
+  if (state.role === 'server') {
+    const peers = (state.status && state.status.peers) || [];
+    if (state.running && peers.length > 0) {
+      hint.textContent = 'Click or drag a machine to any edge to reposition live (double-click to jump)';
+    } else {
+      hint.textContent = 'Click or drag a machine to any edge to reposition live once connected';
+    }
+  } else {
+    hint.textContent = state.running
+      ? 'Click or drag This PC to any edge to reposition live without disconnecting'
+      : 'Click or drag This PC to match where it sits relative to your Primary PC';
+  }
+}
+
+function getActivePeer() {
+  const peers = (state.status && state.status.peers) || [];
+  if (peers.length === 0) return null;
+  if (state.selectedPeerName) {
+    const match = peers.find(p => p.name === state.selectedPeerName);
+    if (match) return match;
+  }
+  return peers[0];
+}
+
+async function movePeerLive(edge, peerName) {
+  if (!state.config) return;
+  if (state.role === 'client') {
+    if (state.config.client.edge === edge && !state.running) return;
+    state.config.client.edge = edge;
+    renderClientEdgePills();
+    renderDeskLayout(true);
+    if (state.running) {
+      const res = await api('/api/move-edge', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ edge }),
+      });
+      if (res.error) toast('Failed: ' + res.error);
+      else toast('Moved This PC live to ' + edge.toUpperCase());
+    } else {
       await pushConfig();
       toast('Client edge set to ' + edge.toUpperCase());
-    } else if (state.running) {
-      await api('/api/switch', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify({ edge }) });
     }
-  };
-});
-
-function renderMonitors(geom) {
-  const box = $('monitorCanvas');
-  if (!geom || !geom.monitors || geom.monitors.length === 0) {
-    box.innerHTML = '<span class="card-sub">This Machine</span>';
     return;
   }
-  const mons = geom.monitors;
-  let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
-  mons.forEach(m => {
-    minX = Math.min(minX, m.x); minY = Math.min(minY, m.y);
-    maxX = Math.max(maxX, m.x + m.width); maxY = Math.max(maxY, m.y + m.height);
-  });
-  const totalW = Math.max(1, maxX - minX);
-  const totalH = Math.max(1, maxY - minY);
-  const pad = 16;
-  const availW = box.clientWidth - pad * 2 || 240;
-  const availH = box.clientHeight - pad * 2 || 118;
-  const scale = Math.min(availW / totalW, availH / totalH);
-  const offX = (box.clientWidth - totalW * scale) / 2;
-  const offY = (box.clientHeight - totalH * scale) / 2;
 
-  box.innerHTML = mons.map(m => {
-    const left = Math.round(offX + (m.x - minX) * scale);
-    const top = Math.round(offY + (m.y - minY) * scale);
-    const w = Math.max(36, Math.round(m.width * scale));
-    const h = Math.max(24, Math.round(m.height * scale));
-    const dpi = Math.round((m.scale || 1) * 100);
-    return `<div style="position:absolute;left:${left}px;top:${top}px;width:${w}px;height:${h}px;
-      background:${m.primary ? 'rgba(59,130,246,0.22)' : 'rgba(255,255,255,0.06)'};
-      border:1.5px solid ${m.primary ? '#60a5fa' : 'rgba(255,255,255,0.22)'};
-      border-radius:6px;display:flex;flex-direction:column;align-items:center;justify-content:center;
-      font-size:10px;color:#e2e8f0;padding:2px;overflow:hidden;">
-      <b>${m.width}&times;${m.height}</b>
-      <span style="color:#94a3b8;font-size:9px;">${dpi}%${m.primary ? ' ★' : ''}</span>
-    </div>`;
-  }).join('');
+  // Server role
+  const peers = (state.status && state.status.peers) || [];
+  if (!state.running || peers.length === 0) {
+    toast('Connect a client first to reposition it live on the desk');
+    return;
+  }
+  const targetName = peerName || (getActivePeer() && getActivePeer().name);
+  if (!targetName) return;
+  const current = peers.find(p => p.name === targetName);
+  if (current && current.edge === edge) return;
+
+  state.selectedPeerName = targetName;
+  const res = await api('/api/move-edge', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ edge, peer_name: targetName }),
+  });
+  if (res.error) toast('Failed: ' + res.error);
+  else toast(`Moved ${targetName} live to ${edge.toUpperCase()}`);
 }
 
-function renderEdgeSlots() {
-  const peersByEdge = {};
-  if (state.status && state.status.peers) {
-    state.status.peers.forEach(p => { peersByEdge[p.edge] = p; });
+async function switchToEdge(edge) {
+  if (!state.running || state.role !== 'server') return;
+  await api('/api/switch', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(edge ? { edge } : {}),
+  });
+}
+
+function renderClientEdgePills() {
+  const cur = (state.config && state.config.client && state.config.client.edge) || 'right';
+  document.querySelectorAll('#clientEdgePills .edge-pill').forEach(btn => {
+    btn.classList.toggle('active', btn.dataset.edge === cur);
+  });
+}
+
+document.querySelectorAll('#clientEdgePills .edge-pill').forEach(btn => {
+  btn.onclick = () => movePeerLive(btn.dataset.edge);
+});
+
+function edgeArrowSymbol(edge) {
+  if (edge === 'left') return '&larr;';
+  if (edge === 'right') return '&rarr;';
+  if (edge === 'top') return '&uarr;';
+  return '&darr;';
+}
+
+function getClientServerLabel(st) {
+  if (st && st.status && st.status.startsWith('Connected to ')) {
+    return st.status.slice('Connected to '.length);
   }
-  document.querySelectorAll('.edge-slot').forEach(el => {
-    const edge = el.dataset.edge;
-    el.classList.remove('selected', 'connected');
+  if (st && st.active_target && st.active_target !== 'Local' && st.active_target !== 'Local (Controlling)') {
+    return st.active_target;
+  }
+  return 'Primary Server';
+}
+
+// 1-Square-Per-Machine Desk Layout Renderer (flicker-free & drag-safe!)
+function renderDeskLayout(force = false) {
+  if (state.dragging && !force) return;
+
+  const st = state.status || {};
+  const peers = st.peers || [];
+  const clientEdge = (state.config && state.config.client && state.config.client.edge) || 'right';
+  const activeTarget = st.active_target || 'Local';
+  const isConnectedClient = state.role === 'client' && state.running && st.status && st.status.startsWith('Connected');
+  const clientControlling = activeTarget === 'Local (Controlling)';
+  const serverLabel = state.role === 'client' ? getClientServerLabel(st) : state.hostname;
+
+  const layoutKey = JSON.stringify({
+    role: state.role,
+    running: state.running,
+    hostname: state.hostname,
+    os: state.os,
+    clientEdge,
+    activeTarget,
+    selectedPeerName: state.selectedPeerName,
+    isConnectedClient,
+    peers: peers.map(p => ({ n: p.name, e: p.edge, o: p.os })),
+  });
+
+  if (!force && layoutKey === state.lastLayoutKey) {
+    // Only update RTT numbers in-place so hover/drag states never flicker!
+    peers.forEach(p => {
+      const rttNode = document.querySelector(`[data-rtt-peer="${CSS.escape(p.name)}"]`);
+      if (rttNode) {
+        rttNode.textContent = p.rtt_ms != null ? p.rtt_ms.toFixed(1) + ' ms' : 'online';
+      }
+    });
+    const selfRtt = document.querySelector('[data-rtt-self="1"]');
+    if (selfRtt) {
+      selfRtt.textContent = st.rtt_ms != null ? st.rtt_ms.toFixed(1) + ' ms' : 'online';
+    }
+    return;
+  }
+  state.lastLayoutKey = layoutKey;
+
+  const myOs = formatOs(state.os);
+  const centerEl = $('centerStage');
+
+  if (state.role === 'server') {
+    const localFocused = !state.running || activeTarget === 'Local';
+    centerEl.innerHTML = `
+      <div class="machine-tile center-tile ${localFocused ? 'focused' : ''}" id="centerTileBtn"
+           title="${localFocused ? 'This PC currently has cursor focus' : 'Click to return cursor focus to This PC'}">
+        <div class="tile-top-row">
+          <span class="os-pill ${myOs.cls}">${osIconSvg(myOs.cls)} ${escapeHtml(myOs.label)}</span>
+          <span class="role-chip">This PC</span>
+        </div>
+        <div class="tile-name">${escapeHtml(state.hostname)}</div>
+        ${localFocused
+          ? `<div class="focus-chip"><span class="pulse-dot"></span>${state.running ? 'Active Focus' : 'Primary Server'}</div>`
+          : `<button class="xs primary" id="returnLocalBtn">Return Here</button>`}
+      </div>`;
+    const cBtn = $('centerTileBtn');
+    if (cBtn && state.running && !localFocused) {
+      cBtn.onclick = () => switchToEdge(null);
+    }
+  } else {
+    const primaryFocused = isConnectedClient && !clientControlling;
+    centerEl.innerHTML = `
+      <div class="machine-tile center-tile ${primaryFocused ? 'focused' : (!isConnectedClient ? 'dimmed' : '')}"
+           title="Primary (Server) PC">
+        <div class="tile-top-row">
+          <span class="role-chip">Primary</span>
+        </div>
+        <div class="tile-name">${escapeHtml(serverLabel)}</div>
+        <div class="card-sub">${isConnectedClient
+          ? (primaryFocused ? '<span class="focus-chip"><span class="pulse-dot"></span>Active Focus</span>' : 'Controlling This PC')
+          : (state.running ? 'Searching LAN\u2026' : 'Server PC')}</div>
+      </div>`;
+  }
+
+  const peersByEdge = {};
+  peers.forEach(p => { peersByEdge[p.edge] = p; });
+
+  document.querySelectorAll('.edge-slot').forEach(slot => {
+    const edge = slot.dataset.edge;
+    const edgeTitle = edge[0].toUpperCase() + edge.slice(1);
+    slot.classList.remove('occupied');
+
     if (state.role === 'client') {
-      const sel = state.config && state.config.client.edge === edge;
-      if (sel) el.classList.add('selected');
-      el.innerHTML = `<span>${edge[0].toUpperCase() + edge.slice(1)}</span>` + (sel ? '<span style="font-size:10px;opacity:.85">This PC</span>' : '');
+      if (clientEdge === edge) {
+        slot.classList.add('occupied');
+        const selfFocused = isConnectedClient && clientControlling;
+        const rttStr = st.rtt_ms != null ? st.rtt_ms.toFixed(1) + ' ms' : (isConnectedClient ? 'online' : '');
+        slot.innerHTML = `
+          <div class="machine-tile draggable ${selfFocused ? 'focused' : ''}" draggable="true" data-drag-kind="self"
+               title="Drag or click any edge to reposition This PC">
+            <div class="tile-main">
+              <div class="tile-top-row">
+                <span class="os-pill ${myOs.cls}">${osIconSvg(myOs.cls)} ${escapeHtml(myOs.label)}</span>
+                ${rttStr ? `<span class="rtt-pill" data-rtt-self="1">${rttStr}</span>` : ''}
+              </div>
+              <div class="tile-name">${escapeHtml(state.hostname)}</div>
+            </div>
+            <div class="tile-actions">
+              ${selfFocused
+                ? '<span class="focus-chip"><span class="pulse-dot"></span>Active</span>'
+                : '<span class="role-chip">This PC</span>'}
+            </div>
+          </div>`;
+      } else {
+        slot.innerHTML = `
+          <div class="slot-empty">
+            <span>${edgeArrowSymbol(edge)} ${edgeTitle}</span>
+            <span class="slot-sub">Click or drop</span>
+          </div>`;
+      }
     } else {
       const peer = peersByEdge[edge];
       if (peer) {
-        el.classList.add('connected');
-        el.innerHTML = `<span>${peer.name}</span><span style="font-size:10px;opacity:.85">${peer.rtt_ms != null ? peer.rtt_ms.toFixed(1)+'ms' : 'online'}</span>`;
+        slot.classList.add('occupied');
+        const posOs = formatOs(peer.os);
+        const peerFocused = activeTarget === peer.name;
+        const isSelected = getActivePeer() && getActivePeer().name === peer.name && peers.length > 1;
+        const rttText = peer.rtt_ms != null ? peer.rtt_ms.toFixed(1) + ' ms' : 'online';
+        slot.innerHTML = `
+          <div class="machine-tile draggable ${peerFocused ? 'focused' : ''} ${isSelected ? 'selected-peer' : ''}"
+               draggable="true" data-drag-kind="peer" data-peer-name="${escapeHtml(peer.name)}" data-peer-edge="${edge}"
+               title="Drag to another edge to move live, or double-click to jump cursor">
+            <div class="tile-main">
+              <div class="tile-top-row">
+                <span class="os-pill ${posOs.cls}">${osIconSvg(posOs.cls)} ${escapeHtml(posOs.label)}</span>
+                <span class="rtt-pill" data-rtt-peer="${escapeHtml(peer.name)}">${rttText}</span>
+              </div>
+              <div class="tile-name">${escapeHtml(peer.name)}</div>
+            </div>
+            <div class="tile-actions">
+              ${peerFocused
+                ? '<span class="focus-chip"><span class="pulse-dot"></span>Active</span>'
+                : `<button class="xs primary jump-peer-btn" data-edge="${edge}" title="Jump cursor to ${escapeHtml(peer.name)}">Jump &rarr;</button>`}
+            </div>
+          </div>`;
       } else {
-        el.innerHTML = `<span>${edge[0].toUpperCase() + edge.slice(1)}</span>`;
+        const canPlace = state.running && peers.length > 0;
+        slot.innerHTML = `
+          <div class="slot-empty">
+            <span>${edgeArrowSymbol(edge)} ${edgeTitle}</span>
+            <span class="slot-sub">${canPlace ? 'Move here' : 'Empty'}</span>
+          </div>`;
       }
     }
   });
+
+  bindTileHandlers();
 }
+
+function bindTileHandlers() {
+  // Drag start / end on draggable tiles
+  document.querySelectorAll('.machine-tile.draggable').forEach(tile => {
+    tile.addEventListener('dragstart', (e) => {
+      state.dragging = true;
+      state.dragPayload = {
+        kind: tile.dataset.dragKind,
+        peerName: tile.dataset.peerName || null,
+      };
+      tile.classList.add('dragging');
+      if (e.dataTransfer) {
+        e.dataTransfer.effectAllowed = 'move';
+        e.dataTransfer.setData('text/plain', tile.dataset.peerName || 'self');
+      }
+    });
+    tile.addEventListener('dragend', () => {
+      tile.classList.remove('dragging');
+      document.querySelectorAll('.edge-slot').forEach(s => s.classList.remove('drop-over'));
+      state.dragging = false;
+      state.dragPayload = null;
+      renderDeskLayout(true);
+    });
+  });
+
+  // Peer tile click / double-click / Jump button
+  document.querySelectorAll('.machine-tile[data-drag-kind="peer"]').forEach(tile => {
+    tile.addEventListener('click', (e) => {
+      if (e.target.closest('.jump-peer-btn')) return;
+      state.selectedPeerName = tile.dataset.peerName;
+      renderDeskLayout(true);
+    });
+    tile.addEventListener('dblclick', (e) => {
+      e.stopPropagation();
+      switchToEdge(tile.dataset.peerEdge);
+    });
+  });
+
+  document.querySelectorAll('.jump-peer-btn').forEach(btn => {
+    btn.addEventListener('click', (e) => {
+      e.stopPropagation();
+      switchToEdge(btn.dataset.edge);
+    });
+  });
+}
+
+// Bind Edge Slot Click + Drop handlers once
+document.querySelectorAll('.edge-slot').forEach(slot => {
+  slot.addEventListener('click', (e) => {
+    // On Server mode, clicking an occupied tile selects/jumps via tile handler, not empty-slot move
+    if (state.role === 'server' && slot.classList.contains('occupied')) return;
+    movePeerLive(slot.dataset.edge);
+  });
+
+  slot.addEventListener('dragover', (e) => {
+    if (!state.dragging) return;
+    e.preventDefault();
+    if (e.dataTransfer) e.dataTransfer.dropEffect = 'move';
+    slot.classList.add('drop-over');
+  });
+
+  slot.addEventListener('dragleave', (e) => {
+    if (!slot.contains(e.relatedTarget)) {
+      slot.classList.remove('drop-over');
+    }
+  });
+
+  slot.addEventListener('drop', async (e) => {
+    e.preventDefault();
+    slot.classList.remove('drop-over');
+    const targetEdge = slot.dataset.edge;
+    const payload = state.dragPayload;
+    state.dragging = false;
+    state.dragPayload = null;
+    if (payload) {
+      await movePeerLive(targetEdge, payload.peerName);
+    }
+  });
+});
 
 function renderSparkline(vals) {
   const svg = $('rttSpark');
   if (!vals || vals.length < 2) { svg.innerHTML = ''; return; }
   const max = Math.max(2, ...vals);
   const pts = vals.map((v, i) => {
-    const x = (i / (vals.length - 1)) * 54;
-    const y = 15 - Math.min(14, (v / max) * 14);
+    const x = (i / (vals.length - 1)) * 46;
+    const y = 13 - Math.min(12, (v / max) * 12);
     return `${x.toFixed(1)},${y.toFixed(1)}`;
   }).join(' ');
-  svg.innerHTML = `<polyline fill="none" stroke="#60a5fa" stroke-width="1.6" points="${pts}" />`;
+  svg.innerHTML = `<polyline fill="none" stroke="#38bdf8" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" points="${pts}" />`;
 }
 
 function renderStatus(st) {
+  if (!st) return;
   state.status = st;
   state.running = st.mode === 'server' || st.mode === 'client';
   if (state.running && st.mode !== state.role) {
     setRole(st.mode);
   }
 
-  $('statusText').textContent = st.status || 'Idle';
+  const statusText = st.status || 'Idle';
+  $('statusText').textContent = statusText;
   const pill = $('statusPill');
   pill.className = 'pill ' + (
-    st.status.startsWith('Connected') ? 'live' :
+    statusText.startsWith('Connected') ? 'live' :
+    statusText.startsWith('Error') ? 'err' :
     state.running ? 'wait' : ''
   );
 
@@ -646,7 +1516,7 @@ function renderStatus(st) {
 
   const lbtn = $('lockBtn');
   lbtn.classList.toggle('locked', !!st.locked);
-  lbtn.textContent = st.locked ? 'Cursor Locked' : 'Lock Cursor';
+  $('lockBtnText').textContent = st.locked ? 'Locked' : 'Lock';
 
   if (st.rtt_ms != null) {
     $('rttBox').style.display = 'inline-flex';
@@ -660,57 +1530,135 @@ function renderStatus(st) {
     $('fpBox').textContent = st.fingerprint;
   }
 
-  if (st.geometry && st.geometry.monitors && st.geometry.monitors.length) {
-    renderMonitors(st.geometry);
+  // Error banner
+  if (st.last_error && st.last_error !== state.dismissedError) {
+    $('errText').textContent = st.last_error;
+    $('errBanner').classList.add('show');
+  } else if (!st.last_error) {
+    state.dismissedError = null;
+    $('errBanner').classList.remove('show');
   }
-  renderEdgeSlots();
 
-  // Clipboard history
+  state.lastClipKey = state.lastClipKey || '';
+  state.lastFilesKey = state.lastFilesKey || '';
+  state.lastPeersKey = state.lastPeersKey || '';
+
+  // Server connected peers list (skip DOM rewrite if unchanged so hover states never flicker)
+  const peers = st.peers || [];
+  $('peerCountBadge').textContent = peers.length + ' online';
+  $('peerCountBadge').className = 'badge ' + (peers.length > 0 ? 'live' : '');
+  const peersKey = JSON.stringify({
+    running: state.running,
+    active: st.active_target,
+    peers: peers.map(p => [p.name, p.os, p.edge, p.addr, p.rtt_ms != null ? p.rtt_ms.toFixed(1) : '']),
+  });
+  if (peersKey !== state.lastPeersKey) {
+    state.lastPeersKey = peersKey;
+    const peersEl = $('serverPeersList');
+    if (peers.length === 0) {
+      peersEl.innerHTML = `<div class="empty-state">
+        <span>${state.running ? 'Listening on LAN\u2026' : 'Server is idle.'}</span>
+        <span>${state.running ? 'Open Glide on your Client PC and click Connect.' : 'Click Start Server to accept Client connections.'}</span>
+      </div>`;
+    } else {
+      peersEl.innerHTML = peers.map(p => {
+        const osInfo = formatOs(p.os);
+        const isFocused = st.active_target === p.name;
+        const rtt = p.rtt_ms != null ? p.rtt_ms.toFixed(1) + ' ms' : 'online';
+        return `<div class="device">
+          <div style="min-width:0;">
+            <div class="dev-name">
+              <span>${escapeHtml(p.name)}</span>
+              <span class="os-pill ${osInfo.cls}">${escapeHtml(osInfo.label)}</span>
+              <span class="badge">${escapeHtml(p.edge)}</span>
+            </div>
+            <div class="dev-meta">${escapeHtml(p.addr)} &middot; ${rtt}</div>
+          </div>
+          <button class="sm ${isFocused ? 'primary' : ''}" onclick="${isFocused ? 'switchToEdge(null)' : `switchToEdge('${escapeHtml(p.edge)}')`}">
+            ${isFocused ? 'Local' : 'Jump &rarr;'}
+          </button>
+        </div>`;
+      }).join('');
+    }
+  }
+
+  updateLayoutHint();
+  renderDeskLayout(false);
+
+  // Clipboard history (only rewrite DOM when entries change)
   const clipEl = $('clipHistory');
-  if (st.clipboard_history && st.clipboard_history.length > 0) {
-    clipEl.innerHTML = st.clipboard_history.map(item => `
-      <div class="list-item">
-        <div style="overflow:hidden;">
-          <div style="font-size:12px;font-weight:600;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;">${escapeHtml(item.preview)}</div>
-          <div class="card-sub">${item.direction} &middot; ${item.format} &middot; ${(item.bytes/1024).toFixed(1)} KB</div>
-        </div>
-        <button class="sm" onclick="resendClip(${item.id})">Send</button>
-      </div>`).join('');
+  const clipHist = st.clipboard_history || [];
+  const clipKey = JSON.stringify(clipHist.map(i => [i.id, i.direction, i.bytes ?? i.size_bytes ?? 0]));
+  if (clipKey !== state.lastClipKey) {
+    state.lastClipKey = clipKey;
+    if (clipHist.length === 0) {
+      clipEl.innerHTML = '<div class="empty-state">Synced clipboard items appear here with 1-click Re-send.</div>';
+    } else {
+      clipEl.innerHTML = clipHist.map(item => {
+        const fmtRaw = item.format || item.kind || 'TextUtf8';
+        const fmtLabel = String(fmtRaw).includes('Png') ? 'PNG' : 'Text';
+        const byteCount = item.bytes ?? item.size_bytes ?? 0;
+        const dirLabel = item.direction === 'sent' ? '&uarr; Sent' : '&darr; Recv';
+        return `<div class="list-item">
+          <div style="min-width:0; flex:1;">
+            <div style="font-size:11.5px;font-weight:600;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;">${escapeHtml(item.preview)}</div>
+            <div class="card-sub">${dirLabel} &middot; ${fmtLabel} &middot; ${formatBytes(byteCount)}</div>
+          </div>
+          <button class="xs" onclick="resendClip(${Number(item.id)})">Re-send</button>
+        </div>`;
+      }).join('');
+    }
   }
 
-  // Recent files
+  // Recent files (only rewrite DOM when entries change)
   const filesEl = $('recentFiles');
-  if (st.recent_files && st.recent_files.length > 0) {
-    filesEl.innerHTML = st.recent_files.slice(0, 4).map(f => `
-      <div class="list-item">
-        <div style="overflow:hidden;">
-          <div style="font-size:12px;font-weight:600;">${escapeHtml(f.filename)}</div>
-          <div class="card-sub">${f.direction} &middot; ${(f.bytes/1024).toFixed(1)} KB${f.saved_path ? ' &rarr; ' + escapeHtml(f.saved_path) : ''}</div>
-        </div>
-      </div>`).join('');
+  const files = st.recent_files || [];
+  const filesKey = JSON.stringify(files.slice(0, 4).map(f => [f.filename, f.direction, f.bytes ?? f.size_bytes ?? 0]));
+  if (filesKey !== state.lastFilesKey) {
+    state.lastFilesKey = filesKey;
+    if (files.length === 0) {
+      filesEl.innerHTML = '';
+    } else {
+      filesEl.innerHTML = files.slice(0, 4).map(f => {
+        const byteCount = f.bytes ?? f.size_bytes ?? 0;
+        const dirLabel = f.direction === 'sent' ? '&uarr; Sent' : '&darr; Recv';
+        return `<div class="list-item" style="padding:4px 8px;">
+          <div style="min-width:0; flex:1;">
+            <div style="font-size:11.5px;font-weight:600;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;">${escapeHtml(f.filename)}</div>
+            <div class="card-sub">${dirLabel} &middot; ${formatBytes(byteCount)}${f.saved_path ? ' &rarr; ' + escapeHtml(f.saved_path) : ''}</div>
+          </div>
+        </div>`;
+      }).join('');
+    }
   }
 }
 
-function escapeHtml(s) {
-  return String(s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
-}
+$('errDismissBtn').onclick = () => {
+  state.dismissedError = state.status ? state.status.last_error : null;
+  $('errBanner').classList.remove('show');
+};
 
 window.resendClip = async (id) => {
-  await api('/api/clipboard/resend', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify({ id }) });
-  toast('Re-sent clipboard item to peer');
+  const res = await api('/api/clipboard/resend', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ id }),
+  });
+  if (res.error) toast('Failed: ' + res.error);
+  else toast('Re-sent clipboard item to peer');
 };
 
 function renderRemaps() {
   const list = $('remapList');
-  const rules = (state.config && state.config.client.key_remap) || [];
+  const rules = (state.config && state.config.client && state.config.client.key_remap) || [];
   if (rules.length === 0) {
-    list.innerHTML = '<div class="card-sub">No active key remaps (1:1 physical HID passthrough).</div>';
+    list.innerHTML = '<div class="empty-state">No key remaps (1:1 physical USB HID passthrough).</div>';
     return;
   }
   list.innerHTML = rules.map((r, i) => `
-    <div class="list-item">
+    <div class="list-item" style="padding:5px 8px;">
       <div><span class="kbd">${escapeHtml(r.from)}</span> &rarr; <span class="kbd">${escapeHtml(r.to)}</span></div>
-      <button class="sm danger" onclick="removeRemap(${i})">Remove</button>
+      <button class="xs danger" onclick="removeRemap(${i})">Remove</button>
     </div>`).join('');
 }
 
@@ -720,23 +1668,32 @@ window.removeRemap = async (idx) => {
   await pushConfig();
 };
 
+async function addRemapRule(from, to) {
+  if (!state.config || !from || !to) return;
+  const rules = state.config.client.key_remap || [];
+  const exists = rules.some(r => r.from.toLowerCase() === from.toLowerCase());
+  if (exists) {
+    toast(`Rule for ${from} already exists`);
+    return;
+  }
+  rules.push({ from, to });
+  state.config.client.key_remap = rules;
+  renderRemaps();
+  await pushConfig();
+  toast(`Remap added: ${from} \u2192 ${to}`);
+}
+
 $('addRemapBtn').onclick = async () => {
   const from = $('remapFrom').value.trim();
   const to = $('remapTo').value.trim();
-  if (!from || !to) return;
-  state.config.client.key_remap.push({ from, to });
-  $('remapFrom').value = ''; $('remapTo').value = '';
-  renderRemaps();
-  await pushConfig();
-  toast(`Remap added: ${from} → ${to}`);
+  if (!from || !to) { toast('Enter both From and To HID key names'); return; }
+  $('remapFrom').value = '';
+  $('remapTo').value = '';
+  await addRemapRule(from, to);
 };
 
-$('addRemapPresetBtn').onclick = async () => {
-  state.config.client.key_remap.push({ from: 'CapsLock', to: 'ControlLeft' });
-  renderRemaps();
-  await pushConfig();
-  toast('Added CapsLock → ControlLeft');
-};
+$('addRemapEscBtn').onclick = () => addRemapRule('CapsLock', 'Escape');
+$('addRemapCtrlBtn').onclick = () => addRemapRule('CapsLock', 'ControlLeft');
 
 function syncFormFromConfig() {
   const c = state.config;
@@ -748,6 +1705,7 @@ function syncFormFromConfig() {
   $('autoDpiToggle').checked = !!c.client.auto_dpi_scale;
   $('invertScrollToggle').checked = !!c.client.invert_scroll;
   $('inputBackendSelect').value = c.client.input_backend || 'auto';
+
   $('threshSlider').value = c.server.edge_threshold_px;
   $('threshVal').textContent = c.server.edge_threshold_px + ' px';
   $('deadCornerSlider').value = c.server.dead_corner_px;
@@ -757,12 +1715,29 @@ function syncFormFromConfig() {
   $('fullscreenLockToggle').checked = !!c.server.auto_lock_fullscreen;
   $('syncLockToggle').checked = !!c.server.sync_lock_keys;
   $('clipToggle').checked = !!c.server.clipboard;
+
+  const { port } = parseBind(c.server.bind);
+  $('serverPortInput').value = port;
+  $('discoveryToggle').checked = c.server.discovery !== false;
   $('manualServerInput').value = c.client.server || '';
+
+  $('trustStateLabel').textContent = c.client.trusted_fingerprint
+    ? 'Pinned server: ' + c.client.trusted_fingerprint.slice(0, 18) + '\u2026'
+    : 'TOFU auto-pinning active on first connect';
+
   renderRemaps();
-  renderEdgeSlots();
+  renderClientEdgePills();
+  renderDeskLayout(true);
+}
+
+let _pushTimer = null;
+function schedulePushConfig(delayMs = 180) {
+  clearTimeout(_pushTimer);
+  _pushTimer = setTimeout(() => { pushConfig(); }, delayMs);
 }
 
 async function pushConfig() {
+  clearTimeout(_pushTimer);
   if (!state.config) return;
   const c = state.config;
   c.client.sensitivity = parseFloat($('sensSlider').value);
@@ -770,6 +1745,7 @@ async function pushConfig() {
   c.client.auto_dpi_scale = $('autoDpiToggle').checked;
   c.client.invert_scroll = $('invertScrollToggle').checked;
   c.client.input_backend = $('inputBackendSelect').value;
+
   const thresh = parseInt($('threshSlider').value, 10);
   const dead = parseInt($('deadCornerSlider').value, 10);
   const dwell = parseInt($('dwellSlider').value, 10);
@@ -783,6 +1759,14 @@ async function pushConfig() {
   c.client.sync_lock_keys = $('syncLockToggle').checked;
   c.server.clipboard = $('clipToggle').checked;
   c.client.clipboard = $('clipToggle').checked;
+
+  const { host } = parseBind(c.server.bind);
+  const portNum = parseInt($('serverPortInput').value, 10);
+  if (portNum >= 1024 && portNum <= 65535) {
+    c.server.bind = `${host}:${portNum}`;
+  }
+  c.server.discovery = $('discoveryToggle').checked;
+
   const manual = $('manualServerInput').value.trim();
   c.client.server = manual ? manual : null;
 
@@ -793,22 +1777,28 @@ async function pushConfig() {
   });
 }
 
-// Live slider & toggle bindings
-['sensSlider','scrollSlider','threshSlider','deadCornerSlider','dwellSlider'].forEach(id => {
+// Live debounced slider & toggle bindings
+['sensSlider', 'scrollSlider', 'threshSlider', 'deadCornerSlider', 'dwellSlider'].forEach(id => {
   $(id).oninput = () => {
     $('sensVal').textContent = Number($('sensSlider').value).toFixed(2) + 'x';
     $('scrollVal').textContent = Number($('scrollSlider').value).toFixed(2) + 'x';
     $('threshVal').textContent = $('threshSlider').value + ' px';
     $('deadCornerVal').textContent = $('deadCornerSlider').value + ' px';
     $('dwellVal').textContent = $('dwellSlider').value + ' ms';
+    schedulePushConfig(180);
   };
-  $(id).onchange = pushConfig;
-});
-['autoDpiToggle','invertScrollToggle','inputBackendSelect','fullscreenLockToggle','syncLockToggle','clipToggle','manualServerInput'].forEach(id => {
-  $(id).onchange = pushConfig;
+  $(id).onchange = () => pushConfig();
 });
 
-// Start / Stop / Lock
+[
+  'autoDpiToggle', 'invertScrollToggle', 'inputBackendSelect',
+  'fullscreenLockToggle', 'syncLockToggle', 'clipToggle',
+  'discoveryToggle', 'serverPortInput', 'manualServerInput'
+].forEach(id => {
+  $(id).onchange = () => pushConfig();
+});
+
+// Start / Stop / Lock / Quit
 $('startStopBtn').onclick = async () => {
   if (state.running) {
     await api('/api/stop', { method: 'POST' });
@@ -821,7 +1811,7 @@ $('startStopBtn').onclick = async () => {
       body: JSON.stringify({ role: state.role }),
     });
     if (res.error) toast('Error: ' + res.error);
-    else toast('Started as ' + (state.role === 'server' ? 'Primary (Server)' : 'Secondary (Client)'));
+    else toast('Started as ' + (state.role === 'server' ? 'Server' : 'Client'));
   }
 };
 
@@ -829,27 +1819,73 @@ $('lockBtn').onclick = async () => {
   await api('/api/lock', { method: 'POST' });
 };
 
-// LAN Discovery
-async function scanLan() {
-  $('scanBtn').textContent = 'Scanning...';
-  const res = await api('/api/discover');
-  $('scanBtn').textContent = 'Scan LAN';
-  const list = $('deviceList');
-  const devices = res.servers || [];
-  if (devices.length === 0) {
-    list.innerHTML = '<div class="card-sub">No Glide servers found yet. Start <b>Primary (Server)</b> on your main computer.</div>';
-    return;
-  }
-  list.innerHTML = devices.map(d => `
-    <div class="device">
-      <div>
-        <div class="dev-name">${escapeHtml(d.name)} <span class="badge">${escapeHtml(d.os)}</span></div>
-        <div class="dev-meta">${escapeHtml(d.addr)} &middot; ${escapeHtml(d.fingerprint.slice(0, 20))}&hellip;</div>
-      </div>
-      <button class="sm primary" onclick="connectDiscovered('${escapeHtml(d.addr)}','${escapeHtml(d.fingerprint)}')">Connect</button>
-    </div>`).join('');
+let _es = null;
+$('quitBtn').onclick = async () => {
+  toast('Quitting Glide KVM\u2026');
+  if (_es) { try { _es.close(); } catch {} }
+  await api('/api/quit', { method: 'POST' });
+  try { window.close(); } catch {}
+};
+
+// LAN Discovery Radar & IP Copy
+let scanning = false;
+function renderLocalIps(ips) {
+  const el = $('localIpsText');
+  if (!el) return;
+  el.textContent = (ips && ips.length > 0) ? ips.join(', ') : 'none (check cable / LAN)';
 }
-$('scanBtn').onclick = scanLan;
+
+$('copyIpBtn').onclick = () => {
+  const first = ($('localIpsText').textContent || '').split(',')[0].trim();
+  const { port } = parseBind(state.config && state.config.server && state.config.server.bind);
+  if (first && !first.startsWith('none')) {
+    const addr = first + ':' + port;
+    navigator.clipboard?.writeText(addr);
+    toast('Copied ' + addr);
+  } else {
+    toast('No active LAN IP found');
+  }
+};
+
+async function scanLan(silent = false) {
+  if (scanning) return;
+  scanning = true;
+  if (!silent) $('scanBtn').textContent = 'Scanning\u2026';
+  try {
+    const res = await api('/api/discover');
+    if (res.local_ips) renderLocalIps(res.local_ips);
+    const list = $('deviceList');
+    const devices = res.servers || [];
+    const devKey = JSON.stringify(devices.map(d => [d.name, d.os, d.addr, d.fingerprint]));
+    if (devKey !== state.lastDevKey) {
+      state.lastDevKey = devKey;
+      if (devices.length === 0) {
+        list.innerHTML = `<div class="empty-state">
+          <span>No Glide servers discovered yet.</span>
+          <span>Start <b>Server</b> on your main PC (check UDP 24801 firewall if hidden).</span>
+        </div>`;
+      } else {
+        list.innerHTML = devices.map(d => {
+          const osInfo = formatOs(d.os);
+          return `<div class="device">
+            <div style="min-width:0;">
+              <div class="dev-name">
+                <span>${escapeHtml(d.name)}</span>
+                <span class="os-pill ${osInfo.cls}">${escapeHtml(osInfo.label)}</span>
+              </div>
+              <div class="dev-meta">${escapeHtml(d.addr)} &middot; ${escapeHtml((d.fingerprint || '').slice(0, 16))}&hellip;</div>
+            </div>
+            <button class="sm primary" onclick="connectDiscovered('${escapeHtml(d.addr)}','${escapeHtml(d.fingerprint)}')">Connect</button>
+          </div>`;
+        }).join('');
+      }
+    }
+  } finally {
+    scanning = false;
+    $('scanBtn').textContent = 'Rescan';
+  }
+}
+$('scanBtn').onclick = () => scanLan(false);
 
 window.connectDiscovered = async (addr, fp) => {
   if (state.running) await api('/api/stop', { method: 'POST' });
@@ -857,26 +1893,38 @@ window.connectDiscovered = async (addr, fp) => {
   state.config.client.server = addr;
   state.config.client.trusted_fingerprint = fp;
   $('manualServerInput').value = addr;
+  $('trustStateLabel').textContent = 'Pinned server: ' + fp.slice(0, 18) + '\u2026';
   await pushConfig();
-  await api('/api/start', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify({ role: 'client' }) });
-  toast('Connecting to ' + addr);
+  const res = await api('/api/start', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ role: 'client' }),
+  });
+  if (res.error) toast('Error: ' + res.error);
+  else toast('Connecting to ' + addr);
 };
 
-// Drag-and-drop file beam
+// File Beam Dropzone
 const dz = $('dropzone');
 dz.onclick = () => $('fileInput').click();
 dz.ondragover = (e) => { e.preventDefault(); dz.classList.add('over'); };
 dz.ondragleave = () => dz.classList.remove('over');
 dz.ondrop = async (e) => {
-  e.preventDefault(); dz.classList.remove('over');
-  await sendFiles(e.dataTransfer.files);
+  e.preventDefault();
+  dz.classList.remove('over');
+  if (e.dataTransfer && e.dataTransfer.files && e.dataTransfer.files.length > 0) {
+    await sendFiles(e.dataTransfer.files);
+  }
 };
-$('fileInput').onchange = async (e) => { await sendFiles(e.target.files); e.target.value = ''; };
+$('fileInput').onchange = async (e) => {
+  await sendFiles(e.target.files);
+  e.target.value = '';
+};
 
 async function sendFiles(files) {
   if (!state.running) { toast('Start Glide first before beaming files'); return; }
   for (const file of files) {
-    toast('Sending ' + file.name + '...');
+    toast('Sending ' + file.name + '\u2026');
     const buf = await file.arrayBuffer();
     const res = await api('/api/send-file', {
       method: 'POST',
@@ -884,35 +1932,43 @@ async function sendFiles(files) {
       body: buf,
     });
     if (res.error) toast('Failed: ' + res.error);
-    else toast('Sent ' + file.name);
+    else toast('Beamed ' + file.name);
   }
 }
 
-// OS Integration & Security buttons
+// OS Integration & Security Actions
 $('copyFpBtn').onclick = () => {
   navigator.clipboard?.writeText($('fpBox').textContent);
-  toast('Fingerprint copied');
+  toast('TLS Fingerprint copied');
 };
+
 $('autostartToggle').onchange = async () => {
   const enabled = $('autostartToggle').checked;
   const res = await api('/api/os/autostart', {
     method: 'POST',
-    headers: {'Content-Type':'application/json'},
+    headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ enabled, role: state.role }),
   });
   toast(res.message || (enabled ? 'Autostart enabled' : 'Autostart disabled'));
 };
+
 $('firewallBtn').onclick = async () => {
   const res = await api('/api/os/firewall', { method: 'POST' });
-  toast(res.message || 'Firewall updated');
+  toast(res.message || 'Firewall rule updated');
 };
+
 $('elevatedBtn').onclick = async () => {
   const res = await api('/api/os/elevated', { method: 'POST' });
   toast(res.message || 'Elevated task configured');
 };
+
 $('resetTofuBtn').onclick = async () => {
   const res = await api('/api/trust/reset', { method: 'POST' });
-  toast(res.message || 'Cleared saved TOFU fingerprint');
+  if (state.config && state.config.client) {
+    state.config.client.trusted_fingerprint = null;
+    $('trustStateLabel').textContent = 'TOFU auto-pinning active on first connect';
+  }
+  toast(res.message || 'Cleared saved TOFU trust');
 };
 
 // Bootstrap
@@ -920,29 +1976,65 @@ async function init() {
   const data = await api('/api/state');
   state.config = data.config;
   state.os = data.os || 'unknown';
-  $('osLabel').textContent = `${data.hostname || 'Local'} (${state.os}) · QUIC Software KVM`;
+  state.hostname = data.hostname || 'This PC';
+  state.trayActive = !!data.tray_active;
+
+  const osInfo = formatOs(state.os);
+  $('osLabel').textContent = `${state.hostname} (${osInfo.label}) \u00b7 LAN QUIC`;
   $('autostartToggle').checked = !!data.autostart;
-  if (state.os.toLowerCase().includes('win')) {
-    $('linuxBackendField').style.display = 'none';
+  renderLocalIps(data.local_ips || []);
+
+  // System Tray awareness on Quit tooltip & System tab
+  if (state.trayActive) {
+    $('quitBtn').title = 'Quit Glide completely (closing window minimizes to tray)';
+    $('trayStatusSub').textContent = 'System tray active (closing window minimizes to tray)';
+  } else {
+    $('quitBtn').title = 'Quit Glide completely';
+    $('trayStatusSub').textContent = 'Configure OS startup, firewall & elevation';
   }
+
+  const isWin = state.os.toLowerCase().includes('win');
+  if (isWin) {
+    $('linuxBackendField').style.display = 'none';
+    $('winOnlyBadge').style.display = 'none';
+  } else {
+    $('winOnlyBadge').textContent = 'Windows-only';
+    $('elevatedBtn').disabled = true;
+    $('elevatedCard').style.opacity = '0.68';
+  }
+
   if (data.doctor) {
+    $('diagOsBadge').textContent = osInfo.label;
+    $('diagSummary').textContent = data.doctor.display_info || 'Display detected';
     const lines = [
+      `OS: ${osInfo.label} (${state.os})`,
       `Display: ${data.doctor.display_info}`,
-      ...data.doctor.notes.map(n => '• ' + n),
+      ...(data.doctor.notes || []).map(n => '\u2022 ' + n),
     ];
     $('doctorBox').textContent = lines.join('\n');
-    if (data.doctor.geometry) renderMonitors(data.doctor.geometry);
   }
+
   if (data.fingerprint) $('fpBox').textContent = data.fingerprint;
+
+  setRole(state.role);
   syncFormFromConfig();
   renderStatus(data.status);
+  fitWindowToContent();
 
-  // Subscribe to real-time SSE updates
-  const es = new EventSource('/api/events');
-  es.onmessage = (ev) => {
+  // Real-time SSE telemetry stream
+  _es = new EventSource('/api/events');
+  _es.onmessage = (ev) => {
     try { renderStatus(JSON.parse(ev.data)); } catch {}
   };
-  scanLan();
+
+  // Auto-poll LAN discovery radar every 4.5s when idle or searching as client
+  scanLan(true);
+  setInterval(() => {
+    const connected = state.status && state.status.status && state.status.status.startsWith('Connected');
+    if (!state.running || (state.role === 'client' && !connected)) {
+      scanLan(true);
+    }
+  }, 4500);
 }
 
 init();

@@ -80,26 +80,31 @@ pub fn set_autostart(enabled: bool, args: &str) -> Result<()> {
 }
 
 /// Opens an elevated PowerShell prompt on Windows to allow UDP ports 24800 & 24801
-/// on Private networks (no-op message on Linux).
+/// from local LAN / direct-link subnets across Private, Domain, and Public/Unidentified profiles.
 pub fn configure_firewall() -> Result<String> {
     #[cfg(target_os = "windows")]
     {
+        use std::os::windows::process::CommandExt;
         use std::process::Command;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
         let ps_cmd = "Remove-NetFirewallRule -DisplayName 'Glide KVM (QUIC + Discovery)' -ErrorAction SilentlyContinue; \
-                      New-NetFirewallRule -DisplayName 'Glide KVM (QUIC + Discovery)' -Direction Inbound -Protocol UDP -LocalPort 24800,24801 -Action Allow -Profile Private";
+                      New-NetFirewallRule -DisplayName 'Glide KVM (QUIC + Discovery)' -Direction Inbound -Protocol UDP -LocalPort 24800,24801 -RemoteAddress LocalSubnet -Action Allow -Profile Any";
         let status = Command::new("powershell")
+            .creation_flags(CREATE_NO_WINDOW)
             .args([
                 "-NoProfile",
+                "-WindowStyle",
+                "Hidden",
                 "-Command",
                 &format!(
-                    "Start-Process powershell -Verb RunAs -Wait -ArgumentList '-NoProfile -Command \"{ps_cmd}\"'"
+                    "Start-Process powershell -Verb RunAs -WindowStyle Hidden -Wait -ArgumentList '-NoProfile -WindowStyle Hidden -Command \"{ps_cmd}\"'"
                 ),
             ])
             .status()
             .context("failed to invoke PowerShell for firewall rule")?;
         if status.success() {
             Ok(
-                "Windows Defender Firewall rule created for UDP 24800 & 24801 (Private networks)."
+                "Windows Firewall rule created for UDP 24800 & 24801 (LocalSubnet across all profiles)."
                     .into(),
             )
         } else {
@@ -121,7 +126,9 @@ pub fn configure_firewall() -> Result<String> {
 pub fn configure_elevated_task() -> Result<String> {
     #[cfg(target_os = "windows")]
     {
+        use std::os::windows::process::CommandExt;
         use std::process::Command;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
         let exe = std::env::current_exe().context("cannot determine glide.exe path")?;
         let ps_cmd = format!(
             "$action = New-ScheduledTaskAction -Execute '{}' -Argument 'gui --minimized'; \
@@ -131,11 +138,14 @@ pub fn configure_elevated_task() -> Result<String> {
             exe.display()
         );
         let status = Command::new("powershell")
+            .creation_flags(CREATE_NO_WINDOW)
             .args([
                 "-NoProfile",
+                "-WindowStyle",
+                "Hidden",
                 "-Command",
                 &format!(
-                    "Start-Process powershell -Verb RunAs -Wait -ArgumentList '-NoProfile -Command \"{ps_cmd}\"'"
+                    "Start-Process powershell -Verb RunAs -WindowStyle Hidden -Wait -ArgumentList '-NoProfile -WindowStyle Hidden -Command \"{ps_cmd}\"'"
                 ),
             ])
             .status()

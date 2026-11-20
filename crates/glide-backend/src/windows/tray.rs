@@ -1,6 +1,8 @@
 //! Native Windows 11 System Tray icon powered directly by `Shell_NotifyIconW`
 //! (zero external dependencies or DLLs).
 
+use crate::icon::render_bgra;
+pub use crate::TrayAction;
 use parking_lot::Mutex;
 use std::mem::size_of;
 use std::ptr;
@@ -8,16 +10,20 @@ use std::sync::OnceLock;
 use std::thread;
 use tokio::sync::mpsc;
 use windows_sys::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, WPARAM};
+use windows_sys::Win32::Graphics::Gdi::{
+    CreateBitmap, CreateDIBSection, DeleteObject, BITMAPINFO, BITMAPINFOHEADER, BI_RGB,
+    DIB_RGB_COLORS,
+};
 use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows_sys::Win32::UI::Shell::{
     Shell_NotifyIconW, NIF_ICON, NIF_MESSAGE, NIF_TIP, NIM_ADD, NIM_DELETE, NOTIFYICONDATAW,
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::{
-    AppendMenuW, CreatePopupMenu, CreateWindowExW, DefWindowProcW, DestroyMenu, DispatchMessageW,
-    GetCursorPos, GetMessageW, LoadIconW, PostQuitMessage, RegisterClassW, SetForegroundWindow,
-    TrackPopupMenu, TranslateMessage, IDI_APPLICATION, MF_SEPARATOR, MF_STRING, MSG,
-    TPM_BOTTOMALIGN, TPM_LEFTALIGN, WM_APP, WM_COMMAND, WM_LBUTTONDBLCLK, WM_LBUTTONUP,
-    WM_RBUTTONUP, WNDCLASSW,
+    AppendMenuW, CreateIconIndirect, CreatePopupMenu, CreateWindowExW, DefWindowProcW, DestroyIcon,
+    DestroyMenu, DispatchMessageW, GetCursorPos, GetMessageW, LoadIconW, PostQuitMessage,
+    RegisterClassW, SetForegroundWindow, TrackPopupMenu, TranslateMessage, HICON, ICONINFO,
+    IDI_APPLICATION, MF_SEPARATOR, MF_STRING, MSG, TPM_BOTTOMALIGN, TPM_LEFTALIGN, WM_APP,
+    WM_COMMAND, WM_LBUTTONDBLCLK, WM_LBUTTONUP, WM_RBUTTONUP, WNDCLASSW,
 };
 
 const WM_TRAY_ICON: u32 = WM_APP + 50;
@@ -25,11 +31,53 @@ const MENU_OPEN_UI: usize = 1001;
 const MENU_TOGGLE_LOCK: usize = 1002;
 const MENU_QUIT: usize = 1003;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum TrayAction {
-    OpenUi,
-    ToggleLock,
-    Quit,
+/// Builds a crisp 32x32 ARGB HICON from our pure-Rust Glide icon renderer.
+unsafe fn create_glide_hicon() -> HICON {
+    let size = 32i32;
+    let bgra = render_bgra(size as u32);
+    let mut bi: BITMAPINFO = unsafe { std::mem::zeroed() };
+    bi.bmiHeader.biSize = size_of::<BITMAPINFOHEADER>() as u32;
+    bi.bmiHeader.biWidth = size;
+    bi.bmiHeader.biHeight = -size; // top-down DIB
+    bi.bmiHeader.biPlanes = 1;
+    bi.bmiHeader.biBitCount = 32;
+    bi.bmiHeader.biCompression = BI_RGB;
+
+    let mut bits: *mut std::ffi::c_void = ptr::null_mut();
+    let hbm_color = unsafe {
+        CreateDIBSection(
+            ptr::null_mut(),
+            &bi,
+            DIB_RGB_COLORS,
+            &mut bits,
+            ptr::null_mut(),
+            0,
+        )
+    };
+    if hbm_color.is_null() || bits.is_null() {
+        return ptr::null_mut();
+    }
+    unsafe {
+        ptr::copy_nonoverlapping(bgra.as_ptr(), bits as *mut u8, bgra.len());
+    }
+    let mask_bytes = vec![0u8; ((size as usize * size as usize) / 8).max(4)];
+    let hbm_mask = unsafe { CreateBitmap(size, size, 1, 1, mask_bytes.as_ptr().cast()) };
+
+    let info = ICONINFO {
+        fIcon: 1,
+        xHotspot: 0,
+        yHotspot: 0,
+        hbmMask: hbm_mask,
+        hbmColor: hbm_color,
+    };
+    let hicon = unsafe { CreateIconIndirect(&info) };
+    unsafe {
+        DeleteObject(hbm_color);
+        if !hbm_mask.is_null() {
+            DeleteObject(hbm_mask);
+        }
+    }
+    hicon
 }
 
 static TRAY_TX: OnceLock<Mutex<Option<mpsc::UnboundedSender<TrayAction>>>> = OnceLock::new();
@@ -161,7 +209,12 @@ pub fn spawn_windows_tray() -> mpsc::UnboundedReceiver<TrayAction> {
             nid.uID = 1;
             nid.uFlags = NIF_ICON | NIF_MESSAGE | NIF_TIP;
             nid.uCallbackMessage = WM_TRAY_ICON;
-            nid.hIcon = unsafe { LoadIconW(ptr::null_mut(), IDI_APPLICATION) };
+            let custom_icon = unsafe { create_glide_hicon() };
+            nid.hIcon = if !custom_icon.is_null() {
+                custom_icon
+            } else {
+                unsafe { LoadIconW(ptr::null_mut(), IDI_APPLICATION) }
+            };
 
             let tip = "Glide Software KVM — Click to Open";
             for (dst, src) in nid.szTip.iter_mut().zip(tip.encode_utf16()) {
@@ -182,6 +235,9 @@ pub fn spawn_windows_tray() -> mpsc::UnboundedReceiver<TrayAction> {
 
             unsafe {
                 Shell_NotifyIconW(NIM_DELETE, &nid);
+                if !custom_icon.is_null() {
+                    DestroyIcon(custom_icon);
+                }
             }
         });
 

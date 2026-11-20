@@ -70,6 +70,7 @@ GenericName=Software KVM
 Comment=Ultra-low-latency mouse, keyboard, clipboard, and file sharing over QUIC
 Exec=/usr/bin/glide gui
 Icon=glide
+StartupWMClass=Glide
 Terminal=false
 Categories=Utility;Network;
 StartupNotify=true
@@ -136,9 +137,22 @@ Description: Ultra-low-latency cross-platform software KVM over QUIC
  and Linux X11 machines over LAN with zero TCP head-of-line blocking, raw
  physical USB HID scancodes (full German/ISO AltGr support), high-resolution
  scrolling, multi-monitor HiDPI awareness, zero-config LAN auto-discovery,
- and a clean modern desktop GUI.
+ native system tray integration, and a clean modern desktop GUI.
 EOF
 chmod 0644 "$PKG_ROOT/DEBIAN/control"
+
+cat > "$PKG_ROOT/DEBIAN/postinst" <<'EOF'
+#!/bin/sh
+set -e
+if command -v update-desktop-database >/dev/null 2>&1; then
+    update-desktop-database -q /usr/share/applications || true
+fi
+if command -v gtk-update-icon-cache >/dev/null 2>&1; then
+    gtk-update-icon-cache -q -t -f /usr/share/icons/hicolor || true
+fi
+exit 0
+EOF
+chmod 0755 "$PKG_ROOT/DEBIAN/postinst"
 
 DEB_PATH="$OUT_DIR/glide_${VERSION}_${ARCH}.deb"
 dpkg-deb --root-owner-group --build "$PKG_ROOT" "$DEB_PATH"
