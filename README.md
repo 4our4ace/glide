@@ -31,7 +31,7 @@ Zero missing DLLs. Zero missing `.so` dependencies. Zero IP fiddling.
 ### 1. Ubuntu 22.04 (X11)
 
 ```bash
-sudo apt install ./glide_0.2.0_amd64.deb
+sudo apt install ./glide_0.2.1_amd64.deb
 ```
 
 Then open **Glide KVM** from your Ubuntu application launcher (or run `glide` in a terminal).

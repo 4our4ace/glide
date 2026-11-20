@@ -29,6 +29,9 @@ use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 use tracing::{debug, info, warn};
 
+#[cfg(target_os = "windows")]
+mod native_window;
+
 const UI_HTML: &str = include_str!("ui.html");
 const FONT_INTER: &[u8] = include_bytes!("../assets/fonts/inter.woff2");
 const FONT_MONO: &[u8] = include_bytes!("../assets/fonts/jetbrains-mono.woff2");
@@ -245,17 +248,20 @@ async fn try_focus_existing_instance(port: u16) -> bool {
 pub async fn run_gui(opts: GuiOptions) -> Result<()> {
     glide_backend::init_platform();
 
-    // Single-instance check: clicking Glide again simply focuses/re-opens the existing window.
-    if opts.port != 0 && !opts.minimized && try_focus_existing_instance(opts.port).await {
-        info!(port = opts.port, "Focused existing Glide GUI instance");
-        return Ok(());
-    }
-
+    // Bind first: in the common case (no other instance) this succeeds immediately and we
+    // skip the single-instance probe entirely, so the window opens without delay.
     let listener = match TcpListener::bind(("127.0.0.1", opts.port)).await {
         Ok(l) => l,
-        Err(_) => TcpListener::bind(("127.0.0.1", 0))
-            .await
-            .context("failed to bind local GUI port")?,
+        Err(_) => {
+            // Port taken: most likely Glide is already running, so just focus its window.
+            if opts.port != 0 && !opts.minimized && try_focus_existing_instance(opts.port).await {
+                info!(port = opts.port, "Focused existing Glide GUI instance");
+                return Ok(());
+            }
+            TcpListener::bind(("127.0.0.1", 0))
+                .await
+                .context("failed to bind local GUI port")?
+        }
     };
     let actual_addr = listener.local_addr()?;
     let url = format!("http://127.0.0.1:{}", actual_addr.port());
@@ -379,9 +385,21 @@ pub async fn run_gui(opts: GuiOptions) -> Result<()> {
     Ok(())
 }
 
-/// Opens (or raises) the Glide desktop app window with a dedicated isolated profile,
-/// dark frame, fixed content dimensions, and native X11 `WM_CLASS`/`_NET_WM_ICON` branding on Linux.
+/// Opens (or raises) the Glide desktop app window.
+///
+/// On Windows this is a native window hosting the system WebView2 control (instant, no
+/// browser cold start); on Linux a Chromium-family browser in `--app` mode with native X11
+/// `WM_CLASS`/`_NET_WM_ICON` branding. Returns the browser child process, if one was spawned.
 pub fn open_app_window(url: &str) -> Option<std::process::Child> {
+    #[cfg(target_os = "windows")]
+    if native_window::show(url) {
+        return None;
+    }
+    launch_browser_window(url)
+}
+
+/// Launches the UI in a Chromium-family browser `--app` window with an isolated profile.
+pub(crate) fn launch_browser_window(url: &str) -> Option<std::process::Child> {
     #[cfg(target_os = "linux")]
     if glide_backend::linux_x11::window_brand::focus_existing_glide_window() {
         return None;
@@ -412,10 +430,12 @@ pub fn open_app_window(url: &str) -> Option<std::process::Child> {
                     &app_arg,
                     &size_arg,
                     &profile_arg,
-                    "--force-dark-mode",
                     "--no-first-run",
                     "--no-default-browser-check",
                     "--disable-extensions",
+                    "--disable-background-networking",
+                    "--disable-sync",
+                    "--disable-component-update",
                 ])
                 .spawn()
             {
@@ -448,7 +468,6 @@ pub fn open_app_window(url: &str) -> Option<std::process::Child> {
                     &profile_arg,
                     "--class=Glide",
                     "--name=Glide",
-                    "--force-dark-mode",
                     "--no-first-run",
                     "--no-default-browser-check",
                     "--disable-extensions",

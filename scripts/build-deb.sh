@@ -2,7 +2,7 @@
 set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
-VERSION="0.2.0"
+VERSION="0.2.1"
 ARCH="amd64"
 BIN_PATH="${1:-$ROOT_DIR/target/x86_64-unknown-linux-musl/release/glide}"
 OUT_DIR="$ROOT_DIR/dist"
