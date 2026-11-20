@@ -1,14 +1,14 @@
 //! X11 Server input capture using XInput2 raw events (`XI_Raw*`), pointer/keyboard grab,
-//! and XRandR multi-monitor edge detection.
+//! XRandR multi-monitor edge detection, dead-corner guards, edge dwell, and hotkeys.
 
 use crate::geometry::DesktopGeometry;
 use crate::linux_x11::query_desktop_geometry;
 use crate::{CaptureConfig, CaptureControl, CaptureEvent, CaptureHandle};
 use anyhow::{Context, Result};
-use glide_hid::{HidUsage, MouseButton};
-use glide_proto::Edge;
+use glide_hid::{HidUsage, ModifierMask, MouseButton};
+use glide_proto::{Edge, LockState};
 use parking_lot::Mutex;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
@@ -26,11 +26,21 @@ use x11rb::rust_connection::RustConnection;
 const CMD_ENTER_REMOTE: u32 = 1;
 const CMD_LEAVE_REMOTE: u32 = 2;
 
+enum LeaveTarget {
+    Edge(Edge, f32),
+    Point(f32, f32),
+}
+
 struct SharedState {
     active_edges: Mutex<Vec<Edge>>,
     geometry: Mutex<DesktopGeometry>,
     remote_mode: AtomicBool,
-    pending_leave: Mutex<Option<(Edge, f32)>>,
+    locked: AtomicBool,
+    edge_threshold_px: AtomicI32,
+    dead_corner_px: AtomicI32,
+    edge_dwell_ms: AtomicU64,
+    pending_leave: Mutex<Option<LeaveTarget>>,
+    last_local_norm: Mutex<(f32, f32)>,
 }
 
 struct X11CaptureControl {
@@ -63,19 +73,61 @@ impl CaptureControl for X11CaptureControl {
         *self.shared.active_edges.lock() = edges.to_vec();
     }
 
+    fn update_tuning(
+        &self,
+        edge_threshold_px: i32,
+        dead_corner_px: i32,
+        edge_dwell_ms: u64,
+        _auto_lock_fullscreen: bool,
+        locked: bool,
+    ) {
+        self.shared
+            .edge_threshold_px
+            .store(edge_threshold_px.max(1), Ordering::Relaxed);
+        self.shared
+            .dead_corner_px
+            .store(dead_corner_px.max(0), Ordering::Relaxed);
+        self.shared
+            .edge_dwell_ms
+            .store(edge_dwell_ms, Ordering::Relaxed);
+        self.shared.locked.store(locked, Ordering::Relaxed);
+    }
+
     fn enter_remote(&self) -> Result<()> {
         self.shared.remote_mode.store(true, Ordering::SeqCst);
         self.send_cmd(CMD_ENTER_REMOTE)
     }
 
     fn leave_remote(&self, return_edge: Edge, normalized_pos: f32) -> Result<()> {
-        *self.shared.pending_leave.lock() = Some((return_edge, normalized_pos));
+        *self.shared.pending_leave.lock() = Some(LeaveTarget::Edge(return_edge, normalized_pos));
+        self.shared.remote_mode.store(false, Ordering::SeqCst);
+        self.send_cmd(CMD_LEAVE_REMOTE)
+    }
+
+    fn leave_remote_at(&self, norm_x: f32, norm_y: f32) -> Result<()> {
+        *self.shared.pending_leave.lock() = Some(LeaveTarget::Point(norm_x, norm_y));
         self.shared.remote_mode.store(false, Ordering::SeqCst);
         self.send_cmd(CMD_LEAVE_REMOTE)
     }
 
     fn desktop_geometry(&self) -> DesktopGeometry {
         self.shared.geometry.lock().clone()
+    }
+
+    fn lock_state(&self) -> LockState {
+        if let Ok(cookie) = self.conn.get_keyboard_control() {
+            if let Ok(reply) = cookie.reply() {
+                return LockState {
+                    caps_lock: (reply.led_mask & 1) != 0,
+                    num_lock: (reply.led_mask & 2) != 0,
+                };
+            }
+        }
+        LockState::default()
+    }
+
+    fn last_local_cursor_norm(&self) -> (f32, f32) {
+        *self.shared.last_local_norm.lock()
     }
 }
 
@@ -114,6 +166,16 @@ fn create_blank_cursor(conn: &RustConnection, root: Window) -> Result<Cursor> {
     Ok(cursor)
 }
 
+fn arrow_to_edge(usage: HidUsage) -> Option<Edge> {
+    match usage.raw() {
+        x if x == HidUsage::keyboard(0x50).raw() => Some(Edge::Left),
+        x if x == HidUsage::keyboard(0x4F).raw() => Some(Edge::Right),
+        x if x == HidUsage::keyboard(0x52).raw() => Some(Edge::Top),
+        x if x == HidUsage::keyboard(0x51).raw() => Some(Edge::Bottom),
+        _ => None,
+    }
+}
+
 /// Starts the X11 server input capture loop on a dedicated OS thread.
 pub fn start_x11_capture(config: CaptureConfig) -> Result<CaptureHandle> {
     let (conn, screen_num) =
@@ -134,7 +196,6 @@ pub fn start_x11_capture(config: CaptureConfig) -> Result<CaptureHandle> {
 
     let geometry = query_desktop_geometry(&conn, screen_num)?;
 
-    // Create a tiny InputOnly window for grabs and instant ClientMessage wakeups.
     let ctrl_win = conn.generate_id()?;
     conn.create_window(
         0,
@@ -157,7 +218,6 @@ pub fn start_x11_capture(config: CaptureConfig) -> Result<CaptureHandle> {
         .atom;
     let blank_cursor = create_blank_cursor(&conn, root)?;
 
-    // Select raw input events on all master devices (XIAllMasterDevices = 1).
     let raw_mask = XIEventMask::RAW_MOTION
         | XIEventMask::RAW_KEY_PRESS
         | XIEventMask::RAW_KEY_RELEASE
@@ -176,7 +236,12 @@ pub fn start_x11_capture(config: CaptureConfig) -> Result<CaptureHandle> {
         active_edges: Mutex::new(Vec::new()),
         geometry: Mutex::new(geometry),
         remote_mode: AtomicBool::new(false),
+        locked: AtomicBool::new(false),
+        edge_threshold_px: AtomicI32::new(config.edge_threshold_px.max(1)),
+        dead_corner_px: AtomicI32::new(config.dead_corner_px.max(0)),
+        edge_dwell_ms: AtomicU64::new(config.edge_dwell_ms),
         pending_leave: Mutex::new(None),
+        last_local_norm: Mutex::new((0.5, 0.5)),
     });
 
     let (tx, rx) = mpsc::unbounded_channel();
@@ -228,8 +293,10 @@ fn run_capture_loop(
     let mut grabbed = false;
     let mut edge_push_edge: Option<Edge> = None;
     let mut edge_push_accum: f32 = 0.0;
+    let mut edge_dwell_start: Option<Instant> = None;
     let mut last_geom_refresh = Instant::now();
     let mut last_local_query = Instant::now();
+    let mut mods = ModifierMask::EMPTY;
 
     let do_grab = |conn: &RustConnection, shared: &SharedState, grabbed: &mut bool| {
         if *grabbed {
@@ -255,7 +322,6 @@ fn run_capture_loop(
             GrabMode::ASYNC,
             GrabMode::ASYNC,
         );
-        // Park cursor at center of primary monitor so compositor hot-corners never trigger.
         let (cx, cy) = shared.geometry.lock().primary_center();
         let _ = conn.warp_pointer(x11rb::NONE, root, 0, 0, 0, 0, cx as i16, cy as i16);
         let _ = conn.flush();
@@ -266,14 +332,18 @@ fn run_capture_loop(
     let do_ungrab = |conn: &RustConnection,
                      shared: &SharedState,
                      grabbed: &mut bool,
-                     return_pos: Option<(Edge, f32)>| {
+                     target: Option<LeaveTarget>| {
         if *grabbed {
             let _ = conn.ungrab_pointer(x11rb::CURRENT_TIME);
             let _ = conn.ungrab_keyboard(x11rb::CURRENT_TIME);
             *grabbed = false;
         }
-        if let Some((edge, norm)) = return_pos {
-            let (x, y) = shared.geometry.lock().point_on_edge(edge, norm, 6);
+        if let Some(t) = target {
+            let geom = shared.geometry.lock().clone();
+            let (x, y) = match t {
+                LeaveTarget::Edge(edge, norm) => geom.point_on_edge(edge, norm, 6),
+                LeaveTarget::Point(nx, ny) => geom.denormalize_point(nx, ny),
+            };
             let _ = conn.warp_pointer(x11rb::NONE, root, 0, 0, 0, 0, x as i16, y as i16);
         }
         let _ = conn.flush();
@@ -305,6 +375,7 @@ fn run_capture_loop(
                         let leave = shared.pending_leave.lock().take();
                         edge_push_edge = None;
                         edge_push_accum = 0.0;
+                        edge_dwell_start = None;
                         do_ungrab(&conn, &shared, &mut grabbed, leave);
                     }
                     _ => {}
@@ -321,7 +392,9 @@ fn run_capture_loop(
                     }
                     let _ = tx.send(CaptureEvent::MouseDelta { dx, dy });
                 } else {
-                    // Local mode: check active screen edges for crossover.
+                    if shared.locked.load(Ordering::Relaxed) {
+                        continue;
+                    }
                     let edges = shared.active_edges.lock().clone();
                     if edges.is_empty() {
                         continue;
@@ -340,6 +413,12 @@ fn run_capture_loop(
                         continue;
                     };
                     let geom = shared.geometry.lock().clone();
+                    *shared.last_local_norm.lock() =
+                        geom.normalize_point(ptr.root_x as i32, ptr.root_y as i32);
+
+                    let threshold = shared.edge_threshold_px.load(Ordering::Relaxed).max(1) as f32;
+                    let dead_corner = shared.dead_corner_px.load(Ordering::Relaxed).max(0);
+                    let dwell_ms = shared.edge_dwell_ms.load(Ordering::Relaxed);
 
                     let mut crossed = None;
                     for &edge in &edges {
@@ -350,16 +429,25 @@ fn run_capture_loop(
                             Edge::Bottom => dy,
                         };
                         if outward > 0.0 {
-                            if let Some(norm) =
-                                geom.hit_outer_edge(edge, ptr.root_x as i32, ptr.root_y as i32, 2)
-                            {
+                            if let Some(norm) = geom.hit_outer_edge_guarded(
+                                edge,
+                                ptr.root_x as i32,
+                                ptr.root_y as i32,
+                                2,
+                                dead_corner,
+                            ) {
                                 if edge_push_edge == Some(edge) {
                                     edge_push_accum += outward;
                                 } else {
                                     edge_push_edge = Some(edge);
                                     edge_push_accum = outward;
+                                    edge_dwell_start = Some(Instant::now());
                                 }
-                                if edge_push_accum >= config.edge_threshold_px.max(1) as f32 {
+                                let dwell_ok = dwell_ms == 0
+                                    || edge_dwell_start.is_some_and(|t| {
+                                        t.elapsed() >= Duration::from_millis(dwell_ms)
+                                    });
+                                if edge_push_accum >= threshold && dwell_ok {
                                     crossed = Some((edge, norm));
                                 }
                                 break;
@@ -370,6 +458,7 @@ fn run_capture_loop(
                     if let Some((edge, normalized_pos)) = crossed {
                         edge_push_edge = None;
                         edge_push_accum = 0.0;
+                        edge_dwell_start = None;
                         shared.remote_mode.store(true, Ordering::SeqCst);
                         do_grab(&conn, &shared, &mut grabbed);
                         let _ = tx.send(CaptureEvent::EdgeCrossed {
@@ -377,14 +466,20 @@ fn run_capture_loop(
                             normalized_pos,
                         });
                     } else if edge_push_edge.is_some() {
-                        // Reset accumulator if pointer moved away from the edge.
                         let still_touching = edge_push_edge.is_some_and(|e| {
-                            geom.hit_outer_edge(e, ptr.root_x as i32, ptr.root_y as i32, 3)
-                                .is_some()
+                            geom.hit_outer_edge_guarded(
+                                e,
+                                ptr.root_x as i32,
+                                ptr.root_y as i32,
+                                3,
+                                dead_corner,
+                            )
+                            .is_some()
                         });
                         if !still_touching {
                             edge_push_edge = None;
                             edge_push_accum = 0.0;
+                            edge_dwell_start = None;
                         }
                     }
                 }
@@ -446,12 +541,28 @@ fn run_capture_loop(
                     trace!(kc, "Unmapped X11 keycode on press");
                     continue;
                 };
+                mods.update(usage, true);
+
                 if usage == config.escape_key && shared.remote_mode.load(Ordering::Acquire) {
                     shared.remote_mode.store(false, Ordering::SeqCst);
                     do_ungrab(&conn, &shared, &mut grabbed, None);
                     let _ = tx.send(CaptureEvent::EscapeHotkey);
                     continue;
                 }
+
+                // Direct keyboard screen-switch (Ctrl+Alt+Arrow) & Lock toggle (Ctrl+Alt+L)
+                if config.enable_hotkeys && mods.ctrl() && mods.contains(ModifierMask::ALT_LEFT) {
+                    if let Some(dir) = arrow_to_edge(usage) {
+                        let _ = tx.send(CaptureEvent::HotkeySwitch { direction: dir });
+                        continue;
+                    }
+                    if usage == HidUsage::keyboard(0x0F) {
+                        // KeyL
+                        let _ = tx.send(CaptureEvent::HotkeyToggleLock);
+                        continue;
+                    }
+                }
+
                 if shared.remote_mode.load(Ordering::Acquire) {
                     let _ = tx.send(CaptureEvent::Key {
                         usage,
@@ -460,19 +571,21 @@ fn run_capture_loop(
                 }
             }
             Event::XinputRawKeyRelease(rk) => {
+                let kc = rk.detail as u8;
+                let Some(usage) = HidUsage::from_x11_keycode(kc) else {
+                    continue;
+                };
+                mods.update(usage, false);
                 if !shared.remote_mode.load(Ordering::Acquire) {
                     continue;
                 }
-                let kc = rk.detail as u8;
-                if let Some(usage) = HidUsage::from_x11_keycode(kc) {
-                    if usage == config.escape_key {
-                        continue;
-                    }
-                    let _ = tx.send(CaptureEvent::Key {
-                        usage,
-                        pressed: false,
-                    });
+                if usage == config.escape_key {
+                    continue;
                 }
+                let _ = tx.send(CaptureEvent::Key {
+                    usage,
+                    pressed: false,
+                });
             }
             _ => {}
         }

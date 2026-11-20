@@ -7,7 +7,7 @@ use crate::{
 };
 use anyhow::Result;
 use glide_hid::{HidUsage, MouseButton};
-use glide_proto::{ClipboardPayload, Edge, OsKind};
+use glide_proto::{ClipboardPayload, Edge, LockState, OsKind};
 use parking_lot::Mutex;
 use std::collections::HashSet;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -18,7 +18,10 @@ use tokio::sync::mpsc;
 pub struct MockCaptureState {
     pub active_edges: Mutex<Vec<Edge>>,
     pub remote_mode: AtomicBool,
+    pub locked: AtomicBool,
     pub last_leave: Mutex<Option<(Edge, f32)>>,
+    pub last_leave_at: Mutex<Option<(f32, f32)>>,
+    pub lock_state: Mutex<LockState>,
 }
 
 pub struct MockCaptureControl {
@@ -29,6 +32,17 @@ pub struct MockCaptureControl {
 impl CaptureControl for MockCaptureControl {
     fn set_active_edges(&self, edges: &[Edge]) {
         *self.state.active_edges.lock() = edges.to_vec();
+    }
+
+    fn update_tuning(
+        &self,
+        _edge_threshold_px: i32,
+        _dead_corner_px: i32,
+        _edge_dwell_ms: u64,
+        _auto_lock_fullscreen: bool,
+        locked: bool,
+    ) {
+        self.state.locked.store(locked, Ordering::SeqCst);
     }
 
     fn enter_remote(&self) -> Result<()> {
@@ -42,8 +56,22 @@ impl CaptureControl for MockCaptureControl {
         Ok(())
     }
 
+    fn leave_remote_at(&self, norm_x: f32, norm_y: f32) -> Result<()> {
+        self.state.remote_mode.store(false, Ordering::SeqCst);
+        *self.state.last_leave_at.lock() = Some((norm_x, norm_y));
+        Ok(())
+    }
+
     fn desktop_geometry(&self) -> DesktopGeometry {
         self.geometry.clone()
+    }
+
+    fn lock_state(&self) -> LockState {
+        *self.state.lock_state.lock()
+    }
+
+    fn last_local_cursor_norm(&self) -> (f32, f32) {
+        (0.5, 0.5)
     }
 }
 
@@ -73,6 +101,8 @@ pub fn create_mock_capture(
 #[derive(Debug, Clone, PartialEq)]
 pub enum InjectedAction {
     Enter(Edge, f32),
+    EnterAt(f32, f32),
+    LockSync(LockState),
     Move(f32, f32),
     Scroll(i16, i16),
     Button(MouseButton, bool),
@@ -128,12 +158,34 @@ impl InputInjector for MockInjector {
         Ok(())
     }
 
+    fn enter_at(&mut self, norm_x: f32, norm_y: f32) -> Result<()> {
+        let (x, y) = self.geometry.denormalize_point(norm_x, norm_y);
+        self.cursor_x = x as f32;
+        self.cursor_y = y as f32;
+        self.edge_push_accum = 0.0;
+        self.log
+            .lock()
+            .push(InjectedAction::EnterAt(norm_x, norm_y));
+        Ok(())
+    }
+
+    fn cursor_norm(&mut self) -> (f32, f32) {
+        self.geometry
+            .normalize_point(self.cursor_x.round() as i32, self.cursor_y.round() as i32)
+    }
+
+    fn sync_lock_state(&mut self, desired: LockState) -> Result<()> {
+        self.log.lock().push(InjectedAction::LockSync(desired));
+        Ok(())
+    }
+
     fn move_relative(
         &mut self,
         dx: f32,
         dy: f32,
         return_edge: Option<Edge>,
         edge_threshold_px: i32,
+        dead_corner_px: i32,
     ) -> Result<Option<(Edge, f32)>> {
         self.log.lock().push(InjectedAction::Move(dx, dy));
         let (min_x, min_y, max_x, max_y) = self.geometry.bounds();
@@ -153,11 +205,12 @@ impl InputInjector for MockInjector {
                 self.edge_push_accum += overshoot;
                 if self.edge_push_accum >= edge_threshold_px.max(1) as f32 {
                     self.edge_push_accum = 0.0;
-                    if let Some(norm) = self.geometry.hit_outer_edge(
+                    if let Some(norm) = self.geometry.hit_outer_edge_guarded(
                         edge,
                         self.cursor_x.round() as i32,
                         self.cursor_y.round() as i32,
                         2,
+                        dead_corner_px,
                     ) {
                         return Ok(Some((edge, norm)));
                     }

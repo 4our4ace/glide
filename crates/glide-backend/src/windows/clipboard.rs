@@ -1,9 +1,13 @@
 //! Event-driven Windows 11 clipboard backend using `AddClipboardFormatListener`
 //! (`WM_CLIPBOARDUPDATE`, zero polling).
 //!
-//! Supports UTF-8 text (via `CF_UNICODETEXT` with `\r\n` <-> `\n` normalization)
-//! and PNG images (`"PNG"` clipboard format) with SHA-256 anti-loop protection.
+//! Supports:
+//! - UTF-8 text via `CF_UNICODETEXT` (with `\r\n` <-> `\n` normalization)
+//! - Universal images: reads `"PNG"`, `CF_DIBV5`, and `CF_DIB` (converting DIB -> PNG),
+//!   and writes BOTH `"PNG"` AND `CF_DIB` (converting PNG -> DIB) so every Windows app
+//!   (Snipping Tool, Paint, Word, Chrome, Discord, Slack) works seamlessly with Ubuntu.
 
+use crate::dib_png::{dib_to_png, png_to_dib};
 use crate::{ClipboardBackend, ClipboardHandle};
 use anyhow::{anyhow, Context, Result};
 use bytes::Bytes;
@@ -29,10 +33,12 @@ use windows_sys::Win32::System::Memory::{
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, DispatchMessageW, GetMessageW, PostMessageW, RegisterClassW,
-    TranslateMessage, HWND_MESSAGE, MSG, WM_APP, WM_CLIPBOARDUPDATE, WNDCLASSW,
+    TranslateMessage, HWND_MESSAGE, MSG, WM_APP, WM_CLIPBOARDUPDATE, WM_QUIT, WNDCLASSW,
 };
 
+const CF_DIB: u32 = 8;
 const CF_UNICODETEXT: u32 = 13;
+const CF_DIBV5: u32 = 17;
 const WM_APP_SET_CLIPBOARD: u32 = WM_APP + 10;
 
 struct ClipState {
@@ -56,6 +62,20 @@ where
 struct WindowsClipboardBackend {
     hwnd: AtomicIsize,
     state: Arc<ClipState>,
+}
+
+impl Drop for WindowsClipboardBackend {
+    fn drop(&mut self) {
+        let hwnd = self.hwnd.swap(0, Ordering::SeqCst) as HWND;
+        if !hwnd.is_null() {
+            unsafe {
+                PostMessageW(hwnd, WM_QUIT, 0, 0);
+            }
+        }
+        if let Some(cell) = GLOBAL_CLIP_STATE.get() {
+            *cell.lock() = None;
+        }
+    }
 }
 
 impl ClipboardBackend for WindowsClipboardBackend {
@@ -82,6 +102,29 @@ fn open_clipboard_with_retry(hwnd: HWND) -> bool {
     false
 }
 
+fn read_raw_format(format: u32) -> Option<Vec<u8>> {
+    if format == 0 || unsafe { IsClipboardFormatAvailable(format) } == 0 {
+        return None;
+    }
+    let handle = unsafe { GetClipboardData(format) };
+    if handle.is_null() {
+        return None;
+    }
+    let size = unsafe { GlobalSize(handle) };
+    if size == 0 || size > MAX_CLIPBOARD_BYTES * 2 {
+        return None;
+    }
+    let ptr = unsafe { GlobalLock(handle) } as *const u8;
+    if ptr.is_null() {
+        return None;
+    }
+    let data = unsafe { std::slice::from_raw_parts(ptr, size) }.to_vec();
+    unsafe {
+        GlobalUnlock(handle);
+    }
+    Some(data)
+}
+
 fn read_clipboard_payload(hwnd: HWND, png_format: u32) -> Option<(ClipboardFormat, Vec<u8>)> {
     if !open_clipboard_with_retry(hwnd) {
         return None;
@@ -100,7 +143,6 @@ fn read_clipboard_payload(hwnd: HWND, png_format: u32) -> Option<(ClipboardForma
                 unsafe {
                     GlobalUnlock(handle);
                 }
-                // Normalize CRLF -> LF for clean Linux/macOS pasting
                 let normalized = text.replace("\r\n", "\n");
                 if !normalized.is_empty() && normalized.len() <= MAX_CLIPBOARD_BYTES {
                     Some((ClipboardFormat::TextUtf8, normalized.into_bytes()))
@@ -113,26 +155,27 @@ fn read_clipboard_payload(hwnd: HWND, png_format: u32) -> Option<(ClipboardForma
         } else {
             None
         }
-    } else if png_format != 0 && unsafe { IsClipboardFormatAvailable(png_format) } != 0 {
-        let handle = unsafe { GetClipboardData(png_format) };
-        if !handle.is_null() {
-            let size = unsafe { GlobalSize(handle) };
-            if size > 0 && size <= MAX_CLIPBOARD_BYTES {
-                let ptr = unsafe { GlobalLock(handle) } as *const u8;
-                if !ptr.is_null() {
-                    let data = unsafe { std::slice::from_raw_parts(ptr, size) }.to_vec();
-                    unsafe {
-                        GlobalUnlock(handle);
-                    }
-                    Some((ClipboardFormat::ImagePng, data))
-                } else {
-                    None
-                }
-            } else {
-                None
-            }
+    } else if let Some(png_data) = read_raw_format(png_format) {
+        if png_data.len() <= MAX_CLIPBOARD_BYTES {
+            Some((ClipboardFormat::ImagePng, png_data))
         } else {
             None
+        }
+    } else if let Some(dib_data) = read_raw_format(CF_DIBV5).or_else(|| read_raw_format(CF_DIB)) {
+        match dib_to_png(&dib_data) {
+            Ok(png_bytes) if png_bytes.len() <= MAX_CLIPBOARD_BYTES => {
+                debug!(
+                    dib_len = dib_data.len(),
+                    png_len = png_bytes.len(),
+                    "Converted Windows CF_DIB screenshot to PNG"
+                );
+                Some((ClipboardFormat::ImagePng, png_bytes))
+            }
+            Ok(_) => None,
+            Err(e) => {
+                debug!(error = %e, "Could not convert CF_DIB to PNG");
+                None
+            }
         }
     } else {
         None
@@ -142,6 +185,23 @@ fn read_clipboard_payload(hwnd: HWND, png_format: u32) -> Option<(ClipboardForma
         CloseClipboard();
     }
     result
+}
+
+fn set_raw_clipboard_bytes(format: u32, bytes: &[u8]) {
+    if format == 0 || bytes.is_empty() {
+        return;
+    }
+    let hmem = unsafe { GlobalAlloc(GMEM_MOVEABLE, bytes.len()) };
+    if !hmem.is_null() {
+        let dst = unsafe { GlobalLock(hmem) } as *mut u8;
+        if !dst.is_null() {
+            unsafe {
+                ptr::copy_nonoverlapping(bytes.as_ptr(), dst, bytes.len());
+                GlobalUnlock(hmem);
+                SetClipboardData(format, hmem as HANDLE);
+            }
+        }
+    }
 }
 
 fn write_clipboard_payload(hwnd: HWND, png_format: u32, payload: &ClipboardPayload) {
@@ -157,41 +217,21 @@ fn write_clipboard_payload(hwnd: HWND, png_format: u32, payload: &ClipboardPaylo
     match payload.format {
         ClipboardFormat::TextUtf8 => {
             if let Ok(s) = std::str::from_utf8(&payload.data) {
-                // Convert LF -> CRLF for native Windows apps (Notepad, etc.)
                 let crlf = s.replace("\r\n", "\n").replace('\n', "\r\n");
                 let mut wide: Vec<u16> = crlf.encode_utf16().collect();
                 wide.push(0);
-                let byte_len = wide.len() * 2;
-                let hmem = unsafe { GlobalAlloc(GMEM_MOVEABLE, byte_len) };
-                if !hmem.is_null() {
-                    let dst = unsafe { GlobalLock(hmem) } as *mut u16;
-                    if !dst.is_null() {
-                        unsafe {
-                            ptr::copy_nonoverlapping(wide.as_ptr(), dst, wide.len());
-                            GlobalUnlock(hmem);
-                            SetClipboardData(CF_UNICODETEXT, hmem as HANDLE);
-                        }
-                    }
-                }
+                let byte_slice = unsafe {
+                    std::slice::from_raw_parts(wide.as_ptr() as *const u8, wide.len() * 2)
+                };
+                set_raw_clipboard_bytes(CF_UNICODETEXT, byte_slice);
             }
         }
         ClipboardFormat::ImagePng => {
-            if png_format != 0 && !payload.data.is_empty() {
-                let hmem = unsafe { GlobalAlloc(GMEM_MOVEABLE, payload.data.len()) };
-                if !hmem.is_null() {
-                    let dst = unsafe { GlobalLock(hmem) } as *mut u8;
-                    if !dst.is_null() {
-                        unsafe {
-                            ptr::copy_nonoverlapping(
-                                payload.data.as_ptr(),
-                                dst,
-                                payload.data.len(),
-                            );
-                            GlobalUnlock(hmem);
-                            SetClipboardData(png_format, hmem as HANDLE);
-                        }
-                    }
-                }
+            // Write BOTH modern "PNG" AND legacy CF_DIB so every Windows app can paste!
+            set_raw_clipboard_bytes(png_format, &payload.data);
+            match png_to_dib(&payload.data) {
+                Ok(dib) => set_raw_clipboard_bytes(CF_DIB, &dib),
+                Err(e) => debug!(error = %e, "Could not synthesize CF_DIB companion for PNG"),
             }
         }
     }

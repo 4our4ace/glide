@@ -1,10 +1,16 @@
-//! Glide CLI — Ultra-low-latency, native-feeling cross-platform software KVM.
+//! Glide CLI & Desktop App Launcher — Ultra-low-latency cross-platform software KVM.
+//!
+//! Running `glide` with no arguments (e.g. double-clicking `glide.exe` on Windows or
+//! clicking "Glide KVM" in Ubuntu's application launcher) opens the modern desktop GUI.
 
 use anyhow::Result;
 use clap::{Parser, Subcommand, ValueEnum};
+use glide_backend::os_integration::{configure_elevated_task, configure_firewall, set_autostart};
+use glide_backend::InputBackendKind;
 use glide_core::client::run_native_client;
 use glide_core::config::{default_config_dir, ClientConfig, GlideConfigFile, ServerConfig};
 use glide_core::server::run_native_server;
+use glide_gui::{run_gui, GuiOptions, DEFAULT_GUI_PORT};
 use glide_hid::HidUsage;
 use glide_net::discovery::{discover_servers, DEFAULT_DISCOVERY_PORT};
 use glide_net::tls::ServerIdentity;
@@ -33,6 +39,37 @@ impl From<CliEdge> for Edge {
     }
 }
 
+#[derive(Debug, Clone, Copy, ValueEnum)]
+enum CliBackend {
+    Auto,
+    Xtest,
+    Uinput,
+}
+
+impl From<CliBackend> for InputBackendKind {
+    fn from(value: CliBackend) -> Self {
+        match value {
+            CliBackend::Auto => InputBackendKind::Auto,
+            CliBackend::Xtest => InputBackendKind::XTest,
+            CliBackend::Uinput => InputBackendKind::Uinput,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+enum SetupAction {
+    /// Add Windows Defender Firewall rule (UDP 24800 & 24801) or show UFW command on Ubuntu
+    Firewall,
+    /// Enable Glide autostart at login (client mode)
+    AutostartClient,
+    /// Enable Glide autostart at login (server mode)
+    AutostartServer,
+    /// Disable Glide autostart
+    AutostartOff,
+    /// Register Windows elevated Scheduled Task (so Glide works over UAC/Admin windows)
+    ElevatedTask,
+}
+
 #[derive(Parser, Debug)]
 #[command(
     name = "glide",
@@ -48,12 +85,28 @@ struct Cli {
     #[arg(short, long, global = true)]
     verbose: bool,
 
+    /// Subcommand (defaults to launching the desktop GUI if omitted)
     #[command(subcommand)]
-    command: Command,
+    command: Option<Command>,
 }
 
 #[derive(Subcommand, Debug)]
 enum Command {
+    /// Launch the modern desktop GUI (also the default when running with no arguments)
+    Gui {
+        /// Localhost port for the embedded UI (default: 24802)
+        #[arg(long, default_value_t = DEFAULT_GUI_PORT)]
+        port: u16,
+
+        /// Start minimized in background / tray without opening the window immediately
+        #[arg(long)]
+        minimized: bool,
+
+        /// Automatically start `server` or `client` on GUI launch
+        #[arg(long)]
+        auto_start: Option<String>,
+    },
+
     /// Run as the primary machine (shares its physical mouse, keyboard, and clipboard)
     Server {
         /// UDP bind address for QUIC (default: 0.0.0.0:24800)
@@ -79,6 +132,18 @@ enum Command {
         /// Outward push threshold in pixels at screen edges (default: 4)
         #[arg(long)]
         edge_threshold: Option<i32>,
+
+        /// Corner dead-zone in pixels to protect close X / Show Desktop (default: 24)
+        #[arg(long)]
+        dead_corner: Option<i32>,
+
+        /// Optional edge dwell delay in milliseconds before crossing (default: 0)
+        #[arg(long)]
+        edge_dwell_ms: Option<u64>,
+
+        /// Allow edge switching even while a fullscreen game/app is focused
+        #[arg(long)]
+        no_fullscreen_lock: bool,
 
         /// Mouse delta coalescing interval in microseconds (default: 1000 = 1000Hz; 0 = immediate)
         #[arg(long)]
@@ -115,9 +180,29 @@ enum Command {
         #[arg(long)]
         sensitivity: Option<f32>,
 
+        /// Automatically scale pointer deltas by client_dpi / server_dpi
+        #[arg(long)]
+        auto_dpi: bool,
+
+        /// Scroll speed multiplier (default: 1.0)
+        #[arg(long)]
+        scroll_speed: Option<f32>,
+
+        /// Invert scroll wheel direction ("natural scrolling")
+        #[arg(long)]
+        invert_scroll: bool,
+
         /// Outward push threshold in pixels to return to server (default: 4)
         #[arg(long)]
         edge_threshold: Option<i32>,
+
+        /// Corner dead-zone in pixels on the return edge (default: 24)
+        #[arg(long)]
+        dead_corner: Option<i32>,
+
+        /// Input backend on Linux: `auto`, `xtest`, or `uinput` (hardware-native)
+        #[arg(long, value_enum)]
+        backend: Option<CliBackend>,
 
         /// Disable bidirectional clipboard sync
         #[arg(long)]
@@ -140,6 +225,12 @@ enum Command {
         /// Output path for config file (default: OS config dir / glide.toml)
         #[arg(short, long)]
         out: Option<PathBuf>,
+    },
+
+    /// One-click OS integration helpers (firewall, autostart, Windows elevated task)
+    Setup {
+        #[arg(value_enum)]
+        action: SetupAction,
     },
 
     /// Inspect monitors, DPI scaling, OS extensions, and German ISO HID key mappings
@@ -174,7 +265,27 @@ async fn main() -> Result<()> {
     let cli = Cli::parse();
     init_logging(cli.verbose);
 
-    match cli.command {
+    let command = cli.command.unwrap_or(Command::Gui {
+        port: DEFAULT_GUI_PORT,
+        minimized: false,
+        auto_start: None,
+    });
+
+    match command {
+        Command::Gui {
+            port,
+            minimized,
+            auto_start,
+        } => {
+            run_gui(GuiOptions {
+                config_path: cli.config,
+                port,
+                minimized,
+                auto_start_role: auto_start,
+            })
+            .await?;
+        }
+
         Command::Server {
             bind,
             name,
@@ -182,6 +293,9 @@ async fn main() -> Result<()> {
             no_clipboard,
             escape_key,
             edge_threshold,
+            dead_corner,
+            edge_dwell_ms,
+            no_fullscreen_lock,
             coalesce_us,
         } => {
             let mut cfg: ServerConfig = load_config(cli.config.as_ref())?.server;
@@ -203,6 +317,15 @@ async fn main() -> Result<()> {
             if let Some(th) = edge_threshold {
                 cfg.edge_threshold_px = th;
             }
+            if let Some(dc) = dead_corner {
+                cfg.dead_corner_px = dc;
+            }
+            if let Some(dw) = edge_dwell_ms {
+                cfg.edge_dwell_ms = dw;
+            }
+            if no_fullscreen_lock {
+                cfg.auto_lock_fullscreen = false;
+            }
             if let Some(cu) = coalesce_us {
                 cfg.motion_coalesce_us = cu;
             }
@@ -223,7 +346,12 @@ async fn main() -> Result<()> {
             fingerprint,
             insecure,
             sensitivity,
+            auto_dpi,
+            scroll_speed,
+            invert_scroll,
             edge_threshold,
+            dead_corner,
+            backend,
             no_clipboard,
         } => {
             let mut cfg: ClientConfig = load_config(cli.config.as_ref())?.client;
@@ -248,8 +376,23 @@ async fn main() -> Result<()> {
             if let Some(sens) = sensitivity {
                 cfg.sensitivity = sens;
             }
+            if auto_dpi {
+                cfg.auto_dpi_scale = true;
+            }
+            if let Some(ss) = scroll_speed {
+                cfg.scroll_speed = ss;
+            }
+            if invert_scroll {
+                cfg.invert_scroll = true;
+            }
             if let Some(th) = edge_threshold {
                 cfg.edge_threshold_px = th;
+            }
+            if let Some(dc) = dead_corner {
+                cfg.dead_corner_px = dc;
+            }
+            if let Some(b) = backend {
+                cfg.input_backend = b.into();
             }
             if no_clipboard {
                 cfg.clipboard = false;
@@ -295,9 +438,27 @@ async fn main() -> Result<()> {
             println!("TLS fingerprint:    {}", id.fingerprint);
             println!();
             println!("Quick start:");
+            println!("  Desktop GUI:       glide");
             println!("  Primary machine:   glide server");
             println!("  Secondary machine: glide client --edge right");
         }
+
+        Command::Setup { action } => match action {
+            SetupAction::Firewall => println!("{}", configure_firewall()?),
+            SetupAction::AutostartClient => {
+                set_autostart(true, "gui --minimized --auto-start client")?;
+                println!("Enabled autostart (client mode).");
+            }
+            SetupAction::AutostartServer => {
+                set_autostart(true, "gui --minimized --auto-start server")?;
+                println!("Enabled autostart (server mode).");
+            }
+            SetupAction::AutostartOff => {
+                set_autostart(false, "")?;
+                println!("Disabled autostart.");
+            }
+            SetupAction::ElevatedTask => println!("{}", configure_elevated_task()?),
+        },
 
         Command::Doctor => {
             let report = glide_backend::run_doctor()?;

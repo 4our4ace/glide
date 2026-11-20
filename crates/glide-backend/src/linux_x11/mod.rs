@@ -129,6 +129,16 @@ pub fn run_doctor() -> Result<DoctorReport> {
         _ => notes.push("XFixes extension: MISSING (clipboard notifications will fail)".into()),
     }
 
+    if std::fs::OpenOptions::new()
+        .write(true)
+        .open("/dev/uinput")
+        .is_ok()
+    {
+        notes.push("Optional /dev/uinput hardware-native HID backend: READY".into());
+    } else {
+        notes.push("Optional /dev/uinput backend: not writable (XTest works out of the box; install 99-glide-uinput.rules to opt in)".into());
+    }
+
     Ok(DoctorReport {
         os_kind: OsKind::LinuxX11,
         display_info: format!("DISPLAY={display} (screen {screen_num})"),
@@ -155,7 +165,7 @@ mod tests {
 
         // Move right 100px, down 20px and verify the real X11 cursor actually moved!
         let ret = inj
-            .move_relative(100.0, 20.0, Some(Edge::Left), 4)
+            .move_relative(100.0, 20.0, Some(Edge::Left), 4, 24)
             .expect("move right");
         assert!(ret.is_none());
 
@@ -176,8 +186,12 @@ mod tests {
         inj.release_all().unwrap();
 
         // Push cursor back past the Left edge and verify edge-return triggers!
-        let _ = inj.move_relative(-150.0, 0.0, Some(Edge::Left), 4).unwrap();
-        let crossed = inj.move_relative(-20.0, 0.0, Some(Edge::Left), 4).unwrap();
+        let _ = inj
+            .move_relative(-150.0, 0.0, Some(Edge::Left), 4, 24)
+            .unwrap();
+        let crossed = inj
+            .move_relative(-20.0, 0.0, Some(Edge::Left), 4, 24)
+            .unwrap();
         assert!(
             crossed.is_some(),
             "expected pushing past Left edge to trigger return"

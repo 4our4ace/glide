@@ -1,12 +1,16 @@
 //! Cross-platform OS input capture, input injection, multi-monitor geometry,
-//! and clipboard backends for Glide.
+//! clipboard, and OS integration backends for Glide.
 //!
-//! Each OS implements the clean [`CaptureBackend`], [`InputInjector`], and
-//! [`ClipboardBackend`] traits so `glide-core` stays 100% platform-agnostic.
+//! Each OS implements [`CaptureControl`], [`InputInjector`], and [`ClipboardBackend`]
+//! so `glide-core` and `glide-gui` stay 100% platform-agnostic.
 
+pub mod dib_png;
 pub mod geometry;
 pub mod mock;
+pub mod os_integration;
 
+#[cfg(target_os = "linux")]
+pub mod linux_uinput;
 #[cfg(target_os = "linux")]
 pub mod linux_x11;
 
@@ -19,16 +23,38 @@ pub mod macos;
 use anyhow::Result;
 use geometry::DesktopGeometry;
 use glide_hid::{HidUsage, MouseButton};
-use glide_proto::{ClipboardPayload, Edge, OsKind};
+use glide_proto::{ClipboardPayload, Edge, LockState, OsKind};
+use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
 
-/// Configuration shared with platform capture backends.
+/// Client input injection backend selector (Linux can opt into kernel `uinput`).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum InputBackendKind {
+    /// Default zero-privilege backend (`XTest` on Linux X11, `SendInput` on Windows).
+    #[default]
+    Auto,
+    /// Explicitly use X11 XTest on Linux.
+    XTest,
+    /// Linux virtual kernel HID device (`/dev/uinput`) for 100% native libinput acceleration & hi-res scroll.
+    Uinput,
+}
+
+/// Runtime-tunable capture settings shared with OS capture threads.
 #[derive(Debug, Clone)]
 pub struct CaptureConfig {
     /// Physical key that unconditionally returns focus to the local server desktop.
     pub escape_key: HidUsage,
-    /// Pixels the user must push past an outer screen edge before switching (anti-accidental switch).
+    /// Pixels the user must push past an outer screen edge before switching.
     pub edge_threshold_px: i32,
+    /// Corner dead-zone in pixels (prevents accidental switches on close `X` / taskbar corners).
+    pub dead_corner_px: i32,
+    /// Optional dwell time in milliseconds before crossing an edge (0 = instant).
+    pub edge_dwell_ms: u64,
+    /// Pause edge switching while an exclusive fullscreen app/game has focus on the server.
+    pub auto_lock_fullscreen: bool,
+    /// Enable `Ctrl + Alt + Arrow` direct screen switching and `Ctrl + Alt + L` cursor lock toggle.
+    pub enable_hotkeys: bool,
 }
 
 impl Default for CaptureConfig {
@@ -36,6 +62,10 @@ impl Default for CaptureConfig {
         Self {
             escape_key: HidUsage::SCROLL_LOCK,
             edge_threshold_px: 4,
+            dead_corner_px: 24,
+            edge_dwell_ms: 0,
+            auto_lock_fullscreen: true,
+            enable_hotkeys: true,
         }
     }
 }
@@ -55,18 +85,38 @@ pub enum CaptureEvent {
     Key { usage: HidUsage, pressed: bool },
     /// Local escape hotkey pressed — unconditionally return control to server.
     EscapeHotkey,
+    /// Keyboard hotkey (`Ctrl+Alt+Arrow`) requesting a direct jump in `direction`.
+    HotkeySwitch { direction: Edge },
+    /// Keyboard hotkey (`Ctrl+Alt+L`) toggling cursor lock to the current screen.
+    HotkeyToggleLock,
 }
 
-/// Control handle to switch the OS capture backend between local and remote modes.
+/// Control handle to switch the OS capture backend between local and remote modes
+/// and hot-update tuning parameters at runtime.
 pub trait CaptureControl: Send + Sync {
     /// Updates the list of outer edges that have an active connected client.
     fn set_active_edges(&self, edges: &[Edge]);
-    /// Enters remote mode: suppresses/grabs local input and streams raw events.
+    /// Hot-updates edge tuning & cursor lock without restarting capture.
+    fn update_tuning(
+        &self,
+        edge_threshold_px: i32,
+        dead_corner_px: i32,
+        edge_dwell_ms: u64,
+        auto_lock_fullscreen: bool,
+        locked: bool,
+    );
+    /// Enters remote mode: suppresses/grabs local input and parks/hides cursor cleanly.
     fn enter_remote(&self) -> Result<()>;
-    /// Leaves remote mode: releases local input grab and warps cursor to `return_edge`.
+    /// Leaves remote mode: releases grab and warps cursor to `return_edge` at `normalized_pos`.
     fn leave_remote(&self, return_edge: Edge, normalized_pos: f32) -> Result<()>;
+    /// Leaves remote mode via hotkey: restores cursor to saved normalized desktop coordinates.
+    fn leave_remote_at(&self, norm_x: f32, norm_y: f32) -> Result<()>;
     /// Queries current multi-monitor desktop geometry.
     fn desktop_geometry(&self) -> DesktopGeometry;
+    /// Reads current CapsLock / NumLock state on the server.
+    fn lock_state(&self) -> LockState;
+    /// Returns the last known normalized `(nx, ny)` local cursor position before leaving server.
+    fn last_local_cursor_norm(&self) -> (f32, f32);
 }
 
 /// Pair returned when starting a server input capture backend.
@@ -82,21 +132,27 @@ pub trait InputInjector: Send {
     /// Returns the current multi-monitor layout.
     fn desktop_geometry(&mut self) -> Result<DesktopGeometry>;
 
-    /// Called when focus enters this client at `edge` and `normalized_pos ∈ [0.0, 1.0]`.
-    /// Places the OS cursor cleanly inside the corresponding monitor edge.
+    /// Called when focus enters this client via a screen border.
     fn enter(&mut self, edge: Edge, normalized_pos: f32) -> Result<()>;
 
+    /// Called when focus enters this client via keyboard hotkey (restoring cursor memory).
+    fn enter_at(&mut self, norm_x: f32, norm_y: f32) -> Result<()>;
+
+    /// Returns the client's current normalized `(nx, ny)` cursor position.
+    fn cursor_norm(&mut self) -> (f32, f32);
+
+    /// Synchronizes CapsLock / NumLock state on the client to match `desired`.
+    fn sync_lock_state(&mut self, desired: LockState) -> Result<()>;
+
     /// Injects a raw relative pointer delta `(dx, dy)` and optionally detects if the user
-    /// pushed back past `return_edge` (the edge facing the server).
-    ///
-    /// Returns `Ok(Some((return_edge, normalized_pos)))` when the cursor should hand
-    /// focus back to the server.
+    /// pushed back past `return_edge` (respecting `dead_corner_px` and `edge_threshold_px`).
     fn move_relative(
         &mut self,
         dx: f32,
         dy: f32,
         return_edge: Option<Edge>,
         edge_threshold_px: i32,
+        dead_corner_px: i32,
     ) -> Result<Option<(Edge, f32)>>;
 
     /// Injects high-resolution scroll (`120` = 1 notch).
@@ -125,7 +181,7 @@ pub struct ClipboardHandle {
 }
 
 /// Diagnostic summary returned by `glide doctor`.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DoctorReport {
     pub os_kind: OsKind,
     pub display_info: String,
@@ -175,18 +231,36 @@ pub fn start_capture(config: CaptureConfig) -> Result<CaptureHandle> {
     }
 }
 
-/// Creates the native OS client input injector.
+/// Creates the native OS client input injector using default backend selection.
 pub fn create_injector() -> Result<Box<dyn InputInjector>> {
+    create_injector_with_kind(InputBackendKind::Auto)
+}
+
+/// Creates the native OS client input injector, honoring `InputBackendKind::Uinput` on Linux.
+pub fn create_injector_with_kind(kind: InputBackendKind) -> Result<Box<dyn InputInjector>> {
     #[cfg(target_os = "linux")]
     {
+        if kind == InputBackendKind::Uinput {
+            match linux_uinput::UinputInjector::connect() {
+                Ok(inj) => return Ok(Box::new(inj)),
+                Err(e) => {
+                    tracing::warn!(
+                        error = %e,
+                        "Requested /dev/uinput backend unavailable; falling back cleanly to XTest"
+                    );
+                }
+            }
+        }
         Ok(Box::new(linux_x11::inject::X11Injector::connect()?))
     }
     #[cfg(target_os = "windows")]
     {
+        let _ = kind;
         Ok(Box::new(windows::inject::WindowsInjector::new()?))
     }
     #[cfg(target_os = "macos")]
     {
+        let _ = kind;
         macos::create_macos_injector()
     }
 }

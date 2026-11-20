@@ -2,10 +2,12 @@
 
 use anyhow::{Context, Result};
 use directories::ProjectDirs;
+use glide_backend::InputBackendKind;
 use glide_hid::HidUsage;
 use glide_net::discovery::{machine_hostname, DEFAULT_DISCOVERY_PORT};
 use glide_proto::Edge;
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::fs;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
@@ -22,6 +24,27 @@ pub fn default_config_dir() -> PathBuf {
     } else {
         PathBuf::from(".glide")
     }
+}
+
+/// Declarative physical key remap rule (e.g. `CapsLock` -> `ControlLeft`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct KeyRemapRule {
+    pub from: String,
+    pub to: String,
+}
+
+/// Compiles declarative key remap rules into a fast `HidUsage -> HidUsage` lookup map.
+pub fn compile_key_remaps(rules: &[KeyRemapRule]) -> HashMap<HidUsage, HidUsage> {
+    let mut map = HashMap::new();
+    for rule in rules {
+        if let (Some(from), Some(to)) = (
+            HidUsage::from_name(&rule.from),
+            HidUsage::from_name(&rule.to),
+        ) {
+            map.insert(from.canonicalize(), to.canonicalize());
+        }
+    }
+    map
 }
 
 /// Top-level `glide.toml` file supporting both `[server]` and `[client]` sections
@@ -68,7 +91,17 @@ pub struct ServerConfig {
     pub escape_key: String,
     /// Outward push threshold in pixels at a screen border before switching.
     pub edge_threshold_px: i32,
-    /// Enable bidirectional clipboard sharing (UTF-8 text & PNG images).
+    /// Corner dead-zone in pixels (prevents accidental switches on close `X` / Show Desktop).
+    pub dead_corner_px: i32,
+    /// Optional edge dwell delay in milliseconds before crossing (0 = instant).
+    pub edge_dwell_ms: u64,
+    /// Automatically pause edge switching while a fullscreen game/app is active.
+    pub auto_lock_fullscreen: bool,
+    /// Enable `Ctrl+Alt+Arrow` direct screen switching and `Ctrl+Alt+L` cursor lock toggle.
+    pub enable_hotkeys: bool,
+    /// Sync CapsLock and NumLock state onto clients on screen entry.
+    pub sync_lock_keys: bool,
+    /// Enable bidirectional clipboard sharing (UTF-8 text & PNG/DIB images).
     pub clipboard: bool,
     /// Microseconds to coalesce high-polling-rate mouse deltas (1000 = 1000Hz max cadence; 0 = immediate).
     pub motion_coalesce_us: u64,
@@ -85,6 +118,11 @@ impl Default for ServerConfig {
             discovery_port: DEFAULT_DISCOVERY_PORT,
             escape_key: "ScrollLock".into(),
             edge_threshold_px: 4,
+            dead_corner_px: 24,
+            edge_dwell_ms: 0,
+            auto_lock_fullscreen: true,
+            enable_hotkeys: true,
+            sync_lock_keys: true,
             clipboard: true,
             motion_coalesce_us: 1000,
             identity_dir: None,
@@ -123,8 +161,22 @@ pub struct ClientConfig {
     pub insecure_skip_verify: bool,
     /// Mouse speed multiplier applied to incoming raw relative deltas (default `1.0`).
     pub sensitivity: f32,
+    /// Automatically scale incoming mouse deltas by `client_dpi_scale / server_dpi_scale`.
+    pub auto_dpi_scale: bool,
+    /// Scroll wheel speed multiplier (default `1.0`).
+    pub scroll_speed: f32,
+    /// Invert scroll direction ("natural scrolling").
+    pub invert_scroll: bool,
     /// Outward push threshold in pixels to return control back to the server.
     pub edge_threshold_px: i32,
+    /// Corner dead-zone in pixels on the return edge.
+    pub dead_corner_px: i32,
+    /// Sync CapsLock / NumLock state when entering this client.
+    pub sync_lock_keys: bool,
+    /// Input injection backend (`auto`, `xtest`, or `uinput` on Linux).
+    pub input_backend: InputBackendKind,
+    /// Declarative per-client physical key remapping rules.
+    pub key_remap: Vec<KeyRemapRule>,
     /// Enable bidirectional clipboard sharing.
     pub clipboard: bool,
     /// Path to persist TOFU server fingerprints.
@@ -142,7 +194,14 @@ impl Default for ClientConfig {
             trusted_fingerprint: None,
             insecure_skip_verify: false,
             sensitivity: 1.0,
+            auto_dpi_scale: false,
+            scroll_speed: 1.0,
+            invert_scroll: false,
             edge_threshold_px: 4,
+            dead_corner_px: 24,
+            sync_lock_keys: true,
+            input_backend: InputBackendKind::Auto,
+            key_remap: Vec::new(),
             clipboard: true,
             tofu_store_path: None,
         }

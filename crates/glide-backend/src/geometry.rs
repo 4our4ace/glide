@@ -4,9 +4,10 @@
 //! (Per-Monitor DPI Aware V2 on Windows, RandR CRTC space on Linux X11).
 
 use glide_proto::Edge;
+use serde::{Deserialize, Serialize};
 
 /// Physical monitor rectangle in virtual desktop coordinates.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct MonitorRect {
     pub name: String,
     pub x: i32,
@@ -40,7 +41,7 @@ impl MonitorRect {
 }
 
 /// Complete multi-monitor layout of a machine.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct DesktopGeometry {
     pub monitors: Vec<MonitorRect>,
 }
@@ -77,12 +78,26 @@ impl DesktopGeometry {
             .or_else(|| self.monitors.first())
     }
 
+    /// Returns the primary monitor's DPI scale factor (e.g. `1.0`, `1.25`, `1.5`, `2.0`).
+    pub fn primary_scale(&self) -> f32 {
+        self.primary().map(|m| m.scale).unwrap_or(1.0).max(0.5)
+    }
+
     /// Returns the center `(x, y)` of the primary monitor (for parking the cursor in remote mode).
     pub fn primary_center(&self) -> (i32, i32) {
         if let Some(m) = self.primary() {
             (m.x + m.width / 2, m.y + m.height / 2)
         } else {
             (960, 540)
+        }
+    }
+
+    /// Returns the extreme bottom-right pixel `(x, y)` of the primary monitor (for invisible cursor parking on Windows).
+    pub fn primary_park_corner(&self) -> (i32, i32) {
+        if let Some(m) = self.primary() {
+            ((m.right() - 1).max(m.left()), (m.bottom() - 1).max(m.top()))
+        } else {
+            (1919, 1079)
         }
     }
 
@@ -104,6 +119,38 @@ impl DesktopGeometry {
         (min_x, min_y, max_x, max_y)
     }
 
+    /// Maps an arbitrary cursor `(x, y)` onto normalized `[0.0, 1.0] x [0.0, 1.0]` desktop coordinates.
+    pub fn normalize_point(&self, x: i32, y: i32) -> (f32, f32) {
+        let (min_x, min_y, max_x, max_y) = self.bounds();
+        let w = (max_x - min_x).max(1) as f32;
+        let h = (max_y - min_y).max(1) as f32;
+        (
+            ((x - min_x) as f32 / w).clamp(0.0, 1.0),
+            ((y - min_y) as f32 / h).clamp(0.0, 1.0),
+        )
+    }
+
+    /// Maps normalized `(nx, ny) ∈ [0.0, 1.0]^2` back to a safe pixel inside a real monitor.
+    pub fn denormalize_point(&self, nx: f32, ny: f32) -> (i32, i32) {
+        let (min_x, min_y, max_x, max_y) = self.bounds();
+        let tx = min_x + ((max_x - min_x - 1).max(0) as f32 * nx.clamp(0.0, 1.0)).round() as i32;
+        let ty = min_y + ((max_y - min_y - 1).max(0) as f32 * ny.clamp(0.0, 1.0)).round() as i32;
+        if self.monitors.iter().any(|m| m.contains(tx, ty)) {
+            return (tx, ty);
+        }
+        if let Some(mon) = self.monitors.iter().min_by_key(|m| {
+            let cx = tx.clamp(m.left(), m.right() - 1);
+            let cy = ty.clamp(m.top(), m.bottom() - 1);
+            (tx - cx).abs() + (ty - cy).abs()
+        }) {
+            return (
+                tx.clamp(mon.left() + 1, (mon.right() - 2).max(mon.left())),
+                ty.clamp(mon.top() + 1, (mon.bottom() - 2).max(mon.top())),
+            );
+        }
+        self.primary_center()
+    }
+
     /// Returns all monitors whose boundary lies on the specified outer edge of the desktop.
     fn monitors_on_edge(&self, edge: Edge) -> Vec<&MonitorRect> {
         let (min_x, min_y, max_x, max_y) = self.bounds();
@@ -120,19 +167,45 @@ impl DesktopGeometry {
     }
 
     /// Checks whether cursor coordinate `(x, y)` is touching/beyond the given outer `edge`
-    /// within `margin_px` pixels, returning the normalized position `t ∈ [0.0, 1.0]` along
-    /// that edge's real monitor span.
+    /// within `margin_px` pixels (with no dead-corner margin).
     pub fn hit_outer_edge(&self, edge: Edge, x: i32, y: i32, margin_px: i32) -> Option<f32> {
+        self.hit_outer_edge_guarded(edge, x, y, margin_px, 0)
+    }
+
+    /// Checks whether `(x, y)` touches outer `edge` while ignoring `dead_corner_px` pixels
+    /// near each corner of the monitor (so slamming into Windows' top-right close `X` or
+    /// bottom-right Show Desktop never accidentally switches screens).
+    pub fn hit_outer_edge_guarded(
+        &self,
+        edge: Edge,
+        x: i32,
+        y: i32,
+        margin_px: i32,
+        dead_corner_px: i32,
+    ) -> Option<f32> {
         let edge_mons = self.monitors_on_edge(edge);
         if edge_mons.is_empty() {
             return None;
         }
         let margin = margin_px.max(0);
+        let dead = dead_corner_px.max(0);
         let touching = edge_mons.iter().any(|m| match edge {
-            Edge::Left => x <= m.left() + margin && y >= m.top() && y <= m.bottom(),
-            Edge::Right => x >= m.right() - 1 - margin && y >= m.top() && y <= m.bottom(),
-            Edge::Top => y <= m.top() + margin && x >= m.left() && x <= m.right(),
-            Edge::Bottom => y >= m.bottom() - 1 - margin && x >= m.left() && x <= m.right(),
+            Edge::Left => {
+                let d = dead.min(m.height / 4);
+                x <= m.left() + margin && y >= m.top() + d && y <= m.bottom() - d
+            }
+            Edge::Right => {
+                let d = dead.min(m.height / 4);
+                x >= m.right() - 1 - margin && y >= m.top() + d && y <= m.bottom() - d
+            }
+            Edge::Top => {
+                let d = dead.min(m.width / 4);
+                y <= m.top() + margin && x >= m.left() + d && x <= m.right() - d
+            }
+            Edge::Bottom => {
+                let d = dead.min(m.width / 4);
+                y >= m.bottom() - 1 - margin && x >= m.left() + d && x <= m.right() - d
+            }
         });
         if !touching {
             return None;
@@ -272,5 +345,21 @@ mod tests {
         let (ex, ey) = geom.point_on_edge(Edge::Left, 0.0, 4);
         assert_eq!(ex, -1916);
         assert!((180..1260).contains(&ey));
+
+        // Dead corner guard: top-right X button (y=10) and bottom-right Show Desktop (y=1430) are blocked!
+        assert!(geom
+            .hit_outer_edge_guarded(Edge::Right, 2559, 10, 0, 24)
+            .is_none());
+        assert!(geom
+            .hit_outer_edge_guarded(Edge::Right, 2559, 1430, 0, 24)
+            .is_none());
+        assert!(geom
+            .hit_outer_edge_guarded(Edge::Right, 2559, 500, 0, 24)
+            .is_some());
+
+        // Normalized cursor point roundtrip
+        let (nx, ny) = geom.normalize_point(1280, 720);
+        let (rx, ry) = geom.denormalize_point(nx, ny);
+        assert!((rx - 1280).abs() <= 2 && (ry - 720).abs() <= 2);
     }
 }

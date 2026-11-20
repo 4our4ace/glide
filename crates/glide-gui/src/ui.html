@@ -1,0 +1,951 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width,initial-scale=1" />
+<title>Glide — Software KVM</title>
+<style>
+  :root {
+    --bg: #0c0f14;
+    --surface: #131822;
+    --surface-2: #19202d;
+    --border: rgba(255, 255, 255, 0.08);
+    --border-strong: rgba(255, 255, 255, 0.16);
+    --text: #eef2f8;
+    --muted: #8b97ad;
+    --accent: #3b82f6;
+    --accent-soft: rgba(59, 130, 246, 0.16);
+    --green: #22c55e;
+    --green-soft: rgba(34, 197, 94, 0.15);
+    --amber: #f59e0b;
+    --amber-soft: rgba(245, 158, 11, 0.15);
+    --red: #ef4444;
+    --red-soft: rgba(239, 68, 68, 0.15);
+    --radius: 12px;
+    --mono: ui-monospace, "Cascadia Code", "JetBrains Mono", Consolas, monospace;
+    --sans: "Inter", "Segoe UI Variable", "Segoe UI", system-ui, -apple-system, sans-serif;
+  }
+  * { box-sizing: border-box; }
+  html, body {
+    margin: 0; padding: 0; height: 100%;
+    background: var(--bg); color: var(--text);
+    font-family: var(--sans); font-size: 13.5px; line-height: 1.45;
+    -webkit-font-smoothing: antialiased;
+    user-select: none;
+  }
+  .app {
+    max-width: 980px; margin: 0 auto; padding: 18px 20px 32px;
+    display: flex; flex-direction: column; gap: 16px;
+  }
+  /* Header */
+  .topbar {
+    display: flex; align-items: center; justify-content: space-between; gap: 12px;
+    background: var(--surface); border: 1px solid var(--border);
+    border-radius: 14px; padding: 12px 16px;
+  }
+  .brand { display: flex; align-items: center; gap: 11px; }
+  .logo {
+    width: 34px; height: 34px; border-radius: 10px;
+    background: linear-gradient(135deg, #3b82f6, #06b6d4);
+    display: grid; place-items: center; font-weight: 800; color: #fff; font-size: 16px;
+    box-shadow: 0 4px 16px rgba(59, 130, 246, 0.35);
+  }
+  .brand-title { font-weight: 700; font-size: 15.5px; letter-spacing: -0.01em; display: flex; align-items: center; gap: 8px; }
+  .ver { font-size: 11px; font-weight: 600; color: var(--muted); background: var(--surface-2); padding: 2px 7px; border-radius: 99px; border: 1px solid var(--border); }
+  .brand-sub { font-size: 12px; color: var(--muted); }
+  .top-actions { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+  .pill {
+    display: inline-flex; align-items: center; gap: 7px;
+    padding: 6px 11px; border-radius: 99px; font-size: 12px; font-weight: 600;
+    background: var(--surface-2); border: 1px solid var(--border); color: var(--muted);
+  }
+  .pill.live { background: var(--green-soft); color: #86efac; border-color: rgba(34,197,94,0.3); }
+  .pill.wait { background: var(--amber-soft); color: #fcd34d; border-color: rgba(245,158,11,0.3); }
+  .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--muted); }
+  .pill.live .dot { background: var(--green); box-shadow: 0 0 8px var(--green); }
+  .pill.wait .dot { background: var(--amber); }
+  .rtt-box { display: inline-flex; align-items: center; gap: 6px; font-family: var(--mono); font-size: 11.5px; color: #93c5fd; background: var(--surface-2); border: 1px solid var(--border); border-radius: 99px; padding: 4px 10px; }
+  button {
+    font-family: inherit; font-size: 13px; font-weight: 600; cursor: pointer;
+    border-radius: 10px; border: 1px solid var(--border-strong);
+    background: var(--surface-2); color: var(--text); padding: 7px 13px;
+    transition: all 0.14s ease;
+  }
+  button:hover { background: #232c3d; border-color: rgba(255,255,255,0.24); }
+  button:active { transform: translateY(1px); }
+  button.primary { background: var(--accent); border-color: #60a5fa; color: #fff; }
+  button.primary:hover { background: #2563eb; }
+  button.danger { background: var(--red-soft); border-color: rgba(239,68,68,0.45); color: #fca5a5; }
+  button.danger:hover { background: rgba(239,68,68,0.28); }
+  button.locked { background: var(--amber-soft); border-color: rgba(245,158,11,0.5); color: #fde68a; }
+  button.sm { padding: 5px 10px; font-size: 12px; border-radius: 8px; }
+
+  /* Tabs */
+  .tabs {
+    display: flex; gap: 6px; background: var(--surface); padding: 5px;
+    border-radius: 12px; border: 1px solid var(--border); width: fit-content;
+  }
+  .tab {
+    background: transparent; border: none; color: var(--muted);
+    padding: 7px 14px; border-radius: 8px; font-size: 13px; font-weight: 600;
+  }
+  .tab:hover { color: var(--text); background: rgba(255,255,255,0.04); }
+  .tab.active { background: var(--surface-2); color: var(--text); box-shadow: inset 0 0 0 1px var(--border-strong); }
+
+  .panel { display: none; flex-direction: column; gap: 14px; }
+  .panel.active { display: flex; }
+
+  .grid-2 { display: grid; grid-template-columns: 1.15fr 1fr; gap: 14px; }
+  @media (max-width: 780px) { .grid-2 { grid-template-columns: 1fr; } }
+
+  .card {
+    background: var(--surface); border: 1px solid var(--border);
+    border-radius: var(--radius); padding: 16px;
+    display: flex; flex-direction: column; gap: 12px;
+  }
+  .card-hdr { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
+  .card-title { font-size: 13.5px; font-weight: 700; letter-spacing: -0.01em; }
+  .card-sub { font-size: 12px; color: var(--muted); }
+
+  /* Segmented role selector */
+  .seg {
+    display: grid; grid-template-columns: 1fr 1fr; gap: 6px;
+    background: var(--bg); padding: 4px; border-radius: 10px; border: 1px solid var(--border);
+  }
+  .seg button {
+    background: transparent; border: 1px solid transparent; color: var(--muted);
+    padding: 8px 10px; border-radius: 8px; display: flex; flex-direction: column; align-items: flex-start; gap: 2px;
+  }
+  .seg button span.small { font-size: 11px; font-weight: 400; color: var(--muted); }
+  .seg button.active {
+    background: var(--surface-2); border-color: rgba(59,130,246,0.55); color: var(--text);
+  }
+
+  /* Interactive Edge Map */
+  .edge-stage {
+    display: grid;
+    grid-template-columns: 78px 1fr 78px;
+    grid-template-rows: 42px 150px 42px;
+    gap: 8px; align-items: stretch; justify-items: stretch;
+  }
+  .edge-slot {
+    border: 1px dashed var(--border-strong); border-radius: 10px;
+    background: rgba(255,255,255,0.02); color: var(--muted);
+    display: flex; flex-direction: column; align-items: center; justify-content: center;
+    font-size: 11.5px; font-weight: 600; cursor: pointer; transition: all 0.14s ease;
+    padding: 4px; text-align: center;
+  }
+  .edge-slot:hover { border-color: var(--accent); color: var(--text); background: var(--accent-soft); }
+  .edge-slot.selected {
+    border-style: solid; border-color: var(--accent);
+    background: var(--accent-soft); color: #bfdbfe;
+  }
+  .edge-slot.connected {
+    border-style: solid; border-color: var(--green);
+    background: var(--green-soft); color: #bbf7d0;
+  }
+  .edge-top { grid-column: 2; grid-row: 1; }
+  .edge-left { grid-column: 1; grid-row: 2; }
+  .edge-center {
+    grid-column: 2; grid-row: 2;
+    background: var(--bg); border: 1px solid var(--border); border-radius: 10px;
+    position: relative; overflow: hidden; display: flex; align-items: center; justify-content: center;
+  }
+  .edge-right { grid-column: 3; grid-row: 2; }
+  .edge-bottom { grid-column: 2; grid-row: 3; }
+
+  /* Devices radar */
+  .device-list { display: flex; flex-direction: column; gap: 8px; }
+  .device {
+    display: flex; align-items: center; justify-content: space-between; gap: 10px;
+    background: var(--surface-2); border: 1px solid var(--border);
+    border-radius: 10px; padding: 10px 12px;
+  }
+  .dev-name { font-weight: 700; font-size: 13px; display: flex; align-items: center; gap: 7px; }
+  .badge {
+    font-size: 10.5px; font-weight: 600; padding: 2px 7px; border-radius: 99px;
+    background: rgba(255,255,255,0.07); color: var(--muted); text-transform: uppercase;
+  }
+  .dev-meta { font-family: var(--mono); font-size: 11px; color: var(--muted); }
+
+  /* Drop zone */
+  .dropzone {
+    border: 1.5px dashed var(--border-strong); border-radius: 10px;
+    padding: 18px 14px; text-align: center; color: var(--muted);
+    background: rgba(255,255,255,0.015); transition: all 0.14s ease; cursor: pointer;
+  }
+  .dropzone.over { border-color: var(--accent); background: var(--accent-soft); color: var(--text); }
+
+  /* Form controls */
+  .row { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
+  .field { display: flex; flex-direction: column; gap: 5px; }
+  .field label { font-size: 12px; color: var(--muted); font-weight: 600; display: flex; justify-content: space-between; }
+  input[type="text"], input[type="number"], select {
+    background: var(--bg); color: var(--text); border: 1px solid var(--border-strong);
+    border-radius: 8px; padding: 7px 10px; font-family: inherit; font-size: 13px; width: 100%;
+  }
+  input[type="range"] { width: 100%; accent-color: var(--accent); cursor: pointer; }
+  .toggle {
+    display: flex; align-items: center; justify-content: space-between; gap: 12px;
+    padding: 8px 10px; background: var(--surface-2); border: 1px solid var(--border); border-radius: 9px;
+  }
+  .toggle-label { font-weight: 600; font-size: 12.5px; }
+  .toggle-desc { font-size: 11.5px; color: var(--muted); }
+  .switch {
+    position: relative; width: 38px; height: 22px; flex-shrink: 0;
+  }
+  .switch input { opacity: 0; width: 0; height: 0; }
+  .slider {
+    position: absolute; inset: 0; background: #2d3748; border-radius: 99px; transition: .16s; cursor: pointer;
+  }
+  .slider:before {
+    content: ""; position: absolute; width: 16px; height: 16px; left: 3px; top: 3px;
+    background: #fff; border-radius: 50%; transition: .16s;
+  }
+  .switch input:checked + .slider { background: var(--accent); }
+  .switch input:checked + .slider:before { transform: translateX(16px); }
+
+  .mono-box {
+    font-family: var(--mono); font-size: 11.5px; background: var(--bg);
+    border: 1px solid var(--border); border-radius: 8px; padding: 8px 10px;
+    word-break: break-all; user-select: text; color: #cbd5e1;
+  }
+  .toast {
+    position: fixed; bottom: 18px; right: 18px; z-index: 99;
+    background: #1e293b; border: 1px solid var(--border-strong); color: var(--text);
+    padding: 10px 14px; border-radius: 10px; font-size: 12.5px; font-weight: 600;
+    box-shadow: 0 10px 30px rgba(0,0,0,0.45); opacity: 0; pointer-events: none; transition: opacity .18s;
+  }
+  .toast.show { opacity: 1; }
+  .kbd {
+    font-family: var(--mono); font-size: 11px; padding: 2px 6px; border-radius: 5px;
+    background: var(--bg); border: 1px solid var(--border-strong); color: #cbd5e1;
+  }
+  .list-item {
+    display: flex; align-items: center; justify-content: space-between; gap: 10px;
+    background: var(--bg); border: 1px solid var(--border); border-radius: 8px; padding: 8px 10px;
+  }
+</style>
+</head>
+<body>
+<div class="app">
+  <!-- Top Bar -->
+  <div class="topbar">
+    <div class="brand">
+      <div class="logo">G</div>
+      <div>
+        <div class="brand-title">Glide <span class="ver">v0.2</span></div>
+        <div class="brand-sub" id="osLabel">Software KVM over QUIC</div>
+      </div>
+    </div>
+    <div class="top-actions">
+      <div class="rtt-box" id="rttBox" style="display:none;">
+        <span id="rttVal">0.0 ms</span>
+        <svg id="rttSpark" width="54" height="16" viewBox="0 0 54 16"></svg>
+      </div>
+      <div class="pill" id="statusPill"><span class="dot"></span><span id="statusText">Idle</span></div>
+      <button id="lockBtn" title="Ctrl+Alt+L">Lock Cursor</button>
+      <button id="startStopBtn" class="primary">Start</button>
+    </div>
+  </div>
+
+  <!-- Navigation Tabs -->
+  <div class="tabs">
+    <button class="tab active" data-tab="overview">Overview &amp; Layout</button>
+    <button class="tab" data-tab="tuning">Feel &amp; Input</button>
+    <button class="tab" data-tab="system">Clipboard &amp; System</button>
+  </div>
+
+  <!-- TAB 1: Overview & Layout -->
+  <div class="panel active" id="tab-overview">
+    <div class="grid-2">
+      <!-- Role + Interactive Edge Layout -->
+      <div class="card">
+        <div class="card-hdr">
+          <div>
+            <div class="card-title">Role &amp; Screen Arrangement</div>
+            <div class="card-sub" id="layoutHint">Choose whether this machine shares or receives input</div>
+          </div>
+          <span class="badge" id="activeTargetBadge">Focus: Local</span>
+        </div>
+
+        <div class="seg">
+          <button id="roleServerBtn" class="active">
+            <strong>Primary (Server)</strong>
+            <span class="small">Physical mouse &amp; keyboard here</span>
+          </button>
+          <button id="roleClientBtn">
+            <strong>Secondary (Client)</strong>
+            <span class="small">Controlled by Primary over LAN</span>
+          </button>
+        </div>
+
+        <div class="edge-stage">
+          <div class="edge-slot edge-top" data-edge="top">Top</div>
+          <div class="edge-slot edge-left" data-edge="left">Left</div>
+          <div class="edge-center" id="monitorCanvas">
+            <span class="card-sub">Detecting monitors...</span>
+          </div>
+          <div class="edge-slot edge-right" data-edge="right">Right</div>
+          <div class="edge-slot edge-bottom" data-edge="bottom">Bottom</div>
+        </div>
+
+        <div class="row" id="serverQuickBar">
+          <span class="card-sub">Hotkeys: <span class="kbd">ScrollLock</span> escape &middot; <span class="kbd">Ctrl+Alt+Arrows</span> jump &middot; <span class="kbd">Ctrl+Alt+L</span> lock</span>
+        </div>
+      </div>
+
+      <!-- LAN Radar + File Beam -->
+      <div style="display:flex; flex-direction:column; gap:14px;">
+        <div class="card">
+          <div class="card-hdr">
+            <div>
+              <div class="card-title">LAN Auto-Discovery</div>
+              <div class="card-sub">LocalSend-style zero-IP detection on your network</div>
+            </div>
+            <button class="sm" id="scanBtn">Scan LAN</button>
+          </div>
+          <div class="device-list" id="deviceList">
+            <div class="card-sub">Click <b>Scan LAN</b> or start <b>Primary (Server)</b> on your main PC.</div>
+          </div>
+          <div id="clientManualAddr" class="field" style="display:none; margin-top:4px;">
+            <label>Optional Manual Server IP:Port (leave empty for auto-discovery)</label>
+            <input type="text" id="manualServerInput" placeholder="Auto-discover on LAN (e.g. 192.168.1.42:24800)" />
+          </div>
+        </div>
+
+        <div class="card">
+          <div class="card-hdr">
+            <div>
+              <div class="card-title">Instant File Drop (QUIC)</div>
+              <div class="card-sub">Drop any file to send directly to the peer's Downloads/Glide folder</div>
+            </div>
+          </div>
+          <div class="dropzone" id="dropzone">
+            Drop files here or <b>click to choose</b>
+            <input type="file" id="fileInput" style="display:none" multiple />
+          </div>
+          <div id="recentFiles" style="display:flex; flex-direction:column; gap:6px;"></div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- TAB 2: Feel & Input -->
+  <div class="panel" id="tab-tuning">
+    <div class="grid-2">
+      <div class="card">
+        <div class="card-title">Mouse &amp; Scroll Feel (Hot-Reloads Live)</div>
+
+        <div class="field">
+          <label><span>Client Mouse Sensitivity</span><span class="mono" id="sensVal">1.00x</span></label>
+          <input type="range" id="sensSlider" min="0.25" max="3.0" step="0.05" value="1.0" />
+        </div>
+
+        <div class="field">
+          <label><span>Scroll Speed</span><span class="mono" id="scrollVal">1.00x</span></label>
+          <input type="range" id="scrollSlider" min="0.25" max="3.0" step="0.05" value="1.0" />
+        </div>
+
+        <div class="toggle">
+          <div>
+            <div class="toggle-label">Auto-DPI Scale Matching</div>
+            <div class="toggle-desc">Automatically normalize pointer speed across mixed HiDPI displays</div>
+          </div>
+          <label class="switch"><input type="checkbox" id="autoDpiToggle"><span class="slider"></span></label>
+        </div>
+
+        <div class="toggle">
+          <div>
+            <div class="toggle-label">Natural (Inverted) Scroll</div>
+            <div class="toggle-desc">Invert vertical &amp; horizontal scroll wheel direction on client</div>
+          </div>
+          <label class="switch"><input type="checkbox" id="invertScrollToggle"><span class="slider"></span></label>
+        </div>
+
+        <div class="field" id="linuxBackendField">
+          <label>Linux Client Input Injection Backend</label>
+          <select id="inputBackendSelect">
+            <option value="auto">Auto / XTest (zero setup, works immediately)</option>
+            <option value="uinput">/dev/uinput Hardware-Native HID (native libinput accel + hi-res scroll)</option>
+          </select>
+        </div>
+      </div>
+
+      <div class="card">
+        <div class="card-title">Edge Switching, Safety &amp; Keyboard</div>
+
+        <div class="field">
+          <label><span>Edge Push Threshold</span><span id="threshVal">4 px</span></label>
+          <input type="range" id="threshSlider" min="1" max="24" step="1" value="4" />
+        </div>
+
+        <div class="field">
+          <label><span>Dead-Corner Guard (protects close X &amp; taskbar)</span><span id="deadCornerVal">24 px</span></label>
+          <input type="range" id="deadCornerSlider" min="0" max="80" step="4" value="24" />
+        </div>
+
+        <div class="field">
+          <label><span>Edge Dwell Delay</span><span id="dwellVal">0 ms</span></label>
+          <input type="range" id="dwellSlider" min="0" max="200" step="10" value="0" />
+        </div>
+
+        <div class="toggle">
+          <div>
+            <div class="toggle-label">Auto-Lock Fullscreen Apps &amp; Games</div>
+            <div class="toggle-desc">Pause edge switching while a fullscreen window has focus</div>
+          </div>
+          <label class="switch"><input type="checkbox" id="fullscreenLockToggle" checked><span class="slider"></span></label>
+        </div>
+
+        <div class="toggle">
+          <div>
+            <div class="toggle-label">Sync CapsLock &amp; NumLock</div>
+            <div class="toggle-desc">Match lock key LEDs automatically when entering a screen</div>
+          </div>
+          <label class="switch"><input type="checkbox" id="syncLockToggle" checked><span class="slider"></span></label>
+        </div>
+      </div>
+    </div>
+
+    <!-- Key Remapping -->
+    <div class="card">
+      <div class="card-hdr">
+        <div>
+          <div class="card-title">Per-Client Physical Key Remapping</div>
+          <div class="card-sub">German AltGr &amp; ISO &lt; &gt; | work natively out of the box — add custom remaps below if desired</div>
+        </div>
+        <button class="sm" id="addRemapPresetBtn">+ CapsLock &rarr; Ctrl</button>
+      </div>
+      <div id="remapList" style="display:flex; flex-direction:column; gap:6px;"></div>
+      <div class="row" style="gap:8px;">
+        <input type="text" id="remapFrom" placeholder="From HID key (e.g. CapsLock, MetaLeft)" />
+        <input type="text" id="remapTo" placeholder="To HID key (e.g. ControlLeft, AltLeft)" />
+        <button class="sm primary" id="addRemapBtn">Add Rule</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- TAB 3: Clipboard & System -->
+  <div class="panel" id="tab-system">
+    <div class="grid-2">
+      <div class="card">
+        <div class="card-hdr">
+          <div>
+            <div class="card-title">Bidirectional Clipboard &amp; History</div>
+            <div class="card-sub">UTF-8 text + PNG/CF_DIB screenshots (lazy transfer &gt; 256 KB)</div>
+          </div>
+        </div>
+        <div class="toggle">
+          <div>
+            <div class="toggle-label">Enable Clipboard Sync</div>
+            <div class="toggle-desc">Sync text &amp; screenshots over independent QUIC streams</div>
+          </div>
+          <label class="switch"><input type="checkbox" id="clipToggle" checked><span class="slider"></span></label>
+        </div>
+        <div id="clipHistory" style="display:flex; flex-direction:column; gap:6px;">
+          <div class="card-sub">Synced clipboard items will appear here with one-click re-send.</div>
+        </div>
+      </div>
+
+      <div class="card">
+        <div class="card-title">Security, OS Integration &amp; Diagnostics</div>
+
+        <div class="field">
+          <label><span>TLS 1.3 Ed25519 Fingerprint</span><button class="sm" id="copyFpBtn">Copy</button></label>
+          <div class="mono-box" id="fpBox">Start server or run init to generate identity</div>
+        </div>
+
+        <div class="toggle">
+          <div>
+            <div class="toggle-label">Start Glide Automatically on Login</div>
+            <div class="toggle-desc">Windows Registry Run key / Ubuntu XDG autostart</div>
+          </div>
+          <label class="switch"><input type="checkbox" id="autostartToggle"><span class="slider"></span></label>
+        </div>
+
+        <div class="row" style="flex-wrap:wrap;">
+          <button class="sm" id="firewallBtn">Configure Firewall (UDP 24800/24801)</button>
+          <button class="sm" id="elevatedBtn">Windows Elevated Task (UAC)</button>
+          <button class="sm" id="resetTofuBtn">Reset Saved TOFU Trust</button>
+        </div>
+
+        <div class="field">
+          <label>Diagnostics (glide doctor)</label>
+          <div class="mono-box" id="doctorBox" style="max-height:130px; overflow:auto; white-space:pre-wrap;">Loading...</div>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<div class="toast" id="toast"></div>
+
+<script>
+const state = {
+  role: 'server',
+  running: false,
+  config: null,
+  status: null,
+  os: 'unknown',
+};
+
+const $ = (id) => document.getElementById(id);
+
+function toast(msg) {
+  const el = $('toast');
+  el.textContent = msg;
+  el.classList.add('show');
+  clearTimeout(window._toastTimer);
+  window._toastTimer = setTimeout(() => el.classList.remove('show'), 2600);
+}
+
+async function api(path, opts = {}) {
+  const res = await fetch(path, opts);
+  const text = await res.text();
+  try { return JSON.parse(text); } catch { return { ok: res.ok, message: text }; }
+}
+
+// Tabs
+document.querySelectorAll('.tab').forEach(btn => {
+  btn.onclick = () => {
+    document.querySelectorAll('.tab').forEach(b => b.classList.remove('active'));
+    document.querySelectorAll('.panel').forEach(p => p.classList.remove('active'));
+    btn.classList.add('active');
+    $('tab-' + btn.dataset.tab).classList.add('active');
+  };
+});
+
+function setRole(role) {
+  state.role = role;
+  $('roleServerBtn').classList.toggle('active', role === 'server');
+  $('roleClientBtn').classList.toggle('active', role === 'client');
+  $('clientManualAddr').style.display = role === 'client' ? 'flex' : 'none';
+  $('layoutHint').textContent = role === 'server'
+    ? 'Click a connected edge to jump focus, or start Primary to accept LAN clients'
+    : 'Click which edge of your Primary machine THIS computer sits on';
+  renderEdgeSlots();
+}
+
+$('roleServerBtn').onclick = () => { if (!state.running) setRole('server'); else toast('Stop active session before switching role'); };
+$('roleClientBtn').onclick = () => { if (!state.running) setRole('client'); else toast('Stop active session before switching role'); };
+
+// Edge slot clicks
+document.querySelectorAll('.edge-slot').forEach(el => {
+  el.onclick = async () => {
+    const edge = el.dataset.edge;
+    if (state.role === 'client') {
+      state.config.client.edge = edge;
+      renderEdgeSlots();
+      await pushConfig();
+      toast('Client edge set to ' + edge.toUpperCase());
+    } else if (state.running) {
+      await api('/api/switch', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify({ edge }) });
+    }
+  };
+});
+
+function renderMonitors(geom) {
+  const box = $('monitorCanvas');
+  if (!geom || !geom.monitors || geom.monitors.length === 0) {
+    box.innerHTML = '<span class="card-sub">This Machine</span>';
+    return;
+  }
+  const mons = geom.monitors;
+  let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
+  mons.forEach(m => {
+    minX = Math.min(minX, m.x); minY = Math.min(minY, m.y);
+    maxX = Math.max(maxX, m.x + m.width); maxY = Math.max(maxY, m.y + m.height);
+  });
+  const totalW = Math.max(1, maxX - minX);
+  const totalH = Math.max(1, maxY - minY);
+  const pad = 16;
+  const availW = box.clientWidth - pad * 2 || 240;
+  const availH = box.clientHeight - pad * 2 || 118;
+  const scale = Math.min(availW / totalW, availH / totalH);
+  const offX = (box.clientWidth - totalW * scale) / 2;
+  const offY = (box.clientHeight - totalH * scale) / 2;
+
+  box.innerHTML = mons.map(m => {
+    const left = Math.round(offX + (m.x - minX) * scale);
+    const top = Math.round(offY + (m.y - minY) * scale);
+    const w = Math.max(36, Math.round(m.width * scale));
+    const h = Math.max(24, Math.round(m.height * scale));
+    const dpi = Math.round((m.scale || 1) * 100);
+    return `<div style="position:absolute;left:${left}px;top:${top}px;width:${w}px;height:${h}px;
+      background:${m.primary ? 'rgba(59,130,246,0.22)' : 'rgba(255,255,255,0.06)'};
+      border:1.5px solid ${m.primary ? '#60a5fa' : 'rgba(255,255,255,0.22)'};
+      border-radius:6px;display:flex;flex-direction:column;align-items:center;justify-content:center;
+      font-size:10px;color:#e2e8f0;padding:2px;overflow:hidden;">
+      <b>${m.width}&times;${m.height}</b>
+      <span style="color:#94a3b8;font-size:9px;">${dpi}%${m.primary ? ' ★' : ''}</span>
+    </div>`;
+  }).join('');
+}
+
+function renderEdgeSlots() {
+  const peersByEdge = {};
+  if (state.status && state.status.peers) {
+    state.status.peers.forEach(p => { peersByEdge[p.edge] = p; });
+  }
+  document.querySelectorAll('.edge-slot').forEach(el => {
+    const edge = el.dataset.edge;
+    el.classList.remove('selected', 'connected');
+    if (state.role === 'client') {
+      const sel = state.config && state.config.client.edge === edge;
+      if (sel) el.classList.add('selected');
+      el.innerHTML = `<span>${edge[0].toUpperCase() + edge.slice(1)}</span>` + (sel ? '<span style="font-size:10px;opacity:.85">This PC</span>' : '');
+    } else {
+      const peer = peersByEdge[edge];
+      if (peer) {
+        el.classList.add('connected');
+        el.innerHTML = `<span>${peer.name}</span><span style="font-size:10px;opacity:.85">${peer.rtt_ms != null ? peer.rtt_ms.toFixed(1)+'ms' : 'online'}</span>`;
+      } else {
+        el.innerHTML = `<span>${edge[0].toUpperCase() + edge.slice(1)}</span>`;
+      }
+    }
+  });
+}
+
+function renderSparkline(vals) {
+  const svg = $('rttSpark');
+  if (!vals || vals.length < 2) { svg.innerHTML = ''; return; }
+  const max = Math.max(2, ...vals);
+  const pts = vals.map((v, i) => {
+    const x = (i / (vals.length - 1)) * 54;
+    const y = 15 - Math.min(14, (v / max) * 14);
+    return `${x.toFixed(1)},${y.toFixed(1)}`;
+  }).join(' ');
+  svg.innerHTML = `<polyline fill="none" stroke="#60a5fa" stroke-width="1.6" points="${pts}" />`;
+}
+
+function renderStatus(st) {
+  state.status = st;
+  state.running = st.mode === 'server' || st.mode === 'client';
+  if (state.running && st.mode !== state.role) {
+    setRole(st.mode);
+  }
+
+  $('statusText').textContent = st.status || 'Idle';
+  const pill = $('statusPill');
+  pill.className = 'pill ' + (
+    st.status.startsWith('Connected') ? 'live' :
+    state.running ? 'wait' : ''
+  );
+
+  $('activeTargetBadge').textContent = 'Focus: ' + (st.active_target || 'Local');
+
+  const btn = $('startStopBtn');
+  if (state.running) {
+    btn.textContent = 'Stop';
+    btn.className = 'danger';
+  } else {
+    btn.textContent = state.role === 'server' ? 'Start Server' : 'Connect Client';
+    btn.className = 'primary';
+  }
+
+  const lbtn = $('lockBtn');
+  lbtn.classList.toggle('locked', !!st.locked);
+  lbtn.textContent = st.locked ? 'Cursor Locked' : 'Lock Cursor';
+
+  if (st.rtt_ms != null) {
+    $('rttBox').style.display = 'inline-flex';
+    $('rttVal').textContent = st.rtt_ms.toFixed(1) + ' ms';
+    renderSparkline(st.rtt_history);
+  } else {
+    $('rttBox').style.display = 'none';
+  }
+
+  if (st.fingerprint) {
+    $('fpBox').textContent = st.fingerprint;
+  }
+
+  if (st.geometry && st.geometry.monitors && st.geometry.monitors.length) {
+    renderMonitors(st.geometry);
+  }
+  renderEdgeSlots();
+
+  // Clipboard history
+  const clipEl = $('clipHistory');
+  if (st.clipboard_history && st.clipboard_history.length > 0) {
+    clipEl.innerHTML = st.clipboard_history.map(item => `
+      <div class="list-item">
+        <div style="overflow:hidden;">
+          <div style="font-size:12px;font-weight:600;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;">${escapeHtml(item.preview)}</div>
+          <div class="card-sub">${item.direction} &middot; ${item.format} &middot; ${(item.bytes/1024).toFixed(1)} KB</div>
+        </div>
+        <button class="sm" onclick="resendClip(${item.id})">Send</button>
+      </div>`).join('');
+  }
+
+  // Recent files
+  const filesEl = $('recentFiles');
+  if (st.recent_files && st.recent_files.length > 0) {
+    filesEl.innerHTML = st.recent_files.slice(0, 4).map(f => `
+      <div class="list-item">
+        <div style="overflow:hidden;">
+          <div style="font-size:12px;font-weight:600;">${escapeHtml(f.filename)}</div>
+          <div class="card-sub">${f.direction} &middot; ${(f.bytes/1024).toFixed(1)} KB${f.saved_path ? ' &rarr; ' + escapeHtml(f.saved_path) : ''}</div>
+        </div>
+      </div>`).join('');
+  }
+}
+
+function escapeHtml(s) {
+  return String(s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+}
+
+window.resendClip = async (id) => {
+  await api('/api/clipboard/resend', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify({ id }) });
+  toast('Re-sent clipboard item to peer');
+};
+
+function renderRemaps() {
+  const list = $('remapList');
+  const rules = (state.config && state.config.client.key_remap) || [];
+  if (rules.length === 0) {
+    list.innerHTML = '<div class="card-sub">No active key remaps (1:1 physical HID passthrough).</div>';
+    return;
+  }
+  list.innerHTML = rules.map((r, i) => `
+    <div class="list-item">
+      <div><span class="kbd">${escapeHtml(r.from)}</span> &rarr; <span class="kbd">${escapeHtml(r.to)}</span></div>
+      <button class="sm danger" onclick="removeRemap(${i})">Remove</button>
+    </div>`).join('');
+}
+
+window.removeRemap = async (idx) => {
+  state.config.client.key_remap.splice(idx, 1);
+  renderRemaps();
+  await pushConfig();
+};
+
+$('addRemapBtn').onclick = async () => {
+  const from = $('remapFrom').value.trim();
+  const to = $('remapTo').value.trim();
+  if (!from || !to) return;
+  state.config.client.key_remap.push({ from, to });
+  $('remapFrom').value = ''; $('remapTo').value = '';
+  renderRemaps();
+  await pushConfig();
+  toast(`Remap added: ${from} → ${to}`);
+};
+
+$('addRemapPresetBtn').onclick = async () => {
+  state.config.client.key_remap.push({ from: 'CapsLock', to: 'ControlLeft' });
+  renderRemaps();
+  await pushConfig();
+  toast('Added CapsLock → ControlLeft');
+};
+
+function syncFormFromConfig() {
+  const c = state.config;
+  if (!c) return;
+  $('sensSlider').value = c.client.sensitivity;
+  $('sensVal').textContent = Number(c.client.sensitivity).toFixed(2) + 'x';
+  $('scrollSlider').value = c.client.scroll_speed;
+  $('scrollVal').textContent = Number(c.client.scroll_speed).toFixed(2) + 'x';
+  $('autoDpiToggle').checked = !!c.client.auto_dpi_scale;
+  $('invertScrollToggle').checked = !!c.client.invert_scroll;
+  $('inputBackendSelect').value = c.client.input_backend || 'auto';
+  $('threshSlider').value = c.server.edge_threshold_px;
+  $('threshVal').textContent = c.server.edge_threshold_px + ' px';
+  $('deadCornerSlider').value = c.server.dead_corner_px;
+  $('deadCornerVal').textContent = c.server.dead_corner_px + ' px';
+  $('dwellSlider').value = c.server.edge_dwell_ms;
+  $('dwellVal').textContent = c.server.edge_dwell_ms + ' ms';
+  $('fullscreenLockToggle').checked = !!c.server.auto_lock_fullscreen;
+  $('syncLockToggle').checked = !!c.server.sync_lock_keys;
+  $('clipToggle').checked = !!c.server.clipboard;
+  $('manualServerInput').value = c.client.server || '';
+  renderRemaps();
+  renderEdgeSlots();
+}
+
+async function pushConfig() {
+  if (!state.config) return;
+  const c = state.config;
+  c.client.sensitivity = parseFloat($('sensSlider').value);
+  c.client.scroll_speed = parseFloat($('scrollSlider').value);
+  c.client.auto_dpi_scale = $('autoDpiToggle').checked;
+  c.client.invert_scroll = $('invertScrollToggle').checked;
+  c.client.input_backend = $('inputBackendSelect').value;
+  const thresh = parseInt($('threshSlider').value, 10);
+  const dead = parseInt($('deadCornerSlider').value, 10);
+  const dwell = parseInt($('dwellSlider').value, 10);
+  c.server.edge_threshold_px = thresh;
+  c.client.edge_threshold_px = thresh;
+  c.server.dead_corner_px = dead;
+  c.client.dead_corner_px = dead;
+  c.server.edge_dwell_ms = dwell;
+  c.server.auto_lock_fullscreen = $('fullscreenLockToggle').checked;
+  c.server.sync_lock_keys = $('syncLockToggle').checked;
+  c.client.sync_lock_keys = $('syncLockToggle').checked;
+  c.server.clipboard = $('clipToggle').checked;
+  c.client.clipboard = $('clipToggle').checked;
+  const manual = $('manualServerInput').value.trim();
+  c.client.server = manual ? manual : null;
+
+  await api('/api/config', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(c),
+  });
+}
+
+// Live slider & toggle bindings
+['sensSlider','scrollSlider','threshSlider','deadCornerSlider','dwellSlider'].forEach(id => {
+  $(id).oninput = () => {
+    $('sensVal').textContent = Number($('sensSlider').value).toFixed(2) + 'x';
+    $('scrollVal').textContent = Number($('scrollSlider').value).toFixed(2) + 'x';
+    $('threshVal').textContent = $('threshSlider').value + ' px';
+    $('deadCornerVal').textContent = $('deadCornerSlider').value + ' px';
+    $('dwellVal').textContent = $('dwellSlider').value + ' ms';
+  };
+  $(id).onchange = pushConfig;
+});
+['autoDpiToggle','invertScrollToggle','inputBackendSelect','fullscreenLockToggle','syncLockToggle','clipToggle','manualServerInput'].forEach(id => {
+  $(id).onchange = pushConfig;
+});
+
+// Start / Stop / Lock
+$('startStopBtn').onclick = async () => {
+  if (state.running) {
+    await api('/api/stop', { method: 'POST' });
+    toast('Stopped Glide');
+  } else {
+    await pushConfig();
+    const res = await api('/api/start', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ role: state.role }),
+    });
+    if (res.error) toast('Error: ' + res.error);
+    else toast('Started as ' + (state.role === 'server' ? 'Primary (Server)' : 'Secondary (Client)'));
+  }
+};
+
+$('lockBtn').onclick = async () => {
+  await api('/api/lock', { method: 'POST' });
+};
+
+// LAN Discovery
+async function scanLan() {
+  $('scanBtn').textContent = 'Scanning...';
+  const res = await api('/api/discover');
+  $('scanBtn').textContent = 'Scan LAN';
+  const list = $('deviceList');
+  const devices = res.servers || [];
+  if (devices.length === 0) {
+    list.innerHTML = '<div class="card-sub">No Glide servers found yet. Start <b>Primary (Server)</b> on your main computer.</div>';
+    return;
+  }
+  list.innerHTML = devices.map(d => `
+    <div class="device">
+      <div>
+        <div class="dev-name">${escapeHtml(d.name)} <span class="badge">${escapeHtml(d.os)}</span></div>
+        <div class="dev-meta">${escapeHtml(d.addr)} &middot; ${escapeHtml(d.fingerprint.slice(0, 20))}&hellip;</div>
+      </div>
+      <button class="sm primary" onclick="connectDiscovered('${escapeHtml(d.addr)}','${escapeHtml(d.fingerprint)}')">Connect</button>
+    </div>`).join('');
+}
+$('scanBtn').onclick = scanLan;
+
+window.connectDiscovered = async (addr, fp) => {
+  if (state.running) await api('/api/stop', { method: 'POST' });
+  setRole('client');
+  state.config.client.server = addr;
+  state.config.client.trusted_fingerprint = fp;
+  $('manualServerInput').value = addr;
+  await pushConfig();
+  await api('/api/start', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify({ role: 'client' }) });
+  toast('Connecting to ' + addr);
+};
+
+// Drag-and-drop file beam
+const dz = $('dropzone');
+dz.onclick = () => $('fileInput').click();
+dz.ondragover = (e) => { e.preventDefault(); dz.classList.add('over'); };
+dz.ondragleave = () => dz.classList.remove('over');
+dz.ondrop = async (e) => {
+  e.preventDefault(); dz.classList.remove('over');
+  await sendFiles(e.dataTransfer.files);
+};
+$('fileInput').onchange = async (e) => { await sendFiles(e.target.files); e.target.value = ''; };
+
+async function sendFiles(files) {
+  if (!state.running) { toast('Start Glide first before beaming files'); return; }
+  for (const file of files) {
+    toast('Sending ' + file.name + '...');
+    const buf = await file.arrayBuffer();
+    const res = await api('/api/send-file', {
+      method: 'POST',
+      headers: { 'X-Filename': encodeURIComponent(file.name) },
+      body: buf,
+    });
+    if (res.error) toast('Failed: ' + res.error);
+    else toast('Sent ' + file.name);
+  }
+}
+
+// OS Integration & Security buttons
+$('copyFpBtn').onclick = () => {
+  navigator.clipboard?.writeText($('fpBox').textContent);
+  toast('Fingerprint copied');
+};
+$('autostartToggle').onchange = async () => {
+  const enabled = $('autostartToggle').checked;
+  const res = await api('/api/os/autostart', {
+    method: 'POST',
+    headers: {'Content-Type':'application/json'},
+    body: JSON.stringify({ enabled, role: state.role }),
+  });
+  toast(res.message || (enabled ? 'Autostart enabled' : 'Autostart disabled'));
+};
+$('firewallBtn').onclick = async () => {
+  const res = await api('/api/os/firewall', { method: 'POST' });
+  toast(res.message || 'Firewall updated');
+};
+$('elevatedBtn').onclick = async () => {
+  const res = await api('/api/os/elevated', { method: 'POST' });
+  toast(res.message || 'Elevated task configured');
+};
+$('resetTofuBtn').onclick = async () => {
+  const res = await api('/api/trust/reset', { method: 'POST' });
+  toast(res.message || 'Cleared saved TOFU fingerprint');
+};
+
+// Bootstrap
+async function init() {
+  const data = await api('/api/state');
+  state.config = data.config;
+  state.os = data.os || 'unknown';
+  $('osLabel').textContent = `${data.hostname || 'Local'} (${state.os}) · QUIC Software KVM`;
+  $('autostartToggle').checked = !!data.autostart;
+  if (state.os.toLowerCase().includes('win')) {
+    $('linuxBackendField').style.display = 'none';
+  }
+  if (data.doctor) {
+    const lines = [
+      `Display: ${data.doctor.display_info}`,
+      ...data.doctor.notes.map(n => '• ' + n),
+    ];
+    $('doctorBox').textContent = lines.join('\n');
+    if (data.doctor.geometry) renderMonitors(data.doctor.geometry);
+  }
+  if (data.fingerprint) $('fpBox').textContent = data.fingerprint;
+  syncFormFromConfig();
+  renderStatus(data.status);
+
+  // Subscribe to real-time SSE updates
+  const es = new EventSource('/api/events');
+  es.onmessage = (ev) => {
+    try { renderStatus(JSON.parse(ev.data)); } catch {}
+  };
+  scanLan();
+}
+
+init();
+</script>
+</body>
+</html>

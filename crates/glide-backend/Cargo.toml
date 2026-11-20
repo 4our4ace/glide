@@ -12,10 +12,13 @@ glide-hid.workspace = true
 glide-net.workspace = true
 glide-proto.workspace = true
 parking_lot.workspace = true
+png.workspace = true
+serde.workspace = true
 tokio.workspace = true
 tracing.workspace = true
 
 [target.'cfg(target_os = "linux")'.dependencies]
+libc.workspace = true
 x11rb.workspace = true
 
 [target.'cfg(target_os = "windows")'.dependencies]

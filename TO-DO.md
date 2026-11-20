@@ -4,63 +4,69 @@ Long-horizon engineering plan to make **Glide** a genuinely native, zero-lag, ze
 
 ---
 
-## Completed Foundation (v0.1.0)
+## Completed Foundation (v0.1.0 + v0.2.0)
 
-- [x] 3-lane QUIC / TLS 1.3 transport (`glide-net`: unreliable datagrams for motion/scroll, reliable control stream for keys/buttons/transitions, independent uni streams for clipboard)
+- [x] 3-lane QUIC / TLS 1.3 transport (`glide-net`: unreliable datagrams for motion/scroll, reliable control stream for keys/buttons/transitions, independent uni streams for clipboard & files)
 - [x] Persistent Ed25519 TLS identity + SHA-256 pinning & automatic TOFU
 - [x] LocalSend-style UDP multicast + broadcast LAN auto-discovery with real hostnames
 - [x] Strictly bijective USB HID Usage scancode table (`glide-hid`) with German ISO (`< > |`, `#/'`, dead keys, umlauts) and Windows fake-`LCtrl` (`0x21D`) `AltGr` filter
 - [x] Multi-monitor & mixed-HiDPI normalized edge geometry (`Per-Monitor DPI Awareness V2` on Windows, XRandR on X11)
-- [x] Bidirectional event-driven clipboard (UTF-8 text with `\r\n` ↔ `\n` normalization + PNG images, SHA-256 anti-loop)
-- [x] Static Linux musl binary + `.deb` package (`glide_0.1.0_amd64.deb`) and standalone static-CRT Windows binary (`glide-windows-x86_64.exe`)
+- [x] Bidirectional event-driven clipboard (UTF-8 text with `\r\n` ↔ `\n` normalization + universal PNG/`CF_DIB`/`CF_DIBV5` screenshots, SHA-256 anti-loop, lazy transfer > 256 KB)
+- [x] Static Linux musl binary + `.deb` package (`glide_0.2.0_amd64.deb`) and standalone static-CRT Windows binary (`glide-windows-x86_64.exe`)
 
 ---
 
-## Next 10 High-Impact Steps (Windows 11 ↔ Ubuntu X11 Daily Driver)
+## Completed Daily-Driver Milestones (Steps 1–7 & 10)
 
 ### 1. Native Desktop GUI + System Tray (`glide-gui`)
-- [ ] Add a decoupled `glide-gui` crate sharing `glide-core` (keeping the headless CLI/daemon intact)
-- [ ] Visual monitor & edge layout editor (click/drag client onto Left/Right/Top/Bottom of server)
-- [ ] Live LocalSend-style discovered LAN devices list with one-click connect and interactive TOFU TLS fingerprint approval dialog
-- [ ] System tray icon with live state indicator (Idle / Connected / Controlling Remote), Start/Stop toggle, and live sensitivity / edge-threshold sliders without restarting
+- [x] Decoupled pure-Rust `glide-gui` crate sharing `glide-core` (headless CLI/daemon intact; zero C GUI deps)
+- [x] Interactive visual monitor & edge layout editor showing real detected monitors, resolutions, and DPI %
+- [x] Live LocalSend-style discovered LAN devices list with one-click connect & automatic fingerprint pinning
+- [x] Native Windows 11 System Tray (`Shell_NotifyIconW`) + frameless desktop app window (`--app` mode) on Windows 11 & Ubuntu + live sensitivity / scroll / dead-corner / dwell sliders without restarting
 
 ### 2. Seamless Windows Remote Cursor Hiding & Clean Parking
-- [ ] Hide the local Windows cursor (or park it cleanly out of sight) while controlling a remote client so no motionless "ghost cursor" lingers on the Windows screen border
-- [ ] Guarantee automatic cursor restoration on return, escape hotkey (`ScrollLock`), client disconnect, or process exit/crash
+- [x] Park the Windows cursor cleanly in the invisible bottom-right corner pixel while controlling Ubuntu (no ghost cursor stuck on the monitor border)
+- [x] Guaranteed cursor restoration on return, escape hotkey (`ScrollLock`), client disconnect, or process exit (`Drop`)
 
 ### 3. Universal Image Clipboard (`CF_DIB` / `CF_DIBV5` ↔ `PNG`) + Lazy Clipboard Transfers
-- [ ] Add transparent Windows `CF_DIB` / `CF_DIBV5` ↔ `PNG` conversion so *every* screenshot tool (Snipping Tool `Win+Shift+S`, Paint, browsers, Ubuntu Flameshot/Screenshot) pastes images bidirectionally
-- [ ] Implement lazy on-demand clipboard offers for payloads > 256 KB (`ClipboardOffer` metadata on copy, bulk QUIC fetch only when the peer switches screens or pastes) so local large copies never waste LAN/Wi-Fi bandwidth
+- [x] Pure-Rust Windows `CF_DIB` / `CF_DIBV5` ↔ `PNG` converter (`glide-backend::dib_png`) so Snipping Tool (`Win+Shift+S`), Paint, browsers, and Ubuntu Flameshot paste screenshots seamlessly both ways
+- [x] Lazy on-demand clipboard offers (`ClipboardOffer` / `ClipboardRequest`) for payloads > 256 KB so local large copies never waste LAN/Wi-Fi bandwidth
+- [x] Live Clipboard History in GUI (last 8 items with one-click re-send)
 
 ### 4. Dead-Corner Guards, Edge Dwell & Fullscreen App Lock
-- [ ] Configurable corner dead-zones (e.g., 24 px top/bottom margin on vertical edges) so hitting Windows' top-right `X` close button, bottom-right Show Desktop, or scrollbars never accidentally switches screens
-- [ ] Optional edge dwell delay (ms) alongside pixel push-through threshold
-- [ ] Auto-lock cursor to Windows when an exclusive fullscreen game/app (or VM/RDP window) is focused, plus a manual "Lock cursor to current screen" toggle
+- [x] Configurable corner dead-zone (24 px default) so clicking Windows' top-right `X` close button or bottom-right Show Desktop never accidentally jumps screens
+- [x] Configurable edge dwell delay (ms) alongside pixel push-through threshold
+- [x] Fullscreen game/app auto-lock on Windows + manual "Lock Cursor to Current Screen" (`Ctrl+Alt+L`, GUI button, Windows tray menu)
 
 ### 5. Direct Keyboard Screen-Switching Hotkeys & Per-Screen Cursor Memory
-- [ ] Configurable hotkeys to jump directly to a specific machine without touching the mouse (e.g., `Ctrl+Alt+Right` / `Ctrl+Alt+Left`)
-- [ ] Remember the last cursor `(x, y)` on each screen when switching via hotkey so jumping back to an editor or terminal lands right where you left off
+- [x] `Ctrl+Alt+Arrow` direct screen jumps (using Left Alt specifically so German `AltGr` never collides!)
+- [x] Per-screen normalized cursor memory (`EnterAt` / `leave_remote_at`) so hotkey jumps restore your cursor right where you left it
 
 ### 6. Scale-Aware Pointer Feel, Scroll Tuning & Optional Linux `uinput` Native Mode
-- [ ] Optional `auto_dpi_scale` multiplier + per-client sensitivity & scroll-speed / natural-scroll inversion settings
-- [ ] Optional Linux `uinput` virtual HID injection backend (alongside zero-privilege XTest): creates a real virtual kernel mouse & keyboard on Ubuntu so `libinput` applies 100% native pointer acceleration, true high-resolution pixel scrolling (`REL_WHEEL_HI_RES`), and works even on login/lock screens
+- [x] Optional `auto_dpi_scale`, live `sensitivity`, `scroll_speed`, and `invert_scroll` (natural scrolling) controls
+- [x] Optional pure-Rust Linux `/dev/uinput` virtual kernel HID backend (`--backend uinput` / GUI selector) delivering 100% native `libinput` pointer acceleration & `REL_WHEEL_HI_RES` smooth scrolling, with clean fallback to XTest
 
 ### 7. Lock-Key Sync (`CapsLock` / `NumLock`) & Per-Client Key Remapping
-- [ ] Synchronize `CapsLock` and `NumLock` state on screen entry so modifier/lock state never silently inverts between machines
-- [ ] Declarative per-client physical key remap rules in `glide.toml` & GUI (e.g., swap `Ctrl`/`Meta` or remap extra keys per target OS)
+- [x] Synchronize `CapsLock` and `NumLock` state on screen entry (`GetKeyState` on Windows, `get_keyboard_control` on X11)
+- [x] Declarative per-client physical key remapping (`[[client.key_remap]]` + live GUI editor with presets)
+
+### 10. Zero-Friction OS Integration & File Drop
+- [x] Windows: one-click login autostart (`HKCU\...\Run` Registry API), one-click Windows Firewall rule helper (UDP `24800`/`24801`), and one-click Elevated Scheduled Task helper (for UAC/Admin windows)
+- [x] Ubuntu `.deb`: `/usr/share/applications/glide.desktop`, crisp SVG icon, XDG autostart support, `systemd --user` units, and optional `/usr/share/doc/glide/99-glide-uinput.rules`
+- [x] Instant drag-and-drop File Transfer over QUIC bulk streams (SHA-256 verified, safe filename sanitization, saved to `Downloads/Glide/`)
+
+---
+
+## Remaining Polish Steps (Next Up After Real-Hardware Test)
 
 ### 8. Bulletproof Sleep/Wake, Display Hotplug & Network Roaming Recovery
-- [ ] Handle OS power, session, and display events (`WM_POWERBROADCAST`, `WM_DISPLAYCHANGE`, `WTSRegisterSessionNotification` on Windows; XRandR `ScreenChangeNotify` on X11)
-- [ ] Instant recovery after laptop lid close/open, Windows sleep/wake, monitor plug/unplug, or Wi-Fi ↔ Ethernet switch (leveraging QUIC connection migration) with zero zombie hooks or stuck keys
+- [ ] Subscribe to `WM_POWERBROADCAST` / `WM_DISPLAYCHANGE` / `WTSRegisterSessionNotification` on Windows and XRandR `ScreenChangeNotify` on X11
+- [ ] Instant recovery after laptop lid close/open, monitor plug/unplug, or Wi-Fi ↔ Ethernet roaming
 
-### 9. Real-Time Telemetry HUD & Interactive Scancode / AltGr Inspector
-- [ ] Continuous Ping/Pong RTT (ms), jitter, UDP datagram drop counter, and effective mouse Hz meter surfaced in both GUI and CLI (`--stats`)
-- [ ] Interactive `glide doctor --keys` (and GUI key inspector) displaying live raw OS scan code → `HidUsage` → target OS code so any exotic or international key can be verified in seconds
-
-### 10. Zero-Friction OS Integration (Autostart, Firewall, Elevated Windows & File Drop)
-- [ ] Windows: one-click "Start with Windows", automatic Private-network UDP firewall rule helper (`24800`/`24801`), and optional elevated Windows service (`uiAccess`) so input continues seamlessly over Administrator windows and UAC prompts
-- [ ] Ubuntu `.deb`: desktop application launcher (`.desktop`), autostart toggle, tray integration, and optional `udev` rule for `uinput` mode
-- [ ] Stretch: Drag-and-drop file transfer across screen edges over the existing QUIC bulk stream lane
+### 9. Interactive Scancode / AltGr Live Inspector & Deep Telemetry
+- [x] Live Ping/Pong RTT (ms) + sparkline in GUI
+- [ ] Jitter, UDP datagram drop counter, and effective mouse Hz meter
+- [ ] Interactive `glide doctor --keys` live raw scancode inspector
 
 ---
 

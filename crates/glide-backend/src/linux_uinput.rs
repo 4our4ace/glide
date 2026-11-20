@@ -1,0 +1,487 @@
+//! Optional Linux `/dev/uinput` virtual kernel HID injector (Step 6).
+//!
+//! Creates a real virtual USB mouse + keyboard device in the Linux kernel so
+//! `libinput` applies Ubuntu's 100% native pointer acceleration, true 1/120th-detent
+//! high-resolution scrolling (`REL_WHEEL_HI_RES` / `REL_HWHEEL_HI_RES`), and
+//! works even over lock screens and raw-input games.
+//!
+//! Uses X11 RandR only for monitor geometry, cursor warp on screen entry, and
+//! edge-return boundary checks.
+
+use crate::geometry::DesktopGeometry;
+use crate::linux_x11::query_desktop_geometry;
+use crate::InputInjector;
+use anyhow::{anyhow, Context, Result};
+use glide_hid::{HidUsage, MouseButton};
+use glide_proto::{Edge, LockState, OsKind};
+use std::collections::HashSet;
+use std::fs::{File, OpenOptions};
+use std::io::Write;
+use std::os::fd::AsRawFd;
+use std::time::{Duration, Instant};
+use tracing::{debug, trace, warn};
+use x11rb::connection::Connection;
+use x11rb::protocol::xproto::{ConnectionExt as XProtoExt, Window};
+use x11rb::rust_connection::RustConnection;
+
+// Linux uinput ioctl numbers (x86_64 / generic asm-generic/ioctl.h)
+const UI_DEV_CREATE: libc::c_ulong = 0x5501;
+const UI_DEV_DESTROY: libc::c_ulong = 0x5502;
+const UI_DEV_SETUP: libc::c_ulong = 0x405C_5503;
+const UI_SET_EVBIT: libc::c_ulong = 0x4004_5564;
+const UI_SET_KEYBIT: libc::c_ulong = 0x4004_5565;
+const UI_SET_RELBIT: libc::c_ulong = 0x4004_5566;
+
+const EV_SYN: u16 = 0x00;
+const EV_KEY: u16 = 0x01;
+const EV_REL: u16 = 0x02;
+const SYN_REPORT: u16 = 0;
+
+const REL_X: u16 = 0x00;
+const REL_Y: u16 = 0x01;
+const REL_HWHEEL: u16 = 0x06;
+const REL_WHEEL: u16 = 0x08;
+const REL_WHEEL_HI_RES: u16 = 0x0B;
+const REL_HWHEEL_HI_RES: u16 = 0x0C;
+
+const BTN_LEFT: u16 = 0x110;
+const BTN_RIGHT: u16 = 0x111;
+const BTN_MIDDLE: u16 = 0x112;
+const BTN_SIDE: u16 = 0x113;
+const BTN_EXTRA: u16 = 0x114;
+
+const BUS_USB: u16 = 0x03;
+
+#[repr(C)]
+struct InputId {
+    bustype: u16,
+    vendor: u16,
+    product: u16,
+    version: u16,
+}
+
+#[repr(C)]
+struct UinputSetup {
+    id: InputId,
+    name: [u8; 80],
+    ff_effects_max: u32,
+}
+
+#[repr(C)]
+struct InputEvent {
+    tv_sec: libc::time_t,
+    tv_usec: libc::suseconds_t,
+    type_: u16,
+    code: u16,
+    value: i32,
+}
+
+fn ioctl_int(fd: i32, req: libc::c_ulong, val: libc::c_int) -> Result<()> {
+    let rc = unsafe { libc::ioctl(fd, req as _, val) };
+    if rc < 0 {
+        return Err(anyhow!(
+            "uinput ioctl 0x{req:X}({val}) failed: {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+    Ok(())
+}
+
+fn mouse_btn_to_evdev(btn: MouseButton) -> u16 {
+    match btn {
+        MouseButton::Left => BTN_LEFT,
+        MouseButton::Right => BTN_RIGHT,
+        MouseButton::Middle => BTN_MIDDLE,
+        MouseButton::Back => BTN_SIDE,
+        MouseButton::Forward => BTN_EXTRA,
+    }
+}
+
+pub struct UinputInjector {
+    file: File,
+    conn: RustConnection,
+    screen_num: usize,
+    root: Window,
+    geometry: DesktopGeometry,
+    rem_x: f32,
+    rem_y: f32,
+    scroll_rem_x: i32,
+    scroll_rem_y: i32,
+    est_x: f32,
+    est_y: f32,
+    last_pointer_sync: Instant,
+    edge_push_accum: f32,
+    pressed_keys: HashSet<u16>,
+    pressed_buttons: HashSet<u16>,
+}
+
+impl UinputInjector {
+    pub fn connect() -> Result<Self> {
+        let file = OpenOptions::new()
+            .write(true)
+            .open("/dev/uinput")
+            .context(
+                "cannot open /dev/uinput (add your user to the `input` group and install 99-glide-uinput.rules)",
+            )?;
+        let fd = file.as_raw_fd();
+
+        ioctl_int(fd, UI_SET_EVBIT, EV_KEY as i32)?;
+        ioctl_int(fd, UI_SET_EVBIT, EV_REL as i32)?;
+
+        for rel in [
+            REL_X,
+            REL_Y,
+            REL_WHEEL,
+            REL_HWHEEL,
+            REL_WHEEL_HI_RES,
+            REL_HWHEEL_HI_RES,
+        ] {
+            ioctl_int(fd, UI_SET_RELBIT, rel as i32)?;
+        }
+
+        // Enable standard keyboard evdev range (1..=248) + mouse buttons
+        for key in 1u16..=248 {
+            let _ = ioctl_int(fd, UI_SET_KEYBIT, key as i32);
+        }
+        for btn in [BTN_LEFT, BTN_RIGHT, BTN_MIDDLE, BTN_SIDE, BTN_EXTRA] {
+            ioctl_int(fd, UI_SET_KEYBIT, btn as i32)?;
+        }
+
+        let mut name = [0u8; 80];
+        let label = b"Glide Virtual HID";
+        name[..label.len()].copy_from_slice(label);
+
+        let setup = UinputSetup {
+            id: InputId {
+                bustype: BUS_USB,
+                vendor: 0x1D6B,
+                product: 0x474C,
+                version: 2,
+            },
+            name,
+            ff_effects_max: 0,
+        };
+        let rc = unsafe { libc::ioctl(fd, UI_DEV_SETUP as _, &setup) };
+        if rc < 0 {
+            return Err(anyhow!(
+                "UI_DEV_SETUP failed: {}",
+                std::io::Error::last_os_error()
+            ));
+        }
+        let rc = unsafe { libc::ioctl(fd, UI_DEV_CREATE as _) };
+        if rc < 0 {
+            return Err(anyhow!(
+                "UI_DEV_CREATE failed: {}",
+                std::io::Error::last_os_error()
+            ));
+        }
+
+        let (conn, screen_num) =
+            RustConnection::connect(None).context("failed to connect to X11 for geometry/warp")?;
+        let root = conn.setup().roots[screen_num].root;
+        let geometry = query_desktop_geometry(&conn, screen_num)?;
+        let (cx, cy) = geometry.primary_center();
+
+        debug!("Initialized Linux /dev/uinput virtual HID device (hardware-native acceleration & hi-res scroll)");
+
+        Ok(Self {
+            file,
+            conn,
+            screen_num,
+            root,
+            geometry,
+            rem_x: 0.0,
+            rem_y: 0.0,
+            scroll_rem_x: 0,
+            scroll_rem_y: 0,
+            est_x: cx as f32,
+            est_y: cy as f32,
+            last_pointer_sync: Instant::now(),
+            edge_push_accum: 0.0,
+            pressed_keys: HashSet::new(),
+            pressed_buttons: HashSet::new(),
+        })
+    }
+
+    fn emit_events(&mut self, events: &[(u16, u16, i32)]) -> Result<()> {
+        let mut buf = Vec::with_capacity((events.len() + 1) * std::mem::size_of::<InputEvent>());
+        for &(type_, code, value) in events {
+            let ev = InputEvent {
+                tv_sec: 0,
+                tv_usec: 0,
+                type_,
+                code,
+                value,
+            };
+            let bytes = unsafe {
+                std::slice::from_raw_parts(
+                    &ev as *const InputEvent as *const u8,
+                    std::mem::size_of::<InputEvent>(),
+                )
+            };
+            buf.extend_from_slice(bytes);
+        }
+        let syn = InputEvent {
+            tv_sec: 0,
+            tv_usec: 0,
+            type_: EV_SYN,
+            code: SYN_REPORT,
+            value: 0,
+        };
+        let syn_bytes = unsafe {
+            std::slice::from_raw_parts(
+                &syn as *const InputEvent as *const u8,
+                std::mem::size_of::<InputEvent>(),
+            )
+        };
+        buf.extend_from_slice(syn_bytes);
+        self.file.write_all(&buf).context("uinput write failed")?;
+        Ok(())
+    }
+
+    fn sync_pointer(&mut self) -> Result<(i32, i32)> {
+        let reply = self.conn.query_pointer(self.root)?.reply()?;
+        self.est_x = reply.root_x as f32;
+        self.est_y = reply.root_y as f32;
+        self.last_pointer_sync = Instant::now();
+        Ok((reply.root_x as i32, reply.root_y as i32))
+    }
+
+    fn query_x11_lock_state(&self) -> LockState {
+        if let Ok(cookie) = self.conn.get_keyboard_control() {
+            if let Ok(reply) = cookie.reply() {
+                return LockState {
+                    caps_lock: (reply.led_mask & 1) != 0,
+                    num_lock: (reply.led_mask & 2) != 0,
+                };
+            }
+        }
+        LockState::default()
+    }
+}
+
+impl InputInjector for UinputInjector {
+    fn os_kind(&self) -> OsKind {
+        OsKind::LinuxX11
+    }
+
+    fn desktop_geometry(&mut self) -> Result<DesktopGeometry> {
+        self.geometry = query_desktop_geometry(&self.conn, self.screen_num)?;
+        Ok(self.geometry.clone())
+    }
+
+    fn enter(&mut self, edge: Edge, normalized_pos: f32) -> Result<()> {
+        if let Ok(geom) = query_desktop_geometry(&self.conn, self.screen_num) {
+            self.geometry = geom;
+        }
+        let (x, y) = self.geometry.point_on_edge(edge, normalized_pos, 4);
+        self.conn
+            .warp_pointer(x11rb::NONE, self.root, 0, 0, 0, 0, x as i16, y as i16)?;
+        self.conn.flush()?;
+        self.rem_x = 0.0;
+        self.rem_y = 0.0;
+        self.est_x = x as f32;
+        self.est_y = y as f32;
+        self.edge_push_accum = 0.0;
+        self.last_pointer_sync = Instant::now();
+        Ok(())
+    }
+
+    fn enter_at(&mut self, norm_x: f32, norm_y: f32) -> Result<()> {
+        if let Ok(geom) = query_desktop_geometry(&self.conn, self.screen_num) {
+            self.geometry = geom;
+        }
+        let (x, y) = self.geometry.denormalize_point(norm_x, norm_y);
+        self.conn
+            .warp_pointer(x11rb::NONE, self.root, 0, 0, 0, 0, x as i16, y as i16)?;
+        self.conn.flush()?;
+        self.rem_x = 0.0;
+        self.rem_y = 0.0;
+        self.est_x = x as f32;
+        self.est_y = y as f32;
+        self.edge_push_accum = 0.0;
+        self.last_pointer_sync = Instant::now();
+        Ok(())
+    }
+
+    fn cursor_norm(&mut self) -> (f32, f32) {
+        if let Ok((x, y)) = self.sync_pointer() {
+            self.geometry.normalize_point(x, y)
+        } else {
+            self.geometry
+                .normalize_point(self.est_x.round() as i32, self.est_y.round() as i32)
+        }
+    }
+
+    fn sync_lock_state(&mut self, desired: LockState) -> Result<()> {
+        let current = self.query_x11_lock_state();
+        if current.caps_lock != desired.caps_lock {
+            let caps = HidUsage::keyboard(0x39).to_evdev().unwrap_or(58);
+            let _ = self.emit_events(&[(EV_KEY, caps, 1)]);
+            let _ = self.emit_events(&[(EV_KEY, caps, 0)]);
+        }
+        if current.num_lock != desired.num_lock {
+            let num = HidUsage::keyboard(0x53).to_evdev().unwrap_or(69);
+            let _ = self.emit_events(&[(EV_KEY, num, 1)]);
+            let _ = self.emit_events(&[(EV_KEY, num, 0)]);
+        }
+        Ok(())
+    }
+
+    fn move_relative(
+        &mut self,
+        dx: f32,
+        dy: f32,
+        return_edge: Option<Edge>,
+        edge_threshold_px: i32,
+        dead_corner_px: i32,
+    ) -> Result<Option<(Edge, f32)>> {
+        self.rem_x += dx;
+        self.rem_y += dy;
+        let ix = self.rem_x.trunc() as i32;
+        let iy = self.rem_y.trunc() as i32;
+        self.rem_x -= ix as f32;
+        self.rem_y -= iy as f32;
+
+        if ix != 0 || iy != 0 {
+            let mut evs = Vec::with_capacity(2);
+            if ix != 0 {
+                evs.push((EV_REL, REL_X, ix));
+            }
+            if iy != 0 {
+                evs.push((EV_REL, REL_Y, iy));
+            }
+            self.emit_events(&evs)?;
+        }
+
+        let (min_x, min_y, max_x, max_y) = self.geometry.bounds();
+        self.est_x = (self.est_x + dx).clamp(min_x as f32, (max_x - 1) as f32);
+        self.est_y = (self.est_y + dy).clamp(min_y as f32, (max_y - 1) as f32);
+
+        let Some(edge) = return_edge else {
+            return Ok(None);
+        };
+        let outward = match edge {
+            Edge::Left => -dx,
+            Edge::Right => dx,
+            Edge::Top => -dy,
+            Edge::Bottom => dy,
+        };
+        if outward <= 0.0 {
+            self.edge_push_accum = 0.0;
+            return Ok(None);
+        }
+
+        let dist = self.geometry.distance_to_edge(
+            edge,
+            self.est_x.round() as i32,
+            self.est_y.round() as i32,
+        );
+        if dist > 96 && self.last_pointer_sync.elapsed() < Duration::from_millis(35) {
+            return Ok(None);
+        }
+
+        let (rx, ry) = self.sync_pointer()?;
+        if let Some(norm) = self
+            .geometry
+            .hit_outer_edge_guarded(edge, rx, ry, 2, dead_corner_px)
+        {
+            self.edge_push_accum += outward;
+            if self.edge_push_accum >= edge_threshold_px.max(1) as f32 {
+                self.edge_push_accum = 0.0;
+                return Ok(Some((edge, norm)));
+            }
+        } else {
+            self.edge_push_accum = 0.0;
+        }
+        Ok(None)
+    }
+
+    fn scroll(&mut self, dx_120: i16, dy_120: i16) -> Result<()> {
+        let mut evs = Vec::with_capacity(4);
+        if dy_120 != 0 {
+            evs.push((EV_REL, REL_WHEEL_HI_RES, dy_120 as i32));
+            self.scroll_rem_y += dy_120 as i32;
+            let ticks = self.scroll_rem_y / 120;
+            if ticks != 0 {
+                self.scroll_rem_y -= ticks * 120;
+                evs.push((EV_REL, REL_WHEEL, ticks));
+            }
+        }
+        if dx_120 != 0 {
+            evs.push((EV_REL, REL_HWHEEL_HI_RES, dx_120 as i32));
+            self.scroll_rem_x += dx_120 as i32;
+            let ticks = self.scroll_rem_x / 120;
+            if ticks != 0 {
+                self.scroll_rem_x -= ticks * 120;
+                evs.push((EV_REL, REL_HWHEEL, ticks));
+            }
+        }
+        if !evs.is_empty() {
+            self.emit_events(&evs)?;
+        }
+        Ok(())
+    }
+
+    fn button(&mut self, button: MouseButton, pressed: bool) -> Result<()> {
+        let code = mouse_btn_to_evdev(button);
+        self.emit_events(&[(EV_KEY, code, i32::from(pressed))])?;
+        if pressed {
+            self.pressed_buttons.insert(code);
+        } else {
+            self.pressed_buttons.remove(&code);
+        }
+        Ok(())
+    }
+
+    fn key(&mut self, usage: HidUsage, pressed: bool) -> Result<()> {
+        let Some(code) = usage.to_evdev() else {
+            trace!(?usage, "Unmapped HID usage for uinput");
+            return Ok(());
+        };
+        self.emit_events(&[(EV_KEY, code, i32::from(pressed))])?;
+        if pressed {
+            self.pressed_keys.insert(code);
+        } else {
+            self.pressed_keys.remove(&code);
+        }
+        Ok(())
+    }
+
+    fn release_all(&mut self) -> Result<()> {
+        let keys: Vec<u16> = self.pressed_keys.drain().collect();
+        let btns: Vec<u16> = self.pressed_buttons.drain().collect();
+        let mut evs = Vec::with_capacity(keys.len() + btns.len());
+        for k in keys {
+            evs.push((EV_KEY, k, 0));
+        }
+        for b in btns {
+            evs.push((EV_KEY, b, 0));
+        }
+        if !evs.is_empty() {
+            if let Err(e) = self.emit_events(&evs) {
+                warn!(error = %e, "Failed releasing uinput keys/buttons");
+            }
+        }
+        Ok(())
+    }
+}
+
+impl Drop for UinputInjector {
+    fn drop(&mut self) {
+        let _ = self.release_all();
+        unsafe {
+            let _ = libc::ioctl(self.file.as_raw_fd(), UI_DEV_DESTROY as _);
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn uinput_setup_abi_size_matches_linux_kernel() {
+        assert_eq!(std::mem::size_of::<UinputSetup>(), 92);
+    }
+}

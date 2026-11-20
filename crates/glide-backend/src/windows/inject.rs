@@ -1,21 +1,22 @@
-//! Windows 11 client input injector using `SendInput` (scancode keys + relative mouse + hi-res scroll).
+//! Windows 11 client input injector using `SendInput` (scancode keys + relative mouse + hi-res scroll),
+//! cursor memory restoration, dead-corner guards, and CapsLock/NumLock sync.
 
 use crate::geometry::DesktopGeometry;
 use crate::windows::{init_dpi_awareness, query_desktop_geometry, GLIDE_EXTRA_INFO};
 use crate::InputInjector;
 use anyhow::Result;
 use glide_hid::{HidUsage, MouseButton};
-use glide_proto::{Edge, OsKind};
+use glide_proto::{Edge, LockState, OsKind};
 use std::collections::HashSet;
 use std::mem::size_of;
 use tracing::{debug, trace};
 use windows_sys::Win32::Foundation::POINT;
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
-    SendInput, INPUT, INPUT_0, INPUT_KEYBOARD, INPUT_MOUSE, KEYBDINPUT, KEYEVENTF_EXTENDEDKEY,
-    KEYEVENTF_KEYUP, KEYEVENTF_SCANCODE, MOUSEEVENTF_HWHEEL, MOUSEEVENTF_LEFTDOWN,
-    MOUSEEVENTF_LEFTUP, MOUSEEVENTF_MIDDLEDOWN, MOUSEEVENTF_MIDDLEUP, MOUSEEVENTF_MOVE,
-    MOUSEEVENTF_RIGHTDOWN, MOUSEEVENTF_RIGHTUP, MOUSEEVENTF_WHEEL, MOUSEEVENTF_XDOWN,
-    MOUSEEVENTF_XUP, MOUSEINPUT,
+    GetKeyState, SendInput, INPUT, INPUT_0, INPUT_KEYBOARD, INPUT_MOUSE, KEYBDINPUT,
+    KEYEVENTF_EXTENDEDKEY, KEYEVENTF_KEYUP, KEYEVENTF_SCANCODE, MOUSEEVENTF_HWHEEL,
+    MOUSEEVENTF_LEFTDOWN, MOUSEEVENTF_LEFTUP, MOUSEEVENTF_MIDDLEDOWN, MOUSEEVENTF_MIDDLEUP,
+    MOUSEEVENTF_MOVE, MOUSEEVENTF_RIGHTDOWN, MOUSEEVENTF_RIGHTUP, MOUSEEVENTF_WHEEL,
+    MOUSEEVENTF_XDOWN, MOUSEEVENTF_XUP, MOUSEINPUT, VK_CAPITAL, VK_NUMLOCK,
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::{GetCursorPos, SetCursorPos, XBUTTON1, XBUTTON2};
 
@@ -115,12 +116,50 @@ impl InputInjector for WindowsInjector {
         Ok(())
     }
 
+    fn enter_at(&mut self, norm_x: f32, norm_y: f32) -> Result<()> {
+        if let Ok(geom) = query_desktop_geometry() {
+            self.geometry = geom;
+        }
+        let (x, y) = self.geometry.denormalize_point(norm_x, norm_y);
+        unsafe {
+            SetCursorPos(x, y);
+        }
+        self.rem_x = 0.0;
+        self.rem_y = 0.0;
+        self.edge_push_accum = 0.0;
+        Ok(())
+    }
+
+    fn cursor_norm(&mut self) -> (f32, f32) {
+        let mut pt = POINT { x: 0, y: 0 };
+        if unsafe { GetCursorPos(&mut pt) } != 0 {
+            self.geometry.normalize_point(pt.x, pt.y)
+        } else {
+            (0.5, 0.5)
+        }
+    }
+
+    fn sync_lock_state(&mut self, desired: LockState) -> Result<()> {
+        let cur_caps = (unsafe { GetKeyState(VK_CAPITAL as i32) } & 1) != 0;
+        let cur_num = (unsafe { GetKeyState(VK_NUMLOCK as i32) } & 1) != 0;
+        if cur_caps != desired.caps_lock {
+            self.send_key_scan(0x3A, false, true);
+            self.send_key_scan(0x3A, false, false);
+        }
+        if cur_num != desired.num_lock {
+            self.send_key_scan(0x45, true, true);
+            self.send_key_scan(0x45, true, false);
+        }
+        Ok(())
+    }
+
     fn move_relative(
         &mut self,
         dx: f32,
         dy: f32,
         return_edge: Option<Edge>,
         edge_threshold_px: i32,
+        dead_corner_px: i32,
     ) -> Result<Option<(Edge, f32)>> {
         self.rem_x += dx;
         self.rem_y += dy;
@@ -151,7 +190,10 @@ impl InputInjector for WindowsInjector {
 
         let mut pt = POINT { x: 0, y: 0 };
         if unsafe { GetCursorPos(&mut pt) } != 0 {
-            if let Some(norm) = self.geometry.hit_outer_edge(edge, pt.x, pt.y, 2) {
+            if let Some(norm) =
+                self.geometry
+                    .hit_outer_edge_guarded(edge, pt.x, pt.y, 2, dead_corner_px)
+            {
                 self.edge_push_accum += outward;
                 if self.edge_push_accum >= edge_threshold_px.max(1) as f32 {
                     self.edge_push_accum = 0.0;

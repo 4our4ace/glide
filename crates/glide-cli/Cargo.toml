@@ -14,6 +14,7 @@ anyhow.workspace = true
 clap.workspace = true
 glide-backend.workspace = true
 glide-core.workspace = true
+glide-gui.workspace = true
 glide-hid.workspace = true
 glide-net.workspace = true
 glide-proto.workspace = true

@@ -143,12 +143,64 @@ impl InputInjector for X11Injector {
         Ok(())
     }
 
+    fn enter_at(&mut self, norm_x: f32, norm_y: f32) -> Result<()> {
+        if let Ok(geom) = query_desktop_geometry(&self.conn, self.screen_num) {
+            self.geometry = geom;
+        }
+        let (x, y) = self.geometry.denormalize_point(norm_x, norm_y);
+        self.conn
+            .warp_pointer(x11rb::NONE, self.root, 0, 0, 0, 0, x as i16, y as i16)
+            .context("X11 warp_pointer on EnterAt failed")?;
+        self.conn.flush().context("X11 flush failed")?;
+
+        self.rem_x = 0.0;
+        self.rem_y = 0.0;
+        self.est_x = x as f32;
+        self.est_y = y as f32;
+        self.edge_push_accum = 0.0;
+        self.last_pointer_sync = Instant::now();
+        Ok(())
+    }
+
+    fn cursor_norm(&mut self) -> (f32, f32) {
+        if let Ok((x, y)) = self.sync_pointer() {
+            self.geometry.normalize_point(x, y)
+        } else {
+            self.geometry
+                .normalize_point(self.est_x.round() as i32, self.est_y.round() as i32)
+        }
+    }
+
+    fn sync_lock_state(&mut self, desired: glide_proto::LockState) -> Result<()> {
+        let Ok(cookie) = self.conn.get_keyboard_control() else {
+            return Ok(());
+        };
+        let Ok(reply) = cookie.reply() else {
+            return Ok(());
+        };
+        let current_caps = (reply.led_mask & 1) != 0;
+        let current_num = (reply.led_mask & 2) != 0;
+
+        if current_caps != desired.caps_lock {
+            let caps = HidUsage::keyboard(0x39);
+            let _ = self.key(caps, true);
+            let _ = self.key(caps, false);
+        }
+        if current_num != desired.num_lock {
+            let num = HidUsage::keyboard(0x53);
+            let _ = self.key(num, true);
+            let _ = self.key(num, false);
+        }
+        Ok(())
+    }
+
     fn move_relative(
         &mut self,
         dx: f32,
         dy: f32,
         return_edge: Option<Edge>,
         edge_threshold_px: i32,
+        dead_corner_px: i32,
     ) -> Result<Option<(Edge, f32)>> {
         self.rem_x += dx;
         self.rem_y += dy;
@@ -208,7 +260,10 @@ impl InputInjector for X11Injector {
         }
 
         let (rx, ry) = self.sync_pointer()?;
-        if let Some(norm) = self.geometry.hit_outer_edge(edge, rx, ry, 2) {
+        if let Some(norm) = self
+            .geometry
+            .hit_outer_edge_guarded(edge, rx, ry, 2, dead_corner_px)
+        {
             self.edge_push_accum += outward;
             if self.edge_push_accum >= edge_threshold_px.max(1) as f32 {
                 self.edge_push_accum = 0.0;

@@ -6,11 +6,12 @@ members = [
     "crates/glide-net",
     "crates/glide-backend",
     "crates/glide-core",
+    "crates/glide-gui",
     "crates/glide-cli",
 ]
 
 [workspace.package]
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 rust-version = "1.80"
 license = "MIT OR Apache-2.0"
@@ -21,12 +22,15 @@ glide-proto = { path = "crates/glide-proto" }
 glide-net = { path = "crates/glide-net" }
 glide-backend = { path = "crates/glide-backend" }
 glide-core = { path = "crates/glide-core" }
+glide-gui = { path = "crates/glide-gui" }
 
 anyhow = "1.0"
 bytes = "1.7"
 clap = { version = "4.5", features = ["derive"] }
 directories = "5.0"
+libc = "0.2"
 parking_lot = "0.12"
+png = "0.17"
 quinn = { version = "0.11", default-features = false, features = ["runtime-tokio", "rustls-ring"] }
 rcgen = { version = "0.13", default-features = false, features = ["crypto", "ring"] }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
@@ -48,10 +52,12 @@ windows-sys = { version = "0.59", features = [
     "Win32_System_DataExchange",
     "Win32_System_LibraryLoader",
     "Win32_System_Memory",
+    "Win32_System_Registry",
     "Win32_System_Threading",
     "Win32_UI_HiDpi",
     "Win32_UI_Input",
     "Win32_UI_Input_KeyboardAndMouse",
+    "Win32_UI_Shell",
     "Win32_UI_WindowsAndMessaging",
 ] }
 
