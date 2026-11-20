@@ -2365,26 +2365,26 @@ fn settings_page(s: &Ui, p: Palette) -> El {
     let version_foot = row()
         .key("version-foot")
         .w_full()
-        .pt(2.0)
-        .gap(10.0)
+        .pt(12.0)
+        .border_sides([1.0, 0.0, 0.0, 0.0], p.line)
+        .gap(8.0)
         .center_y()
-        .child(icons::glide_mark(24.0, 6.0, p.accent))
+        .justify_between()
         .child(
-            col()
-                .grow(1.0)
-                .shrink()
-                .min_w(0.0)
-                .gap(1.0)
+            row()
+                .gap(8.0)
+                .center_y()
+                .child(icons::glide_mark(18.0, 4.5, p.accent))
                 .child(
                     text(format!("Glide v{APP_VERSION}"))
                         .font(ty::SUB_MED)
-                        .color(p.text),
-                )
-                .child(
-                    text("No account, no cloud, no internet.")
-                        .font(ty::SUB)
-                        .color(p.muted),
+                        .color(p.text_2),
                 ),
+        )
+        .child(
+            text("No account, no cloud, no internet.")
+                .font(ty::SUB)
+                .color(p.faint),
         );
 
     let mut left_inner = col()
@@ -2520,8 +2520,6 @@ fn settings_page(s: &Ui, p: Palette) -> El {
                 .child(security_card),
         );
     }
-
-    left_inner = left_inner.child(version_foot);
 
     let left_col = col()
         .key("settings-left")
@@ -2667,6 +2665,7 @@ fn settings_page(s: &Ui, p: Palette) -> El {
                 .child(left_col)
                 .child(right_col),
         )
+        .child(version_foot)
 }
 
 // ---------------------------------------------------------------------------
