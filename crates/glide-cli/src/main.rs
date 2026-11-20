@@ -12,7 +12,7 @@ use glide_backend::InputBackendKind;
 use glide_core::client::run_native_client;
 use glide_core::config::{default_config_dir, ClientConfig, GlideConfigFile, ServerConfig};
 use glide_core::server::run_native_server;
-use glide_gui::{run_gui, GuiOptions, DEFAULT_GUI_PORT};
+use glide_gui::{run_gui_blocking, GuiOptions, DEFAULT_GUI_PORT};
 use glide_hid::HidUsage;
 use glide_net::discovery::{discover_servers, DEFAULT_DISCOVERY_PORT};
 use glide_net::tls::ServerIdentity;
@@ -273,8 +273,7 @@ fn attach_parent_console_if_cli() {
     }
 }
 
-#[tokio::main]
-async fn main() -> Result<()> {
+fn main() -> Result<()> {
     #[cfg(target_os = "windows")]
     attach_parent_console_if_cli();
 
@@ -288,20 +287,31 @@ async fn main() -> Result<()> {
         auto_start: None,
     });
 
-    match command {
-        Command::Gui {
+    // The native GUI owns the main thread (its window event loop) and builds its own runtime.
+    if let Command::Gui {
+        port,
+        minimized,
+        auto_start,
+    } = command
+    {
+        return run_gui_blocking(GuiOptions {
+            config_path: cli.config,
             port,
             minimized,
-            auto_start,
-        } => {
-            run_gui(GuiOptions {
-                config_path: cli.config,
-                port,
-                minimized,
-                auto_start_role: auto_start,
-            })
-            .await?;
-        }
+            auto_start_role: auto_start,
+        });
+    }
+
+    tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()?
+        .block_on(run_command(command, cli.config))
+}
+
+async fn run_command(command: Command, config: Option<PathBuf>) -> Result<()> {
+    let cli_config = config;
+    match command {
+        Command::Gui { .. } => unreachable!("handled in main"),
 
         Command::Server {
             bind,
@@ -315,7 +325,7 @@ async fn main() -> Result<()> {
             no_fullscreen_lock,
             coalesce_us,
         } => {
-            let mut cfg: ServerConfig = load_config(cli.config.as_ref())?.server;
+            let mut cfg: ServerConfig = load_config(cli_config.as_ref())?.server;
             if let Some(b) = bind {
                 cfg.bind = b;
             }
@@ -371,7 +381,7 @@ async fn main() -> Result<()> {
             backend,
             no_clipboard,
         } => {
-            let mut cfg: ClientConfig = load_config(cli.config.as_ref())?.client;
+            let mut cfg: ClientConfig = load_config(cli_config.as_ref())?.client;
             if let Some(s) = server {
                 cfg.server = Some(s);
             }

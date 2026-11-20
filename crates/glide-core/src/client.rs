@@ -165,6 +165,9 @@ pub async fn run_client_session(
 
     let mut ping_interval = tokio::time::interval(Duration::from_millis(500));
     ping_interval.tick().await;
+    let mut reveal_interval = tokio::time::interval(Duration::from_millis(150));
+    reveal_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    reveal_interval.tick().await;
 
     let conn = session.conn;
     let mut ctrl_send = session.ctrl_send;
@@ -184,6 +187,10 @@ pub async fn run_client_session(
                     let rtt_ms = conn.rtt().as_secs_f32() * 1000.0;
                     rt.record_rtt(rtt_ms);
                 }
+            }
+
+            _ = reveal_interval.tick(), if !focused => {
+                injector.reveal_if_moved_locally();
             }
 
             cmd = async {
@@ -300,6 +307,7 @@ pub async fn run_client_session(
                                 let (cx, cy) = injector.cursor_norm();
                                 focused = false;
                                 let _ = injector.release_all();
+                                let _ = injector.leave();
                                 if let Some(rt) = runtime {
                                     rt.update(|s| s.active_target = server_name.clone());
                                 }
@@ -381,6 +389,7 @@ pub async fn run_client_session(
                     ControlMessage::Leave { .. } | ControlMessage::ReleaseAll => {
                         focused = false;
                         let _ = injector.release_all();
+                        let _ = injector.leave();
                         if let Some(rt) = runtime {
                             rt.update(|s| s.active_target = server_name.clone());
                         }
@@ -513,6 +522,7 @@ pub async fn run_client_session(
     };
 
     let _ = injector.release_all();
+    let _ = injector.show_cursor();
     session_result
 }
 

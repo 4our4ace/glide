@@ -2,7 +2,7 @@
 //! XRandR multi-monitor edge detection, dead-corner guards, edge dwell, and hotkeys.
 
 use crate::geometry::DesktopGeometry;
-use crate::linux_x11::query_desktop_geometry;
+use crate::linux_x11::{query_desktop_geometry, X11CursorHider};
 use crate::{CaptureConfig, CaptureControl, CaptureEvent, CaptureHandle};
 use anyhow::{Context, Result};
 use glide_hid::{HidUsage, ModifierMask, MouseButton};
@@ -291,6 +291,7 @@ fn run_capture_loop(
     tx: mpsc::UnboundedSender<CaptureEvent>,
 ) {
     let mut grabbed = false;
+    let mut cursor_hider = X11CursorHider::init(&conn);
     let mut edge_push_edge: Option<Edge> = None;
     let mut edge_push_accum: f32 = 0.0;
     let mut edge_dwell_start: Option<Instant> = None;
@@ -298,7 +299,10 @@ fn run_capture_loop(
     let mut last_local_query = Instant::now();
     let mut mods = ModifierMask::EMPTY;
 
-    let do_grab = |conn: &RustConnection, shared: &SharedState, grabbed: &mut bool| {
+    let do_grab = |conn: &RustConnection,
+                   shared: &SharedState,
+                   grabbed: &mut bool,
+                   cursor_hider: &mut X11CursorHider| {
         if *grabbed {
             return;
         }
@@ -324,6 +328,7 @@ fn run_capture_loop(
         );
         let (cx, cy) = shared.geometry.lock().primary_center();
         let _ = conn.warp_pointer(x11rb::NONE, root, 0, 0, 0, 0, cx as i16, cy as i16);
+        cursor_hider.hide(conn, root);
         let _ = conn.flush();
         *grabbed = true;
         debug!("X11Capture grabbed pointer & keyboard (remote mode)");
@@ -332,6 +337,7 @@ fn run_capture_loop(
     let do_ungrab = |conn: &RustConnection,
                      shared: &SharedState,
                      grabbed: &mut bool,
+                     cursor_hider: &mut X11CursorHider,
                      target: Option<LeaveTarget>| {
         if *grabbed {
             let _ = conn.ungrab_pointer(x11rb::CURRENT_TIME);
@@ -346,6 +352,7 @@ fn run_capture_loop(
             };
             let _ = conn.warp_pointer(x11rb::NONE, root, 0, 0, 0, 0, x as i16, y as i16);
         }
+        cursor_hider.show(conn, root);
         let _ = conn.flush();
         debug!("X11Capture ungrabbed pointer & keyboard (local mode)");
     };
@@ -370,13 +377,13 @@ fn run_capture_loop(
             Event::ClientMessage(cm) if cm.type_ == wake_atom => {
                 let cmd = cm.data.as_data32()[0];
                 match cmd {
-                    CMD_ENTER_REMOTE => do_grab(&conn, &shared, &mut grabbed),
+                    CMD_ENTER_REMOTE => do_grab(&conn, &shared, &mut grabbed, &mut cursor_hider),
                     CMD_LEAVE_REMOTE => {
                         let leave = shared.pending_leave.lock().take();
                         edge_push_edge = None;
                         edge_push_accum = 0.0;
                         edge_dwell_start = None;
-                        do_ungrab(&conn, &shared, &mut grabbed, leave);
+                        do_ungrab(&conn, &shared, &mut grabbed, &mut cursor_hider, leave);
                     }
                     _ => {}
                 }
@@ -388,7 +395,7 @@ fn run_capture_loop(
                 }
                 if shared.remote_mode.load(Ordering::Acquire) {
                     if !grabbed {
-                        do_grab(&conn, &shared, &mut grabbed);
+                        do_grab(&conn, &shared, &mut grabbed, &mut cursor_hider);
                     }
                     let _ = tx.send(CaptureEvent::MouseDelta { dx, dy });
                 } else {
@@ -460,7 +467,7 @@ fn run_capture_loop(
                         edge_push_accum = 0.0;
                         edge_dwell_start = None;
                         shared.remote_mode.store(true, Ordering::SeqCst);
-                        do_grab(&conn, &shared, &mut grabbed);
+                        do_grab(&conn, &shared, &mut grabbed, &mut cursor_hider);
                         let _ = tx.send(CaptureEvent::EdgeCrossed {
                             edge,
                             normalized_pos,
@@ -545,7 +552,7 @@ fn run_capture_loop(
 
                 if usage == config.escape_key && shared.remote_mode.load(Ordering::Acquire) {
                     shared.remote_mode.store(false, Ordering::SeqCst);
-                    do_ungrab(&conn, &shared, &mut grabbed, None);
+                    do_ungrab(&conn, &shared, &mut grabbed, &mut cursor_hider, None);
                     let _ = tx.send(CaptureEvent::EscapeHotkey);
                     continue;
                 }
@@ -594,7 +601,8 @@ fn run_capture_loop(
     if grabbed {
         let _ = conn.ungrab_pointer(x11rb::CURRENT_TIME);
         let _ = conn.ungrab_keyboard(x11rb::CURRENT_TIME);
-        let _ = conn.flush();
     }
+    cursor_hider.show(&conn, root);
+    let _ = conn.flush();
     let _ = xinput::xi_select_events(&*conn, root, &[]);
 }

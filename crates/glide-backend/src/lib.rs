@@ -175,6 +175,21 @@ pub trait InputInjector: Send {
 
     /// Releases every currently held key and mouse button (called on Leave/Disconnect).
     fn release_all(&mut self) -> Result<()>;
+
+    /// Called when focus leaves this client back to the server: hides and parks the cursor
+    /// so it does not sit visibly on the screen edge while another machine is active.
+    fn leave(&mut self) -> Result<()> {
+        Ok(())
+    }
+
+    /// Ensures the local cursor is visible again (called on disconnect or shutdown).
+    fn show_cursor(&mut self) -> Result<()> {
+        Ok(())
+    }
+
+    /// Checks whether the user physically moved a local mouse/touchpad while the cursor was
+    /// hidden and reveals it immediately if so.
+    fn reveal_if_moved_locally(&mut self) {}
 }
 
 /// Bidirectional OS clipboard backend (event-driven, zero polling).

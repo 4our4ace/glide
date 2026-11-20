@@ -266,6 +266,15 @@ impl InputInjector for WindowsInjector {
         }
         Ok(())
     }
+
+    fn leave(&mut self) -> Result<()> {
+        let (px, py) = self.geometry.primary_park_corner();
+        unsafe {
+            SetCursorPos(px, py);
+        }
+        self.edge_push_accum = 0.0;
+        Ok(())
+    }
 }
 
 impl Drop for WindowsInjector {

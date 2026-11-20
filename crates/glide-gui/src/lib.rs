@@ -1,8 +1,9 @@
-//! Embedded zero-dependency desktop GUI + native Windows System Tray for Glide.
+//! Glide desktop GUI + native system tray.
 //!
-//! Serves a clean, modern, identical UI across Windows 11 and Ubuntu X11 over a
-//! loopback-only HTTP + Server-Sent Events control server and launches it in a
-//! frameless desktop app window (`--app` mode with browser fallback).
+//! The window is a native, GPU-rendered Rust UI (Rune: wgpu + winit) that looks identical on
+//! Windows 11 and Ubuntu X11, with no browser or WebView. A loopback-only HTTP control server
+//! remains for single-instance handoff (a second launch focuses the running window) and as a
+//! last-resort browser fallback if the machine cannot create a GPU window at all.
 
 use anyhow::{Context, Result};
 use bytes::Bytes;
@@ -29,8 +30,7 @@ use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 use tracing::{debug, info, warn};
 
-#[cfg(target_os = "windows")]
-mod native_window;
+mod native_ui;
 
 const UI_HTML: &str = include_str!("ui.html");
 const FONT_INTER: &[u8] = include_bytes!("../assets/fonts/inter.woff2");
@@ -38,6 +38,8 @@ const FONT_MONO: &[u8] = include_bytes!("../assets/fonts/jetbrains-mono.woff2");
 pub const DEFAULT_GUI_PORT: u16 = 24802;
 pub const GUI_WIDTH: u32 = 900;
 pub const GUI_HEIGHT: u32 = 640;
+
+type Hook = Arc<dyn Fn() + Send + Sync>;
 
 struct ActiveEngine {
     task: JoinHandle<()>,
@@ -54,6 +56,10 @@ struct AppController {
     favicon_png: Vec<u8>,
     tray_active: AtomicBool,
     quit_tx: mpsc::UnboundedSender<()>,
+    /// Shows the native window (installed by `native_ui` while its event loop runs).
+    ui_show: Mutex<Option<Hook>>,
+    /// Quits the native window's event loop.
+    ui_quit: Mutex<Option<Hook>>,
 }
 
 impl AppController {
@@ -85,6 +91,27 @@ impl AppController {
             favicon_png: render_png(64),
             tray_active: AtomicBool::new(false),
             quit_tx,
+            ui_show: Mutex::new(None),
+            ui_quit: Mutex::new(None),
+        }
+    }
+
+    /// Brings the Glide window to the front: the native window when it runs, else the
+    /// browser fallback.
+    fn show_window(&self) {
+        let hook = self.ui_show.lock().clone();
+        match hook {
+            Some(show) => show(),
+            None => {
+                let _ = launch_browser_window(&self.url);
+            }
+        }
+    }
+
+    fn quit_ui(&self) {
+        let hook = self.ui_quit.lock().clone();
+        if let Some(quit) = hook {
+            quit();
         }
     }
 
@@ -244,10 +271,17 @@ async fn try_focus_existing_instance(port: u16) -> bool {
     }
 }
 
-/// Launches the Glide desktop GUI (embedded loopback app server + branded window + native OS tray).
-pub async fn run_gui(opts: GuiOptions) -> Result<()> {
-    glide_backend::init_platform();
+struct Prepared {
+    ctrl: Arc<AppController>,
+    listener: TcpListener,
+    quit_rx: mpsc::UnboundedReceiver<()>,
+    #[cfg(target_os = "linux")]
+    linux_tray: glide_backend::linux_x11::tray::LinuxTrayHandle,
+}
 
+/// Binds the control port (or hands off to a running instance), builds the controller,
+/// auto-starts the engine and spawns the system tray. `None` means another instance took over.
+async fn prepare(opts: &GuiOptions) -> Result<Option<Prepared>> {
     // Bind first: in the common case (no other instance) this succeeds immediately and we
     // skip the single-instance probe entirely, so the window opens without delay.
     let listener = match TcpListener::bind(("127.0.0.1", opts.port)).await {
@@ -256,7 +290,7 @@ pub async fn run_gui(opts: GuiOptions) -> Result<()> {
             // Port taken: most likely Glide is already running, so just focus its window.
             if opts.port != 0 && !opts.minimized && try_focus_existing_instance(opts.port).await {
                 info!(port = opts.port, "Focused existing Glide GUI instance");
-                return Ok(());
+                return Ok(None);
             }
             TcpListener::bind(("127.0.0.1", 0))
                 .await
@@ -266,11 +300,12 @@ pub async fn run_gui(opts: GuiOptions) -> Result<()> {
     let actual_addr = listener.local_addr()?;
     let url = format!("http://127.0.0.1:{}", actual_addr.port());
 
-    let (quit_tx, mut quit_rx) = mpsc::unbounded_channel::<()>();
+    let (quit_tx, quit_rx) = mpsc::unbounded_channel::<()>();
     let cfg_path = opts
         .config_path
+        .clone()
         .unwrap_or_else(|| default_config_dir().join("glide.toml"));
-    let ctrl = Arc::new(AppController::new(cfg_path, url.clone(), quit_tx.clone()));
+    let ctrl = Arc::new(AppController::new(cfg_path, url.clone(), quit_tx));
 
     if let Some(ref role) = opts.auto_start_role {
         if let Err(e) = ctrl.start_engine(role).await {
@@ -282,53 +317,15 @@ pub async fn run_gui(opts: GuiOptions) -> Result<()> {
     #[cfg(target_os = "windows")]
     {
         ctrl.tray_active.store(true, Ordering::SeqCst);
-        let mut tray_rx = glide_backend::windows::tray::spawn_windows_tray();
-        let tray_ctrl = Arc::clone(&ctrl);
-        let tray_quit = quit_tx.clone();
-        tokio::spawn(async move {
-            use glide_backend::TrayAction;
-            while let Some(act) = tray_rx.recv().await {
-                match act {
-                    TrayAction::OpenUi => {
-                        let _ = open_app_window(&tray_ctrl.url);
-                    }
-                    TrayAction::ToggleLock => {
-                        tray_ctrl.send_cmd(RuntimeCommand::ToggleLock);
-                    }
-                    TrayAction::Quit => {
-                        tray_ctrl.stop_engine().await;
-                        let _ = tray_quit.send(());
-                        break;
-                    }
-                }
-            }
-        });
+        let tray_rx = glide_backend::windows::tray::spawn_windows_tray();
+        spawn_tray_listener(Arc::clone(&ctrl), tray_rx);
     }
 
     #[cfg(target_os = "linux")]
-    let linux_tray_handle = {
-        let (handle, mut tray_rx) = glide_backend::linux_x11::tray::spawn_linux_tray().await;
+    let linux_tray = {
+        let (handle, tray_rx) = glide_backend::linux_x11::tray::spawn_linux_tray().await;
         ctrl.tray_active.store(handle.is_active(), Ordering::SeqCst);
-        let tray_ctrl = Arc::clone(&ctrl);
-        let tray_quit = quit_tx.clone();
-        tokio::spawn(async move {
-            use glide_backend::TrayAction;
-            while let Some(act) = tray_rx.recv().await {
-                match act {
-                    TrayAction::OpenUi => {
-                        let _ = open_app_window(&tray_ctrl.url);
-                    }
-                    TrayAction::ToggleLock => {
-                        tray_ctrl.send_cmd(RuntimeCommand::ToggleLock);
-                    }
-                    TrayAction::Quit => {
-                        tray_ctrl.stop_engine().await;
-                        let _ = tray_quit.send(());
-                        break;
-                    }
-                }
-            }
-        });
+        spawn_tray_listener(Arc::clone(&ctrl), tray_rx);
         handle
     };
 
@@ -338,21 +335,45 @@ pub async fn run_gui(opts: GuiOptions) -> Result<()> {
         "Glide GUI ready"
     );
 
-    if !opts.minimized {
-        let child = open_app_window(&url);
-        // If no system tray is available on this desktop (e.g. minimal Linux WM without AppIndicators),
-        // exit cleanly when the user closes the window so Glide never leaves an invisible orphan process.
-        if !ctrl.tray_active.load(Ordering::SeqCst) {
-            if let Some(mut child) = child {
-                let no_tray_quit = quit_tx.clone();
-                std::thread::spawn(move || {
-                    let _ = child.wait();
-                    let _ = no_tray_quit.send(());
-                });
+    Ok(Some(Prepared {
+        ctrl,
+        listener,
+        quit_rx,
+        #[cfg(target_os = "linux")]
+        linux_tray,
+    }))
+}
+
+#[cfg(any(target_os = "windows", target_os = "linux"))]
+fn spawn_tray_listener(
+    ctrl: Arc<AppController>,
+    mut tray_rx: mpsc::UnboundedReceiver<glide_backend::TrayAction>,
+) {
+    tokio::spawn(async move {
+        use glide_backend::TrayAction;
+        while let Some(act) = tray_rx.recv().await {
+            match act {
+                TrayAction::OpenUi => ctrl.show_window(),
+                TrayAction::ToggleLock => {
+                    ctrl.send_cmd(RuntimeCommand::ToggleLock);
+                }
+                TrayAction::Quit => {
+                    ctrl.stop_engine().await;
+                    let _ = ctrl.quit_tx.send(());
+                    break;
+                }
             }
         }
-    }
+    });
+}
 
+/// Serves the loopback control API until a quit request (tray, `/api/quit`, the window, Ctrl+C),
+/// then asks the native window to close.
+async fn serve(
+    listener: TcpListener,
+    ctrl: Arc<AppController>,
+    mut quit_rx: mpsc::UnboundedReceiver<()>,
+) {
     loop {
         tokio::select! {
             accept = listener.accept() => {
@@ -378,24 +399,70 @@ pub async fn run_gui(opts: GuiOptions) -> Result<()> {
             }
         }
     }
-
-    ctrl.stop_engine().await;
-    #[cfg(target_os = "linux")]
-    linux_tray_handle.shutdown().await;
-    Ok(())
+    ctrl.quit_ui();
 }
 
-/// Opens (or raises) the Glide desktop app window.
-///
-/// On Windows this is a native window hosting the system WebView2 control (instant, no
-/// browser cold start); on Linux a Chromium-family browser in `--app` mode with native X11
-/// `WM_CLASS`/`_NET_WM_ICON` branding. Returns the browser child process, if one was spawned.
-pub fn open_app_window(url: &str) -> Option<std::process::Child> {
-    #[cfg(target_os = "windows")]
-    if native_window::show(url) {
-        return None;
+/// Runs the Glide desktop GUI: native window on the calling (main) thread, engine, control
+/// server and tray on a Tokio runtime. Returns when the user quits.
+pub fn run_gui_blocking(opts: GuiOptions) -> Result<()> {
+    glide_backend::init_platform();
+    // Start creating the GPU device in parallel with runtime and tray setup.
+    if !opts.minimized && std::env::var_os("GLIDE_RUNE_ARGS").is_none() {
+        rune::prewarm_gpu();
     }
-    launch_browser_window(url)
+
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .thread_name("glide-rt")
+        .build()
+        .context("failed to start async runtime")?;
+
+    let Some(prepared) = rt.block_on(prepare(&opts))? else {
+        return Ok(());
+    };
+    let Prepared {
+        ctrl,
+        listener,
+        quit_rx,
+        #[cfg(target_os = "linux")]
+        linux_tray,
+    } = prepared;
+
+    let mut server = Some(rt.spawn(serve(listener, Arc::clone(&ctrl), quit_rx)));
+
+    if let Err(e) = native_ui::run(Arc::clone(&ctrl), rt.handle().clone(), opts.minimized) {
+        // No display or no usable GPU: keep Glide usable through the browser fallback.
+        warn!(error = %e, "Native window unavailable; using the browser fallback");
+        *ctrl.ui_show.lock() = None;
+        *ctrl.ui_quit.lock() = None;
+        if !opts.minimized {
+            let child = launch_browser_window(&ctrl.url);
+            if !ctrl.tray_active.load(Ordering::SeqCst) {
+                if let Some(mut child) = child {
+                    let quit_tx = ctrl.quit_tx.clone();
+                    std::thread::spawn(move || {
+                        let _ = child.wait();
+                        let _ = quit_tx.send(());
+                    });
+                }
+            }
+        }
+        if let Some(task) = server.take() {
+            let _ = rt.block_on(task);
+        }
+    }
+
+    let _ = ctrl.quit_tx.send(());
+    rt.block_on(async {
+        if let Some(task) = server.take() {
+            let _ = tokio::time::timeout(Duration::from_millis(500), task).await;
+        }
+        ctrl.stop_engine().await;
+        #[cfg(target_os = "linux")]
+        linux_tray.shutdown().await;
+    });
+    rt.shutdown_timeout(Duration::from_millis(300));
+    Ok(())
 }
 
 /// Launches the UI in a Chromium-family browser `--app` window with an isolated profile.
@@ -934,7 +1001,7 @@ async fn handle_http_conn(mut stream: TcpStream, ctrl: Arc<AppController>) -> Re
         }
 
         ("POST", "/api/show") => {
-            let _ = open_app_window(&ctrl.url);
+            ctrl.show_window();
             write_response(&mut stream, "200 OK", "application/json", br#"{"ok":true}"#).await?;
         }
 

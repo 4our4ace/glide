@@ -1,7 +1,7 @@
 //! X11 Client input injector using XTest (`x11rb`) with zero-roundtrip hot path.
 
 use crate::geometry::DesktopGeometry;
-use crate::linux_x11::query_desktop_geometry;
+use crate::linux_x11::{query_desktop_geometry, X11CursorHider};
 use crate::InputInjector;
 use anyhow::{Context, Result};
 use glide_hid::{HidUsage, MouseButton};
@@ -22,6 +22,8 @@ pub struct X11Injector {
     screen_num: usize,
     root: Window,
     geometry: DesktopGeometry,
+    cursor_hider: X11CursorHider,
+    parked_pos: (i32, i32),
     // Sub-pixel motion remainder accumulator so fractional deltas never get dropped.
     rem_x: f32,
     rem_y: f32,
@@ -55,6 +57,7 @@ impl X11Injector {
             "Connected X11Injector with XTest"
         );
 
+        let cursor_hider = X11CursorHider::init(&conn);
         let geometry = query_desktop_geometry(&conn, screen_num)?;
         let (cx, cy) = geometry.primary_center();
 
@@ -63,6 +66,8 @@ impl X11Injector {
             screen_num,
             root,
             geometry,
+            cursor_hider,
+            parked_pos: (cx, cy),
             rem_x: 0.0,
             rem_y: 0.0,
             scroll_rem_x: 0,
@@ -129,6 +134,7 @@ impl InputInjector for X11Injector {
         self.conn
             .warp_pointer(x11rb::NONE, self.root, 0, 0, 0, 0, x as i16, y as i16)
             .context("X11 warp_pointer on Enter failed")?;
+        self.cursor_hider.show(&self.conn, self.root);
         self.conn.flush().context("X11 flush failed")?;
 
         self.rem_x = 0.0;
@@ -151,6 +157,7 @@ impl InputInjector for X11Injector {
         self.conn
             .warp_pointer(x11rb::NONE, self.root, 0, 0, 0, 0, x as i16, y as i16)
             .context("X11 warp_pointer on EnterAt failed")?;
+        self.cursor_hider.show(&self.conn, self.root);
         self.conn.flush().context("X11 flush failed")?;
 
         self.rem_x = 0.0;
@@ -374,10 +381,46 @@ impl InputInjector for X11Injector {
         let _ = self.conn.flush();
         Ok(())
     }
+
+    fn leave(&mut self) -> Result<()> {
+        let (px, py) = self.geometry.primary_park_corner();
+        let _ = self
+            .conn
+            .warp_pointer(x11rb::NONE, self.root, 0, 0, 0, 0, px as i16, py as i16);
+        self.cursor_hider.hide(&self.conn, self.root);
+        let _ = self.conn.flush();
+        self.parked_pos = (px, py);
+        self.est_x = px as f32;
+        self.est_y = py as f32;
+        self.edge_push_accum = 0.0;
+        debug!(px, py, "X11Injector left screen; cursor hidden & parked");
+        Ok(())
+    }
+
+    fn show_cursor(&mut self) -> Result<()> {
+        self.cursor_hider.show(&self.conn, self.root);
+        let _ = self.conn.flush();
+        Ok(())
+    }
+
+    fn reveal_if_moved_locally(&mut self) {
+        if !self.cursor_hider.is_hidden() {
+            return;
+        }
+        if let Ok((x, y)) = self.sync_pointer() {
+            let (px, py) = self.parked_pos;
+            if (x - px).abs() > 4 || (y - py).abs() > 4 {
+                self.cursor_hider.show(&self.conn, self.root);
+                let _ = self.conn.flush();
+                debug!(x, y, "Local pointer moved while hidden; cursor revealed");
+            }
+        }
+    }
 }
 
 impl Drop for X11Injector {
     fn drop(&mut self) {
         let _ = self.release_all();
+        let _ = self.show_cursor();
     }
 }

@@ -9,7 +9,7 @@
 //! edge-return boundary checks.
 
 use crate::geometry::DesktopGeometry;
-use crate::linux_x11::query_desktop_geometry;
+use crate::linux_x11::{query_desktop_geometry, X11CursorHider};
 use crate::InputInjector;
 use anyhow::{anyhow, Context, Result};
 use glide_hid::{HidUsage, MouseButton};
@@ -104,6 +104,8 @@ pub struct UinputInjector {
     screen_num: usize,
     root: Window,
     geometry: DesktopGeometry,
+    cursor_hider: X11CursorHider,
+    parked_pos: (i32, i32),
     rem_x: f32,
     rem_y: f32,
     scroll_rem_x: i32,
@@ -180,6 +182,7 @@ impl UinputInjector {
         let (conn, screen_num) =
             RustConnection::connect(None).context("failed to connect to X11 for geometry/warp")?;
         let root = conn.setup().roots[screen_num].root;
+        let cursor_hider = X11CursorHider::init(&conn);
         let geometry = query_desktop_geometry(&conn, screen_num)?;
         let (cx, cy) = geometry.primary_center();
 
@@ -191,6 +194,8 @@ impl UinputInjector {
             screen_num,
             root,
             geometry,
+            cursor_hider,
+            parked_pos: (cx, cy),
             rem_x: 0.0,
             rem_y: 0.0,
             scroll_rem_x: 0,
@@ -278,6 +283,7 @@ impl InputInjector for UinputInjector {
         let (x, y) = self.geometry.point_on_edge(edge, normalized_pos, 4);
         self.conn
             .warp_pointer(x11rb::NONE, self.root, 0, 0, 0, 0, x as i16, y as i16)?;
+        self.cursor_hider.show(&self.conn, self.root);
         self.conn.flush()?;
         self.rem_x = 0.0;
         self.rem_y = 0.0;
@@ -295,6 +301,7 @@ impl InputInjector for UinputInjector {
         let (x, y) = self.geometry.denormalize_point(norm_x, norm_y);
         self.conn
             .warp_pointer(x11rb::NONE, self.root, 0, 0, 0, 0, x as i16, y as i16)?;
+        self.cursor_hider.show(&self.conn, self.root);
         self.conn.flush()?;
         self.rem_x = 0.0;
         self.rem_y = 0.0;
@@ -466,11 +473,47 @@ impl InputInjector for UinputInjector {
         }
         Ok(())
     }
+
+    fn leave(&mut self) -> Result<()> {
+        let (px, py) = self.geometry.primary_park_corner();
+        let _ = self
+            .conn
+            .warp_pointer(x11rb::NONE, self.root, 0, 0, 0, 0, px as i16, py as i16);
+        self.cursor_hider.hide(&self.conn, self.root);
+        let _ = self.conn.flush();
+        self.parked_pos = (px, py);
+        self.est_x = px as f32;
+        self.est_y = py as f32;
+        self.edge_push_accum = 0.0;
+        debug!(px, py, "UinputInjector left screen; cursor hidden & parked");
+        Ok(())
+    }
+
+    fn show_cursor(&mut self) -> Result<()> {
+        self.cursor_hider.show(&self.conn, self.root);
+        let _ = self.conn.flush();
+        Ok(())
+    }
+
+    fn reveal_if_moved_locally(&mut self) {
+        if !self.cursor_hider.is_hidden() {
+            return;
+        }
+        if let Ok((x, y)) = self.sync_pointer() {
+            let (px, py) = self.parked_pos;
+            if (x - px).abs() > 4 || (y - py).abs() > 4 {
+                self.cursor_hider.show(&self.conn, self.root);
+                let _ = self.conn.flush();
+                debug!(x, y, "Local pointer moved while hidden; cursor revealed");
+            }
+        }
+    }
 }
 
 impl Drop for UinputInjector {
     fn drop(&mut self) {
         let _ = self.release_all();
+        let _ = self.show_cursor();
         unsafe {
             let _ = libc::ioctl(self.file.as_raw_fd(), UI_DEV_DESTROY as _);
         }

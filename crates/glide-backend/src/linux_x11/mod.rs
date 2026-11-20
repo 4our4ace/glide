@@ -90,6 +90,58 @@ pub fn query_desktop_geometry(conn: &RustConnection, screen_num: usize) -> Resul
     Ok(DesktopGeometry::new(monitors))
 }
 
+/// Safe wrapper around XFixes `HideCursor` / `ShowCursor` (v4.0+).
+///
+/// XFixes tracks a per-client hide counter on the X server, so calling `hide` twice without
+/// an intervening `show` would require two `show` calls to unhide. This helper guarantees
+/// balanced hide/show calls and gracefully degrades if XFixes < 4.0.
+pub struct X11CursorHider {
+    xfixes_ready: bool,
+    hidden: bool,
+}
+
+impl X11CursorHider {
+    pub fn init(conn: &RustConnection) -> Self {
+        let xfixes_ready = conn
+            .xfixes_query_version(4, 0)
+            .ok()
+            .and_then(|c| c.reply().ok())
+            .is_some_and(|r| r.major_version >= 4);
+        Self {
+            xfixes_ready,
+            hidden: false,
+        }
+    }
+
+    pub fn is_hidden(&self) -> bool {
+        self.hidden
+    }
+
+    pub fn hide(&mut self, conn: &RustConnection, root: x11rb::protocol::xproto::Window) {
+        if self.xfixes_ready && !self.hidden {
+            match conn.xfixes_hide_cursor(root) {
+                Ok(cookie) => match cookie.check() {
+                    Ok(()) => self.hidden = true,
+                    Err(e) => tracing::warn!(error = %e, "XFixesHideCursor rejected by X server"),
+                },
+                Err(e) => tracing::warn!(error = %e, "XFixesHideCursor send failed"),
+            }
+        }
+    }
+
+    pub fn show(&mut self, conn: &RustConnection, root: x11rb::protocol::xproto::Window) {
+        if self.xfixes_ready && self.hidden {
+            match conn.xfixes_show_cursor(root) {
+                Ok(cookie) => match cookie.check() {
+                    Ok(()) => self.hidden = false,
+                    Err(e) => tracing::warn!(error = %e, "XFixesShowCursor rejected by X server"),
+                },
+                Err(e) => tracing::warn!(error = %e, "XFixesShowCursor send failed"),
+            }
+        }
+    }
+}
+
 /// Runs X11 diagnostics for `glide doctor`.
 pub fn run_doctor() -> Result<DoctorReport> {
     let display = std::env::var("DISPLAY").unwrap_or_else(|_| "<unset>".into());
@@ -204,6 +256,19 @@ mod tests {
             norm > 0.3 && norm < 0.7,
             "expected norm near 0.5, got {norm}"
         );
+
+        // Leave hides cursor via XFixes and parks it away from the screen edge
+        inj.leave().expect("leave hides & parks cursor");
+        let parked = conn.query_pointer(root).unwrap().reply().unwrap();
+        let (px, py) = inj.desktop_geometry().unwrap().primary_park_corner();
+        assert_eq!(
+            (parked.root_x as i32, parked.root_y as i32),
+            (px, py),
+            "expected cursor parked at bottom-right corner on leave"
+        );
+        // Re-entering restores cursor to the entry edge and unhides it
+        inj.enter(Edge::Left, 0.5).expect("re-enter unhides cursor");
+        inj.show_cursor().expect("show_cursor is idempotent");
 
         // Smoke-test XInput2 capture grab/ungrab lifecycle
         let cap = capture::start_x11_capture(CaptureConfig::default()).expect("X11Capture start");

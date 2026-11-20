@@ -2,9 +2,9 @@
 set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
-VERSION="0.2.1"
+VERSION="0.3.0"
 ARCH="amd64"
-BIN_PATH="${1:-$ROOT_DIR/target/x86_64-unknown-linux-musl/release/glide}"
+BIN_PATH="${1:-$ROOT_DIR/target/release/glide}"
 OUT_DIR="$ROOT_DIR/dist"
 PKG_ROOT="$(mktemp -d)"
 
@@ -139,6 +139,7 @@ Version: $VERSION
 Section: net
 Priority: optional
 Architecture: $ARCH
+Depends: libc6 (>= 2.35), libvulkan1, mesa-vulkan-drivers | vulkan-icd, libxkbcommon-x11-0, libxkbcommon0, libwayland-client0
 Installed-Size: $INSTALLED_KB
 Maintainer: Glide Contributors <glide@local>
 Description: Ultra-low-latency cross-platform software KVM over QUIC
@@ -146,7 +147,7 @@ Description: Ultra-low-latency cross-platform software KVM over QUIC
  and Linux X11 machines over LAN with zero TCP head-of-line blocking, raw
  physical USB HID scancodes (full German/ISO AltGr support), high-resolution
  scrolling, multi-monitor HiDPI awareness, zero-config LAN auto-discovery,
- native system tray integration, and a clean modern desktop GUI.
+ native system tray integration, and a truly native GPU-rendered desktop GUI.
 EOF
 chmod 0644 "$PKG_ROOT/DEBIAN/control"
 

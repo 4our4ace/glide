@@ -39,6 +39,7 @@ Glide is a clean-slate, ultra-low-latency software KVM designed for long-term ma
 | `glide-hid` | Bijective USB HID Usage ↔ Windows Set 1 ScanCode ↔ Linux evdev/X11 ↔ macOS keycode tables + Windows AltGr filter |
 | `glide-proto` | Versioned binary wire protocol for datagrams, reliable control frames, and clipboard bulk headers |
 | `glide-net` | QUIC transport (`quinn` + `rustls`), Ed25519 identity + SHA-256/TOFU pinning, LAN multicast/broadcast discovery |
-| `glide-backend` | Cross-platform traits (`CaptureControl`, `InputInjector`, `ClipboardBackend`, `DesktopGeometry`) + native `windows`, `linux_x11`, `macos` (stub), and `mock` implementations |
+| `glide-backend` | Cross-platform traits (`CaptureControl`, `InputInjector`, `ClipboardBackend`, `DesktopGeometry`) + native `windows`, `linux_x11` (with `XFixes` cursor hiding & `StatusNotifierItem` tray), `linux_uinput`, `macos` (stub), and `mock` implementations |
 | `glide-core` | Platform-agnostic server & client state machines, motion coalescer, multi-edge router, clipboard coordinator, and TOML config |
-| `glide-cli` | Single `glide` binary (`server`, `client`, `discover`, `init`, `doctor`) |
+| `glide-gui` | Native GPU-rendered desktop GUI (Rune: `wgpu` + `winit` + `taffy` + `parley`), system tray wiring, single-instance handoff, and loopback control fallback |
+| `glide-cli` | Single `glide` binary (`gui`, `server`, `client`, `discover`, `init`, `doctor`) |

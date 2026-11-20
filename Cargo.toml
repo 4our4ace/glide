@@ -11,7 +11,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.2.1"
+version = "0.3.0"
 edition = "2021"
 rust-version = "1.80"
 license = "MIT OR Apache-2.0"
@@ -45,6 +45,9 @@ toml = "0.8"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 
+# Native GPU-rendered UI (wgpu + winit). Pinned: Rune has no releases yet.
+rune = { git = "https://github.com/anomalyco/rune", rev = "07f1ddde9a1d61def92e69f89beb28319a56bc17", default-features = false, features = ["dbus", "native-file-dialog"] }
+
 # Platform-specific dependencies (pure Rust, zero system C dev libraries)
 ksni = { version = "0.3", default-features = false, features = ["tokio"] }
 x11rb = { version = "0.13", features = ["randr", "xinput", "xtest", "xfixes"] }
@@ -69,6 +72,14 @@ unsafe_op_in_unsafe_fn = "warn"
 
 [workspace.lints.clippy]
 all = "warn"
+
+# Rune ships patched forks of these crates; Cargo does not inherit a dependency's patches, so
+# every app that builds Rune repeats them at the same revision (see Rune's README).
+[patch.crates-io]
+wgpu-hal = { git = "https://github.com/anomalyco/rune", rev = "07f1ddde9a1d61def92e69f89beb28319a56bc17" }
+winit = { git = "https://github.com/anomalyco/rune", rev = "07f1ddde9a1d61def92e69f89beb28319a56bc17" }
+sctk-adwaita = { git = "https://github.com/anomalyco/rune", rev = "07f1ddde9a1d61def92e69f89beb28319a56bc17" }
+parley_engine = { git = "https://github.com/anomalyco/rune", rev = "07f1ddde9a1d61def92e69f89beb28319a56bc17" }
 
 [profile.release]
 lto = "thin"
