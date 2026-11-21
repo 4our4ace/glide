@@ -9,7 +9,7 @@ mod tables;
 
 use serde::{Deserialize, Serialize};
 use std::fmt;
-use tables::KEY_TABLE;
+use tables::{KeyEntry, KEY_TABLE};
 
 /// USB HID Usage Page for Keyboard/Keypad.
 pub const PAGE_KEYBOARD: u16 = 0x0007;
@@ -18,6 +18,82 @@ pub const PAGE_CONSUMER: u16 = 0x000C;
 
 /// Offset between Linux evdev keycodes and X11/XKB keycodes under Xorg evdev/libinput.
 pub const X11_EVDEV_OFFSET: u8 = 8;
+
+const _: () = assert!(KEY_TABLE.len() < u8::MAX as usize);
+
+const EVDEV_TO_IDX: [u8; 256] = {
+    let mut lut = [0u8; 256];
+    let mut i = 0;
+    while i < KEY_TABLE.len() {
+        let code = KEY_TABLE[i].evdev as usize;
+        if code < lut.len() {
+            lut[code] = (i + 1) as u8;
+        }
+        i += 1;
+    }
+    lut
+};
+
+const WIN_TO_IDX: [[u8; 256]; 2] = {
+    let mut lut = [[0u8; 256]; 2];
+    let mut i = 0;
+    while i < KEY_TABLE.len() {
+        let w = KEY_TABLE[i].win;
+        let ext = if w.extended { 1 } else { 0 };
+        let code = w.code as usize;
+        if code < 256 {
+            lut[ext][code] = (i + 1) as u8;
+        }
+        i += 1;
+    }
+    lut
+};
+
+const HID_KB_TO_IDX: [u8; 256] = {
+    let mut lut = [0u8; 256];
+    let mut i = 0;
+    while i < KEY_TABLE.len() {
+        let h = KEY_TABLE[i].hid;
+        if h.page() == PAGE_KEYBOARD && (h.id() as usize) < 256 {
+            lut[h.id() as usize] = (i + 1) as u8;
+        }
+        i += 1;
+    }
+    lut
+};
+
+const HID_CONSUMER_TO_IDX: [u8; 256] = {
+    let mut lut = [0u8; 256];
+    let mut i = 0;
+    while i < KEY_TABLE.len() {
+        let h = KEY_TABLE[i].hid;
+        if h.page() == PAGE_CONSUMER && (h.id() as usize) < 256 {
+            lut[h.id() as usize] = (i + 1) as u8;
+        }
+        i += 1;
+    }
+    lut
+};
+
+#[inline]
+fn lookup_by_hid(usage: HidUsage) -> Option<&'static KeyEntry> {
+    let canon = usage.canonicalize();
+    let id = canon.id() as usize;
+    if id < 256 {
+        let idx = match canon.page() {
+            PAGE_KEYBOARD => HID_KB_TO_IDX[id],
+            PAGE_CONSUMER => HID_CONSUMER_TO_IDX[id],
+            _ => 0,
+        };
+        if idx != 0 {
+            return Some(&KEY_TABLE[(idx - 1) as usize]);
+        }
+        if canon.page() == PAGE_KEYBOARD || canon.page() == PAGE_CONSUMER {
+            return None;
+        }
+    }
+    KEY_TABLE.iter().find(|e| e.hid == canon)
+}
 
 /// A canonical USB HID usage packed as `(usage_page << 16) | usage_id`.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
@@ -73,23 +149,34 @@ impl HidUsage {
     }
 
     /// Look up by Linux evdev keycode (from `<linux/input-event-codes.h>`).
+    #[inline]
     pub fn from_evdev(evdev: u16) -> Option<Self> {
+        if (evdev as usize) < EVDEV_TO_IDX.len() {
+            let idx = EVDEV_TO_IDX[evdev as usize];
+            return if idx != 0 {
+                Some(KEY_TABLE[(idx - 1) as usize].hid)
+            } else {
+                None
+            };
+        }
         KEY_TABLE.iter().find(|e| e.evdev == evdev).map(|e| e.hid)
     }
 
     /// Convert to Linux evdev keycode.
+    #[inline]
     pub fn to_evdev(self) -> Option<u16> {
-        let canon = self.canonicalize();
-        KEY_TABLE.iter().find(|e| e.hid == canon).map(|e| e.evdev)
+        lookup_by_hid(self).map(|e| e.evdev)
     }
 
     /// Look up from an X11 keycode (evdev + 8).
+    #[inline]
     pub fn from_x11_keycode(keycode: u8) -> Option<Self> {
         let evdev = keycode.checked_sub(X11_EVDEV_OFFSET)? as u16;
         Self::from_evdev(evdev)
     }
 
     /// Convert to an X11 keycode (evdev + 8), if it fits in X11's 8-bit range.
+    #[inline]
     pub fn to_x11_keycode(self) -> Option<u8> {
         let evdev = self.to_evdev()?;
         let x11 = evdev.checked_add(X11_EVDEV_OFFSET as u16)?;
@@ -97,23 +184,29 @@ impl HidUsage {
     }
 
     /// Look up from a Windows Set 1 scan code + E0 extended flag.
+    #[inline]
     pub fn from_win_scan(scan: WinScan) -> Option<Self> {
+        if (scan.code as usize) < 256 {
+            let idx = WIN_TO_IDX[usize::from(scan.extended)][scan.code as usize];
+            return if idx != 0 {
+                Some(KEY_TABLE[(idx - 1) as usize].hid)
+            } else {
+                None
+            };
+        }
         KEY_TABLE.iter().find(|e| e.win == scan).map(|e| e.hid)
     }
 
     /// Convert to a Windows Set 1 scan code + E0 extended flag.
+    #[inline]
     pub fn to_win_scan(self) -> Option<WinScan> {
-        let canon = self.canonicalize();
-        KEY_TABLE.iter().find(|e| e.hid == canon).map(|e| e.win)
+        lookup_by_hid(self).map(|e| e.win)
     }
 
     /// Convert to macOS virtual keycode (for future macOS backend).
+    #[inline]
     pub fn to_macos_keycode(self) -> Option<u16> {
-        let canon = self.canonicalize();
-        KEY_TABLE
-            .iter()
-            .find(|e| e.hid == canon)
-            .and_then(|e| e.macos)
+        lookup_by_hid(self).and_then(|e| e.macos)
     }
 
     /// Parse a key by case-insensitive canonical name (e.g. `"ScrollLock"`, `"AltRight"`).
@@ -136,9 +229,9 @@ impl HidUsage {
     }
 
     /// Human-readable canonical key name, if known.
+    #[inline]
     pub fn name(self) -> Option<&'static str> {
-        let canon = self.canonicalize();
-        KEY_TABLE.iter().find(|e| e.hid == canon).map(|e| e.name)
+        lookup_by_hid(self).map(|e| e.name)
     }
 
     /// Returns the bit in [`ModifierMask`] corresponding to this key, if it is a modifier.
