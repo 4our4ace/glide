@@ -437,4 +437,149 @@ mod tests {
         cli_task.abort();
         srv_task.abort();
     }
+
+    #[tokio::test]
+    async fn switch_between_peers_releases_previous_peer_and_clears_coalesced_motion() {
+        use crate::runtime::RuntimeCommand;
+
+        let identity = ServerIdentity::generate_ephemeral().unwrap();
+        let fp = identity.fingerprint.clone();
+        let endpoint =
+            GlideServerEndpoint::bind("127.0.0.1:0".parse().unwrap(), &identity).unwrap();
+        let addr = endpoint.local_addr();
+
+        let (capture_handle, cap_tx, cap_state) =
+            create_mock_capture(DesktopGeometry::fallback());
+        let (srv_cmd_tx, srv_cmd_rx) = tokio::sync::mpsc::unbounded_channel();
+
+        let srv_cfg = ServerConfig {
+            name: "srv-multi".into(),
+            discovery: false,
+            clipboard: false,
+            // Long coalesce window so queued motion is still pending when we switch peers.
+            motion_coalesce_us: 80_000,
+            ..Default::default()
+        };
+        let srv_task = tokio::spawn(async move {
+            let _ = run_server_with_backends(
+                srv_cfg,
+                endpoint,
+                capture_handle,
+                None,
+                "linux-x11",
+                None,
+                Some(srv_cmd_rx),
+            )
+            .await;
+        });
+
+        let (mut inj_a, log_a) = MockInjector::new(DesktopGeometry::fallback());
+        let mut cfg_a = ClientConfig {
+            name: "client-left".into(),
+            server: Some(addr.to_string()),
+            edge: Edge::Left,
+            trusted_fingerprint: Some(fp.clone()),
+            clipboard: false,
+            ..Default::default()
+        };
+        let task_a = tokio::spawn(async move {
+            let mut none_clip = None;
+            let _ =
+                run_client_session(&mut cfg_a, addr, &mut inj_a, &mut none_clip, None, None).await;
+        });
+
+        let (mut inj_b, log_b) = MockInjector::new(DesktopGeometry::fallback());
+        let mut cfg_b = ClientConfig {
+            name: "client-right".into(),
+            server: Some(addr.to_string()),
+            edge: Edge::Right,
+            trusted_fingerprint: Some(fp),
+            clipboard: false,
+            ..Default::default()
+        };
+        let task_b = tokio::spawn(async move {
+            let mut none_clip = None;
+            let _ =
+                run_client_session(&mut cfg_b, addr, &mut inj_b, &mut none_clip, None, None).await;
+        });
+
+        for _ in 0..40 {
+            if cap_state.active_edges.lock().len() == 2 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert_eq!(cap_state.active_edges.lock().len(), 2);
+
+        // Focus Left client and hold KeyA.
+        srv_cmd_tx.send(RuntimeCommand::SwitchToEdge(Edge::Left)).unwrap();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        cap_tx
+            .send(CaptureEvent::Key {
+                usage: HidUsage::keyboard(0x04),
+                pressed: true,
+            })
+            .unwrap();
+        for _ in 0..30 {
+            if log_a
+                .lock()
+                .contains(&InjectedAction::Key(HidUsage::keyboard(0x04), true))
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(log_a
+            .lock()
+            .contains(&InjectedAction::Key(HidUsage::keyboard(0x04), true)));
+
+        // Queue a pending coalesced mouse move, let the server ingest it, then switch to Right
+        // before the 80ms coalesce timer fires.
+        cap_tx
+            .send(CaptureEvent::MouseDelta {
+                dx: 99.0,
+                dy: 77.0,
+            })
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(15)).await;
+        srv_cmd_tx
+            .send(RuntimeCommand::SwitchToEdge(Edge::Right))
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(120)).await;
+
+        // Client A must have had KeyA released and received ReleaseAll.
+        {
+            let la = log_a.lock();
+            assert!(
+                la.contains(&InjectedAction::ReleaseAll),
+                "switching directly to another peer must release previous peer"
+            );
+            assert!(
+                la.contains(&InjectedAction::Key(HidUsage::keyboard(0x04), false)),
+                "held key on previous peer must be released"
+            );
+        }
+
+        // Client B must be entered and must NOT have received Client A's stale coalesced (99, 77) move!
+        {
+            let lb = log_b.lock();
+            assert!(lb.iter().any(|a| matches!(a, InjectedAction::EnterAt(_, _))));
+            assert!(
+                !lb.contains(&InjectedAction::Move(99.0, 77.0)),
+                "stale coalesced motion from previous peer must not bleed into newly focused peer"
+            );
+        }
+
+        // Graceful shutdown while Client B is active must restore local capture mode.
+        assert!(cap_state.remote_mode.load(Ordering::SeqCst));
+        srv_cmd_tx.send(RuntimeCommand::Shutdown).unwrap();
+        let _ = tokio::time::timeout(Duration::from_secs(2), srv_task).await;
+        assert!(
+            !cap_state.remote_mode.load(Ordering::SeqCst),
+            "server shutdown must release remote capture mode"
+        );
+
+        task_a.abort();
+        task_b.abort();
+    }
 }

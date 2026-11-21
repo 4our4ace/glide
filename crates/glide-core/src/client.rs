@@ -429,7 +429,10 @@ pub async fn run_client_session(
                             rt.update(|s| s.active_target = "Local (Controlling)".into());
                         }
                     }
-                    ControlMessage::Leave { .. } | ControlMessage::ReleaseAll => {
+                    ControlMessage::ReleaseAll => {
+                        let _ = injector.release_all();
+                    }
+                    ControlMessage::Leave { .. } => {
                         focused = false;
                         let _ = injector.release_all();
                         let _ = injector.leave();
