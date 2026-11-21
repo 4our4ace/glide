@@ -22,6 +22,7 @@ pub struct X11Injector {
     screen_num: usize,
     root: Window,
     geometry: DesktopGeometry,
+    last_geom_refresh: Instant,
     cursor_hider: X11CursorHider,
     parked_pos: (i32, i32),
     // Sub-pixel motion remainder accumulator so fractional deltas never get dropped.
@@ -60,12 +61,14 @@ impl X11Injector {
         let cursor_hider = X11CursorHider::init(&conn);
         let geometry = query_desktop_geometry(&conn, screen_num)?;
         let (cx, cy) = geometry.primary_center();
+        let now = Instant::now();
 
         Ok(Self {
             conn,
             screen_num,
             root,
             geometry,
+            last_geom_refresh: now,
             cursor_hider,
             parked_pos: (cx, cy),
             rem_x: 0.0,
@@ -74,11 +77,20 @@ impl X11Injector {
             scroll_rem_y: 0,
             est_x: cx as f32,
             est_y: cy as f32,
-            last_pointer_sync: Instant::now(),
+            last_pointer_sync: now,
             edge_push_accum: 0.0,
             pressed_keys: HashSet::new(),
             pressed_buttons: HashSet::new(),
         })
+    }
+
+    fn maybe_refresh_geometry(&mut self) {
+        if self.last_geom_refresh.elapsed() >= Duration::from_secs(5) {
+            if let Ok(geom) = query_desktop_geometry(&self.conn, self.screen_num) {
+                self.geometry = geom;
+            }
+            self.last_geom_refresh = Instant::now();
+        }
     }
 
     fn sync_pointer(&mut self) -> Result<(i32, i32)> {
@@ -122,14 +134,12 @@ impl InputInjector for X11Injector {
 
     fn desktop_geometry(&mut self) -> Result<DesktopGeometry> {
         self.geometry = query_desktop_geometry(&self.conn, self.screen_num)?;
+        self.last_geom_refresh = Instant::now();
         Ok(self.geometry.clone())
     }
 
     fn enter(&mut self, edge: Edge, normalized_pos: f32) -> Result<()> {
-        // Refresh RandR geometry on every screen entry so monitor hotplug works seamlessly.
-        if let Ok(geom) = query_desktop_geometry(&self.conn, self.screen_num) {
-            self.geometry = geom;
-        }
+        self.maybe_refresh_geometry();
         let (x, y) = self.geometry.point_on_edge(edge, normalized_pos, 4);
         self.conn
             .warp_pointer(x11rb::NONE, self.root, 0, 0, 0, 0, x as i16, y as i16)
@@ -150,9 +160,7 @@ impl InputInjector for X11Injector {
     }
 
     fn enter_at(&mut self, norm_x: f32, norm_y: f32) -> Result<()> {
-        if let Ok(geom) = query_desktop_geometry(&self.conn, self.screen_num) {
-            self.geometry = geom;
-        }
+        self.maybe_refresh_geometry();
         let (x, y) = self.geometry.denormalize_point(norm_x, norm_y);
         self.conn
             .warp_pointer(x11rb::NONE, self.root, 0, 0, 0, 0, x as i16, y as i16)
@@ -260,8 +268,11 @@ impl InputInjector for X11Injector {
             return Ok(None);
         }
 
-        let should_sync =
-            dist <= 96 || self.last_pointer_sync.elapsed() >= Duration::from_millis(35);
+        let elapsed = self.last_pointer_sync.elapsed();
+        let should_sync = dist <= 8
+            || self.edge_push_accum > 0.0
+            || (dist <= 96 && elapsed >= Duration::from_millis(4))
+            || elapsed >= Duration::from_millis(35);
         if !should_sync {
             return Ok(None);
         }
@@ -401,6 +412,10 @@ impl InputInjector for X11Injector {
         self.cursor_hider.show(&self.conn, self.root);
         let _ = self.conn.flush();
         Ok(())
+    }
+
+    fn is_cursor_hidden(&self) -> bool {
+        self.cursor_hider.is_hidden()
     }
 
     fn reveal_if_moved_locally(&mut self) {

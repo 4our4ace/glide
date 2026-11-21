@@ -266,6 +266,11 @@ pub trait InputInjector: Send {
         Ok(())
     }
 
+    /// Returns `true` when the backend currently has the local cursor hidden after leaving the screen.
+    fn is_cursor_hidden(&self) -> bool {
+        false
+    }
+
     /// Checks whether the user physically moved a local mouse/touchpad while the cursor was
     /// hidden and reveals it immediately if so.
     fn reveal_if_moved_locally(&mut self) {}

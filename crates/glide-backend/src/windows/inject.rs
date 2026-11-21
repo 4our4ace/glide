@@ -9,6 +9,7 @@ use glide_hid::{HidUsage, MouseButton};
 use glide_proto::{Edge, LockState, OsKind};
 use std::collections::HashSet;
 use std::mem::size_of;
+use std::time::{Duration, Instant};
 use tracing::{debug, trace};
 use windows_sys::Win32::Foundation::POINT;
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
@@ -22,6 +23,7 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{GetCursorPos, SetCursorPos, XB
 
 pub struct WindowsInjector {
     geometry: DesktopGeometry,
+    last_geom_refresh: Instant,
     rem_x: f32,
     rem_y: f32,
     edge_push_accum: f32,
@@ -35,12 +37,22 @@ impl WindowsInjector {
         let geometry = query_desktop_geometry()?;
         Ok(Self {
             geometry,
+            last_geom_refresh: Instant::now(),
             rem_x: 0.0,
             rem_y: 0.0,
             edge_push_accum: 0.0,
             pressed_keys: HashSet::new(),
             pressed_buttons: HashSet::new(),
         })
+    }
+
+    fn maybe_refresh_geometry(&mut self) {
+        if self.last_geom_refresh.elapsed() >= Duration::from_secs(5) {
+            if let Ok(geom) = query_desktop_geometry() {
+                self.geometry = geom;
+            }
+            self.last_geom_refresh = Instant::now();
+        }
     }
 
     fn send_mouse(&self, dx: i32, dy: i32, mouse_data: u32, flags: u32) {
@@ -95,13 +107,12 @@ impl InputInjector for WindowsInjector {
 
     fn desktop_geometry(&mut self) -> Result<DesktopGeometry> {
         self.geometry = query_desktop_geometry()?;
+        self.last_geom_refresh = Instant::now();
         Ok(self.geometry.clone())
     }
 
     fn enter(&mut self, edge: Edge, normalized_pos: f32) -> Result<()> {
-        if let Ok(geom) = query_desktop_geometry() {
-            self.geometry = geom;
-        }
+        self.maybe_refresh_geometry();
         let (x, y) = self.geometry.point_on_edge(edge, normalized_pos, 4);
         unsafe {
             SetCursorPos(x, y);
@@ -117,9 +128,7 @@ impl InputInjector for WindowsInjector {
     }
 
     fn enter_at(&mut self, norm_x: f32, norm_y: f32) -> Result<()> {
-        if let Ok(geom) = query_desktop_geometry() {
-            self.geometry = geom;
-        }
+        self.maybe_refresh_geometry();
         let (x, y) = self.geometry.denormalize_point(norm_x, norm_y);
         unsafe {
             SetCursorPos(x, y);
