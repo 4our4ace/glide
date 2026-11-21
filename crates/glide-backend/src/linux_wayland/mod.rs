@@ -213,16 +213,31 @@ pub fn load_restore_token() -> Option<String> {
     }
 }
 
+fn write_restore_token_file(path: &std::path::Path, token: &str) -> std::io::Result<()> {
+    use std::io::Write;
+    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o600)
+        .open(path)?;
+    file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+    file.write_all(token.as_bytes())?;
+    Ok(())
+}
+
 pub fn save_restore_token(token: &str) {
     let trimmed = token.trim();
     if trimmed.is_empty() {
         return;
     }
     if let Some(path) = restore_token_path() {
-        if let Some(parent) = path.parent() {
-            let _ = std::fs::create_dir_all(parent);
-        }
-        if let Err(e) = std::fs::write(&path, trimmed) {
+        if let Err(e) = write_restore_token_file(&path, trimmed) {
             tracing::debug!(error = %e, path = %path.display(), "failed to persist Wayland restore token");
         }
     }
@@ -543,5 +558,26 @@ mod tests {
             assert_eq!(evdev_to_mouse_button(code), Some(btn));
         }
         assert_eq!(evdev_to_mouse_button(0x999), None);
+    }
+
+    #[test]
+    fn restore_token_file_created_with_0600_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = std::env::temp_dir().join(format!(
+            "glide-wl-token-test-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let token_path = dir.join("wayland_remote_desktop.token");
+        write_restore_token_file(&token_path, "secret-restore-token").unwrap();
+
+        let meta = std::fs::metadata(&token_path).unwrap();
+        assert_eq!(meta.permissions().mode() & 0o777, 0o600);
+        assert_eq!(
+            std::fs::read_to_string(&token_path).unwrap(),
+            "secret-restore-token"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

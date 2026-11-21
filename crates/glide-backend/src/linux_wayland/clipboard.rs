@@ -9,7 +9,7 @@ use crate::{ClipboardBackend, ClipboardHandle};
 use anyhow::{anyhow, Result};
 use bytes::Bytes;
 use glide_net::sha256_bytes;
-use glide_proto::{ClipboardFormat, ClipboardPayload};
+use glide_proto::{ClipboardFormat, ClipboardPayload, MAX_CLIPBOARD_BYTES};
 use parking_lot::Mutex;
 use std::io::Read;
 use std::sync::Arc;
@@ -21,8 +21,6 @@ use wl_clipboard_rs::copy::{
 };
 use wl_clipboard_rs::paste::{ClipboardType as PasteClipboardType, Seat as PasteSeat};
 use wl_clipboard_rs::watch::{CancelHandle, ClipboardEvent, ClipboardType as WatchClipboardType, Watcher};
-
-const MAX_CLIPBOARD_BYTES: usize = 16 * 1024 * 1024;
 
 struct SharedState {
     last_written_hash: Mutex<Option<[u8; 32]>>,
@@ -117,6 +115,16 @@ fn pick_best_mime(mime_types: &[String]) -> Option<(ClipboardFormat, String)> {
     None
 }
 
+fn read_bounded_clipboard<R: Read>(reader: R, max_bytes: usize) -> Option<Vec<u8>> {
+    let mut buf = Vec::new();
+    let limit = (max_bytes as u64).saturating_add(1);
+    reader.take(limit).read_to_end(&mut buf).ok()?;
+    if buf.is_empty() || buf.len() > max_bytes {
+        return None;
+    }
+    Some(buf)
+}
+
 /// Starts the Wayland bidirectional clipboard monitor/writer.
 ///
 /// Falls back cleanly to the XWayland X11 clipboard bridge if the compositor does not
@@ -164,17 +172,9 @@ pub fn start_wayland_clipboard() -> Result<ClipboardHandle> {
                                 let Ok(pipe) = offer.receive(&mime) else {
                                     continue;
                                 };
-                                let mut buf = Vec::new();
-                                if pipe
-                                    .take((MAX_CLIPBOARD_BYTES + 1) as u64)
-                                    .read_to_end(&mut buf)
-                                    .is_err()
-                                {
+                                let Some(buf) = read_bounded_clipboard(pipe, MAX_CLIPBOARD_BYTES) else {
                                     continue;
-                                }
-                                if buf.is_empty() || buf.len() > MAX_CLIPBOARD_BYTES {
-                                    continue;
-                                }
+                                };
                                 let hash = sha256_bytes(&buf);
                                 if shared_bg.last_written_hash.lock().as_ref() == Some(&hash) {
                                     continue;
@@ -242,5 +242,16 @@ mod tests {
                 "text/plain;charset=utf-8".to_owned()
             ))
         );
+    }
+
+    #[test]
+    fn bounded_clipboard_read_enforces_max_bytes() {
+        assert_eq!(read_bounded_clipboard(&b""[..], 16), None);
+        assert_eq!(
+            read_bounded_clipboard(&b"hello"[..], 5),
+            Some(b"hello".to_vec())
+        );
+        // Oversized stream (including an infinite reader) stops at max_bytes + 1 and returns None.
+        assert_eq!(read_bounded_clipboard(std::io::repeat(b'x'), 64), None);
     }
 }

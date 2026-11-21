@@ -279,11 +279,20 @@ pub enum ControlMessage {
     Pong { ts_us: u64 },
 }
 
+/// Sanitizes a normalized `[0.0, 1.0]` screen coordinate, replacing `NaN` or `±Infinity` with `0.5`.
+pub fn sanitize_unit(v: f32) -> f32 {
+    if v.is_finite() {
+        v.clamp(0.0, 1.0)
+    } else {
+        0.5
+    }
+}
+
 fn put_string(buf: &mut BytesMut, s: &str) {
-    let bytes = s.as_bytes();
-    let len = bytes.len().min(u16::MAX as usize);
-    buf.put_u16(len as u16);
-    buf.put_slice(&bytes[..len]);
+    let truncated = truncate_utf8_bytes(s, u16::MAX as usize);
+    let bytes = truncated.as_bytes();
+    buf.put_u16(bytes.len() as u16);
+    buf.put_slice(bytes);
 }
 
 fn get_string(data: &mut &[u8]) -> Result<String, ProtoError> {
@@ -333,7 +342,12 @@ impl ControlMessage {
                 buf.put_slice(&PROTOCOL_MAGIC);
                 buf.put_u16(*version);
                 buf.put_u8(u8::from(*accepted));
-                buf.put_f32(*server_scale);
+                let scale = if server_scale.is_finite() && *server_scale > 0.0 {
+                    *server_scale
+                } else {
+                    1.0
+                };
+                buf.put_f32(scale);
                 put_string(&mut buf, server_name);
                 put_string(&mut buf, reason);
             }
@@ -358,7 +372,7 @@ impl ControlMessage {
             } => {
                 buf.put_u8(0x30);
                 buf.put_u8(*edge as u8);
-                buf.put_f32(normalized_pos.clamp(0.0, 1.0));
+                buf.put_f32(sanitize_unit(*normalized_pos));
                 buf.put_u8(lock_state.to_u8());
             }
             Self::Leave {
@@ -369,9 +383,9 @@ impl ControlMessage {
             } => {
                 buf.put_u8(0x31);
                 buf.put_u8(*edge as u8);
-                buf.put_f32(normalized_pos.clamp(0.0, 1.0));
-                buf.put_f32(cursor_norm_x.clamp(0.0, 1.0));
-                buf.put_f32(cursor_norm_y.clamp(0.0, 1.0));
+                buf.put_f32(sanitize_unit(*normalized_pos));
+                buf.put_f32(sanitize_unit(*cursor_norm_x));
+                buf.put_f32(sanitize_unit(*cursor_norm_y));
             }
             Self::ReleaseAll => {
                 buf.put_u8(0x32);
@@ -382,8 +396,8 @@ impl ControlMessage {
                 lock_state,
             } => {
                 buf.put_u8(0x33);
-                buf.put_f32(norm_x.clamp(0.0, 1.0));
-                buf.put_f32(norm_y.clamp(0.0, 1.0));
+                buf.put_f32(sanitize_unit(*norm_x));
+                buf.put_f32(sanitize_unit(*norm_y));
                 buf.put_u8(lock_state.to_u8());
             }
             Self::LockSync { lock_state } => {
@@ -472,7 +486,12 @@ impl ControlMessage {
                 data.advance(4);
                 let version = data.get_u16();
                 let accepted = data.get_u8() != 0;
-                let server_scale = data.get_f32();
+                let raw_scale = data.get_f32();
+                let server_scale = if raw_scale.is_finite() && raw_scale > 0.0 {
+                    raw_scale
+                } else {
+                    1.0
+                };
                 let server_name = get_string(&mut data)?;
                 let reason = get_string(&mut data)?;
                 Ok(Self::Welcome {
@@ -528,7 +547,7 @@ impl ControlMessage {
                     });
                 }
                 let edge = Edge::from_u8(data.get_u8())?;
-                let normalized_pos = data.get_f32().clamp(0.0, 1.0);
+                let normalized_pos = sanitize_unit(data.get_f32());
                 let lock_state = LockState::from_u8(data.get_u8());
                 Ok(Self::Enter {
                     edge,
@@ -544,9 +563,9 @@ impl ControlMessage {
                     });
                 }
                 let edge = Edge::from_u8(data.get_u8())?;
-                let normalized_pos = data.get_f32().clamp(0.0, 1.0);
-                let cursor_norm_x = data.get_f32().clamp(0.0, 1.0);
-                let cursor_norm_y = data.get_f32().clamp(0.0, 1.0);
+                let normalized_pos = sanitize_unit(data.get_f32());
+                let cursor_norm_x = sanitize_unit(data.get_f32());
+                let cursor_norm_y = sanitize_unit(data.get_f32());
                 Ok(Self::Leave {
                     edge,
                     normalized_pos,
@@ -562,8 +581,8 @@ impl ControlMessage {
                         actual: data.len(),
                     });
                 }
-                let norm_x = data.get_f32().clamp(0.0, 1.0);
-                let norm_y = data.get_f32().clamp(0.0, 1.0);
+                let norm_x = sanitize_unit(data.get_f32());
+                let norm_y = sanitize_unit(data.get_f32());
                 let lock_state = LockState::from_u8(data.get_u8());
                 Ok(Self::EnterAt {
                     norm_x,
@@ -947,5 +966,64 @@ mod tests {
         let safe_no_ext = sanitize_filename(&long_no_ext);
         assert!(safe_no_ext.len() <= MAX_FILENAME_BYTES);
         assert!(safe_no_ext.len() == 1 + 49 * 4);
+    }
+
+    #[test]
+    fn sanitize_unit_handles_nan_and_infinity_on_encode_and_decode() {
+        assert_eq!(sanitize_unit(f32::NAN), 0.5);
+        assert_eq!(sanitize_unit(f32::INFINITY), 0.5);
+        assert_eq!(sanitize_unit(f32::NEG_INFINITY), 0.5);
+        assert_eq!(sanitize_unit(-2.0), 0.0);
+        assert_eq!(sanitize_unit(5.0), 1.0);
+        assert_eq!(sanitize_unit(0.25), 0.25);
+
+        // Raw wire Enter message with NaN normalized_pos must decode to 0.5, never NaN.
+        let mut raw_enter = BytesMut::new();
+        raw_enter.put_u8(0x30);
+        raw_enter.put_u8(Edge::Right as u8);
+        raw_enter.put_f32(f32::NAN);
+        raw_enter.put_u8(0);
+        match ControlMessage::decode_body(&raw_enter).unwrap() {
+            ControlMessage::Enter { normalized_pos, .. } => assert_eq!(normalized_pos, 0.5),
+            other => panic!("unexpected variant: {other:?}"),
+        }
+
+        // Raw wire EnterAt message with +Inf / -Inf must decode to (0.5, 0.5).
+        let mut raw_enter_at = BytesMut::new();
+        raw_enter_at.put_u8(0x33);
+        raw_enter_at.put_f32(f32::INFINITY);
+        raw_enter_at.put_f32(f32::NEG_INFINITY);
+        raw_enter_at.put_u8(0);
+        match ControlMessage::decode_body(&raw_enter_at).unwrap() {
+            ControlMessage::EnterAt { norm_x, norm_y, .. } => {
+                assert_eq!(norm_x, 0.5);
+                assert_eq!(norm_y, 0.5);
+            }
+            other => panic!("unexpected variant: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn put_string_truncates_on_utf8_char_boundary() {
+        // 1 ASCII byte + 16384 4-byte emojis = 65537 bytes (> u16::MAX = 65535);
+        // raw byte slicing at 65535 would split the final 4-byte UTF-8 sequence.
+        let oversized = format!("a{}", "🚀".repeat(16_384));
+        assert!(oversized.len() > u16::MAX as usize);
+        let msg = ControlMessage::Hello {
+            version: PROTOCOL_VERSION,
+            peer_name: oversized,
+            edge_on_server: Edge::Left,
+            os: OsKind::LinuxWayland,
+        };
+        let encoded = msg.encode_body();
+        match ControlMessage::decode_body(&encoded).unwrap() {
+            ControlMessage::Hello { peer_name, .. } => {
+                assert!(peer_name.len() <= u16::MAX as usize);
+                assert!(peer_name.starts_with("a🚀"));
+                assert!(peer_name.ends_with('🚀'));
+                assert_eq!(peer_name.len(), 1 + 16_383 * 4);
+            }
+            other => panic!("unexpected variant: {other:?}"),
+        }
     }
 }
