@@ -36,6 +36,7 @@ struct SharedState {
     geometry: Mutex<DesktopGeometry>,
     remote_mode: AtomicBool,
     locked: AtomicBool,
+    pin_media_keys_local: AtomicBool,
     edge_threshold_px: AtomicI32,
     dead_corner_px: AtomicI32,
     edge_dwell_ms: AtomicU64,
@@ -91,6 +92,12 @@ impl CaptureControl for X11CaptureControl {
             .edge_dwell_ms
             .store(edge_dwell_ms, Ordering::Relaxed);
         self.shared.locked.store(locked, Ordering::Relaxed);
+    }
+
+    fn set_pin_media_keys_local(&self, enabled: bool) {
+        self.shared
+            .pin_media_keys_local
+            .store(enabled, Ordering::Relaxed);
     }
 
     fn enter_remote(&self) -> Result<()> {
@@ -237,6 +244,7 @@ pub fn start_x11_capture(config: CaptureConfig) -> Result<CaptureHandle> {
         geometry: Mutex::new(geometry),
         remote_mode: AtomicBool::new(false),
         locked: AtomicBool::new(false),
+        pin_media_keys_local: AtomicBool::new(config.pin_media_keys_local),
         edge_threshold_px: AtomicI32::new(config.edge_threshold_px.max(1)),
         dead_corner_px: AtomicI32::new(config.dead_corner_px.max(0)),
         edge_dwell_ms: AtomicU64::new(config.edge_dwell_ms),
@@ -570,7 +578,12 @@ fn run_capture_loop(
                     }
                 }
 
-                if shared.remote_mode.load(Ordering::Acquire) {
+                if shared.remote_mode.load(Ordering::Acquire)
+                    && crate::should_forward_key_in_remote(
+                        usage,
+                        shared.pin_media_keys_local.load(Ordering::Relaxed),
+                    )
+                {
                     let _ = tx.send(CaptureEvent::Key {
                         usage,
                         pressed: true,
@@ -587,6 +600,12 @@ fn run_capture_loop(
                     continue;
                 }
                 if usage == config.escape_key {
+                    continue;
+                }
+                if !crate::should_forward_key_in_remote(
+                    usage,
+                    shared.pin_media_keys_local.load(Ordering::Relaxed),
+                ) {
                     continue;
                 }
                 let _ = tx.send(CaptureEvent::Key {

@@ -170,6 +170,7 @@ struct SharedState {
     dead_corner_px: Mutex<i32>,
     locked: AtomicBool,
     in_remote: AtomicBool,
+    pin_media_keys_local: AtomicBool,
     activation_id: Mutex<Option<u32>>,
     last_local_norm: Mutex<(f32, f32)>,
     zone_set: Mutex<u32>,
@@ -202,6 +203,12 @@ impl CaptureControl for WaylandCaptureControl {
         if changed_dc || prev_locked != locked {
             let _ = self.cmd_tx.send(ControlMsg::UpdateBarriers);
         }
+    }
+
+    fn set_pin_media_keys_local(&self, enabled: bool) {
+        self.shared
+            .pin_media_keys_local
+            .store(enabled, Ordering::Relaxed);
     }
 
     fn enter_remote(&self) -> Result<()> {
@@ -381,6 +388,7 @@ fn start_wayland_capture_blocking(config: CaptureConfig) -> Result<CaptureHandle
         dead_corner_px: Mutex::new(config.dead_corner_px),
         locked: AtomicBool::new(false),
         in_remote: AtomicBool::new(false),
+        pin_media_keys_local: AtomicBool::new(config.pin_media_keys_local),
         activation_id: Mutex::new(None),
         last_local_norm: Mutex::new((0.5, 0.5)),
         zone_set: Mutex::new(zone_set),
@@ -698,6 +706,10 @@ fn start_wayland_capture_blocking(config: CaptureConfig) -> Result<CaptureHandle
                             }
 
                             if shared_eis.in_remote.load(Ordering::Relaxed)
+                                && crate::should_forward_key_in_remote(
+                                    usage,
+                                    shared_eis.pin_media_keys_local.load(Ordering::Relaxed),
+                                )
                                 && ev_tx
                                     .send(CaptureEvent::Key { usage, pressed })
                                     .is_err()

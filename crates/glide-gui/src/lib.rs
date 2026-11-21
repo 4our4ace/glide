@@ -257,6 +257,7 @@ impl AppController {
             auto_lock_fullscreen: s.auto_lock_fullscreen,
             locked,
             sync_lock_keys: s.sync_lock_keys,
+            pin_media_keys_local: s.pin_media_keys_local,
             clipboard: s.clipboard,
         });
         self.send_cmd(RuntimeCommand::UpdateClientTuning {

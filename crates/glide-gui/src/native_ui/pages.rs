@@ -1382,6 +1382,22 @@ fn input_server_cols(s: &Ui, p: Palette) -> El {
                 },
             ),
         ),
+        setting_row(
+            p,
+            "srv-pin-media-row",
+            "Keep media & volume keys on this PC",
+            Some("Volume & playback keys stay local"),
+            toggle(
+                p,
+                "srv-pin-media-toggle",
+                "Keep media & volume keys on this PC",
+                s.config.server.pin_media_keys_local,
+                |s, _| {
+                    s.config.server.pin_media_keys_local = !s.config.server.pin_media_keys_local;
+                    s.push_config();
+                },
+            ),
+        ),
     ];
 
     let left_col = col()

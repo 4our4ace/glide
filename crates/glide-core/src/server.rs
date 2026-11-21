@@ -296,6 +296,7 @@ pub async fn run_server_with_backends(
                         auto_lock_fullscreen,
                         locked: new_locked,
                         sync_lock_keys,
+                        pin_media_keys_local,
                         clipboard: clip_enabled,
                     } => {
                         config.edge_threshold_px = edge_threshold_px;
@@ -303,6 +304,7 @@ pub async fn run_server_with_backends(
                         config.edge_dwell_ms = edge_dwell_ms;
                         config.auto_lock_fullscreen = auto_lock_fullscreen;
                         config.sync_lock_keys = sync_lock_keys;
+                        config.pin_media_keys_local = pin_media_keys_local;
                         config.clipboard = clip_enabled;
                         locked = new_locked;
                         capture_ctrl.update_tuning(
@@ -313,6 +315,7 @@ pub async fn run_server_with_backends(
                             locked,
                         );
                         capture_ctrl.set_sync_lock_keys(sync_lock_keys);
+                        capture_ctrl.set_pin_media_keys_local(pin_media_keys_local);
                         sync_runtime_peers(&runtime, &peers, active_remote, locked);
                     }
                     RuntimeCommand::ToggleLock => {
@@ -1019,6 +1022,7 @@ pub async fn run_native_server_with_runtime(
         auto_lock_fullscreen: config.auto_lock_fullscreen,
         enable_hotkeys: config.enable_hotkeys,
         sync_lock_keys: config.sync_lock_keys,
+        pin_media_keys_local: config.pin_media_keys_local,
     })?;
 
     let clipboard = if config.clipboard {

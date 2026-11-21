@@ -149,6 +149,10 @@ enum Command {
         #[arg(long)]
         no_fullscreen_lock: bool,
 
+        /// Forward media and volume keys to the active remote client instead of keeping them local
+        #[arg(long)]
+        forward_media_keys: bool,
+
         /// Mouse delta coalescing interval in microseconds (default: 1000 = 1000Hz; 0 = immediate)
         #[arg(long)]
         coalesce_us: Option<u64>,
@@ -325,6 +329,7 @@ async fn run_command(command: Command, config: Option<PathBuf>) -> Result<()> {
             dead_corner,
             edge_dwell_ms,
             no_fullscreen_lock,
+            forward_media_keys,
             coalesce_us,
         } => {
             let mut cfg: ServerConfig = load_config(cli_config.as_ref())?.effective_server_config();
@@ -354,6 +359,9 @@ async fn run_command(command: Command, config: Option<PathBuf>) -> Result<()> {
             }
             if no_fullscreen_lock {
                 cfg.auto_lock_fullscreen = false;
+            }
+            if forward_media_keys {
+                cfg.pin_media_keys_local = false;
             }
             if let Some(cu) = coalesce_us {
                 cfg.motion_coalesce_us = cu;

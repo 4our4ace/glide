@@ -19,6 +19,7 @@ pub struct MockCaptureState {
     pub active_edges: Mutex<Vec<Edge>>,
     pub remote_mode: AtomicBool,
     pub locked: AtomicBool,
+    pub pin_media_keys_local: AtomicBool,
     pub last_leave: Mutex<Option<(Edge, f32)>>,
     pub last_leave_at: Mutex<Option<(f32, f32)>>,
     pub lock_state: Mutex<LockState>,
@@ -43,6 +44,12 @@ impl CaptureControl for MockCaptureControl {
         locked: bool,
     ) {
         self.state.locked.store(locked, Ordering::SeqCst);
+    }
+
+    fn set_pin_media_keys_local(&self, enabled: bool) {
+        self.state
+            .pin_media_keys_local
+            .store(enabled, Ordering::SeqCst);
     }
 
     fn enter_remote(&self) -> Result<()> {

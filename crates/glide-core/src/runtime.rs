@@ -88,6 +88,7 @@ pub enum RuntimeCommand {
         auto_lock_fullscreen: bool,
         locked: bool,
         sync_lock_keys: bool,
+        pin_media_keys_local: bool,
         clipboard: bool,
     },
     UpdateClientTuning {

@@ -63,6 +63,7 @@ struct HookState {
     locked: AtomicBool,
     auto_lock_fullscreen: AtomicBool,
     sync_lock_keys: AtomicBool,
+    pin_media_keys_local: AtomicBool,
     edge_threshold_px: AtomicI32,
     dead_corner_px: AtomicI32,
     edge_dwell_ms: AtomicU64,
@@ -177,6 +178,12 @@ impl CaptureControl for WindowsCaptureControl {
         self.state.sync_lock_keys.store(enabled, Ordering::Relaxed);
     }
 
+    fn set_pin_media_keys_local(&self, enabled: bool) {
+        self.state
+            .pin_media_keys_local
+            .store(enabled, Ordering::Relaxed);
+    }
+
     fn enter_remote(&self) -> Result<()> {
         self.state.remote_mode.store(true, Ordering::SeqCst);
         let hwnd = self.hwnd.load(Ordering::Acquire) as HWND;
@@ -239,6 +246,19 @@ fn arrow_to_edge(usage: HidUsage) -> Option<Edge> {
 }
 
 fn translate_ll_key(vk_code: u32, scan_code: u32, flags: u32) -> Option<HidUsage> {
+    // Handle Consumer Control / Media VKs explicitly so keyboards/headsets that send
+    // scanCode == 0 for volume/playback buttons still resolve reliably.
+    match vk_code {
+        0xAD => return Some(HidUsage::consumer(0x00E2)), // VK_VOLUME_MUTE
+        0xAE => return Some(HidUsage::consumer(0x00EA)), // VK_VOLUME_DOWN
+        0xAF => return Some(HidUsage::consumer(0x00E9)), // VK_VOLUME_UP
+        0xB0 => return Some(HidUsage::consumer(0x00B5)), // VK_MEDIA_NEXT_TRACK
+        0xB1 => return Some(HidUsage::consumer(0x00B6)), // VK_MEDIA_PREV_TRACK
+        0xB2 => return Some(HidUsage::consumer(0x00B7)), // VK_MEDIA_STOP
+        0xB3 => return Some(HidUsage::consumer(0x00CD)), // VK_MEDIA_PLAY_PAUSE
+        _ => {}
+    }
+
     let win_scan = match vk_code {
         VK_PAUSE_CODE => WinScan {
             code: 0x45,
@@ -359,6 +379,12 @@ unsafe extern "system" fn keyboard_ll_proc(code: i32, wparam: WPARAM, lparam: LP
                     }
 
                     if remote {
+                        if !crate::should_forward_key_in_remote(
+                            usage,
+                            state.pin_media_keys_local.load(Ordering::Relaxed),
+                        ) {
+                            return false;
+                        }
                         let _ = state.tx.send(CaptureEvent::Key { usage, pressed });
                         // Keep the physical keyboard's CapsLock / NumLock LED and Windows'
                         // toggle state in sync with the client when lock-key sync is enabled.
@@ -669,6 +695,7 @@ pub fn start_windows_capture(config: CaptureConfig) -> Result<CaptureHandle> {
         edge_dwell_ms: AtomicU64::new(config.edge_dwell_ms),
         auto_lock_fullscreen: AtomicBool::new(config.auto_lock_fullscreen),
         sync_lock_keys: AtomicBool::new(config.sync_lock_keys),
+        pin_media_keys_local: AtomicBool::new(config.pin_media_keys_local),
         config,
         tx,
         active_edges: Mutex::new(Vec::new()),

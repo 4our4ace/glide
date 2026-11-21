@@ -181,6 +181,9 @@ pub struct ServerConfig {
     pub enable_hotkeys: bool,
     /// Sync CapsLock and NumLock state onto clients on screen entry.
     pub sync_lock_keys: bool,
+    /// Keep media, volume, and brightness keys on this PC instead of forwarding them to remote clients.
+    #[serde(default = "default_true")]
+    pub pin_media_keys_local: bool,
     /// Enable bidirectional clipboard sharing (UTF-8 text & PNG/DIB images).
     pub clipboard: bool,
     /// Microseconds to coalesce high-polling-rate mouse deltas (1000 = 1000Hz max cadence; 0 = immediate).
@@ -206,6 +209,7 @@ impl Default for ServerConfig {
             auto_lock_fullscreen: true,
             enable_hotkeys: true,
             sync_lock_keys: true,
+            pin_media_keys_local: true,
             clipboard: true,
             motion_coalesce_us: 1000,
             identity_dir: None,
@@ -393,5 +397,24 @@ mod tests {
         let reloaded = GlideConfigFile::load(&tmp).unwrap();
         assert_eq!(reloaded.max_file_mb, MAX_MAX_FILE_MB);
         let _ = std::fs::remove_file(&tmp);
+    }
+
+    #[test]
+    fn pin_media_keys_local_defaults_true_and_roundtrips() {
+        let legacy: GlideConfigFile = toml::from_str(
+            r#"
+            [server]
+            edge_threshold_px = 5
+            "#,
+        )
+        .unwrap();
+        assert!(legacy.server.pin_media_keys_local);
+        assert!(ServerConfig::default().pin_media_keys_local);
+
+        let mut cfg = GlideConfigFile::default();
+        cfg.server.pin_media_keys_local = false;
+        let raw = toml::to_string_pretty(&cfg).unwrap();
+        let parsed: GlideConfigFile = toml::from_str(&raw).unwrap();
+        assert!(!parsed.server.pin_media_keys_local);
     }
 }

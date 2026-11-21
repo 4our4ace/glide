@@ -71,6 +71,8 @@ pub struct CaptureConfig {
     pub enable_hotkeys: bool,
     /// Keep the server's local CapsLock / NumLock state & keyboard LEDs in sync while controlling a client.
     pub sync_lock_keys: bool,
+    /// Keep USB Consumer Control media/volume keys on the local server PC instead of forwarding to clients.
+    pub pin_media_keys_local: bool,
 }
 
 impl Default for CaptureConfig {
@@ -83,8 +85,16 @@ impl Default for CaptureConfig {
             auto_lock_fullscreen: true,
             enable_hotkeys: true,
             sync_lock_keys: true,
+            pin_media_keys_local: true,
         }
     }
+}
+
+/// Returns whether a physical key event should be suppressed locally and forwarded to the active
+/// remote client, taking `pin_media_keys_local` into account.
+#[inline]
+pub const fn should_forward_key_in_remote(usage: HidUsage, pin_media_keys_local: bool) -> bool {
+    !(pin_media_keys_local && usage.is_media_key())
 }
 
 /// Low-latency input events emitted by the server's OS capture thread.
@@ -124,6 +134,8 @@ pub trait CaptureControl: Send + Sync {
     );
     /// Updates whether CapsLock / NumLock keys should also toggle local OS state & LEDs in remote mode.
     fn set_sync_lock_keys(&self, _enabled: bool) {}
+    /// Updates whether USB Consumer Control media/volume keys remain pinned to the local server OS.
+    fn set_pin_media_keys_local(&self, _enabled: bool) {}
     /// Enters remote mode: suppresses/grabs local input and parks/hides cursor cleanly.
     fn enter_remote(&self) -> Result<()>;
     /// Leaves remote mode: releases grab and warps cursor to `return_edge` at `normalized_pos`.
@@ -368,5 +380,51 @@ pub fn run_doctor() -> Result<DoctorReport> {
     #[cfg(target_os = "macos")]
     {
         macos::run_doctor()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn media_keys_stay_local_when_pinned_and_forward_when_unpinned() {
+        let media_names = [
+            "AudioVolumeMute",
+            "AudioVolumeDown",
+            "AudioVolumeUp",
+            "MediaPlayPause",
+            "MediaTrackNext",
+            "MediaTrackPrev",
+            "MediaStop",
+        ];
+        for name in media_names {
+            let usage = HidUsage::from_name(name).expect("known media key");
+            assert_eq!(usage.page(), HidUsage::PAGE_CONSUMER);
+            assert!(usage.is_media_key());
+            assert!(
+                !should_forward_key_in_remote(usage, true),
+                "{name} must stay local when pin_media_keys_local is true"
+            );
+            assert!(
+                should_forward_key_in_remote(usage, false),
+                "{name} must forward when pin_media_keys_local is false"
+            );
+        }
+
+        // Standard keyboard keys always forward regardless of pin_media_keys_local.
+        for key in [
+            HidUsage::from_name("KeyA").unwrap(),
+            HidUsage::from_name("Space").unwrap(),
+            HidUsage::ALT_RIGHT,
+            HidUsage::ISO_BACKSLASH,
+        ] {
+            assert!(!key.is_media_key());
+            assert!(should_forward_key_in_remote(key, true));
+            assert!(should_forward_key_in_remote(key, false));
+        }
+
+        // Default CaptureConfig pins media keys locally.
+        assert!(CaptureConfig::default().pin_media_keys_local);
     }
 }

@@ -24,6 +24,11 @@ pub const X11_EVDEV_OFFSET: u8 = 8;
 pub struct HidUsage(pub u32);
 
 impl HidUsage {
+    /// USB HID Usage Page for Keyboard/Keypad (`0x07`).
+    pub const PAGE_KEYBOARD: u16 = PAGE_KEYBOARD;
+    /// USB HID Usage Page for Consumer Control / Media keys (`0x0C`).
+    pub const PAGE_CONSUMER: u16 = PAGE_CONSUMER;
+
     pub const fn new(page: u16, id: u16) -> Self {
         Self(((page as u32) << 16) | (id as u32))
     }
@@ -46,6 +51,13 @@ impl HidUsage {
 
     pub const fn raw(self) -> u32 {
         self.0
+    }
+
+    /// Returns `true` if this usage belongs to USB HID Consumer Control page (`0x0C`:
+    /// volume, mute, play/pause, next/prev track, stop).
+    #[inline]
+    pub const fn is_media_key(self) -> bool {
+        self.page() == Self::PAGE_CONSUMER
     }
 
     // Well-known keys used across crates
@@ -385,5 +397,30 @@ mod tests {
         assert!(!is_windows_fake_altgr_lctrl(0xA2, 0x1D));
         // Real physical Right Alt
         assert!(!is_windows_fake_altgr_lctrl(0xA5, 0x38));
+    }
+
+    #[test]
+    fn classifies_consumer_media_and_brightness_keys() {
+        for name in [
+            "AudioVolumeMute",
+            "AudioVolumeDown",
+            "AudioVolumeUp",
+            "MediaPlayPause",
+            "MediaTrackNext",
+            "MediaTrackPrev",
+            "MediaStop",
+        ] {
+            let u = HidUsage::from_name(name).expect("known media key");
+            assert!(u.is_media_key(), "{name} should be classified as media key");
+        }
+        // Brightness Increment (0x006F) and Decrement (0x0070) on USB Consumer Control page 0x0C
+        assert!(HidUsage::consumer(0x006F).is_media_key());
+        assert!(HidUsage::consumer(0x0070).is_media_key());
+
+        // Standard keyboard usages are not media keys
+        assert!(!HidUsage::ESCAPE.is_media_key());
+        assert!(!HidUsage::ALT_RIGHT.is_media_key());
+        assert!(!HidUsage::ISO_BACKSLASH.is_media_key());
+        assert!(!HidUsage::from_name("KeyA").unwrap().is_media_key());
     }
 }
