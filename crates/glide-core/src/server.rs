@@ -18,8 +18,8 @@ use glide_hid::ModifierMask;
 use glide_net::discovery::spawn_server_beacon;
 use glide_net::tls::ServerIdentity;
 use glide_net::{
-    recv_bulk_on_with_limit, send_clipboard_on, send_file_on_with_limit, sha256_bytes, Connection,
-    GlideServerEndpoint, GlideSession,
+    recv_bulk_on_with_atomic_limit, send_clipboard_on, send_file_on_with_limit, sha256_bytes,
+    Connection, GlideServerEndpoint, GlideSession,
 };
 use glide_proto::{
     BulkTransfer, ClipboardPayload, ControlMessage, DatagramMessage, Edge, FilePayload, LockState,
@@ -396,20 +396,37 @@ pub async fn run_server_with_backends(
                     }
                     RuntimeCommand::SendFile { filename, data } => {
                         let limit = max_file_bytes.load(Ordering::Relaxed);
-                        let payload = FilePayload {
-                            filename: filename.clone(),
-                            sha256: sha256_bytes(&data),
-                            data,
-                        };
-                        if let Some(ref rt) = runtime {
-                            rt.record_file("sent", filename, payload.data.len(), None);
-                        }
-                        for peer in peers.values() {
-                            let conn = peer.conn.clone();
-                            let p = payload.clone();
+                        if data.len() > limit {
+                            warn!(
+                                file = %filename,
+                                bytes = data.len(),
+                                limit,
+                                "Refusing to send file exceeding max_file_bytes limit"
+                            );
+                        } else if peers.is_empty() {
+                            warn!(file = %filename, "Cannot send file: no connected peers");
+                        } else {
+                            let byte_len = data.len();
+                            let payload = FilePayload {
+                                filename: filename.clone(),
+                                sha256: sha256_bytes(&data),
+                                data,
+                            };
+                            let conns: Vec<Connection> =
+                                peers.values().map(|p| p.conn.clone()).collect();
+                            let rt_opt = runtime.clone();
                             tokio::spawn(async move {
-                                if let Err(e) = send_file_on_with_limit(&conn, &p, limit).await {
-                                    warn!(error = %e, "Failed beaming file to client");
+                                let mut any_sent = false;
+                                for conn in conns {
+                                    match send_file_on_with_limit(&conn, &payload, limit).await {
+                                        Ok(()) => any_sent = true,
+                                        Err(e) => warn!(error = %e, "Failed beaming file to client"),
+                                    }
+                                }
+                                if any_sent {
+                                    if let Some(rt) = rt_opt {
+                                        rt.record_file("sent", filename, byte_len, None);
+                                    }
                                 }
                             });
                         }
@@ -986,8 +1003,7 @@ async fn handle_incoming_session(
     let bulk_tx = peer_tx.clone();
     tokio::spawn(async move {
         loop {
-            let limit = max_file_bytes.load(Ordering::Relaxed);
-            match recv_bulk_on_with_limit(&bulk_conn, limit).await {
+            match recv_bulk_on_with_atomic_limit(&bulk_conn, &max_file_bytes).await {
                 Ok(transfer) => {
                     if bulk_tx.send(PeerEvent::Bulk { peer_id, transfer }).is_err() {
                         break;

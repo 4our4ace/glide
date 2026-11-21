@@ -255,4 +255,157 @@ mod tests {
         cli_task.abort();
         srv_task.abort();
     }
+
+    #[tokio::test]
+    async fn server_to_client_file_transfer_survives_active_datagrams_and_rejects_oversized_without_recording_sent(
+    ) {
+        let identity = ServerIdentity::generate_ephemeral().unwrap();
+        let fp = identity.fingerprint.clone();
+        let endpoint =
+            GlideServerEndpoint::bind("127.0.0.1:0".parse().unwrap(), &identity).unwrap();
+        let addr = endpoint.local_addr();
+
+        let geom = DesktopGeometry::new(vec![MonitorRect {
+            name: "Disp-1".into(),
+            x: 0,
+            y: 0,
+            width: 1920,
+            height: 1080,
+            scale: 1.0,
+            primary: true,
+        }]);
+
+        let (capture_handle, cap_tx, _cap_state) = create_mock_capture(geom.clone());
+        let (mut injector, _inj_log) = MockInjector::new(geom);
+        let srv_rt = RuntimeState::new();
+        let cli_rt = RuntimeState::new();
+        let (srv_cmd_tx, srv_cmd_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (cli_cmd_tx, mut cli_cmd_rx) = tokio::sync::mpsc::unbounded_channel();
+
+        let recv_dir = std::env::temp_dir().join(format!(
+            "glide-e2e-bulk-cancel-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&recv_dir);
+
+        let srv_cfg = ServerConfig {
+            name: "bulk-srv".into(),
+            discovery: false,
+            motion_coalesce_us: 0,
+            max_file_bytes: Some(4 * 1024 * 1024),
+            ..Default::default()
+        };
+        let mut cli_cfg = ClientConfig {
+            name: "bulk-cli".into(),
+            server: Some(addr.to_string()),
+            edge: Edge::Right,
+            trusted_fingerprint: Some(fp),
+            max_file_bytes: Some(128 * 1024), // start low, raise live via UpdateMaxFileBytes!
+            receive_dir: Some(recv_dir.display().to_string()),
+            ..Default::default()
+        };
+
+        let srv_rt_c = srv_rt.clone();
+        let srv_task = tokio::spawn(async move {
+            let _ = run_server_with_backends(
+                srv_cfg,
+                endpoint,
+                capture_handle,
+                None,
+                "linux-x11",
+                Some(srv_rt_c),
+                Some(srv_cmd_rx),
+            )
+            .await;
+        });
+
+        let cli_rt_c = cli_rt.clone();
+        let cli_task = tokio::spawn(async move {
+            let mut opt_clip = None;
+            let _ = run_client_session(
+                &mut cli_cfg,
+                addr,
+                &mut injector,
+                &mut opt_clip,
+                Some(&cli_rt_c),
+                Some(&mut cli_cmd_rx),
+            )
+            .await;
+        });
+
+        tokio::time::sleep(Duration::from_millis(120)).await;
+
+        // 1. Live-update client max_file_bytes to 4 MiB so the dedicated bulk task accepts 2 MiB
+        cli_cmd_tx
+            .send(crate::runtime::RuntimeCommand::UpdateMaxFileBytes(
+                4 * 1024 * 1024,
+            ))
+            .unwrap();
+        // Enter remote mode so high-frequency datagrams stream continuously during the file transfer
+        cap_tx
+            .send(CaptureEvent::EdgeCrossed {
+                edge: Edge::Right,
+                normalized_pos: 0.5,
+            })
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        // 2. Oversized SendFile (> 4 MiB) must NOT be recorded as "sent" in server RuntimeState
+        srv_cmd_tx
+            .send(crate::runtime::RuntimeCommand::SendFile {
+                filename: "too-big.bin".into(),
+                data: Bytes::from(vec![0xFFu8; 5 * 1024 * 1024]),
+            })
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(40)).await;
+        assert!(
+            srv_rt.snapshot().recent_files.is_empty(),
+            "oversized rejected transfer must not be recorded as sent"
+        );
+
+        // 3. Send a 2 MiB file from server -> client while hammering 1000Hz datagrams!
+        let file_data: Vec<u8> = (0..(2 * 1024 * 1024)).map(|i| (i % 251) as u8).collect();
+        srv_cmd_tx
+            .send(crate::runtime::RuntimeCommand::SendFile {
+                filename: "large-payload.bin".into(),
+                data: Bytes::from(file_data.clone()),
+            })
+            .unwrap();
+
+        for _ in 0..80 {
+            let _ = cap_tx.send(CaptureEvent::MouseDelta { dx: 1.0, dy: 0.0 });
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+
+        // Wait up to 2s for the 2 MiB file to arrive intact despite datagram + timer traffic
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+        loop {
+            if !cli_rt.snapshot().recent_files.is_empty() {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "timed out waiting for server->client 2 MiB file transfer"
+            );
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+
+        let cli_files = cli_rt.snapshot().recent_files;
+        assert_eq!(cli_files.len(), 1);
+        assert_eq!(cli_files[0].direction, "received");
+        assert_eq!(cli_files[0].filename, "large-payload.bin");
+        assert_eq!(cli_files[0].bytes, file_data.len());
+        let saved = std::path::PathBuf::from(cli_files[0].saved_path.as_ref().unwrap());
+        assert_eq!(std::fs::read(&saved).unwrap(), file_data);
+
+        // Server recorded the clean sent transfer
+        let srv_files = srv_rt.snapshot().recent_files;
+        assert_eq!(srv_files.len(), 1);
+        assert_eq!(srv_files[0].direction, "sent");
+        assert_eq!(srv_files[0].filename, "large-payload.bin");
+
+        cli_task.abort();
+        srv_task.abort();
+        let _ = std::fs::remove_dir_all(&recv_dir);
+    }
 }

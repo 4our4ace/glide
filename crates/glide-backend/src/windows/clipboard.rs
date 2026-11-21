@@ -9,7 +9,7 @@
 
 use crate::clipboard_privacy::{
     is_windows_clipboard_sensitive, WindowsPrivacyCheck, WIN_CAN_INCLUDE_HISTORY_FORMAT,
-    WIN_CLIPBOARD_VIEWER_IGNORE_FORMAT, WIN_EXCLUDE_MONITOR_FORMAT,
+    WIN_CAN_UPLOAD_CLOUD_FORMAT, WIN_CLIPBOARD_VIEWER_IGNORE_FORMAT, WIN_EXCLUDE_MONITOR_FORMAT,
 };
 use crate::dib_png::{dib_to_png, png_to_dib};
 use crate::{ClipboardBackend, ClipboardHandle};
@@ -49,6 +49,7 @@ const WM_APP_SET_CLIPBOARD: u32 = WM_APP + 10;
 struct PrivacyFormats {
     exclude_monitor: u32,
     can_include_history: u32,
+    can_upload_cloud: u32,
     viewer_ignore: u32,
 }
 
@@ -61,6 +62,7 @@ impl PrivacyFormats {
         Self {
             exclude_monitor: reg(WIN_EXCLUDE_MONITOR_FORMAT),
             can_include_history: reg(WIN_CAN_INCLUDE_HISTORY_FORMAT),
+            can_upload_cloud: reg(WIN_CAN_UPLOAD_CLOUD_FORMAT),
             viewer_ignore: reg(WIN_CLIPBOARD_VIEWER_IGNORE_FORMAT),
         }
     }
@@ -75,10 +77,16 @@ impl PrivacyFormats {
         } else {
             None
         };
+        let can_upload_raw = if is_avail(self.can_upload_cloud) {
+            Some(read_raw_format(self.can_upload_cloud))
+        } else {
+            None
+        };
         let check = WindowsPrivacyCheck {
             has_exclude_monitor,
             has_viewer_ignore,
             can_include_in_history: can_include_raw.as_ref().map(|opt| opt.as_deref()),
+            can_upload_to_cloud: can_upload_raw.as_ref().map(|opt| opt.as_deref()),
         };
         is_windows_clipboard_sensitive(check)
     }

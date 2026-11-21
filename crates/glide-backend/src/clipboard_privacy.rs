@@ -4,7 +4,8 @@
 //! secrets with platform-specific clipboard format/MIME hints so clipboard sync tools
 //! and clipboard history managers never read, store, or transmit credentials:
 //! - Windows: `ExcludeClipboardContentFromMonitorProcessing`,
-//!   `CanIncludeInClipboardHistory` (DWORD `0`), and `Clipboard Viewer Ignore`.
+//!   `CanIncludeInClipboardHistory` (DWORD `0`), `CanUploadToCloudClipboard` (DWORD `0`),
+//!   and `Clipboard Viewer Ignore`.
 //! - Linux (X11 & Wayland): `x-kde-passwordManagerHint`.
 
 /// Standard freedesktop / KDE / password-manager MIME type & X11 target atom name.
@@ -15,6 +16,9 @@ pub const WIN_EXCLUDE_MONITOR_FORMAT: &str = "ExcludeClipboardContentFromMonitor
 
 /// Windows clipboard format: DWORD `0` forbids clipboard history / sensitive sync.
 pub const WIN_CAN_INCLUDE_HISTORY_FORMAT: &str = "CanIncludeInClipboardHistory";
+
+/// Windows clipboard format: DWORD `0` forbids syncing clipboard content across devices/cloud.
+pub const WIN_CAN_UPLOAD_CLOUD_FORMAT: &str = "CanUploadToCloudClipboard";
 
 /// Legacy Windows privacy marker used by KeePass and clipboard managers.
 pub const WIN_CLIPBOARD_VIEWER_IGNORE_FORMAT: &str = "Clipboard Viewer Ignore";
@@ -30,6 +34,26 @@ pub struct WindowsPrivacyCheck<'a> {
     /// `Some(None)` if the format is present with a null/unreadable handle;
     /// `Some(Some(bytes))` if the format is present with raw payload bytes.
     pub can_include_in_history: Option<Option<&'a [u8]>>,
+    /// `None` if `CanUploadToCloudClipboard` is NOT on the clipboard;
+    /// `Some(None)` if the format is present with a null/unreadable handle;
+    /// `Some(Some(bytes))` if the format is present with raw payload bytes.
+    pub can_upload_to_cloud: Option<Option<&'a [u8]>>,
+}
+
+/// Evaluates a Windows clipboard DWORD privacy policy format (`CanIncludeInClipboardHistory` /
+/// `CanUploadToCloudClipboard`): returns `true` (sensitive / excluded) if the format is present
+/// with DWORD `0` or an unreadable/empty payload (fail-closed).
+fn is_win_policy_dword_zero(raw_opt: Option<&[u8]>) -> bool {
+    match raw_opt {
+        // Format present with unreadable/empty payload: fail closed as excluded.
+        None | Some([]) => true,
+        // Standard Win32 DWORD (4-byte little-endian; GlobalSize may round up >= 4).
+        Some(bytes) if bytes.len() >= 4 => {
+            u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]) == 0
+        }
+        // Short payload (< 4 bytes): exclude if all zero bytes.
+        Some(bytes) => bytes.iter().all(|&b| b == 0),
+    }
 }
 
 /// Returns `true` if Windows privacy clipboard formats indicate the current clipboard
@@ -39,17 +63,17 @@ pub fn is_windows_clipboard_sensitive(check: WindowsPrivacyCheck<'_>) -> bool {
     if check.has_exclude_monitor || check.has_viewer_ignore {
         return true;
     }
-    if let Some(raw_opt) = check.can_include_in_history {
-        return match raw_opt {
-            // Format present with unreadable/empty payload: fail closed as excluded.
-            None | Some([]) => true,
-            // Standard Win32 DWORD (4-byte little-endian; GlobalSize may round up >= 4).
-            Some(bytes) if bytes.len() >= 4 => {
-                u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]) == 0
-            }
-            // Short payload (< 4 bytes): exclude if all zero bytes.
-            Some(bytes) => bytes.iter().all(|&b| b == 0),
-        };
+    if check
+        .can_include_in_history
+        .is_some_and(is_win_policy_dword_zero)
+    {
+        return true;
+    }
+    if check
+        .can_upload_to_cloud
+        .is_some_and(is_win_policy_dword_zero)
+    {
+        return true;
     }
     false
 }
@@ -122,6 +146,41 @@ mod tests {
         assert!(is_windows_clipboard_sensitive(WindowsPrivacyCheck {
             has_exclude_monitor: true,
             can_include_in_history: Some(Some(&one)),
+            ..Default::default()
+        }));
+    }
+
+    #[test]
+    fn windows_can_upload_to_cloud_clipboard_fails_closed_on_zero_or_empty() {
+        let zero = 0u32.to_le_bytes();
+        let one = 1u32.to_le_bytes();
+        let padded_zero = [0u8, 0, 0, 0, 0xAA, 0xBB, 0xCC, 0xDD];
+
+        // DWORD 0 -> sensitive (even if CanIncludeInClipboardHistory == 1)
+        assert!(is_windows_clipboard_sensitive(WindowsPrivacyCheck {
+            can_include_in_history: Some(Some(&one)),
+            can_upload_to_cloud: Some(Some(&zero)),
+            ..Default::default()
+        }));
+        assert!(is_windows_clipboard_sensitive(WindowsPrivacyCheck {
+            can_upload_to_cloud: Some(Some(&padded_zero)),
+            ..Default::default()
+        }));
+
+        // Present with unreadable/empty payload -> fail closed as sensitive
+        assert!(is_windows_clipboard_sensitive(WindowsPrivacyCheck {
+            can_upload_to_cloud: Some(None),
+            ..Default::default()
+        }));
+        assert!(is_windows_clipboard_sensitive(WindowsPrivacyCheck {
+            can_upload_to_cloud: Some(Some(&[])),
+            ..Default::default()
+        }));
+
+        // DWORD 1 -> allowed
+        assert!(!is_windows_clipboard_sensitive(WindowsPrivacyCheck {
+            can_include_in_history: Some(Some(&one)),
+            can_upload_to_cloud: Some(Some(&one)),
             ..Default::default()
         }));
     }

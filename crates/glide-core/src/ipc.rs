@@ -12,14 +12,14 @@
 //! (64 KiB) with a [`IPC_IO_TIMEOUT`] (5s) per-message timeout.
 
 use crate::config::default_config_dir;
-use crate::runtime::{PeerSummary, RuntimeCommand, RuntimeState, StatusSnapshot};
+use crate::runtime::{
+    read_regular_file_bounded, PeerSummary, RuntimeCommand, RuntimeState, StatusSnapshot,
+};
 use anyhow::{anyhow, Context, Result};
-use bytes::Bytes;
 use glide_net::tls::random_hex_token_32;
 use glide_proto::Edge;
 use serde::{Deserialize, Serialize};
 use std::fs;
-use std::io::Read;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -492,53 +492,6 @@ async fn handle_ipc_stream<S: AsyncRead + AsyncWrite + Unpin>(
 
     let resp = dispatch_action(req.action, backend).await;
     write_response_line(&mut writer, &resp).await
-}
-
-fn read_regular_file_bounded(path: &Path, max_bytes: usize) -> Result<(String, Bytes)> {
-    if path.as_os_str().is_empty() {
-        anyhow::bail!("file path cannot be empty");
-    }
-    let meta = fs::metadata(path)
-        .with_context(|| format!("failed to inspect file '{}'", path.display()))?;
-    if !meta.is_file() {
-        anyhow::bail!("'{}' is not a regular file", path.display());
-    }
-    if meta.len() > max_bytes as u64 {
-        anyhow::bail!(
-            "file '{}' ({} bytes) exceeds max file transfer limit ({} bytes)",
-            path.display(),
-            meta.len(),
-            max_bytes
-        );
-    }
-
-    let file = fs::File::open(path)
-        .with_context(|| format!("failed to open file '{}'", path.display()))?;
-    let opened_meta = file.metadata()?;
-    if !opened_meta.is_file() {
-        anyhow::bail!("'{}' is not a regular file", path.display());
-    }
-
-    let mut data = Vec::with_capacity(opened_meta.len().min(max_bytes as u64) as usize);
-    file.take((max_bytes as u64).saturating_add(1))
-        .read_to_end(&mut data)
-        .with_context(|| format!("failed to read file '{}'", path.display()))?;
-    if data.len() > max_bytes {
-        anyhow::bail!(
-            "file '{}' grew beyond max file transfer limit ({} bytes)",
-            path.display(),
-            max_bytes
-        );
-    }
-
-    let filename = path
-        .file_name()
-        .and_then(|n| n.to_str())
-        .filter(|n| !n.is_empty())
-        .ok_or_else(|| anyhow!("cannot determine filename for '{}'", path.display()))?
-        .to_owned();
-
-    Ok((filename, Bytes::from(data)))
 }
 
 async fn dispatch_action(action: IpcAction, backend: Arc<dyn IpcBackend>) -> IpcResponse {

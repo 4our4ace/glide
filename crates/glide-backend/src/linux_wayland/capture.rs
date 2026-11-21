@@ -10,7 +10,7 @@ use crate::linux_wayland::{
     call_portal_request, close_portal_session, evdev_to_mouse_button, extract_object_path,
     next_portal_token, opt_str, INPUT_CAPTURE_IFACE, PORTAL_DEST, PORTAL_PATH,
 };
-use crate::{CaptureConfig, CaptureControl, CaptureEvent, CaptureHandle};
+use crate::{CaptureConfig, CaptureControl, CaptureEvent, CaptureHandle, RemoteMediaKeyTracker};
 use anyhow::{anyhow, Context, Result};
 use glide_hid::HidUsage;
 use glide_proto::{Edge, LockState};
@@ -557,11 +557,19 @@ fn start_wayland_capture_blocking(config: CaptureConfig) -> Result<CaptureHandle
         .spawn(move || {
             let mut converter = EiEventConverter::new(&ei_ctx, handshake_resp);
             let mut held_keys: HashSet<HidUsage> = HashSet::new();
+            let mut media_tracker = RemoteMediaKeyTracker::new();
+            let mut was_in_remote = false;
             let mut scroll_acc_x: f32 = 0.0;
             let mut scroll_acc_y: f32 = 0.0;
 
             let fd = ei_ctx.as_raw_fd();
             loop {
+                let in_remote_now = shared_eis.in_remote.load(Ordering::Acquire);
+                if was_in_remote && !in_remote_now {
+                    media_tracker.clear();
+                }
+                was_in_remote = in_remote_now;
+
                 while let Some(res) = ei_ctx.pending_event() {
                     let req = match res {
                         PendingRequestResult::Request(r) => r,
@@ -659,6 +667,8 @@ fn start_wayland_capture_blocking(config: CaptureConfig) -> Result<CaptureHandle
 
                             if pressed && usage == config.escape_key {
                                 shared_eis.in_remote.store(false, Ordering::SeqCst);
+                                media_tracker.clear();
+                                was_in_remote = false;
                                 if ev_tx.send(CaptureEvent::EscapeHotkey).is_err() {
                                     return;
                                 }
@@ -705,14 +715,16 @@ fn start_wayland_capture_blocking(config: CaptureConfig) -> Result<CaptureHandle
                                 }
                             }
 
-                            if shared_eis.in_remote.load(Ordering::Relaxed)
-                                && crate::should_forward_key_in_remote(
-                                    usage,
-                                    shared_eis.pin_media_keys_local.load(Ordering::Relaxed),
-                                )
-                                && ev_tx
-                                    .send(CaptureEvent::Key { usage, pressed })
-                                    .is_err()
+                            let in_remote = shared_eis.in_remote.load(Ordering::Acquire);
+                            if !in_remote {
+                                media_tracker.clear();
+                            } else if media_tracker.should_forward(
+                                usage,
+                                pressed,
+                                shared_eis.pin_media_keys_local.load(Ordering::Relaxed),
+                            ) && ev_tx
+                                .send(CaptureEvent::Key { usage, pressed })
+                                .is_err()
                             {
                                 return;
                             }

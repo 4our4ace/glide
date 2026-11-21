@@ -2,8 +2,7 @@
 //! Windows Elevated Task helper, and safe file-drop destination folder).
 
 use anyhow::{anyhow, Context, Result};
-use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::path::{Component, Path, PathBuf};
 
 fn user_home_dir() -> Option<PathBuf> {
     #[cfg(target_os = "windows")]
@@ -29,11 +28,28 @@ fn default_receive_dir_path() -> PathBuf {
     }
 }
 
+/// Returns `true` if `s` has a root or Windows drive/UNC prefix (checked cross-platform so
+/// paths like `~/C:\Windows` are rejected everywhere).
+fn has_drive_or_root_prefix(s: &str) -> bool {
+    let path = Path::new(s);
+    if path.is_absolute()
+        || path
+            .components()
+            .any(|c| matches!(c, Component::Prefix(_) | Component::RootDir))
+    {
+        return true;
+    }
+    let bytes = s.as_bytes();
+    bytes.len() >= 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':'
+}
+
 /// Resolves a custom or default file-receive directory without modifying the filesystem.
 ///
 /// - `None` resolves to `~/Downloads/Glide` (or `%USERPROFILE%\Downloads\Glide` on Windows).
-/// - `Some(raw)` validates that the path is non-empty and free of NUL bytes, and safely expands
-///   a leading `~`, `~/`, or `~\` against the user's home directory.
+/// - `Some(raw)` validates that the path is non-empty and free of NUL bytes, expands a leading
+///   `~`, `~/`, or `~\` against the user's home directory (trimming repeated leading slashes and
+///   rejecting rooted/drive-prefixed remainders such as `~/C:\Windows`), and rejects bare relative
+///   paths so files never land in an arbitrary process CWD.
 pub fn resolve_receive_dir(custom: Option<&str>) -> Result<PathBuf> {
     let Some(raw) = custom else {
         return Ok(default_receive_dir_path());
@@ -52,19 +68,29 @@ pub fn resolve_receive_dir(custom: Option<&str>) -> Result<PathBuf> {
             .ok_or_else(|| anyhow!("cannot expand '~': user home directory is unavailable"));
     }
 
-    if let Some(rest) = trimmed
-        .strip_prefix("~/")
-        .or_else(|| trimmed.strip_prefix("~\\"))
-    {
+    if trimmed.starts_with("~/") || trimmed.starts_with("~\\") {
         let home = user_home_dir()
             .ok_or_else(|| anyhow!("cannot expand '~/': user home directory is unavailable"))?;
+        let rest = trimmed[1..].trim_start_matches(['/', '\\']);
         if rest.is_empty() {
             return Ok(home);
+        }
+        if has_drive_or_root_prefix(rest) {
+            return Err(anyhow!(
+                "invalid rooted or drive-prefixed path after '~': '{trimmed}'"
+            ));
         }
         return Ok(home.join(rest));
     }
 
-    Ok(PathBuf::from(trimmed))
+    let path = PathBuf::from(trimmed);
+    if !path.is_absolute() {
+        return Err(anyhow!(
+            "receive directory must be an absolute path or start with '~/': '{trimmed}'"
+        ));
+    }
+
+    Ok(path)
 }
 
 /// Resolves and creates (if needed) the destination folder for received files.
@@ -81,54 +107,187 @@ pub fn file_receive_dir() -> Result<PathBuf> {
     ensure_receive_dir(None)
 }
 
+/// Strips Windows verbatim prefixes (`\\?\` / `\\?\UNC\`) and normalizes `/` -> `\` for Shell APIs.
+#[allow(dead_code)]
+fn normalize_windows_shell_path(raw: &str) -> String {
+    let stripped = if let Some(unc) = raw.strip_prefix(r"\\?\UNC\") {
+        format!(r"\\{unc}")
+    } else if let Some(rest) = raw.strip_prefix(r"\\?\") {
+        rest.to_owned()
+    } else {
+        raw.to_owned()
+    };
+    stripped.replace('/', "\\")
+}
+
+/// Converts `path` into an absolute path (preserving symlink names) and normalizes it for OS APIs.
+fn absolutize_os_path(path: &Path) -> PathBuf {
+    let abs = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir()
+            .map(|cwd| cwd.join(path))
+            .unwrap_or_else(|_| path.to_path_buf())
+    };
+    #[cfg(target_os = "windows")]
+    {
+        PathBuf::from(normalize_windows_shell_path(&abs.to_string_lossy()))
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        abs
+    }
+}
+
+/// Computes the parent directory to open when revealing a file (falling back to `.` for bare
+/// relative filenames so a file path is never passed directly to a folder opener).
+fn reveal_parent_dir(path: &Path) -> &Path {
+    path.parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."))
+}
+
+/// Reaps a spawned Unix helper process on a detached thread so Glide never accumulates zombies.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn reap_child_in_background(mut child: std::process::Child) {
+    let _ = std::thread::Builder::new()
+        .name("glide-reaper".into())
+        .spawn(move || {
+            let _ = child.wait();
+        });
+}
+
+#[cfg(target_os = "windows")]
+fn encode_wide_null(path: &Path) -> Vec<u16> {
+    use std::os::windows::ffi::OsStrExt;
+    path.as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect()
+}
+
+#[cfg(target_os = "windows")]
+fn windows_shell_open(path: &Path) -> Result<()> {
+    use std::ptr;
+    use windows_sys::Win32::UI::Shell::ShellExecuteW;
+    use windows_sys::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
+
+    let op: Vec<u16> = "open\0".encode_utf16().collect();
+    let wide = encode_wide_null(path);
+    let res = unsafe {
+        ShellExecuteW(
+            ptr::null_mut(),
+            op.as_ptr(),
+            wide.as_ptr(),
+            ptr::null(),
+            ptr::null(),
+            SW_SHOWNORMAL,
+        )
+    };
+    if (res as isize) > 32 {
+        Ok(())
+    } else {
+        anyhow::bail!(
+            "ShellExecuteW failed opening {} (code {})",
+            path.display(),
+            res as isize
+        )
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn windows_reveal_in_explorer(path: &Path) -> Result<()> {
+    use std::ptr;
+    use windows_sys::Win32::Foundation::RPC_E_CHANGED_MODE;
+    use windows_sys::Win32::System::Com::{
+        CoInitializeEx, CoUninitialize, COINIT_APARTMENTTHREADED, COINIT_DISABLE_OLE1DDE,
+    };
+    use windows_sys::Win32::UI::Shell::{ILCreateFromPathW, ILFree, SHOpenFolderAndSelectItems};
+
+    let com_hr = unsafe {
+        CoInitializeEx(
+            ptr::null(),
+            (COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE) as u32,
+        )
+    };
+    let should_uninit = com_hr >= 0;
+    if com_hr < 0 && com_hr != RPC_E_CHANGED_MODE {
+        return windows_shell_open(reveal_parent_dir(path));
+    }
+
+    struct ComGuard(bool);
+    impl Drop for ComGuard {
+        fn drop(&mut self) {
+            if self.0 {
+                unsafe {
+                    CoUninitialize();
+                }
+            }
+        }
+    }
+    let _com_guard = ComGuard(should_uninit);
+
+    let wide = encode_wide_null(path);
+    let pidl = unsafe { ILCreateFromPathW(wide.as_ptr()) };
+    if !pidl.is_null() {
+        // Vista+: passing cidl == 0 with a file PIDL opens its parent folder and selects the item
+        // reliably even when the filename contains commas, spaces, or Unicode characters.
+        let hr = unsafe { SHOpenFolderAndSelectItems(pidl, 0, ptr::null(), 0) };
+        unsafe {
+            ILFree(pidl);
+        }
+        if hr >= 0 {
+            return Ok(());
+        }
+    }
+
+    windows_shell_open(reveal_parent_dir(path))
+}
+
 /// Opens a file or folder in the user's OS default handler / file manager without invoking a shell.
 pub fn open_path_in_os(path: &Path) -> Result<()> {
     if !path.exists() {
         anyhow::bail!("path does not exist: {}", path.display());
     }
+    let abs = absolutize_os_path(path);
 
     #[cfg(target_os = "linux")]
     {
-        Command::new("xdg-open")
-            .arg(path)
+        use std::process::{Command, Stdio};
+        let child = Command::new("xdg-open")
+            .arg(&abs)
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .spawn()
-            .with_context(|| format!("failed to open {} with xdg-open", path.display()))?;
+            .with_context(|| format!("failed to open {} with xdg-open", abs.display()))?;
+        reap_child_in_background(child);
         Ok(())
     }
 
     #[cfg(target_os = "windows")]
     {
-        use std::os::windows::process::CommandExt;
-        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-        Command::new("explorer.exe")
-            .arg(path)
-            .creation_flags(CREATE_NO_WINDOW)
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-            .with_context(|| format!("failed to open {} with explorer.exe", path.display()))?;
-        Ok(())
+        windows_shell_open(&abs)
     }
 
     #[cfg(target_os = "macos")]
     {
-        Command::new("open")
-            .arg(path)
+        use std::process::{Command, Stdio};
+        let child = Command::new("open")
+            .arg("--")
+            .arg(&abs)
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .spawn()
-            .with_context(|| format!("failed to open {} with open", path.display()))?;
+            .with_context(|| format!("failed to open {} with open", abs.display()))?;
+        reap_child_in_background(child);
         Ok(())
     }
 
     #[cfg(not(any(target_os = "linux", target_os = "windows", target_os = "macos")))]
     {
-        let _ = path;
+        let _ = abs;
         anyhow::bail!("opening local paths is unsupported on this OS")
     }
 }
@@ -138,58 +297,50 @@ pub fn reveal_in_file_manager(path: &Path) -> Result<()> {
     if !path.exists() {
         anyhow::bail!("path does not exist: {}", path.display());
     }
-    if path.is_dir() {
-        return open_path_in_os(path);
+    let abs = absolutize_os_path(path);
+    if abs.is_dir() {
+        return open_path_in_os(&abs);
     }
 
     #[cfg(target_os = "linux")]
     {
-        let target = path
-            .parent()
-            .filter(|p| !p.as_os_str().is_empty())
-            .unwrap_or(path);
-        Command::new("xdg-open")
+        use std::process::{Command, Stdio};
+        let target = reveal_parent_dir(&abs);
+        let child = Command::new("xdg-open")
             .arg(target)
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .spawn()
             .with_context(|| format!("failed to reveal {} with xdg-open", target.display()))?;
+        reap_child_in_background(child);
         Ok(())
     }
 
     #[cfg(target_os = "windows")]
     {
-        use std::os::windows::process::CommandExt;
-        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-        Command::new("explorer.exe")
-            .arg("/select,")
-            .arg(path)
-            .creation_flags(CREATE_NO_WINDOW)
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-            .with_context(|| format!("failed to reveal {} with explorer.exe", path.display()))?;
-        Ok(())
+        windows_reveal_in_explorer(&abs)
     }
 
     #[cfg(target_os = "macos")]
     {
-        Command::new("open")
+        use std::process::{Command, Stdio};
+        let child = Command::new("open")
             .arg("-R")
-            .arg(path)
+            .arg("--")
+            .arg(&abs)
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .spawn()
-            .with_context(|| format!("failed to reveal {} with open", path.display()))?;
+            .with_context(|| format!("failed to reveal {} with open", abs.display()))?;
+        reap_child_in_background(child);
         Ok(())
     }
 
     #[cfg(not(any(target_os = "linux", target_os = "windows", target_os = "macos")))]
     {
-        let _ = path;
+        let _ = abs;
         anyhow::bail!("revealing local files is unsupported on this OS")
     }
 }
@@ -444,11 +595,19 @@ mod tests {
             default_dir.display()
         );
 
-        // Explicit custom path is trimmed and preserved
-        let custom = resolve_receive_dir(Some("  /tmp/glide-inbox  ")).expect("custom dir");
-        assert_eq!(custom, PathBuf::from("/tmp/glide-inbox"));
+        // Explicit absolute custom path is trimmed and preserved
+        #[cfg(not(windows))]
+        {
+            let custom = resolve_receive_dir(Some("  /tmp/glide-inbox  ")).expect("custom dir");
+            assert_eq!(custom, PathBuf::from("/tmp/glide-inbox"));
+        }
+        #[cfg(windows)]
+        {
+            let custom = resolve_receive_dir(Some(r"  C:\GlideInbox  ")).expect("custom dir");
+            assert_eq!(custom, PathBuf::from(r"C:\GlideInbox"));
+        }
 
-        // Tilde expansion against user home
+        // Tilde expansion against user home (including repeated leading slashes!)
         if let Some(home) = user_home_dir() {
             assert_eq!(resolve_receive_dir(Some("~")).unwrap(), home);
             assert_eq!(
@@ -456,12 +615,58 @@ mod tests {
                 home.join("Transfers/Glide")
             );
             assert_eq!(resolve_receive_dir(Some("~/")).unwrap(), home);
+            assert_eq!(resolve_receive_dir(Some("~///")).unwrap(), home);
+            // ~//etc MUST stay anchored under home and NEVER discard home to become /etc!
+            assert_eq!(resolve_receive_dir(Some("~//etc")).unwrap(), home.join("etc"));
+            assert_eq!(
+                resolve_receive_dir(Some("~///tmp/evil")).unwrap(),
+                home.join("tmp/evil")
+            );
+            assert_eq!(
+                resolve_receive_dir(Some(r"~\\Downloads\Glide")).unwrap(),
+                home.join(r"Downloads\Glide")
+            );
+            // Drive-prefixed paths after ~/ MUST be rejected
+            assert!(resolve_receive_dir(Some(r"~/C:\Windows")).is_err());
+            assert!(resolve_receive_dir(Some("~///C:/Windows")).is_err());
         }
 
-        // Empty, whitespace-only, and NUL-containing paths are rejected
+        // Empty, whitespace-only, NUL-containing, and bare relative paths are rejected
         assert!(resolve_receive_dir(Some("")).is_err());
         assert!(resolve_receive_dir(Some("   \t  ")).is_err());
         assert!(resolve_receive_dir(Some("/tmp/bad\0path")).is_err());
+        assert!(resolve_receive_dir(Some("Inbox/Glide")).is_err());
+        assert!(resolve_receive_dir(Some("./Glide")).is_err());
+        assert!(resolve_receive_dir(Some("~otheruser/Downloads")).is_err());
+    }
+
+    #[test]
+    fn reveal_parent_dir_never_returns_bare_filename_itself() {
+        assert_eq!(reveal_parent_dir(Path::new("notes.txt")), Path::new("."));
+        assert_eq!(
+            reveal_parent_dir(Path::new("/home/user/Downloads/notes.txt")),
+            Path::new("/home/user/Downloads")
+        );
+        assert_eq!(
+            reveal_parent_dir(Path::new("subdir/notes.txt")),
+            Path::new("subdir")
+        );
+    }
+
+    #[test]
+    fn normalize_windows_shell_path_strips_verbatim_prefixes_and_normalizes_slashes() {
+        assert_eq!(
+            normalize_windows_shell_path(r"\\?\C:\Users\alice/Downloads/a, b.txt"),
+            r"C:\Users\alice\Downloads\a, b.txt"
+        );
+        assert_eq!(
+            normalize_windows_shell_path(r"\\?\UNC\fileserver\share/inbox/report.pdf"),
+            r"\\fileserver\share\inbox\report.pdf"
+        );
+        assert_eq!(
+            normalize_windows_shell_path("C:/Users/alice/Downloads"),
+            r"C:\Users\alice\Downloads"
+        );
     }
 
     #[test]

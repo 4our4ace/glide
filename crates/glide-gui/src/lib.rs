@@ -788,8 +788,15 @@ async fn handle_http_conn(mut stream: TcpStream, ctrl: Arc<AppController>) -> Re
         return Ok(());
     }
 
-    let max_file_bytes = ctrl.config.lock().max_file_bytes();
-    if content_len > max_file_bytes {
+    const MAX_API_BODY_BYTES: usize = 1024 * 1024; // 1 MiB for JSON/control endpoints
+    const HTTP_INITIAL_BODY_CAP: usize = 64 * 1024;
+
+    let max_body_bytes = if method == "POST" && path == "/api/send-file" {
+        ctrl.config.lock().max_file_bytes()
+    } else {
+        MAX_API_BODY_BYTES
+    };
+    if content_len > max_body_bytes {
         write_response(
             &mut stream,
             "413 Payload Too Large",
@@ -801,18 +808,22 @@ async fn handle_http_conn(mut stream: TcpStream, ctrl: Arc<AppController>) -> Re
     }
 
     let body_start = header_end + 4;
-    let mut body = Vec::with_capacity(content_len);
+    let mut body = Vec::with_capacity(content_len.min(HTTP_INITIAL_BODY_CAP));
     if buf.len() > body_start {
-        body.extend_from_slice(&buf[body_start..]);
+        let initial = &buf[body_start..];
+        let take = initial.len().min(content_len);
+        body.extend_from_slice(&initial[..take]);
     }
-    while body.len() < content_len {
-        let to_read = (content_len - body.len()).min(65536);
-        let mut tmp = vec![0u8; to_read];
-        let n = stream.read(&mut tmp).await?;
-        if n == 0 {
-            break;
+    if body.len() < content_len {
+        let mut tmp = vec![0u8; (content_len - body.len()).min(HTTP_INITIAL_BODY_CAP)];
+        while body.len() < content_len {
+            let to_read = (content_len - body.len()).min(tmp.len());
+            let n = stream.read(&mut tmp[..to_read]).await?;
+            if n == 0 {
+                break;
+            }
+            body.extend_from_slice(&tmp[..n]);
         }
-        body.extend_from_slice(&tmp[..n]);
     }
     body.truncate(content_len);
 
@@ -1212,6 +1223,86 @@ mod tests {
         let mut r3 = String::new();
         s3.read_to_string(&mut r3).await.unwrap();
         assert!(r3.starts_with("HTTP/1.1 403 Forbidden"));
+
+        srv.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn gui_http_enforces_route_body_limits() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let url = format!("http://127.0.0.1:{}", addr.port());
+        let tmp_cfg = std::env::temp_dir().join(format!(
+            "glide-gui-limit-test-{}.toml",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&tmp_cfg);
+        let (quit_tx, _quit_rx) = mpsc::unbounded_channel();
+        let ctrl = Arc::new(AppController::new(tmp_cfg, url, quit_tx));
+        ctrl.config.lock().max_file_mb = 4; // 4 MiB for /api/send-file
+
+        let srv_ctrl = Arc::clone(&ctrl);
+        let srv = tokio::spawn(async move {
+            for _ in 0..3 {
+                let (stream, _) = listener.accept().await.unwrap();
+                let _ = handle_http_conn(stream, Arc::clone(&srv_ctrl)).await;
+            }
+        });
+
+        // 1. Non-file route declaring > 1 MiB is rejected with 413 even when max_file_mb is 4 MiB
+        let mut s1 = TcpStream::connect(addr).await.unwrap();
+        s1.write_all(
+            format!(
+                "POST /api/config HTTP/1.1\r\nHost: 127.0.0.1:{}\r\nContent-Length: {}\r\n\r\n",
+                addr.port(),
+                2 * 1024 * 1024
+            )
+            .as_bytes(),
+        )
+        .await
+        .unwrap();
+        let mut r1 = String::new();
+        s1.read_to_string(&mut r1).await.unwrap();
+        assert!(r1.starts_with("HTTP/1.1 413 Payload Too Large"), "got: {r1}");
+
+        // 2. /api/send-file declaring > max_file_bytes (4 MiB) is rejected with 413
+        let mut s2 = TcpStream::connect(addr).await.unwrap();
+        s2.write_all(
+            format!(
+                "POST /api/send-file HTTP/1.1\r\nHost: 127.0.0.1:{}\r\nContent-Length: {}\r\n\r\n",
+                addr.port(),
+                5 * 1024 * 1024
+            )
+            .as_bytes(),
+        )
+        .await
+        .unwrap();
+        let mut r2 = String::new();
+        s2.read_to_string(&mut r2).await.unwrap();
+        assert!(r2.starts_with("HTTP/1.1 413 Payload Too Large"), "got: {r2}");
+
+        // 3. /api/send-file within max_file_bytes (e.g. 1.5 MiB) passes the body-size check
+        // (and returns 400 "Glide is not currently running" instead of 413)
+        let mut s3 = TcpStream::connect(addr).await.unwrap();
+        let payload_len = 1536 * 1024;
+        s3.write_all(
+            format!(
+                "POST /api/send-file HTTP/1.1\r\nHost: 127.0.0.1:{}\r\nX-Filename: big.bin\r\nContent-Length: {}\r\n\r\n",
+                addr.port(),
+                payload_len
+            )
+            .as_bytes(),
+        )
+        .await
+        .unwrap();
+        let chunk = vec![0x5Au8; 64 * 1024];
+        for _ in 0..(payload_len / chunk.len()) {
+            s3.write_all(&chunk).await.unwrap();
+        }
+        let mut r3 = String::new();
+        s3.read_to_string(&mut r3).await.unwrap();
+        assert!(r3.starts_with("HTTP/1.1 400 Bad Request"), "got: {r3}");
+        assert!(r3.contains("not currently running"));
 
         srv.await.unwrap();
     }

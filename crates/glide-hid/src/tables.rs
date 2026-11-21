@@ -7,7 +7,7 @@ pub(crate) struct KeyEntry {
     pub name: &'static str,
     pub hid: HidUsage,
     pub evdev: u16,
-    pub win: WinScan,
+    pub win: Option<WinScan>,
     #[allow(dead_code)]
     pub macos: Option<u16>,
 }
@@ -20,18 +20,18 @@ const fn consumer(usage_id: u16) -> HidUsage {
     HidUsage::consumer(usage_id)
 }
 
-const fn ws(code: u16) -> WinScan {
-    WinScan {
+const fn ws(code: u16) -> Option<WinScan> {
+    Some(WinScan {
         code,
         extended: false,
-    }
+    })
 }
 
-const fn wse(code: u16) -> WinScan {
-    WinScan {
+const fn wse(code: u16) -> Option<WinScan> {
+    Some(WinScan {
         code,
         extended: true,
-    }
+    })
 }
 
 /// Complete bijective physical key table.
@@ -924,6 +924,20 @@ pub(crate) static KEY_TABLE: &[KeyEntry] = &[
         hid: consumer(0x00B7),
         evdev: 166,
         win: wse(0x24),
+        macos: None,
+    },
+    KeyEntry {
+        name: "BrightnessDown",
+        hid: consumer(0x0070),
+        evdev: 224,
+        win: None,
+        macos: None,
+    },
+    KeyEntry {
+        name: "BrightnessUp",
+        hid: consumer(0x006F),
+        evdev: 225,
+        win: None,
         macos: None,
     },
 ];

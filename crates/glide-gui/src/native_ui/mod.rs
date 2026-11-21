@@ -7,7 +7,6 @@ mod widgets;
 
 use crate::updater::{self, UpdateCheckState};
 use crate::{launch_browser_window, AppController, GUI_HEIGHT, GUI_WIDTH};
-use bytes::Bytes;
 use glide_backend::os_integration::{
     configure_elevated_task, configure_firewall, ensure_receive_dir, is_autostart_enabled,
     open_path_in_os, resolve_receive_dir, reveal_in_file_manager, set_autostart,
@@ -16,7 +15,8 @@ use glide_core::config::{
     list_known_servers, remove_known_server, GlideConfigFile, KeyRemapRule, KnownServer,
 };
 use glide_core::runtime::{
-    ClipboardHistoryEntry, FileTransferEntry, PeerSummary, RuntimeCommand, StatusSnapshot,
+    read_regular_file_bounded, ClipboardHistoryEntry, FileTransferEntry, PeerSummary,
+    RuntimeCommand, StatusSnapshot,
 };
 use glide_net::discovery::{discover_servers, local_ipv4_addresses, machine_hostname};
 use glide_proto::{ClipboardFormat, Edge, OsKind};
@@ -348,9 +348,9 @@ impl Ui {
         }
     }
 
-    pub fn commit_text_fields(&mut self) -> bool {
+    fn commit_text_fields_inner(&mut self, include_focused: bool) -> bool {
         let mut changed = false;
-        if !self.port_edit.focused {
+        if include_focused || !self.port_edit.focused {
             let port_raw = self.port_edit.text.trim().to_owned();
             if port_raw != self.last_committed_port {
                 if let Ok(p) = port_raw.parse::<u16>() {
@@ -362,7 +362,7 @@ impl Ui {
                 }
             }
         }
-        if !self.server_edit.focused {
+        if include_focused || !self.server_edit.focused {
             let srv_raw = self.server_edit.text.trim().to_owned();
             if srv_raw != self.last_committed_server {
                 self.config.client.server = if srv_raw.is_empty() {
@@ -374,13 +374,21 @@ impl Ui {
                 changed = true;
             }
         }
-        if !self.max_file_mb_edit.focused {
+        if include_focused || !self.max_file_mb_edit.focused {
             changed |= self.commit_max_file_mb();
         }
-        if !self.receive_dir_edit.focused {
+        if include_focused || !self.receive_dir_edit.focused {
             changed |= self.commit_receive_dir();
         }
         changed
+    }
+
+    pub fn commit_text_fields(&mut self) -> bool {
+        self.commit_text_fields_inner(false)
+    }
+
+    pub fn commit_all_text_fields(&mut self) -> bool {
+        self.commit_text_fields_inner(true)
     }
 
     pub fn commit_max_file_mb(&mut self) -> bool {
@@ -432,38 +440,7 @@ impl Ui {
     }
 
     pub fn commit_text_fields_and_push(&mut self) {
-        let mut changed = self.commit_text_fields();
-        if self.port_edit.focused {
-            let port_raw = self.port_edit.text.trim().to_owned();
-            if port_raw != self.last_committed_port {
-                if let Ok(p) = port_raw.parse::<u16>() {
-                    if p >= 1024 {
-                        self.config.server.bind.set_port(p);
-                        self.last_committed_port = port_raw;
-                        changed = true;
-                    }
-                }
-            }
-        }
-        if self.server_edit.focused {
-            let srv_raw = self.server_edit.text.trim().to_owned();
-            if srv_raw != self.last_committed_server {
-                self.config.client.server = if srv_raw.is_empty() {
-                    None
-                } else {
-                    Some(srv_raw.clone())
-                };
-                self.last_committed_server = srv_raw;
-                changed = true;
-            }
-        }
-        if self.max_file_mb_edit.focused {
-            changed |= self.commit_max_file_mb();
-        }
-        if self.receive_dir_edit.focused {
-            changed |= self.commit_receive_dir();
-        }
-        if changed {
+        if self.commit_all_text_fields() {
             self.push_config();
         }
     }
@@ -488,7 +465,7 @@ impl Ui {
             });
         } else {
             let role = self.role;
-            self.commit_text_fields();
+            self.commit_all_text_fields();
             self.config.last_role = Some(role.as_str().to_owned());
             self.config.auto_start_on_launch = true;
             self.push_config();
@@ -826,43 +803,25 @@ impl Ui {
         if paths.is_empty() {
             return;
         }
-        let max_file_bytes = self.config.max_file_bytes() as u64;
-        let max_file_mb = self.config.max_file_mb_clamped();
+        let max_file_bytes = self.config.max_file_bytes();
         let ctrl = Arc::clone(&self.ctrl);
         let handle = self.handle.clone();
         self.rt.spawn_blocking(move || {
             for path in paths {
-                let filename = path
+                let display_name = path
                     .file_name()
                     .and_then(|n| n.to_str())
                     .unwrap_or("glide-transfer.bin")
                     .to_owned();
                 if let Some(ref h) = handle {
-                    let msg = format!("Sending {filename}…");
+                    let msg = format!("Sending {display_name}…");
                     h.update(move |s, tx| s.toast(msg, tx));
                 }
-                match std::fs::metadata(&path) {
-                    Ok(meta) if meta.len() > max_file_bytes => {
-                        if let Some(ref h) = handle {
-                            let msg = format!("{filename} exceeds the {max_file_mb} MB limit");
-                            h.update(move |s, tx| s.toast(msg, tx));
-                        }
-                        continue;
-                    }
-                    Err(e) => {
-                        if let Some(ref h) = handle {
-                            let msg = format!("Could not read {filename}: {e}");
-                            h.update(move |s, tx| s.toast(msg, tx));
-                        }
-                        continue;
-                    }
-                    Ok(_) => {}
-                }
-                match std::fs::read(&path) {
-                    Ok(data) => {
+                match read_regular_file_bounded(&path, max_file_bytes) {
+                    Ok((filename, data)) => {
                         let ok = ctrl.send_cmd(RuntimeCommand::SendFile {
                             filename: filename.clone(),
-                            data: Bytes::from(data),
+                            data,
                         });
                         if let Some(ref h) = handle {
                             let msg = if ok {
@@ -875,7 +834,7 @@ impl Ui {
                     }
                     Err(e) => {
                         if let Some(ref h) = handle {
-                            let msg = format!("Failed reading {filename}: {e}");
+                            let msg = format!("Could not send {display_name}: {e}");
                             h.update(move |s, tx| s.toast(msg, tx));
                         }
                     }

@@ -19,7 +19,7 @@ use glide_backend::{ClipboardHandle, InputInjector};
 use glide_net::discovery::discover_servers;
 use glide_net::tls::TrustMode;
 use glide_net::{
-    connect_client, recv_bulk_on_with_limit, send_clipboard_on, send_file_on_with_limit,
+    connect_client, recv_bulk_on_with_atomic_limit, send_clipboard_on, send_file_on_with_limit,
     sha256_bytes,
 };
 use glide_proto::{
@@ -28,10 +28,19 @@ use glide_proto::{
 };
 use std::collections::HashMap;
 use std::net::SocketAddr;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
 use std::time::Duration;
 use tokio::net::lookup_host;
 use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
+
+struct AbortOnDrop(tokio::task::JoinHandle<()>);
+impl Drop for AbortOnDrop {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
 
 /// Resolves the target server socket address either from explicit `config.server`
 /// or by auto-discovering a running Glide server on the local network.
@@ -194,6 +203,32 @@ pub async fn run_client_session(
     let mut ctrl_send = session.ctrl_send;
     let mut ctrl_recv = session.ctrl_recv;
 
+    let max_file_bytes = Arc::new(AtomicUsize::new(config.resolved_max_file_bytes()));
+    let (bulk_tx, mut bulk_rx) = mpsc::channel::<BulkTransfer>(8);
+    let mut bulk_closed = false;
+    let bulk_conn = conn.clone();
+    let bulk_limit = Arc::clone(&max_file_bytes);
+    let _bulk_guard = AbortOnDrop(tokio::spawn(async move {
+        loop {
+            match recv_bulk_on_with_atomic_limit(&bulk_conn, &bulk_limit).await {
+                Ok(transfer) => {
+                    if bulk_tx.send(transfer).await.is_err() {
+                        break;
+                    }
+                }
+                Err(e) => {
+                    if bulk_conn.close_reason().is_some()
+                        || e.to_string().contains("bulk uni stream closed")
+                    {
+                        debug!(error = %e, "Remote bulk uni-stream loop ended");
+                        break;
+                    }
+                    warn!(error = %e, "Rejected incoming bulk transfer from server");
+                }
+            }
+        }
+    }));
+
     let session_result: Result<()> = loop {
         let dpi_mult = if config.auto_dpi_scale {
             (client_scale / server_scale).clamp(0.25, 4.0)
@@ -245,24 +280,41 @@ pub async fn run_client_session(
                             config.key_remap = key_remap;
                         }
                         RuntimeCommand::SendFile { filename, data } => {
-                            let limit = config.resolved_max_file_bytes();
-                            let payload = FilePayload {
-                                filename: filename.clone(),
-                                sha256: sha256_bytes(&data),
-                                data,
-                            };
-                            if let Some(rt) = runtime {
-                                rt.record_file("sent", filename, payload.data.len(), None);
+                            let limit = max_file_bytes.load(Ordering::Relaxed);
+                            if data.len() > limit {
+                                warn!(
+                                    file = %filename,
+                                    bytes = data.len(),
+                                    limit,
+                                    "Refusing to send file exceeding max_file_bytes limit"
+                                );
+                            } else {
+                                let byte_len = data.len();
+                                let payload = FilePayload {
+                                    filename: filename.clone(),
+                                    sha256: sha256_bytes(&data),
+                                    data,
+                                };
+                                let c = conn.clone();
+                                let rt_opt = runtime.cloned();
+                                tokio::spawn(async move {
+                                    match send_file_on_with_limit(&c, &payload, limit).await {
+                                        Ok(()) => {
+                                            if let Some(rt) = rt_opt {
+                                                rt.record_file("sent", filename, byte_len, None);
+                                            }
+                                        }
+                                        Err(e) => {
+                                            warn!(error = %e, "Failed beaming file to server");
+                                        }
+                                    }
+                                });
                             }
-                            let c = conn.clone();
-                            tokio::spawn(async move {
-                                if let Err(e) = send_file_on_with_limit(&c, &payload, limit).await {
-                                    warn!(error = %e, "Failed beaming file to server");
-                                }
-                            });
                         }
                         RuntimeCommand::UpdateMaxFileBytes(limit) => {
-                            config.max_file_bytes = Some(limit);
+                            let effective = limit.min(u32::MAX as usize);
+                            config.max_file_bytes = Some(effective);
+                            max_file_bytes.store(effective, Ordering::Relaxed);
                         }
                         RuntimeCommand::UpdateReceiveDir(dir) => {
                             config.receive_dir = dir;
@@ -478,9 +530,9 @@ pub async fn run_client_session(
                 }
             }
 
-            remote_bulk = recv_bulk_on_with_limit(&conn, config.resolved_max_file_bytes()) => {
+            remote_bulk = bulk_rx.recv(), if !bulk_closed => {
                 match remote_bulk {
-                    Ok(BulkTransfer::Clipboard(payload)) => {
+                    Some(BulkTransfer::Clipboard(payload)) => {
                         if config.clipboard {
                             if let Some(rt) = runtime {
                                 rt.record_clipboard("received", &payload);
@@ -493,7 +545,7 @@ pub async fn run_client_session(
                             }
                         }
                     }
-                    Ok(BulkTransfer::File(file)) => {
+                    Some(BulkTransfer::File(file)) => {
                         match config
                             .resolved_receive_dir()
                             .and_then(|dir| save_received_file(&dir, &file.filename, &file.data))
@@ -507,8 +559,8 @@ pub async fn run_client_session(
                             Err(e) => warn!(error = %e, "Failed saving received file"),
                         }
                     }
-                    Err(e) => {
-                        debug!(error = %e, "Remote bulk uni-stream loop ended");
+                    None => {
+                        bulk_closed = true;
                     }
                 }
             }

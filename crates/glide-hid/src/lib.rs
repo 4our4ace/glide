@@ -110,13 +110,16 @@ impl HidUsage {
 
     /// Look up from a Windows Set 1 scan code + E0 extended flag.
     pub fn from_win_scan(scan: WinScan) -> Option<Self> {
-        KEY_TABLE.iter().find(|e| e.win == scan).map(|e| e.hid)
+        KEY_TABLE
+            .iter()
+            .find(|e| e.win == Some(scan))
+            .map(|e| e.hid)
     }
 
     /// Convert to a Windows Set 1 scan code + E0 extended flag.
     pub fn to_win_scan(self) -> Option<WinScan> {
         let canon = self.canonicalize();
-        KEY_TABLE.iter().find(|e| e.hid == canon).map(|e| e.win)
+        KEY_TABLE.iter().find(|e| e.hid == canon).and_then(|e| e.win)
     }
 
     /// Convert to macOS virtual keycode (for future macOS backend).
@@ -325,19 +328,25 @@ mod tests {
                 entry.evdev,
                 entry.name
             );
-            assert!(
-                wins.insert(entry.win),
-                "Duplicate WinScan {:?} for {}",
-                entry.win,
-                entry.name
-            );
+            if let Some(win) = entry.win {
+                assert!(
+                    wins.insert(win),
+                    "Duplicate WinScan {:?} for {}",
+                    win,
+                    entry.name
+                );
+            }
             assert!(names.insert(entry.name), "Duplicate name {}", entry.name);
 
             // Round-trip checks
             assert_eq!(HidUsage::from_evdev(entry.evdev), Some(entry.hid));
             assert_eq!(entry.hid.to_evdev(), Some(entry.evdev));
-            assert_eq!(HidUsage::from_win_scan(entry.win), Some(entry.hid));
-            assert_eq!(entry.hid.to_win_scan(), Some(entry.win));
+            if let Some(win) = entry.win {
+                assert_eq!(HidUsage::from_win_scan(win), Some(entry.hid));
+                assert_eq!(entry.hid.to_win_scan(), Some(win));
+            } else {
+                assert_eq!(entry.hid.to_win_scan(), None);
+            }
         }
     }
 
@@ -409,11 +418,17 @@ mod tests {
             "MediaTrackNext",
             "MediaTrackPrev",
             "MediaStop",
+            "BrightnessDown",
+            "BrightnessUp",
         ] {
             let u = HidUsage::from_name(name).expect("known media key");
             assert!(u.is_media_key(), "{name} should be classified as media key");
         }
-        // Brightness Increment (0x006F) and Decrement (0x0070) on USB Consumer Control page 0x0C
+        // Brightness Decrement (0x0070) / Increment (0x006F) roundtrip with evdev 224/225 & X11 232/233
+        assert_eq!(HidUsage::from_evdev(224), Some(HidUsage::consumer(0x0070)));
+        assert_eq!(HidUsage::from_evdev(225), Some(HidUsage::consumer(0x006F)));
+        assert_eq!(HidUsage::from_x11_keycode(232), Some(HidUsage::consumer(0x0070)));
+        assert_eq!(HidUsage::from_x11_keycode(233), Some(HidUsage::consumer(0x006F)));
         assert!(HidUsage::consumer(0x006F).is_media_key());
         assert!(HidUsage::consumer(0x0070).is_media_key());
 

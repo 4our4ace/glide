@@ -3,7 +3,7 @@
 
 use crate::geometry::DesktopGeometry;
 use crate::linux_x11::{query_desktop_geometry, X11CursorHider};
-use crate::{CaptureConfig, CaptureControl, CaptureEvent, CaptureHandle};
+use crate::{CaptureConfig, CaptureControl, CaptureEvent, CaptureHandle, RemoteMediaKeyTracker};
 use anyhow::{Context, Result};
 use glide_hid::{HidUsage, ModifierMask, MouseButton};
 use glide_proto::{Edge, LockState};
@@ -17,8 +17,9 @@ use tracing::{debug, trace, warn};
 use x11rb::connection::Connection;
 use x11rb::protocol::xinput::{self, ConnectionExt as XInputExt, EventMask, Fp3232, XIEventMask};
 use x11rb::protocol::xproto::{
-    AtomEnum, ClientMessageData, ClientMessageEvent, ConnectionExt as XProtoExt, CreateWindowAux,
-    Cursor, EventMask as CoreEventMask, GrabMode, Window, WindowClass, CLIENT_MESSAGE_EVENT,
+    Allow, AtomEnum, ClientMessageData, ClientMessageEvent, ConnectionExt as XProtoExt,
+    CreateWindowAux, Cursor, EventMask as CoreEventMask, GrabMode, GrabStatus, Window, WindowClass,
+    CLIENT_MESSAGE_EVENT,
 };
 use x11rb::protocol::Event;
 use x11rb::rust_connection::RustConnection;
@@ -326,6 +327,8 @@ pub fn start_x11_capture(config: CaptureConfig) -> Result<CaptureHandle> {
     let geometry = query_desktop_geometry(&conn, screen_num)?;
 
     let ctrl_win = conn.generate_id()?;
+    let ctrl_aux =
+        CreateWindowAux::new().event_mask(CoreEventMask::KEY_PRESS | CoreEventMask::KEY_RELEASE);
     conn.create_window(
         0,
         ctrl_win,
@@ -337,7 +340,7 @@ pub fn start_x11_capture(config: CaptureConfig) -> Result<CaptureHandle> {
         0,
         WindowClass::INPUT_ONLY,
         0,
-        &CreateWindowAux::new(),
+        &ctrl_aux,
     )?;
     conn.map_window(ctrl_win)?;
 
@@ -411,6 +414,49 @@ pub fn start_x11_capture(config: CaptureConfig) -> Result<CaptureHandle> {
     })
 }
 
+/// Returns `true` if a grabbed X11 `KeyPress` should be replayed to the local desktop so passive
+/// root `XGrabKey` bindings (`gnome-settings-daemon`, `kglobalaccel`, etc.) handle locally-pinned
+/// media and brightness keys instead of having them swallowed by our grab.
+fn should_replay_x11_key_press(
+    keycode: u8,
+    remote_mode: bool,
+    pin_media_keys_local: bool,
+    media_tracker: &RemoteMediaKeyTracker,
+) -> bool {
+    if !remote_mode || !pin_media_keys_local {
+        return false;
+    }
+    match HidUsage::from_x11_keycode(keycode) {
+        Some(usage) => usage.is_media_key() && !media_tracker.is_forwarded(usage),
+        None => false,
+    }
+}
+
+/// Acquires an active synchronous keyboard grab on `ctrl_win` and immediately arms
+/// `Allow::SYNC_KEYBOARD` so each subsequent `KeyPress`/`KeyRelease` is delivered to `ctrl_win`
+/// (freezing on delivery so we can inspect and either `SYNC_KEYBOARD` or `REPLAY_KEYBOARD`).
+fn grab_keyboard_sync(conn: &RustConnection, ctrl_win: Window, kbd_grabbed: &mut bool) {
+    if *kbd_grabbed {
+        return;
+    }
+    let ok = conn
+        .grab_keyboard(
+            false,
+            ctrl_win,
+            x11rb::CURRENT_TIME,
+            GrabMode::ASYNC,
+            GrabMode::SYNC,
+        )
+        .ok()
+        .and_then(|c| c.reply().ok())
+        .is_some_and(|r| r.status == GrabStatus::SUCCESS);
+    if ok {
+        let _ = conn.allow_events(Allow::SYNC_KEYBOARD, x11rb::CURRENT_TIME);
+        let _ = conn.flush();
+        *kbd_grabbed = true;
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn run_capture_loop(
     conn: Arc<RustConnection>,
@@ -425,6 +471,7 @@ fn run_capture_loop(
     tx: mpsc::UnboundedSender<CaptureEvent>,
 ) {
     let mut grabbed = false;
+    let mut kbd_grabbed = false;
     let mut cursor_hider = X11CursorHider::init(&conn);
     let mut edge_push_edge: Option<Edge> = None;
     let mut edge_push_accum: f32 = 0.0;
@@ -432,52 +479,55 @@ fn run_capture_loop(
     let mut last_geom_refresh = Instant::now();
     let mut last_local_query = Instant::now();
     let mut mods = ModifierMask::EMPTY;
+    let mut media_tracker = RemoteMediaKeyTracker::new();
 
     let do_grab = |conn: &RustConnection,
                    shared: &SharedState,
                    grabbed: &mut bool,
+                   kbd_grabbed: &mut bool,
                    cursor_hider: &mut X11CursorHider| {
-        if *grabbed {
-            return;
+        if !*grabbed {
+            let pointer_mask = CoreEventMask::BUTTON_PRESS
+                | CoreEventMask::BUTTON_RELEASE
+                | CoreEventMask::POINTER_MOTION;
+            let _ = conn.grab_pointer(
+                false,
+                ctrl_win,
+                pointer_mask,
+                GrabMode::ASYNC,
+                GrabMode::ASYNC,
+                x11rb::NONE,
+                blank_cursor,
+                x11rb::CURRENT_TIME,
+            );
+            let (cx, cy) = shared.geometry.lock().primary_center();
+            let _ = conn.warp_pointer(x11rb::NONE, root, 0, 0, 0, 0, cx as i16, cy as i16);
+            cursor_hider.hide(conn, root);
+            *grabbed = true;
         }
-        let pointer_mask = CoreEventMask::BUTTON_PRESS
-            | CoreEventMask::BUTTON_RELEASE
-            | CoreEventMask::POINTER_MOTION;
-        let _ = conn.grab_pointer(
-            false,
-            ctrl_win,
-            pointer_mask,
-            GrabMode::ASYNC,
-            GrabMode::ASYNC,
-            x11rb::NONE,
-            blank_cursor,
-            x11rb::CURRENT_TIME,
-        );
-        let _ = conn.grab_keyboard(
-            false,
-            ctrl_win,
-            x11rb::CURRENT_TIME,
-            GrabMode::ASYNC,
-            GrabMode::ASYNC,
-        );
-        let (cx, cy) = shared.geometry.lock().primary_center();
-        let _ = conn.warp_pointer(x11rb::NONE, root, 0, 0, 0, 0, cx as i16, cy as i16);
-        cursor_hider.hide(conn, root);
+        grab_keyboard_sync(conn, ctrl_win, kbd_grabbed);
         let _ = conn.flush();
-        *grabbed = true;
-        debug!("X11Capture grabbed pointer & keyboard (remote mode)");
+        debug!("X11Capture grabbed pointer & sync keyboard (remote mode)");
     };
 
     let do_ungrab = |conn: &RustConnection,
                      shared: &SharedState,
                      grabbed: &mut bool,
+                     kbd_grabbed: &mut bool,
+                     media_tracker: &mut RemoteMediaKeyTracker,
                      cursor_hider: &mut X11CursorHider,
                      target: Option<LeaveTarget>| {
+        if *kbd_grabbed {
+            // Always thaw any frozen synchronous keyboard grab before ungrabbing!
+            let _ = conn.allow_events(Allow::ASYNC_KEYBOARD, x11rb::CURRENT_TIME);
+            let _ = conn.ungrab_keyboard(x11rb::CURRENT_TIME);
+            *kbd_grabbed = false;
+        }
         if *grabbed {
             let _ = conn.ungrab_pointer(x11rb::CURRENT_TIME);
-            let _ = conn.ungrab_keyboard(x11rb::CURRENT_TIME);
             *grabbed = false;
         }
+        media_tracker.clear();
         if let Some(t) = target {
             let geom = shared.geometry.lock().clone();
             let (x, y) = match t {
@@ -511,15 +561,56 @@ fn run_capture_loop(
             Event::ClientMessage(cm) if cm.type_ == wake_atom => {
                 let cmd = cm.data.as_data32()[0];
                 match cmd {
-                    CMD_ENTER_REMOTE => do_grab(&conn, &shared, &mut grabbed, &mut cursor_hider),
+                    CMD_ENTER_REMOTE => {
+                        do_grab(
+                            &conn,
+                            &shared,
+                            &mut grabbed,
+                            &mut kbd_grabbed,
+                            &mut cursor_hider,
+                        );
+                    }
                     CMD_LEAVE_REMOTE => {
                         let leave = shared.pending_leave.lock().take();
                         edge_push_edge = None;
                         edge_push_accum = 0.0;
                         edge_dwell_start = None;
-                        do_ungrab(&conn, &shared, &mut grabbed, &mut cursor_hider, leave);
+                        do_ungrab(
+                            &conn,
+                            &shared,
+                            &mut grabbed,
+                            &mut kbd_grabbed,
+                            &mut media_tracker,
+                            &mut cursor_hider,
+                            leave,
+                        );
                     }
                     _ => {}
+                }
+            }
+            Event::KeyPress(kp) => {
+                if !kbd_grabbed {
+                    continue;
+                }
+                if should_replay_x11_key_press(
+                    kp.detail,
+                    shared.remote_mode.load(Ordering::Acquire),
+                    shared.pin_media_keys_local.load(Ordering::Relaxed),
+                    &media_tracker,
+                ) {
+                    let _ = conn.allow_events(Allow::REPLAY_KEYBOARD, kp.time);
+                    let _ = conn.flush();
+                    kbd_grabbed = false;
+                    grab_keyboard_sync(&conn, ctrl_win, &mut kbd_grabbed);
+                } else {
+                    let _ = conn.allow_events(Allow::SYNC_KEYBOARD, kp.time);
+                    let _ = conn.flush();
+                }
+            }
+            Event::KeyRelease(kr) => {
+                if kbd_grabbed {
+                    let _ = conn.allow_events(Allow::SYNC_KEYBOARD, kr.time);
+                    let _ = conn.flush();
                 }
             }
             Event::XinputRawMotion(rm) => {
@@ -529,7 +620,13 @@ fn run_capture_loop(
                 }
                 if shared.remote_mode.load(Ordering::Acquire) {
                     if !grabbed {
-                        do_grab(&conn, &shared, &mut grabbed, &mut cursor_hider);
+                        do_grab(
+                            &conn,
+                            &shared,
+                            &mut grabbed,
+                            &mut kbd_grabbed,
+                            &mut cursor_hider,
+                        );
                     }
                     let _ = tx.send(CaptureEvent::MouseDelta { dx, dy });
                 } else {
@@ -611,7 +708,13 @@ fn run_capture_loop(
                         edge_push_accum = 0.0;
                         edge_dwell_start = None;
                         shared.remote_mode.store(true, Ordering::SeqCst);
-                        do_grab(&conn, &shared, &mut grabbed, &mut cursor_hider);
+                        do_grab(
+                            &conn,
+                            &shared,
+                            &mut grabbed,
+                            &mut kbd_grabbed,
+                            &mut cursor_hider,
+                        );
                         let _ = tx.send(CaptureEvent::EdgeCrossed {
                             edge,
                             normalized_pos,
@@ -688,15 +791,27 @@ fn run_capture_loop(
             }
             Event::XinputRawKeyPress(rk) => {
                 let kc = rk.detail as u8;
+                let remote = shared.remote_mode.load(Ordering::Acquire);
                 let Some(usage) = HidUsage::from_x11_keycode(kc) else {
+                    if remote && !kbd_grabbed {
+                        grab_keyboard_sync(&conn, ctrl_win, &mut kbd_grabbed);
+                    }
                     trace!(kc, "Unmapped X11 keycode on press");
                     continue;
                 };
                 mods.update(usage, true);
 
-                if usage == config.escape_key && shared.remote_mode.load(Ordering::Acquire) {
+                if usage == config.escape_key && remote {
                     shared.remote_mode.store(false, Ordering::SeqCst);
-                    do_ungrab(&conn, &shared, &mut grabbed, &mut cursor_hider, None);
+                    do_ungrab(
+                        &conn,
+                        &shared,
+                        &mut grabbed,
+                        &mut kbd_grabbed,
+                        &mut media_tracker,
+                        &mut cursor_hider,
+                        None,
+                    );
                     let _ = tx.send(CaptureEvent::EscapeHotkey);
                     continue;
                 }
@@ -714,32 +829,40 @@ fn run_capture_loop(
                     }
                 }
 
-                if shared.remote_mode.load(Ordering::Acquire)
-                    && crate::should_forward_key_in_remote(
-                        usage,
-                        shared.pin_media_keys_local.load(Ordering::Relaxed),
-                    )
-                {
-                    let _ = tx.send(CaptureEvent::Key {
-                        usage,
-                        pressed: true,
-                    });
+                if remote {
+                    let pin = shared.pin_media_keys_local.load(Ordering::Relaxed);
+                    if media_tracker.should_forward(usage, true, pin) {
+                        if !kbd_grabbed {
+                            grab_keyboard_sync(&conn, ctrl_win, &mut kbd_grabbed);
+                        }
+                        let _ = tx.send(CaptureEvent::Key {
+                            usage,
+                            pressed: true,
+                        });
+                    }
                 }
             }
             Event::XinputRawKeyRelease(rk) => {
                 let kc = rk.detail as u8;
+                let remote = shared.remote_mode.load(Ordering::Acquire);
+                if remote && !kbd_grabbed {
+                    // Re-acquire our synchronous keyboard grab after a replayed media key's
+                    // passive WM grab automatically releases on KeyRelease.
+                    grab_keyboard_sync(&conn, ctrl_win, &mut kbd_grabbed);
+                }
                 let Some(usage) = HidUsage::from_x11_keycode(kc) else {
                     continue;
                 };
                 mods.update(usage, false);
-                if !shared.remote_mode.load(Ordering::Acquire) {
+                if !remote {
                     continue;
                 }
                 if usage == config.escape_key {
                     continue;
                 }
-                if !crate::should_forward_key_in_remote(
+                if !media_tracker.should_forward(
                     usage,
+                    false,
                     shared.pin_media_keys_local.load(Ordering::Relaxed),
                 ) {
                     continue;
@@ -753,9 +876,12 @@ fn run_capture_loop(
         }
     }
 
+    if kbd_grabbed {
+        let _ = conn.allow_events(Allow::ASYNC_KEYBOARD, x11rb::CURRENT_TIME);
+        let _ = conn.ungrab_keyboard(x11rb::CURRENT_TIME);
+    }
     if grabbed {
         let _ = conn.ungrab_pointer(x11rb::CURRENT_TIME);
-        let _ = conn.ungrab_keyboard(x11rb::CURRENT_TIME);
     }
     cursor_hider.show(&conn, root);
     let _ = conn.flush();
@@ -833,5 +959,49 @@ mod tests {
         ));
         assert!(!wm_window_type_is_desktop(&[ATOM_NORMAL], ATOM_DESKTOP));
         assert!(!wm_window_type_is_desktop(&[ATOM_DESKTOP], x11rb::NONE));
+    }
+
+    #[test]
+    fn x11_sync_replay_respects_pin_setting_brightness_and_forwarded_tracker() {
+        let mut tracker = RemoteMediaKeyTracker::new();
+        let vol_up_kc = HidUsage::from_name("AudioVolumeUp")
+            .unwrap()
+            .to_x11_keycode()
+            .unwrap();
+        let bright_up_kc = HidUsage::from_name("BrightnessUp")
+            .unwrap()
+            .to_x11_keycode()
+            .unwrap();
+        let key_a_kc = HidUsage::from_name("KeyA")
+            .unwrap()
+            .to_x11_keycode()
+            .unwrap();
+
+        // In remote mode with pin=true, media & brightness keys replay to passive WM grabs
+        assert!(should_replay_x11_key_press(vol_up_kc, true, true, &tracker));
+        assert!(should_replay_x11_key_press(
+            bright_up_kc,
+            true,
+            true,
+            &tracker
+        ));
+        // Standard keyboard keys never replay
+        assert!(!should_replay_x11_key_press(key_a_kc, true, true, &tracker));
+        // When pin=false or not in remote mode, nothing replays
+        assert!(!should_replay_x11_key_press(
+            vol_up_kc, false, true, &tracker
+        ));
+        assert!(!should_replay_x11_key_press(
+            vol_up_kc, true, false, &tracker
+        ));
+
+        // If a media key was ALREADY forwarded while pin=false, toggling pin=true mid-hold
+        // must NOT replay its repeat presses locally until released!
+        let vol_up = HidUsage::from_x11_keycode(vol_up_kc).unwrap();
+        assert!(tracker.should_forward(vol_up, true, false));
+        assert!(!should_replay_x11_key_press(vol_up_kc, true, true, &tracker));
+        // Once released, future presses replay locally again
+        assert!(tracker.should_forward(vol_up, false, true));
+        assert!(should_replay_x11_key_press(vol_up_kc, true, true, &tracker));
     }
 }

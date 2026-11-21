@@ -8,7 +8,10 @@
 
 use crate::geometry::DesktopGeometry;
 use crate::windows::{init_dpi_awareness, query_desktop_geometry, GLIDE_EXTRA_INFO};
-use crate::{CaptureConfig, CaptureControl, CaptureEvent, CaptureHandle};
+use crate::{
+    is_windows_consumer_or_media_vk, CaptureConfig, CaptureControl, CaptureEvent, CaptureHandle,
+    RemoteMediaKeyTracker,
+};
 use anyhow::{anyhow, Context, Result};
 use glide_hid::{is_windows_fake_altgr_lctrl, HidUsage, ModifierMask, MouseButton, WinScan};
 use glide_proto::{Edge, LockState};
@@ -64,6 +67,7 @@ struct HookState {
     auto_lock_fullscreen: AtomicBool,
     sync_lock_keys: AtomicBool,
     pin_media_keys_local: AtomicBool,
+    forwarded_media_keys: Mutex<RemoteMediaKeyTracker>,
     edge_threshold_px: AtomicI32,
     dead_corner_px: AtomicI32,
     edge_dwell_ms: AtomicU64,
@@ -198,6 +202,7 @@ impl CaptureControl for WindowsCaptureControl {
     fn leave_remote(&self, return_edge: Edge, normalized_pos: f32) -> Result<()> {
         *self.state.pending_leave.lock() = Some(LeaveTarget::Edge(return_edge, normalized_pos));
         self.state.remote_mode.store(false, Ordering::SeqCst);
+        self.state.forwarded_media_keys.lock().clear();
         let hwnd = self.hwnd.load(Ordering::Acquire) as HWND;
         if !hwnd.is_null() {
             unsafe {
@@ -210,6 +215,7 @@ impl CaptureControl for WindowsCaptureControl {
     fn leave_remote_at(&self, norm_x: f32, norm_y: f32) -> Result<()> {
         *self.state.pending_leave.lock() = Some(LeaveTarget::Point(norm_x, norm_y));
         self.state.remote_mode.store(false, Ordering::SeqCst);
+        self.state.forwarded_media_keys.lock().clear();
         let hwnd = self.hwnd.load(Ordering::Acquire) as HWND;
         if !hwnd.is_null() {
             unsafe {
@@ -337,6 +343,12 @@ unsafe extern "system" fn keyboard_ll_proc(code: i32, wparam: WPARAM, lparam: LP
                     }
 
                     let Some(usage) = translate_ll_key(kb.vkCode, kb.scanCode, kb.flags) else {
+                        if remote
+                            && state.pin_media_keys_local.load(Ordering::Relaxed)
+                            && is_windows_consumer_or_media_vk(kb.vkCode, kb.scanCode, kb.flags)
+                        {
+                            return false;
+                        }
                         trace!(
                             vk = kb.vkCode,
                             scan = kb.scanCode,
@@ -354,6 +366,7 @@ unsafe extern "system" fn keyboard_ll_proc(code: i32, wparam: WPARAM, lparam: LP
                     if usage == state.config.escape_key {
                         if pressed && remote {
                             state.remote_mode.store(false, Ordering::SeqCst);
+                            state.forwarded_media_keys.lock().clear();
                             let _ = state.tx.send(CaptureEvent::EscapeHotkey);
                             return true;
                         }
@@ -379,10 +392,13 @@ unsafe extern "system" fn keyboard_ll_proc(code: i32, wparam: WPARAM, lparam: LP
                     }
 
                     if remote {
-                        if !crate::should_forward_key_in_remote(
-                            usage,
-                            state.pin_media_keys_local.load(Ordering::Relaxed),
-                        ) {
+                        if usage.is_media_key()
+                            && !state.forwarded_media_keys.lock().should_forward(
+                                usage,
+                                pressed,
+                                state.pin_media_keys_local.load(Ordering::Relaxed),
+                            )
+                        {
                             return false;
                         }
                         let _ = state.tx.send(CaptureEvent::Key { usage, pressed });
@@ -696,6 +712,7 @@ pub fn start_windows_capture(config: CaptureConfig) -> Result<CaptureHandle> {
         auto_lock_fullscreen: AtomicBool::new(config.auto_lock_fullscreen),
         sync_lock_keys: AtomicBool::new(config.sync_lock_keys),
         pin_media_keys_local: AtomicBool::new(config.pin_media_keys_local),
+        forwarded_media_keys: Mutex::new(RemoteMediaKeyTracker::new()),
         config,
         tx,
         active_edges: Mutex::new(Vec::new()),
