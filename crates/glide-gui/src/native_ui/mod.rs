@@ -2026,11 +2026,17 @@ const SCENES: &[(&str, SceneFn)] = &[
         s.theme = ThemePref::Light;
         s.tab = Tab::Input;
         s.role = Role::Client;
+        s.is_windows = false;
+        s.os_kind = OsKind::LinuxX11;
+        s.os_label = "Linux";
     }),
     ("input-client-dark", |s| {
         s.theme = ThemePref::Dark;
         s.tab = Tab::Input;
         s.role = Role::Client;
+        s.is_windows = false;
+        s.os_kind = OsKind::LinuxX11;
+        s.os_label = "Linux";
         s.config.client.key_remap.push(KeyRemapRule {
             from: "CapsLock".into(),
             to: "Escape".into(),
