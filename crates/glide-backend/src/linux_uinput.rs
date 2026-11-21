@@ -417,8 +417,10 @@ impl InputInjector for UinputInjector {
     }
 
     fn cursor_norm(&mut self) -> (f32, f32) {
-        self.geometry
-            .normalize_point(self.est_x.round() as i32, self.est_y.round() as i32)
+        let (x, y) = self
+            .sync_pointer()
+            .unwrap_or((self.est_x.round() as i32, self.est_y.round() as i32));
+        self.geometry.normalize_point(x, y)
     }
 
     fn sync_lock_state(&mut self, desired: LockState) -> Result<()> {
@@ -485,22 +487,33 @@ impl InputInjector for UinputInjector {
             return Ok(None);
         }
 
-        // Normal mouse motion anywhere away from the return edge (> 48px) executes ZERO
-        // blocking X11 roundtrips (kernel uinput write only).
+        // Keep a low-frequency outward calibration sync (> 48px: 150ms) so nonlinear Xorg/libinput
+        // acceleration or multi-monitor gaps can never leave est_x/est_y permanently drifted away
+        // from the real cursor at the return edge, while keeping near-edge checks responsive.
         let dist = self.geometry.distance_to_edge(
             edge,
             self.est_x.round() as i32,
             self.est_y.round() as i32,
         );
-        if dist > 48 {
-            self.edge_push_accum = 0.0;
-            return Ok(None);
-        }
 
         let mut synced_this_call = false;
         if should_sync_x11_pointer(dist, self.edge_push_accum, self.last_pointer_sync.elapsed()) {
             let _ = self.sync_pointer()?;
             synced_this_call = true;
+        }
+
+        let dist = if synced_this_call {
+            self.geometry.distance_to_edge(
+                edge,
+                self.est_x.round() as i32,
+                self.est_y.round() as i32,
+            )
+        } else {
+            dist
+        };
+        if dist > 48 {
+            self.edge_push_accum = 0.0;
+            return Ok(None);
         }
 
         let px = self.est_x.round() as i32;

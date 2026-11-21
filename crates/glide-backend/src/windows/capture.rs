@@ -69,8 +69,8 @@ const VK_SNAPSHOT_CODE: u32 = 0x2C;
 const VK_NUMLOCK_CODE: u32 = 0x90;
 const VK_RSHIFT_CODE: u32 = 0xA1;
 
-/// Minimum squared movement (8 px) from `WM_LBUTTONDOWN` origin before arming DnD edge strips.
-const DRAG_ARM_MIN_MOVE_SQ: i64 = 64;
+/// Minimum squared movement (4 px = Win32 `SM_CXDRAG`) from `WM_LBUTTONDOWN` origin before arming DnD edge strips.
+const DRAG_ARM_MIN_MOVE_SQ: i64 = 16;
 /// Distance (px) from an active outer edge at which an active drag arms the pre-created 4px strip.
 const DRAG_ARM_EDGE_DIST_PX: i32 = 160;
 /// Hysteresis distance (px) beyond which a retreating drag disarms the edge strip.
@@ -781,7 +781,7 @@ unsafe extern "system" fn mouse_ll_proc(code: i32, wparam: WPARAM, lparam: LPARA
                             };
                             // Record press origin and defer arming the WS_EX_TOPMOST|WS_EX_LAYERED
                             // edge strip (and fullscreen check) until the user actually drags
-                            // >= 8 px within 160 px of an active edge — eliminating per-click
+                            // >= 4 px within 160 px of an active edge — eliminating per-click
                             // DWM/MPO composition hitches on normal clicks and fullscreen apps.
                             state.lmb_down_x.store(ms.pt.x, Ordering::Relaxed);
                             state.lmb_down_y.store(ms.pt.y, Ordering::Relaxed);
@@ -979,7 +979,7 @@ fn process_local_edge_motion(state: &HookState, dx: f32, dy: f32, pt: POINT) -> 
     let block_drag_arm = state.lmb_block_drag_arm.load(Ordering::Relaxed);
 
     // Lazily arm the pre-created 4px edge-strip drop targets ONLY when an interior LMB drag has
-    // moved >= 8 px from its press origin and approaches within 160 px of an active outer edge
+    // moved >= 4 px from its press origin and approaches within 160 px of an active outer edge
     // (checking fullscreen status at most once per drag hold), and disarm if retreating past
     // 220 px or once LMB releases / DnD is disabled.
     if lmb_down && dnd_enabled && !started_on_edge && !block_drag_arm {

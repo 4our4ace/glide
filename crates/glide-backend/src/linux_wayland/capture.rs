@@ -28,7 +28,7 @@ use std::collections::{HashMap, HashSet};
 use std::io;
 use std::os::fd::AsRawFd;
 use std::os::unix::net::UnixStream;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::mpsc;
@@ -212,6 +212,7 @@ struct SharedState {
     dead_corner_px: Mutex<i32>,
     locked: AtomicBool,
     in_remote: AtomicBool,
+    remote_gen: AtomicU64,
     pin_media_keys_local: AtomicBool,
     hotkeys: AtomicHotkeys,
     activation_id: Mutex<Option<u32>>,
@@ -264,11 +265,13 @@ impl CaptureControl for WaylandCaptureControl {
 
     fn enter_remote(&self) -> Result<()> {
         self.shared.in_remote.store(true, Ordering::SeqCst);
+        self.shared.remote_gen.fetch_add(1, Ordering::AcqRel);
         Ok(())
     }
 
     fn leave_remote(&self, return_edge: Edge, normalized_pos: f32) -> Result<()> {
         self.shared.in_remote.store(false, Ordering::SeqCst);
+        self.shared.remote_gen.fetch_add(1, Ordering::AcqRel);
         let (x, y) = self
             .shared
             .geometry
@@ -283,6 +286,7 @@ impl CaptureControl for WaylandCaptureControl {
 
     fn leave_remote_at(&self, norm_x: f32, norm_y: f32) -> Result<()> {
         self.shared.in_remote.store(false, Ordering::SeqCst);
+        self.shared.remote_gen.fetch_add(1, Ordering::AcqRel);
         let (x, y) = self
             .shared
             .geometry
@@ -521,6 +525,7 @@ fn start_wayland_capture_blocking(config: CaptureConfig) -> Result<CaptureHandle
         dead_corner_px: Mutex::new(config.dead_corner_px),
         locked: AtomicBool::new(false),
         in_remote: AtomicBool::new(false),
+        remote_gen: AtomicU64::new(0),
         pin_media_keys_local: AtomicBool::new(config.pin_media_keys_local),
         hotkeys: AtomicHotkeys::new(config.hotkeys),
         activation_id: Mutex::new(None),
@@ -611,6 +616,7 @@ fn start_wayland_capture_blocking(config: CaptureConfig) -> Result<CaptureHandle
                                 if let Some(edge) = edge_opt {
                                     let norm = normalize_barrier_hit(&geom, edge, cx, cy);
                                     shared_sig.in_remote.store(true, Ordering::SeqCst);
+                                    shared_sig.remote_gen.fetch_add(1, Ordering::AcqRel);
                                     let _ = ev_tx_sig.send(CaptureEvent::EdgeCrossed {
                                         edge,
                                         normalized_pos: norm,
@@ -621,6 +627,7 @@ fn start_wayland_capture_blocking(config: CaptureConfig) -> Result<CaptureHandle
                             }
                             "Deactivated" | "Disabled" => {
                                 if shared_sig.in_remote.swap(false, Ordering::SeqCst) {
+                                    shared_sig.remote_gen.fetch_add(1, Ordering::AcqRel);
                                     debug!(
                                         signal = %member,
                                         "Wayland InputCapture ended by compositor; releasing remote session"
@@ -723,16 +730,19 @@ fn start_wayland_capture_blocking(config: CaptureConfig) -> Result<CaptureHandle
             let hotkey_suppressor = AtomicHotkeySuppressor::new();
             let mut media_tracker = RemoteMediaKeyTracker::new();
             let mut was_in_remote = false;
+            let mut last_remote_gen = shared_eis.remote_gen.load(Ordering::Acquire);
             let mut scroll_acc_x: f32 = 0.0;
             let mut scroll_acc_y: f32 = 0.0;
 
             let fd = ei_ctx.as_raw_fd();
             loop {
                 let in_remote_now = shared_eis.in_remote.load(Ordering::Acquire);
-                if was_in_remote && !in_remote_now {
+                let current_gen = shared_eis.remote_gen.load(Ordering::Acquire);
+                if last_remote_gen != current_gen || (was_in_remote && !in_remote_now) {
                     media_tracker.clear();
                     held_keys.clear();
                     hotkey_suppressor.clear();
+                    last_remote_gen = current_gen;
                 }
                 was_in_remote = in_remote_now;
 
@@ -761,6 +771,12 @@ fn start_wayland_capture_blocking(config: CaptureConfig) -> Result<CaptureHandle
                                     | DeviceCapability::Keyboard,
                             );
                             let _ = ei_ctx.flush();
+                        }
+                        EiEvent::DevicePaused(_) => {
+                            media_tracker.clear();
+                            held_keys.clear();
+                            hotkey_suppressor.clear();
+                            last_remote_gen = shared_eis.remote_gen.load(Ordering::Acquire);
                         }
                         EiEvent::PointerMotion(m) => {
                             if shared_eis.in_remote.load(Ordering::Relaxed)
@@ -821,6 +837,13 @@ fn start_wayland_capture_blocking(config: CaptureConfig) -> Result<CaptureHandle
                             }
                         }
                         EiEvent::KeyboardKey(k) => {
+                            let current_gen = shared_eis.remote_gen.load(Ordering::Acquire);
+                            if last_remote_gen != current_gen {
+                                media_tracker.clear();
+                                held_keys.clear();
+                                hotkey_suppressor.clear();
+                                last_remote_gen = current_gen;
+                            }
                             let pressed = k.state == ei::keyboard::KeyState::Press;
                             let Some(usage) = HidUsage::from_evdev(k.key as u16) else {
                                 continue;
@@ -845,7 +868,13 @@ fn start_wayland_capture_blocking(config: CaptureConfig) -> Result<CaptureHandle
                             ) {
                                 HotkeyMatch::Trigger(HotkeyAction::Escape) => {
                                     shared_eis.in_remote.store(false, Ordering::SeqCst);
+                                    last_remote_gen = shared_eis
+                                        .remote_gen
+                                        .fetch_add(1, Ordering::AcqRel)
+                                        .wrapping_add(1);
                                     media_tracker.clear();
+                                    held_keys.clear();
+                                    hotkey_suppressor.clear();
                                     was_in_remote = false;
                                     if ev_tx.send(CaptureEvent::EscapeHotkey).is_err() {
                                         return;

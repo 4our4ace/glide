@@ -1569,6 +1569,237 @@ fn build_ignore_list(
 }
 
 #[allow(clippy::too_many_arguments)]
+fn drain_x11_dnd_events(
+    conn: &RustConnection,
+    screen_num: usize,
+    root: Window,
+    atoms: &XdndAtoms,
+    shared: &SharedX11Dnd,
+    cached_geom: &mut DesktopGeometry,
+    strips: &mut Vec<StripWin>,
+    active_inbound: &mut Option<ActiveEdgeInbound>,
+    clipboard_offer: &mut Option<ClipboardOffer>,
+    preview: &mut Option<X11DragPreview>,
+    live_xdnd: &mut Option<ActiveLiveXdnd>,
+) -> bool {
+    loop {
+        let ev = match conn.poll_for_event() {
+            Ok(Some(ev)) => ev,
+            Ok(None) => return true,
+            Err(e) => {
+                debug!(error = %e, "X11 DnD connection closed");
+                return false;
+            }
+        };
+
+        match ev {
+            Event::RandrScreenChangeNotify(_) | Event::RandrNotify(_) => {
+                if let Ok(new_geom) = query_desktop_geometry(conn, screen_num) {
+                    if new_geom != *cached_geom {
+                        *cached_geom = new_geom;
+                        if let Some(ref mut p) = preview {
+                            p.geom = cached_geom.clone();
+                        }
+                        sync_x11_strips(conn, root, atoms, shared, cached_geom, strips);
+                    }
+                }
+            }
+
+            // --- Live drag-in: XdndStatus feedback from hovered target ---
+            Event::ClientMessage(cm) if cm.type_ == atoms.xdnd_status => {
+                if let Some(ref mut live) = live_xdnd {
+                    let d = cm.data.as_data32();
+                    if let Some((target_win, send_win, _)) = live.target {
+                        if d[0] == target_win || d[0] == send_win {
+                            let accepted = (d[1] & 1) != 0;
+                            live.accepted = accepted;
+                            if let Some(ref mut p) = preview {
+                                p.set_status(
+                                    conn,
+                                    if accepted {
+                                        X11PreviewStatus::Accepted
+                                    } else {
+                                        X11PreviewStatus::Rejected
+                                    },
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+
+            Event::Expose(exp) => {
+                if let Some(ref p) = preview {
+                    if exp.window == p.win {
+                        p.draw(conn);
+                    }
+                }
+            }
+
+            // --- Drag-out: edge-strip XdndEnter ---
+            Event::ClientMessage(cm) if cm.type_ == atoms.xdnd_enter => {
+                let Some(strip) = strips.iter().find(|s| s.win == cm.window) else {
+                    continue;
+                };
+                let d = cm.data.as_data32();
+                let source_win = d[0];
+                let edge = strip.rect.edge;
+                let has_uri = offered_types_include_uri_list(conn, atoms, source_win, d);
+                if has_uri {
+                    debug!(?edge, source_win, "XdndEnter with text/uri-list on X11 edge strip");
+                    let _ = conn.convert_selection(
+                        cm.window,
+                        atoms.xdnd_selection,
+                        atoms.text_uri_list,
+                        atoms.prop_data,
+                        x11rb::CURRENT_TIME,
+                    );
+                    let _ = conn.flush();
+                    *active_inbound = Some(ActiveEdgeInbound {
+                        edge,
+                        strip_win: cm.window,
+                        source_win,
+                        has_uri_list: true,
+                        requested_selection: true,
+                    });
+                } else {
+                    // Non-file XDND drag (e.g. text or tab): reject and hide strip immediately.
+                    send_xdnd_status(conn, atoms, source_win, cm.window, false);
+                    shared.armed.store(false, Ordering::SeqCst);
+                    unmap_strips(conn, strips);
+                    *active_inbound = None;
+                }
+            }
+
+            // --- Drag-out: edge-strip XdndPosition ---
+            Event::ClientMessage(cm) if cm.type_ == atoms.xdnd_position => {
+                let d = cm.data.as_data32();
+                let source_win = d[0];
+                let time = d[3];
+                if let Some(ref mut inb) = active_inbound {
+                    if inb.strip_win == cm.window && inb.source_win == source_win && inb.has_uri_list
+                    {
+                        let already_staged = shared
+                            .staged
+                            .lock()
+                            .as_ref()
+                            .is_some_and(|s| s.edge == inb.edge);
+                        if !already_staged && (!inb.requested_selection || time != 0) {
+                            inb.requested_selection = true;
+                            let _ = conn.convert_selection(
+                                cm.window,
+                                atoms.xdnd_selection,
+                                atoms.text_uri_list,
+                                atoms.prop_data,
+                                if time != 0 { time } else { x11rb::CURRENT_TIME },
+                            );
+                        }
+                        if let Some(ref mut staged) = *shared.staged.lock() {
+                            if staged.edge == inb.edge {
+                                staged.staged_at = Instant::now();
+                                staged.left_at = None;
+                                shared.staged_tracker.touch(inb.edge);
+                            }
+                        }
+                        send_xdnd_status(conn, atoms, source_win, cm.window, true);
+                        continue;
+                    }
+                }
+                send_xdnd_status(conn, atoms, source_win, cm.window, false);
+            }
+
+            // --- Drag-out: edge-strip XdndLeave ---
+            Event::ClientMessage(cm) if cm.type_ == atoms.xdnd_leave => {
+                if let Some(inb) = active_inbound.take() {
+                    if inb.strip_win == cm.window {
+                        if let Some(ref mut staged) = *shared.staged.lock() {
+                            if staged.edge == inb.edge {
+                                staged.left_at = Some(Instant::now());
+                                shared.staged_tracker.mark_left(inb.edge);
+                            }
+                        }
+                    } else {
+                        *active_inbound = Some(inb);
+                    }
+                }
+            }
+
+            // --- Drag-out: edge-strip XdndDrop ---
+            Event::ClientMessage(cm) if cm.type_ == atoms.xdnd_drop => {
+                let d = cm.data.as_data32();
+                let source_win = d[0];
+                // Always reply accepted=false so source never deletes original files on a Move drag.
+                send_xdnd_finished(conn, atoms, source_win, cm.window, false);
+                *active_inbound = None;
+            }
+
+            // --- Drag-out: SelectionNotify containing text/uri-list ---
+            Event::SelectionNotify(sn) if sn.selection == atoms.xdnd_selection => {
+                if sn.property == x11rb::NONE {
+                    continue;
+                }
+                let edge = active_inbound
+                    .as_ref()
+                    .filter(|i| i.strip_win == sn.requestor)
+                    .map(|i| i.edge)
+                    .or_else(|| {
+                        strips
+                            .iter()
+                            .find(|s| s.win == sn.requestor)
+                            .map(|s| s.rect.edge)
+                    });
+                let Some(edge) = edge else { continue };
+
+                if let Ok(cookie) = conn.get_property(
+                    true,
+                    sn.requestor,
+                    sn.property,
+                    AtomEnum::ANY,
+                    0,
+                    65536,
+                ) {
+                    if let Ok(prop) = cookie.reply() {
+                        let paths = parse_uri_list(&prop.value);
+                        if !paths.is_empty() {
+                            debug!(
+                                ?edge,
+                                count = paths.len(),
+                                "Captured text/uri-list paths on X11 edge strip"
+                            );
+                            let mut guard = shared.staged.lock();
+                            *guard = Some(StagedDrag {
+                                edge,
+                                paths,
+                                staged_at: Instant::now(),
+                                left_at: None,
+                            });
+                            shared.staged_tracker.mark_staged(edge, false);
+                        }
+                    }
+                }
+            }
+
+            // --- Live XDND + Clipboard fallback SelectionRequest ---
+            Event::SelectionRequest(req) => {
+                serve_selection_request(
+                    conn,
+                    atoms,
+                    &req,
+                    live_xdnd.as_ref().map(|l| &l.offer),
+                    clipboard_offer.as_ref(),
+                );
+            }
+
+            Event::SelectionClear(sc) if sc.selection == atoms.clipboard => {
+                *clipboard_offer = None;
+            }
+
+            _ => {}
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
 fn run_x11_dnd_loop(
     conn: RustConnection,
     screen_num: usize,
@@ -1713,220 +1944,20 @@ fn run_x11_dnd_loop(
         }
 
         // 2. Drain all queued/readable X11 events non-blockingly before sleeping in poll(2).
-        loop {
-            let ev = match conn.poll_for_event() {
-                Ok(Some(ev)) => ev,
-                Ok(None) => break,
-                Err(e) => {
-                    debug!(error = %e, "X11 DnD connection closed");
-                    break 'outer;
-                }
-            };
-
-            match ev {
-            Event::RandrScreenChangeNotify(_) | Event::RandrNotify(_) => {
-                if let Ok(new_geom) = query_desktop_geometry(&conn, screen_num) {
-                    if new_geom != cached_geom {
-                        cached_geom = new_geom;
-                        if let Some(ref mut p) = preview {
-                            p.geom = cached_geom.clone();
-                        }
-                        sync_x11_strips(&conn, root, &atoms, &shared, &cached_geom, &mut strips);
-                    }
-                }
-            }
-
-            // --- Live drag-in: XdndStatus feedback from hovered target ---
-            Event::ClientMessage(cm) if cm.type_ == atoms.xdnd_status => {
-                if let Some(ref mut live) = live_xdnd {
-                    let d = cm.data.as_data32();
-                    if let Some((target_win, send_win, _)) = live.target {
-                        if d[0] == target_win || d[0] == send_win {
-                            let accepted = (d[1] & 1) != 0;
-                            live.accepted = accepted;
-                            if let Some(ref mut p) = preview {
-                                p.set_status(
-                                    &conn,
-                                    if accepted {
-                                        X11PreviewStatus::Accepted
-                                    } else {
-                                        X11PreviewStatus::Rejected
-                                    },
-                                );
-                            }
-                        }
-                    }
-                }
-            }
-
-            Event::Expose(exp) => {
-                if let Some(ref p) = preview {
-                    if exp.window == p.win {
-                        p.draw(&conn);
-                    }
-                }
-            }
-
-            // --- Drag-out: edge-strip XdndEnter ---
-            Event::ClientMessage(cm) if cm.type_ == atoms.xdnd_enter => {
-                let Some(strip) = strips.iter().find(|s| s.win == cm.window) else {
-                    continue;
-                };
-                let d = cm.data.as_data32();
-                let source_win = d[0];
-                let edge = strip.rect.edge;
-                let has_uri = offered_types_include_uri_list(&conn, &atoms, source_win, d);
-                if has_uri {
-                    debug!(?edge, source_win, "XdndEnter with text/uri-list on X11 edge strip");
-                    let _ = conn.convert_selection(
-                        cm.window,
-                        atoms.xdnd_selection,
-                        atoms.text_uri_list,
-                        atoms.prop_data,
-                        x11rb::CURRENT_TIME,
-                    );
-                    let _ = conn.flush();
-                    active_inbound = Some(ActiveEdgeInbound {
-                        edge,
-                        strip_win: cm.window,
-                        source_win,
-                        has_uri_list: true,
-                        requested_selection: true,
-                    });
-                } else {
-                    // Non-file XDND drag (e.g. text or tab): reject and hide strip immediately.
-                    send_xdnd_status(&conn, &atoms, source_win, cm.window, false);
-                    shared.armed.store(false, Ordering::SeqCst);
-                    unmap_strips(&conn, &mut strips);
-                    active_inbound = None;
-                }
-            }
-
-            // --- Drag-out: edge-strip XdndPosition ---
-            Event::ClientMessage(cm) if cm.type_ == atoms.xdnd_position => {
-                let d = cm.data.as_data32();
-                let source_win = d[0];
-                let time = d[3];
-                if let Some(ref mut inb) = active_inbound {
-                    if inb.strip_win == cm.window && inb.source_win == source_win && inb.has_uri_list
-                    {
-                        let already_staged = shared
-                            .staged
-                            .lock()
-                            .as_ref()
-                            .is_some_and(|s| s.edge == inb.edge);
-                        if !already_staged && (!inb.requested_selection || time != 0) {
-                            inb.requested_selection = true;
-                            let _ = conn.convert_selection(
-                                cm.window,
-                                atoms.xdnd_selection,
-                                atoms.text_uri_list,
-                                atoms.prop_data,
-                                if time != 0 { time } else { x11rb::CURRENT_TIME },
-                            );
-                        }
-                        if let Some(ref mut staged) = *shared.staged.lock() {
-                            if staged.edge == inb.edge {
-                                staged.staged_at = Instant::now();
-                                staged.left_at = None;
-                                shared.staged_tracker.touch(inb.edge);
-                            }
-                        }
-                        send_xdnd_status(&conn, &atoms, source_win, cm.window, true);
-                        continue;
-                    }
-                }
-                send_xdnd_status(&conn, &atoms, source_win, cm.window, false);
-            }
-
-            // --- Drag-out: edge-strip XdndLeave ---
-            Event::ClientMessage(cm) if cm.type_ == atoms.xdnd_leave => {
-                if let Some(inb) = active_inbound.take() {
-                    if inb.strip_win == cm.window {
-                        if let Some(ref mut staged) = *shared.staged.lock() {
-                            if staged.edge == inb.edge {
-                                staged.left_at = Some(Instant::now());
-                                shared.staged_tracker.mark_left(inb.edge);
-                            }
-                        }
-                    } else {
-                        active_inbound = Some(inb);
-                    }
-                }
-            }
-
-            // --- Drag-out: edge-strip XdndDrop ---
-            Event::ClientMessage(cm) if cm.type_ == atoms.xdnd_drop => {
-                let d = cm.data.as_data32();
-                let source_win = d[0];
-                // Always reply accepted=false so source never deletes original files on a Move drag.
-                send_xdnd_finished(&conn, &atoms, source_win, cm.window, false);
-                active_inbound = None;
-            }
-
-            // --- Drag-out: SelectionNotify containing text/uri-list ---
-            Event::SelectionNotify(sn) if sn.selection == atoms.xdnd_selection => {
-                if sn.property == x11rb::NONE {
-                    continue;
-                }
-                let edge = active_inbound
-                    .as_ref()
-                    .filter(|i| i.strip_win == sn.requestor)
-                    .map(|i| i.edge)
-                    .or_else(|| {
-                        strips
-                            .iter()
-                            .find(|s| s.win == sn.requestor)
-                            .map(|s| s.rect.edge)
-                    });
-                let Some(edge) = edge else { continue };
-
-                if let Ok(cookie) = conn.get_property(
-                    true,
-                    sn.requestor,
-                    sn.property,
-                    AtomEnum::ANY,
-                    0,
-                    65536,
-                ) {
-                    if let Ok(prop) = cookie.reply() {
-                        let paths = parse_uri_list(&prop.value);
-                        if !paths.is_empty() {
-                            debug!(
-                                ?edge,
-                                count = paths.len(),
-                                "Captured text/uri-list paths on X11 edge strip"
-                            );
-                            let mut guard = shared.staged.lock();
-                            *guard = Some(StagedDrag {
-                                edge,
-                                paths,
-                                staged_at: Instant::now(),
-                                left_at: None,
-                            });
-                            shared.staged_tracker.mark_staged(edge, false);
-                        }
-                    }
-                }
-            }
-
-            // --- Live XDND + Clipboard fallback SelectionRequest ---
-            Event::SelectionRequest(req) => {
-                serve_selection_request(
-                    &conn,
-                    &atoms,
-                    &req,
-                    live_xdnd.as_ref().map(|l| &l.offer),
-                    clipboard_offer.as_ref(),
-                );
-            }
-
-            Event::SelectionClear(sc) if sc.selection == atoms.clipboard => {
-                clipboard_offer = None;
-            }
-
-            _ => {}
-            }
+        if !drain_x11_dnd_events(
+            &conn,
+            screen_num,
+            root,
+            &atoms,
+            &shared,
+            &mut cached_geom,
+            &mut strips,
+            &mut active_inbound,
+            &mut clipboard_offer,
+            &mut preview,
+            &mut live_xdnd,
+        ) {
+            break 'outer;
         }
 
         if !shared.cmds.lock().is_empty() {
@@ -1971,6 +2002,24 @@ fn run_x11_dnd_loop(
                             }
                         }
                     }
+                }
+                // Drain any X11 events (e.g. XdndStatus / SelectionRequest) buffered into
+                // x11rb during Step 3's `.reply()` roundtrips so they are processed immediately
+                // rather than sleeping up to 12ms in poll(2).
+                if !drain_x11_dnd_events(
+                    &conn,
+                    screen_num,
+                    root,
+                    &atoms,
+                    &shared,
+                    &mut cached_geom,
+                    &mut strips,
+                    &mut active_inbound,
+                    &mut clipboard_offer,
+                    &mut preview,
+                    &mut live_xdnd,
+                ) {
+                    break 'outer;
                 }
             }
             12i32

@@ -47,23 +47,32 @@ pub fn init_dpi_awareness() {
     }
 }
 
-/// Opts this process out of Windows 11 EcoQoS (E-core efficiency throttling) and
-/// minimized/background timer-resolution throttling so 1000Hz input hooks and QUIC
-/// timers stay jitter-free even while minimized to the system tray.
+/// Opts this process out of Windows EcoQoS (E-core efficiency throttling) and
+/// Windows 11 minimized/background timer-resolution throttling so 1000Hz input hooks
+/// and QUIC timers stay jitter-free even while minimized to the system tray.
+///
+/// Issued as two separate `SetProcessInformation` calls because Windows 10 supports
+/// `PROCESS_POWER_THROTTLING_EXECUTION_SPEED` while `PROCESS_POWER_THROTTLING_IGNORE_TIMER_RESOLUTION`
+/// (Windows 11 22000+) causes Windows 10 to reject a combined mask with `ERROR_INVALID_PARAMETER`.
 pub fn init_windows_realtime_qos() {
-    let state = PROCESS_POWER_THROTTLING_STATE {
-        Version: PROCESS_POWER_THROTTLING_CURRENT_VERSION,
-        ControlMask: PROCESS_POWER_THROTTLING_EXECUTION_SPEED
-            | PROCESS_POWER_THROTTLING_IGNORE_TIMER_RESOLUTION,
-        StateMask: 0,
-    };
-    unsafe {
-        let _ = SetProcessInformation(
-            GetCurrentProcess(),
-            ProcessPowerThrottling,
-            &state as *const PROCESS_POWER_THROTTLING_STATE as *const std::ffi::c_void,
-            size_of::<PROCESS_POWER_THROTTLING_STATE>() as u32,
-        );
+    let process = unsafe { GetCurrentProcess() };
+    for flag in [
+        PROCESS_POWER_THROTTLING_EXECUTION_SPEED,
+        PROCESS_POWER_THROTTLING_IGNORE_TIMER_RESOLUTION,
+    ] {
+        let state = PROCESS_POWER_THROTTLING_STATE {
+            Version: PROCESS_POWER_THROTTLING_CURRENT_VERSION,
+            ControlMask: flag,
+            StateMask: 0,
+        };
+        unsafe {
+            let _ = SetProcessInformation(
+                process,
+                ProcessPowerThrottling,
+                &state as *const PROCESS_POWER_THROTTLING_STATE as *const std::ffi::c_void,
+                size_of::<PROCESS_POWER_THROTTLING_STATE>() as u32,
+            );
+        }
     }
 }
 

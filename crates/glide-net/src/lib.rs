@@ -30,8 +30,10 @@ use tls::{ensure_crypto_provider, FingerprintVerifier, ServerIdentity, TrustMode
 ///   Wi-Fi PSM sleep timers that otherwise cause 150–200ms wakeup spikes.
 /// - `enable_segmentation_offload(false)` eliminates the `quinn-udp` Windows 11 Wi-Fi
 ///   GSO/USO silent batch-drop bug.
-/// - `AckFrequencyConfig` (`ack_eliciting_threshold = 0`, `max_ack_delay = 2ms`,
-///   `reordering_threshold = 1`) eliminates 35–240ms PTO stalls on single-packet Wi-Fi loss.
+/// - `AckFrequencyConfig` (`ack_eliciting_threshold = 1`, `max_ack_delay = 2ms`,
+///   `reordering_threshold = 1`) cuts reverse-direction Wi-Fi ACK airtime by 50% on 1000Hz
+///   mouse streams while keeping solitary clicks/keys ACKed within <= 2ms and eliminating
+///   35–240ms PTO stalls on single-packet Wi-Fi loss.
 /// - `mtu_discovery_config(None)` avoids transient probe stalls on LANs.
 /// - Tight datagram buffers (`2 KiB` send / `4 KiB` recv) prevent seconds of stale mouse
 ///   rubber-banding backlog during transient RF interference.
@@ -46,7 +48,7 @@ fn build_transport_config() -> TransportConfig {
 
     let mut ack_cfg = quinn::AckFrequencyConfig::default();
     ack_cfg
-        .ack_eliciting_threshold(0u32.into())
+        .ack_eliciting_threshold(1u32.into())
         .max_ack_delay(Some(Duration::from_millis(2)))
         .reordering_threshold(1u32.into());
     transport.ack_frequency_config(Some(ack_cfg));
@@ -1117,7 +1119,7 @@ mod tests {
             "debug: {dbg}"
         );
         assert!(
-            dbg.contains("ack_eliciting_threshold: 0")
+            dbg.contains("ack_eliciting_threshold: 1")
                 && dbg.contains("max_ack_delay: Some(2ms)")
                 && dbg.contains("reordering_threshold: 1"),
             "debug: {dbg}"

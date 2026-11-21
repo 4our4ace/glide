@@ -216,8 +216,10 @@ impl InputInjector for X11Injector {
     }
 
     fn cursor_norm(&mut self) -> (f32, f32) {
-        self.geometry
-            .normalize_point(self.est_x.round() as i32, self.est_y.round() as i32)
+        let (x, y) = self
+            .sync_pointer()
+            .unwrap_or((self.est_x.round() as i32, self.est_y.round() as i32));
+        self.geometry.normalize_point(x, y)
     }
 
     fn sync_lock_state(&mut self, desired: glide_proto::LockState) -> Result<()> {
@@ -295,23 +297,34 @@ impl InputInjector for X11Injector {
             return Ok(None);
         }
 
-        // Normal mouse motion anywhere away from the return edge (> 48px) executes ZERO
-        // blocking X11 roundtrips (xtest_fake_input + flush only).
+        // Keep a low-frequency outward calibration sync (> 48px: 150ms) so nonlinear Xorg/libinput
+        // acceleration or multi-monitor gaps can never leave est_x/est_y permanently drifted away
+        // from the real cursor at the return edge, while keeping near-edge checks responsive.
         let dist = self.geometry.distance_to_edge(
             edge,
             self.est_x.round() as i32,
             self.est_y.round() as i32,
         );
-        if dist > 48 {
-            self.edge_push_accum = 0.0;
-            self.edge_push_start = None;
-            return Ok(None);
-        }
 
         let mut synced_this_call = false;
         if should_sync_x11_pointer(dist, self.edge_push_accum, self.last_pointer_sync.elapsed()) {
             let _ = self.sync_pointer()?;
             synced_this_call = true;
+        }
+
+        let dist = if synced_this_call {
+            self.geometry.distance_to_edge(
+                edge,
+                self.est_x.round() as i32,
+                self.est_y.round() as i32,
+            )
+        } else {
+            dist
+        };
+        if dist > 48 {
+            self.edge_push_accum = 0.0;
+            self.edge_push_start = None;
+            return Ok(None);
         }
 
         let px = self.est_x.round() as i32;
@@ -503,9 +516,13 @@ impl Drop for X11Injector {
     }
 }
 
-/// Returns `true` only when `move_relative` should issue a rate-limited X11 `query_pointer`
-/// calibration roundtrip near the return edge (<= 48px). Mid-screen motion (> 48px) always
-/// returns `false` so normal pointer movement stays 100% roundtrip-free.
+/// Returns `true` when `move_relative` should issue a rate-limited X11 `query_pointer`
+/// calibration roundtrip during outward motion toward the return edge:
+/// - Mid-screen (`> 48px`): low-frequency `150ms` calibration sync so nonlinear Xorg/libinput
+///   pointer acceleration or multi-monitor gaps can never leave `est_x`/`est_y` permanently
+///   drifted away from the real cursor at the return edge.
+/// - Approaching return edge (`<= 48px`): `25ms`.
+/// - Actively pushing into return edge (`edge_push_accum > 0`): `12ms`.
 #[inline]
 pub(crate) fn should_sync_x11_pointer(
     dist_px: i32,
@@ -513,7 +530,7 @@ pub(crate) fn should_sync_x11_pointer(
     elapsed: Duration,
 ) -> bool {
     if dist_px > 48 {
-        return false;
+        return elapsed >= Duration::from_millis(150);
     }
     if edge_push_accum > 0.0 {
         elapsed >= Duration::from_millis(12)
@@ -528,10 +545,13 @@ mod tests {
 
     #[test]
     fn x11_pointer_sync_never_fires_mid_screen_and_rate_limits_near_edge() {
-        // Mid-screen (> 48px): NEVER sync regardless of elapsed time or accum
-        assert!(!should_sync_x11_pointer(49, 0.0, Duration::from_secs(10)));
-        assert!(!should_sync_x11_pointer(500, 0.0, Duration::from_secs(60)));
-        assert!(!should_sync_x11_pointer(60, 5.0, Duration::from_secs(10)));
+        // Mid-screen (> 48px): low-frequency outward calibration sync at >= 150ms
+        assert!(!should_sync_x11_pointer(49, 0.0, Duration::from_millis(149)));
+        assert!(should_sync_x11_pointer(49, 0.0, Duration::from_millis(150)));
+        assert!(!should_sync_x11_pointer(500, 0.0, Duration::from_millis(100)));
+        assert!(should_sync_x11_pointer(500, 0.0, Duration::from_millis(150)));
+        assert!(!should_sync_x11_pointer(60, 5.0, Duration::from_millis(149)));
+        assert!(should_sync_x11_pointer(60, 5.0, Duration::from_millis(150)));
 
         // Approaching return edge (<= 48px): rate-limited to >= 25ms
         assert!(!should_sync_x11_pointer(48, 0.0, Duration::from_millis(24)));
