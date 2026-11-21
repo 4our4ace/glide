@@ -15,7 +15,7 @@ use crate::config::{
 };
 use crate::dnd::{
     collect_local_drag_files, next_drag_id, spawn_commit_incoming_drag, spawn_send_drag_files,
-    IncomingDragState,
+    EarlyDragBuffer, IncomingDragState,
 };
 use crate::resilience::{HealthProbe, ReconnectBackoff, SleepDetector};
 use crate::runtime::{save_received_file, RuntimeCommand, RuntimeState};
@@ -362,7 +362,7 @@ async fn run_client_session_tracked(
         }
     };
 
-    let client_geom = injector.desktop_geometry().unwrap_or_default();
+    let mut client_geom = injector.desktop_geometry().unwrap_or_default();
     let mut client_scale = client_geom.primary_scale();
 
     if let Err(e) = session
@@ -485,6 +485,7 @@ async fn run_client_session_tracked(
     let mut pending_offer_hash: Option<[u8; 32]> = None;
     let mut local_clip_cache: HashMap<[u8; 32], ClipboardPayload> = HashMap::new();
     let mut incoming_drag: Option<IncomingDragState> = None;
+    let mut early_drag_files = EarlyDragBuffer::default();
     let mut client_lmb_down = false;
 
     let mut ping_interval = tokio::time::interval(Duration::from_millis(500));
@@ -580,6 +581,7 @@ async fn run_client_session_tracked(
                     last_local_ips = fresh_ips.clone();
                     last_ip_check = now;
                     if let Some(ref g) = fresh_geom {
+                        client_geom = g.clone();
                         client_scale = g.primary_scale();
                     }
                     if let Some(rt) = runtime {
@@ -627,6 +629,7 @@ async fn run_client_session_tracked(
 
                 // 5. Live monitor hotplug / DPI scaling refresh
                 if let Some(new_geom) = injector.poll_geometry_changed() {
+                    client_geom = new_geom.clone();
                     client_scale = new_geom.primary_scale();
                     info!(
                         monitors = new_geom.monitors.len(),
@@ -646,7 +649,7 @@ async fn run_client_session_tracked(
                 }
             }
 
-            _ = reveal_interval.tick(), if !focused => {
+            _ = reveal_interval.tick(), if !focused && injector.is_cursor_hidden() => {
                 injector.reveal_if_moved_locally();
             }
 
@@ -793,6 +796,7 @@ async fn run_client_session_tracked(
                                 if let Some(inc) = incoming_drag.take() {
                                     if !inc.drop_requested {
                                         debug!(drag_id = inc.drag_id, "Cancelled uncommitted incoming drag on return-edge exit");
+                                        early_drag_files.remove_drag(inc.drag_id);
                                         dnd.on_incoming_drag_cancel();
                                     } else {
                                         incoming_drag = Some(inc);
@@ -806,9 +810,10 @@ async fn run_client_session_tracked(
                                 } else {
                                     None
                                 };
+                                let limit = max_file_bytes.load(Ordering::Relaxed);
                                 let drag_files = staged_paths
                                     .as_deref()
-                                    .map(collect_local_drag_files)
+                                    .map(|paths| collect_local_drag_files(paths, limit))
                                     .filter(|(infos, _)| !infos.is_empty());
                                 if drag_files.is_some() {
                                     dnd.cancel_local_drag();
@@ -851,6 +856,7 @@ async fn run_client_session_tracked(
                                         conn.clone(),
                                         drag_id,
                                         send_list,
+                                        limit,
                                         runtime.cloned(),
                                     );
                                 }
@@ -932,6 +938,7 @@ async fn run_client_session_tracked(
                         dnd.set_drag_armed(false);
                         if let Some(inc) = incoming_drag.take() {
                             if !inc.drop_requested {
+                                early_drag_files.remove_drag(inc.drag_id);
                                 dnd.on_incoming_drag_cancel();
                             } else {
                                 incoming_drag = Some(inc);
@@ -946,7 +953,13 @@ async fn run_client_session_tracked(
                     ControlMessage::DragStart { drag_id, files } => {
                         if config.drag_drop_files {
                             debug!(drag_id, count = files.len(), "Incoming cross-edge drag from server");
-                            incoming_drag = IncomingDragState::start(drag_id, files);
+                            let limit = max_file_bytes.load(Ordering::Relaxed);
+                            incoming_drag = IncomingDragState::start(drag_id, files, limit).map(|mut inc| {
+                                for buffered in early_drag_files.drain_for(drag_id) {
+                                    inc.push_file(drag_id, buffered);
+                                }
+                                inc
+                            });
                         }
                     }
                     ControlMessage::DragDrop { drag_id } => {
@@ -957,6 +970,7 @@ async fn run_client_session_tracked(
                                         done.drag_id,
                                         done.into_files(),
                                         receive_dir.clone(),
+                                        config.receive_dir.clone(),
                                         Arc::clone(&dnd),
                                         runtime.cloned(),
                                     );
@@ -965,6 +979,7 @@ async fn run_client_session_tracked(
                         }
                     }
                     ControlMessage::DragCancel { drag_id } => {
+                        early_drag_files.remove_drag(drag_id);
                         if incoming_drag.as_ref().is_some_and(|i| i.drag_id == drag_id) {
                             debug!(drag_id, "Cancelled incoming cross-edge drag from server");
                             incoming_drag = None;
@@ -1095,20 +1110,31 @@ async fn run_client_session_tracked(
                     }
                     Some(BulkTransfer::DragFile(drag_file)) => {
                         health_probe.mark_alive();
-                        if let Some(ref mut inc) = incoming_drag {
-                            if inc.push_file(drag_file.drag_id, drag_file.file)
-                                && inc.is_ready_to_commit()
-                            {
-                                if let Some(done) = incoming_drag.take() {
-                                    spawn_commit_incoming_drag(
-                                        done.drag_id,
-                                        done.into_files(),
-                                        receive_dir.clone(),
-                                        Arc::clone(&dnd),
-                                        runtime.cloned(),
-                                    );
+                        if !config.drag_drop_files {
+                            continue;
+                        }
+                        if incoming_drag
+                            .as_ref()
+                            .is_some_and(|i| i.drag_id == drag_file.drag_id)
+                        {
+                            if let Some(ref mut inc) = incoming_drag {
+                                if inc.push_file(drag_file.drag_id, drag_file.file)
+                                    && inc.is_ready_to_commit()
+                                {
+                                    if let Some(done) = incoming_drag.take() {
+                                        spawn_commit_incoming_drag(
+                                            done.drag_id,
+                                            done.into_files(),
+                                            receive_dir.clone(),
+                                            config.receive_dir.clone(),
+                                            Arc::clone(&dnd),
+                                            runtime.cloned(),
+                                        );
+                                    }
                                 }
                             }
+                        } else {
+                            early_drag_files.push(drag_file.drag_id, drag_file.file);
                         }
                     }
                     None => {

@@ -635,9 +635,11 @@ pub async fn discover_servers(
         .ok()
         .map(|(s, _)| s);
 
-    // Send probes out of EVERY interface AND from probe_sock so server unicast replies reach probe_sock
-    blaster.blast(MAGIC_PROBE, discovery_port, true);
+    // Send from `probe_sock` FIRST so the server's per-source ProbeRateLimiter replies unicast
+    // to the socket we actually read from, then fan out across secondary NICs via `blaster`
+    // (skipping loopback on `blaster` since `probe_sock` already probed `127.0.0.1`).
     let _ = send_probe_from_socket(&probe_sock, discovery_port, &ifaces).await;
+    blaster.blast(MAGIC_PROBE, discovery_port, false);
 
     let mut found: HashMap<String, DiscoveredServer> = HashMap::new();
     let deadline = tokio::time::Instant::now() + timeout;
@@ -658,8 +660,8 @@ pub async fn discover_servers(
         let recv_event: Option<std::io::Result<(&[u8], SocketAddr)>> = tokio::select! {
             _ = tokio::time::sleep(remaining) => break,
             _ = probe_retry.tick() => {
-                blaster.blast(MAGIC_PROBE, discovery_port, true);
                 let _ = send_probe_from_socket(&probe_sock, discovery_port, &ifaces).await;
+                blaster.blast(MAGIC_PROBE, discovery_port, false);
                 continue;
             }
             res = probe_sock.recv_from(&mut buf_a) => {

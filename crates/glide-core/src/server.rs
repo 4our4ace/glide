@@ -13,7 +13,7 @@
 use crate::config::ServerConfig;
 use crate::dnd::{
     collect_local_drag_files, next_drag_id, spawn_commit_incoming_drag, spawn_send_drag_files,
-    IncomingDragState, OutgoingDragState,
+    EarlyDragBuffer, IncomingDragState, OutgoingDragState,
 };
 use crate::resilience::{HealthProbe, SleepDetector};
 use crate::runtime::{save_received_file, PeerSummary, RuntimeCommand, RuntimeState};
@@ -29,8 +29,8 @@ use glide_net::{
     Connection, GlideServerEndpoint, GlideSession,
 };
 use glide_proto::{
-    BulkTransfer, ClipboardPayload, ControlMessage, DatagramMessage, Edge, FilePayload, LockState,
-    OsKind, LAZY_CLIPBOARD_THRESHOLD, PROTOCOL_VERSION,
+    BulkTransfer, ClipboardPayload, ControlMessage, DatagramEncoder, DatagramMessage, Edge,
+    FilePayload, LockState, OsKind, LAZY_CLIPBOARD_THRESHOLD, PROTOCOL_VERSION,
 };
 use std::collections::HashMap;
 use std::net::SocketAddr;
@@ -229,8 +229,11 @@ pub async fn run_server_with_dnd(
     let mut local_clip_cache: HashMap<[u8; 32], ClipboardPayload> = HashMap::new();
     let mut outgoing_drag: Option<OutgoingDragState> = None;
     let mut incoming_drag: Option<IncomingDragState> = None;
+    let mut incoming_drag_peer: Option<u64> = None;
+    let mut early_drag_files = EarlyDragBuffer::default();
     let mut local_lmb_down = false;
 
+    let mut dgram_enc = DatagramEncoder::new();
     let mut seq: u32 = 0;
     let mut pending_dx: f32 = 0.0;
     let mut pending_dy: f32 = 0.0;
@@ -286,7 +289,8 @@ pub async fn run_server_with_dnd(
                                 pending_dx: &mut f32,
                                 pending_dy: &mut f32,
                                 seq: &mut u32,
-                                coalesce_armed: &mut bool| {
+                                coalesce_armed: &mut bool,
+                                dgram_enc: &mut DatagramEncoder| {
         if *pending_dx == 0.0 && *pending_dy == 0.0 {
             *coalesce_armed = false;
             return;
@@ -299,7 +303,7 @@ pub async fn run_server_with_dnd(
                     dx: *pending_dx,
                     dy: *pending_dy,
                 };
-                let _ = peer.conn.send_datagram(msg.encode());
+                let _ = peer.conn.send_datagram(dgram_enc.encode(msg));
             }
         }
         *pending_dx = 0.0;
@@ -324,6 +328,7 @@ pub async fn run_server_with_dnd(
                     &mut pending_dy,
                     &mut seq,
                     &mut coalesce_armed,
+                    &mut dgram_enc,
                 );
             }
 
@@ -411,6 +416,20 @@ pub async fn run_server_with_dnd(
                         if edge_to_peer.get(&peer.edge) == Some(&dead_id) {
                             edge_to_peer.remove(&peer.edge);
                         }
+                        if outgoing_drag.as_ref().is_some_and(|o| o.peer_id == dead_id) {
+                            outgoing_drag = None;
+                        }
+                        if incoming_drag_peer == Some(dead_id) {
+                            incoming_drag_peer = None;
+                            early_drag_files.clear();
+                            if let Some(inc) = incoming_drag.take() {
+                                if !inc.drop_requested {
+                                    dnd.on_incoming_drag_cancel();
+                                } else {
+                                    incoming_drag = Some(inc);
+                                }
+                            }
+                        }
                         if active_remote == Some(dead_id) {
                             active_remote = None;
                             active_edge = None;
@@ -422,6 +441,7 @@ pub async fn run_server_with_dnd(
                         }
                         let edges: Vec<Edge> = edge_to_peer.keys().copied().collect();
                         capture_ctrl.set_active_edges(&edges);
+                        dnd.set_active_edges(&edges, config.dead_corner_px);
                         sync_runtime_peers(&runtime, &peers, active_remote, locked);
                     }
                 }
@@ -724,11 +744,13 @@ pub async fn run_server_with_dnd(
                                 inc.request_drop_active();
                                 if inc.is_ready_to_commit() {
                                     if let Some(done) = incoming_drag.take() {
+                                        incoming_drag_peer = None;
                                         let drag_id = done.drag_id;
                                         spawn_commit_incoming_drag(
                                             drag_id,
                                             done.into_files(),
                                             receive_dir.clone(),
+                                            config.receive_dir.clone(),
                                             Arc::clone(&dnd),
                                             runtime.clone(),
                                         );
@@ -761,6 +783,8 @@ pub async fn run_server_with_dnd(
                         if let Some(inc) = incoming_drag.take() {
                             if !inc.drop_requested {
                                 debug!(drag_id = inc.drag_id, "Cancelled incoming drag after crossing back to peer");
+                                incoming_drag_peer = None;
+                                early_drag_files.remove_drag(inc.drag_id);
                                 dnd.on_incoming_drag_cancel();
                             } else {
                                 incoming_drag = Some(inc);
@@ -786,9 +810,10 @@ pub async fn run_server_with_dnd(
                                 } else {
                                     None
                                 };
+                                let limit = max_file_bytes.load(Ordering::Relaxed);
                                 let drag_files = staged_paths
                                     .as_deref()
-                                    .map(collect_local_drag_files)
+                                    .map(|paths| collect_local_drag_files(paths, limit))
                                     .filter(|(infos, _)| !infos.is_empty());
 
                                 if drag_files.is_some() {
@@ -834,6 +859,7 @@ pub async fn run_server_with_dnd(
                                         peer.conn.clone(),
                                         drag_id,
                                         send_list,
+                                        limit,
                                         runtime.clone(),
                                     );
                                     outgoing_drag = Some(OutgoingDragState { drag_id, peer_id });
@@ -934,9 +960,9 @@ pub async fn run_server_with_dnd(
                                 if let Some(pid) = active_remote {
                                     if let Some(peer) = peers.get(&pid) {
                                         seq = seq.wrapping_add(1);
-                                        let _ = peer.conn.send_datagram(
-                                            DatagramMessage::MouseMove { seq, dx, dy }.encode()
-                                        );
+                                        let _ = peer.conn.send_datagram(dgram_enc.encode(
+                                            DatagramMessage::MouseMove { seq, dx, dy },
+                                        ));
                                     }
                                 }
                             } else {
@@ -958,13 +984,14 @@ pub async fn run_server_with_dnd(
                             &mut pending_dy,
                             &mut seq,
                             &mut coalesce_armed,
+                            &mut dgram_enc,
                         );
                         if let Some(pid) = active_remote {
                             if let Some(peer) = peers.get(&pid) {
                                 seq = seq.wrapping_add(1);
-                                let _ = peer.conn.send_datagram(
-                                    DatagramMessage::MouseScroll { seq, dx_120, dy_120 }.encode()
-                                );
+                                let _ = peer.conn.send_datagram(dgram_enc.encode(
+                                    DatagramMessage::MouseScroll { seq, dx_120, dy_120 },
+                                ));
                             }
                         }
                     }
@@ -980,6 +1007,7 @@ pub async fn run_server_with_dnd(
                             &mut pending_dy,
                             &mut seq,
                             &mut coalesce_armed,
+                            &mut dgram_enc,
                         );
                         if button == MouseButton::Left && !pressed {
                             if let Some(out) = outgoing_drag.take() {
@@ -1018,6 +1046,7 @@ pub async fn run_server_with_dnd(
                             &mut pending_dy,
                             &mut seq,
                             &mut coalesce_armed,
+                            &mut dgram_enc,
                         );
                         if let Some(pid) = active_remote {
                             if let Some(peer) = peers.get(&pid) {
@@ -1073,6 +1102,13 @@ pub async fn run_server_with_dnd(
                     }
 
                     CaptureEvent::SystemSuspended => {
+                        if let Some(out) = outgoing_drag.take() {
+                            if let Some(peer) = peers.get(&out.peer_id) {
+                                let _ = peer
+                                    .ctrl_tx
+                                    .send(ControlMessage::DragCancel { drag_id: out.drag_id });
+                            }
+                        }
                         if let Some(pid) = active_remote.take() {
                             if let Some(peer) = peers.get(&pid) {
                                 info!(
@@ -1160,6 +1196,17 @@ pub async fn run_server_with_dnd(
                             if outgoing_drag.as_ref().is_some_and(|o| o.peer_id == old_id) {
                                 outgoing_drag = None;
                             }
+                            if incoming_drag_peer == Some(old_id) {
+                                incoming_drag_peer = None;
+                                early_drag_files.clear();
+                                if let Some(inc) = incoming_drag.take() {
+                                    if !inc.drop_requested {
+                                        dnd.on_incoming_drag_cancel();
+                                    } else {
+                                        incoming_drag = Some(inc);
+                                    }
+                                }
+                            }
                         }
                         info!(
                             peer = %peer.name,
@@ -1218,12 +1265,30 @@ pub async fn run_server_with_dnd(
                             ControlMessage::DragStart { drag_id, files } => {
                                 if config.drag_drop_files {
                                     debug!(peer_id, drag_id, count = files.len(), "Incoming cross-edge drag from client");
-                                    if let Some(mut inc) = IncomingDragState::start(drag_id, files) {
+                                    let limit = max_file_bytes.load(Ordering::Relaxed);
+                                    if let Some(mut inc) = IncomingDragState::start(drag_id, files, limit) {
+                                        for buffered in early_drag_files.drain_for(drag_id) {
+                                            inc.push_file(drag_id, buffered);
+                                        }
                                         if !local_lmb_down {
                                             // Physical LMB was already released during edge handoff.
                                             inc.request_drop_active();
                                         }
-                                        incoming_drag = Some(inc);
+                                        if inc.is_ready_to_commit() {
+                                            incoming_drag = None;
+                                            incoming_drag_peer = None;
+                                            spawn_commit_incoming_drag(
+                                                inc.drag_id,
+                                                inc.into_files(),
+                                                receive_dir.clone(),
+                                                config.receive_dir.clone(),
+                                                Arc::clone(&dnd),
+                                                runtime.clone(),
+                                            );
+                                        } else {
+                                            incoming_drag = Some(inc);
+                                            incoming_drag_peer = Some(peer_id);
+                                        }
                                     }
                                 }
                             }
@@ -1231,10 +1296,12 @@ pub async fn run_server_with_dnd(
                                 if let Some(ref mut inc) = incoming_drag {
                                     if inc.request_drop(drag_id) && inc.is_ready_to_commit() {
                                         if let Some(done) = incoming_drag.take() {
+                                            incoming_drag_peer = None;
                                             spawn_commit_incoming_drag(
                                                 done.drag_id,
                                                 done.into_files(),
                                                 receive_dir.clone(),
+                                                config.receive_dir.clone(),
                                                 Arc::clone(&dnd),
                                                 runtime.clone(),
                                             );
@@ -1243,9 +1310,11 @@ pub async fn run_server_with_dnd(
                                 }
                             }
                             ControlMessage::DragCancel { drag_id } => {
+                                early_drag_files.remove_drag(drag_id);
                                 if incoming_drag.as_ref().is_some_and(|i| i.drag_id == drag_id) {
                                     debug!(peer_id, drag_id, "Cancelled incoming cross-edge drag from client");
                                     incoming_drag = None;
+                                    incoming_drag_peer = None;
                                     dnd.on_incoming_drag_cancel();
                                 }
                             }
@@ -1382,20 +1451,32 @@ pub async fn run_server_with_dnd(
                                 });
                             }
                             BulkTransfer::DragFile(drag_file) => {
-                                if let Some(ref mut inc) = incoming_drag {
-                                    if inc.push_file(drag_file.drag_id, drag_file.file)
-                                        && inc.is_ready_to_commit()
-                                    {
-                                        if let Some(done) = incoming_drag.take() {
-                                            spawn_commit_incoming_drag(
-                                                done.drag_id,
-                                                done.into_files(),
-                                                receive_dir.clone(),
-                                                Arc::clone(&dnd),
-                                                runtime.clone(),
-                                            );
+                                if !config.drag_drop_files {
+                                    continue;
+                                }
+                                if incoming_drag
+                                    .as_ref()
+                                    .is_some_and(|i| i.drag_id == drag_file.drag_id)
+                                {
+                                    if let Some(ref mut inc) = incoming_drag {
+                                        if inc.push_file(drag_file.drag_id, drag_file.file)
+                                            && inc.is_ready_to_commit()
+                                        {
+                                            if let Some(done) = incoming_drag.take() {
+                                                incoming_drag_peer = None;
+                                                spawn_commit_incoming_drag(
+                                                    done.drag_id,
+                                                    done.into_files(),
+                                                    receive_dir.clone(),
+                                                    config.receive_dir.clone(),
+                                                    Arc::clone(&dnd),
+                                                    runtime.clone(),
+                                                );
+                                            }
                                         }
                                     }
+                                } else {
+                                    early_drag_files.push(drag_file.drag_id, drag_file.file);
                                 }
                             }
                         }
@@ -1412,6 +1493,17 @@ pub async fn run_server_with_dnd(
                             dnd.set_active_edges(&edges, config.dead_corner_px);
                             if outgoing_drag.as_ref().is_some_and(|o| o.peer_id == peer_id) {
                                 outgoing_drag = None;
+                            }
+                            if incoming_drag_peer == Some(peer_id) {
+                                incoming_drag_peer = None;
+                                early_drag_files.clear();
+                                if let Some(inc) = incoming_drag.take() {
+                                    if !inc.drop_requested {
+                                        dnd.on_incoming_drag_cancel();
+                                    } else {
+                                        incoming_drag = Some(inc);
+                                    }
+                                }
                             }
 
                             if active_remote == Some(peer_id) {
