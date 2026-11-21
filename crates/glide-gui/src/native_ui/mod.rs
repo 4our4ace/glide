@@ -16,7 +16,7 @@ use glide_core::runtime::{
     ClipboardHistoryEntry, FileTransferEntry, PeerSummary, RuntimeCommand, StatusSnapshot,
 };
 use glide_net::discovery::{discover_servers, local_ipv4_addresses, machine_hostname};
-use glide_proto::{ClipboardFormat, Edge, OsKind, MAX_FILE_BYTES};
+use glide_proto::{ClipboardFormat, Edge, OsKind};
 use rune::{App, AppHandle, AppSpec, Cx, El, Key, KeyEvent, TextEdit, Tx, WindowOptions};
 use std::path::PathBuf;
 use std::sync::atomic::Ordering;
@@ -118,10 +118,12 @@ pub struct Ui {
     // Editable text fields + last committed snapshots
     pub port_edit: TextEdit,
     pub server_edit: TextEdit,
+    pub max_file_mb_edit: TextEdit,
     pub remap_from: TextEdit,
     pub remap_to: TextEdit,
     last_committed_port: String,
     last_committed_server: String,
+    last_committed_max_file_mb: String,
 
     // Transient UI state
     toast: Option<(String, Option<Instant>)>,
@@ -149,6 +151,7 @@ impl Ui {
 
         let port_str = cfg.server.bind.port().to_string();
         let server_str = cfg.client.server.clone().unwrap_or_default();
+        let max_file_mb_str = cfg.max_file_mb_clamped().to_string();
         let role = if status.mode == "client" {
             Role::Client
         } else if status.mode == "server" {
@@ -185,10 +188,12 @@ impl Ui {
             update_state: UpdateCheckState::Idle,
             port_edit: TextEdit::new(&port_str),
             server_edit: TextEdit::new(&server_str),
+            max_file_mb_edit: TextEdit::new(&max_file_mb_str),
             remap_from: TextEdit::default(),
             remap_to: TextEdit::default(),
             last_committed_port: port_str,
             last_committed_server: server_str,
+            last_committed_max_file_mb: max_file_mb_str,
             toast: None,
             dismissed_error: None,
             desk_drag: None,
@@ -324,31 +329,87 @@ impl Ui {
 
     pub fn commit_text_fields(&mut self) -> bool {
         let mut changed = false;
-        let port_raw = self.port_edit.text.trim().to_owned();
-        if port_raw != self.last_committed_port {
-            if let Ok(p) = port_raw.parse::<u16>() {
-                if p >= 1024 {
-                    self.config.server.bind.set_port(p);
-                    self.last_committed_port = port_raw;
-                    changed = true;
+        if !self.port_edit.focused {
+            let port_raw = self.port_edit.text.trim().to_owned();
+            if port_raw != self.last_committed_port {
+                if let Ok(p) = port_raw.parse::<u16>() {
+                    if p >= 1024 {
+                        self.config.server.bind.set_port(p);
+                        self.last_committed_port = port_raw;
+                        changed = true;
+                    }
                 }
             }
         }
-        let srv_raw = self.server_edit.text.trim().to_owned();
-        if srv_raw != self.last_committed_server {
-            self.config.client.server = if srv_raw.is_empty() {
-                None
-            } else {
-                Some(srv_raw.clone())
-            };
-            self.last_committed_server = srv_raw;
-            changed = true;
+        if !self.server_edit.focused {
+            let srv_raw = self.server_edit.text.trim().to_owned();
+            if srv_raw != self.last_committed_server {
+                self.config.client.server = if srv_raw.is_empty() {
+                    None
+                } else {
+                    Some(srv_raw.clone())
+                };
+                self.last_committed_server = srv_raw;
+                changed = true;
+            }
+        }
+        if !self.max_file_mb_edit.focused {
+            changed |= self.commit_max_file_mb();
         }
         changed
     }
 
+    pub fn commit_max_file_mb(&mut self) -> bool {
+        let raw = self.max_file_mb_edit.text.trim().to_owned();
+        if raw == self.last_committed_max_file_mb {
+            return false;
+        }
+        if let Ok(parsed) = raw.parse::<u32>() {
+            let clamped = GlideConfigFile::clamp_max_file_mb(parsed);
+            let normalized = clamped.to_string();
+            self.config.max_file_mb = clamped;
+            if self.max_file_mb_edit.text != normalized {
+                self.max_file_mb_edit = TextEdit::new(&normalized);
+            }
+            self.last_committed_max_file_mb = normalized;
+            true
+        } else {
+            let prev = self.last_committed_max_file_mb.clone();
+            self.max_file_mb_edit = TextEdit::new(&prev);
+            false
+        }
+    }
+
     pub fn commit_text_fields_and_push(&mut self) {
-        if self.commit_text_fields() {
+        let mut changed = self.commit_text_fields();
+        if self.port_edit.focused {
+            let port_raw = self.port_edit.text.trim().to_owned();
+            if port_raw != self.last_committed_port {
+                if let Ok(p) = port_raw.parse::<u16>() {
+                    if p >= 1024 {
+                        self.config.server.bind.set_port(p);
+                        self.last_committed_port = port_raw;
+                        changed = true;
+                    }
+                }
+            }
+        }
+        if self.server_edit.focused {
+            let srv_raw = self.server_edit.text.trim().to_owned();
+            if srv_raw != self.last_committed_server {
+                self.config.client.server = if srv_raw.is_empty() {
+                    None
+                } else {
+                    Some(srv_raw.clone())
+                };
+                self.last_committed_server = srv_raw;
+                changed = true;
+            }
+        }
+        if self.max_file_mb_edit.focused {
+            changed |= self.commit_max_file_mb();
+        }
+        if changed {
             self.push_config();
         }
     }
@@ -671,6 +732,8 @@ impl Ui {
         if paths.is_empty() {
             return;
         }
+        let max_file_bytes = self.config.max_file_bytes() as u64;
+        let max_file_mb = self.config.max_file_mb_clamped();
         let ctrl = Arc::clone(&self.ctrl);
         let handle = self.handle.clone();
         self.rt.spawn_blocking(move || {
@@ -685,9 +748,9 @@ impl Ui {
                     h.update(move |s, tx| s.toast(msg, tx));
                 }
                 match std::fs::metadata(&path) {
-                    Ok(meta) if meta.len() as usize > MAX_FILE_BYTES => {
+                    Ok(meta) if meta.len() > max_file_bytes => {
                         if let Some(ref h) = handle {
-                            let msg = format!("{filename} exceeds the 256 MB limit");
+                            let msg = format!("{filename} exceeds the {max_file_mb} MB limit");
                             h.update(move |s, tx| s.toast(msg, tx));
                         }
                         continue;
@@ -825,8 +888,8 @@ fn poll(s: &mut Ui, _now: f64, _tx: &mut Tx) -> bool {
         }
     }
 
-    // Commit edited Port or Server fields once they lose focus.
-    if !s.port_edit.focused && !s.server_edit.focused && s.commit_text_fields() {
+    // Commit edited Port, Server, or Advanced text fields once they lose focus.
+    if s.commit_text_fields() {
         s.push_config();
         changed = true;
     }

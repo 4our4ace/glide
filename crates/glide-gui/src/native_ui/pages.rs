@@ -2588,18 +2588,51 @@ fn settings_page(s: &Ui, p: Palette) -> El {
             ],
         );
 
-        left_inner = left_inner.child(
-            col()
-                .w_full()
-                .gap(7.0)
-                .child(section_head(
-                    p,
-                    "sec-head",
-                    "Security & firewall",
-                    Some(text("TLS 1.3 · fingerprint").font(ty::SUB).color(p.faint)),
-                ))
-                .child(security_card),
+        let transfers_card = card_rows(
+            p,
+            "adv-transfers-card",
+            vec![setting_row(
+                p,
+                "max-file-mb-row",
+                "Max file size",
+                Some("Single file transfer ceiling (1–4096 MB)"),
+                row()
+                    .gap(6.0)
+                    .center_y()
+                    .child(text_field(
+                        p,
+                        "max-file-mb-input",
+                        &s.max_file_mb_edit,
+                        Some(76.0),
+                        "256",
+                        true,
+                        |s| &mut s.max_file_mb_edit,
+                        Some(|s, _| s.commit_text_fields_and_push()),
+                    ))
+                    .child(text("MB").font(ty::SUB).color(p.muted)),
+            )],
         );
+
+        left_inner = left_inner
+            .child(
+                col()
+                    .w_full()
+                    .gap(7.0)
+                    .child(section_head(
+                        p,
+                        "sec-head",
+                        "Security & firewall",
+                        Some(text("TLS 1.3 · fingerprint").font(ty::SUB).color(p.faint)),
+                    ))
+                    .child(security_card),
+            )
+            .child(
+                col()
+                    .w_full()
+                    .gap(7.0)
+                    .child(section_head(p, "adv-transfers-head", "File transfers", None))
+                    .child(transfers_card),
+            );
     }
 
     let left_col = col()

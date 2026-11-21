@@ -19,6 +19,7 @@ pub const PROTOCOL_VERSION: u16 = 2;
 pub const MAX_CONTROL_FRAME_LEN: usize = 64 * 1024;
 pub const MAX_CLIPBOARD_BYTES: usize = 32 * 1024 * 1024;
 pub const MAX_FILE_BYTES: usize = 256 * 1024 * 1024;
+pub const DEFAULT_MAX_FILE_BYTES: usize = MAX_FILE_BYTES;
 /// Payloads above this threshold use lazy `ClipboardOffer` / `ClipboardRequest`.
 pub const LAZY_CLIPBOARD_THRESHOLD: usize = 256 * 1024;
 

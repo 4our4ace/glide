@@ -16,7 +16,10 @@ use glide_backend::os_integration::file_receive_dir;
 use glide_backend::{ClipboardHandle, InputInjector};
 use glide_net::discovery::discover_servers;
 use glide_net::tls::TrustMode;
-use glide_net::{connect_client, recv_bulk_on, send_clipboard_on, send_file_on, sha256_bytes};
+use glide_net::{
+    connect_client, recv_bulk_on_with_limit, send_clipboard_on, send_file_on_with_limit,
+    sha256_bytes,
+};
 use glide_proto::{
     BulkTransfer, ClipboardPayload, ControlMessage, DatagramMessage, FilePayload,
     LAZY_CLIPBOARD_THRESHOLD, PROTOCOL_VERSION,
@@ -224,6 +227,7 @@ pub async fn run_client_session(
                             config.key_remap = key_remap;
                         }
                         RuntimeCommand::SendFile { filename, data } => {
+                            let limit = config.resolved_max_file_bytes();
                             let payload = FilePayload {
                                 filename: filename.clone(),
                                 sha256: sha256_bytes(&data),
@@ -234,10 +238,13 @@ pub async fn run_client_session(
                             }
                             let c = conn.clone();
                             tokio::spawn(async move {
-                                if let Err(e) = send_file_on(&c, &payload).await {
+                                if let Err(e) = send_file_on_with_limit(&c, &payload, limit).await {
                                     warn!(error = %e, "Failed beaming file to server");
                                 }
                             });
+                        }
+                        RuntimeCommand::UpdateMaxFileBytes(limit) => {
+                            config.max_file_bytes = Some(limit);
                         }
                         RuntimeCommand::ResendClipboard(id) => {
                             if let Some(rt) = runtime {
@@ -450,7 +457,7 @@ pub async fn run_client_session(
                 }
             }
 
-            remote_bulk = recv_bulk_on(&conn) => {
+            remote_bulk = recv_bulk_on_with_limit(&conn, config.resolved_max_file_bytes()) => {
                 match remote_bulk {
                     Ok(BulkTransfer::Clipboard(payload)) => {
                         if config.clipboard {

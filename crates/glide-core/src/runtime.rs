@@ -112,6 +112,7 @@ pub enum RuntimeCommand {
         filename: String,
         data: Bytes,
     },
+    UpdateMaxFileBytes(usize),
     ResendClipboard(usize),
     Shutdown,
 }

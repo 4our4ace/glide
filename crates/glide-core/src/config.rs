@@ -47,8 +47,16 @@ pub fn compile_key_remaps(rules: &[KeyRemapRule]) -> HashMap<HidUsage, HidUsage>
     map
 }
 
+pub const DEFAULT_MAX_FILE_MB: u32 = 256;
+pub const MIN_MAX_FILE_MB: u32 = 1;
+pub const MAX_MAX_FILE_MB: u32 = 4096;
+
 fn default_true() -> bool {
     true
+}
+
+fn default_max_file_mb() -> u32 {
+    DEFAULT_MAX_FILE_MB
 }
 
 /// Top-level `glide.toml` file supporting both `[server]` and `[client]` sections
@@ -67,6 +75,9 @@ pub struct GlideConfigFile {
     /// Hide clipboard history entries behind a privacy cover until explicitly revealed.
     #[serde(default)]
     pub hide_clipboard_history: bool,
+    /// Maximum single file transfer size in megabytes (default `256`, safely clamped to `1..=4096`).
+    #[serde(default = "default_max_file_mb")]
+    pub max_file_mb: u32,
     #[serde(default)]
     pub server: ServerConfig,
     #[serde(default)]
@@ -80,6 +91,7 @@ impl Default for GlideConfigFile {
             auto_start_on_launch: false,
             clipboard_history: true,
             hide_clipboard_history: false,
+            max_file_mb: DEFAULT_MAX_FILE_MB,
             server: ServerConfig::default(),
             client: ClientConfig::default(),
         }
@@ -87,18 +99,57 @@ impl Default for GlideConfigFile {
 }
 
 impl GlideConfigFile {
+    /// Clamps a requested max file size in MB to the safe range `1..=4096`.
+    pub fn clamp_max_file_mb(mb: u32) -> u32 {
+        mb.clamp(MIN_MAX_FILE_MB, MAX_MAX_FILE_MB)
+    }
+
+    /// Returns `max_file_mb` clamped safely to `1..=4096`.
+    pub fn max_file_mb_clamped(&self) -> u32 {
+        Self::clamp_max_file_mb(self.max_file_mb)
+    }
+
+    /// Converts a MB limit into a wire-safe byte ceiling (clamped to `1..=4096` MB and `u32::MAX` bytes).
+    pub fn max_file_bytes_for_mb(mb: u32) -> usize {
+        let bytes = u64::from(Self::clamp_max_file_mb(mb)).saturating_mul(1024 * 1024);
+        bytes.min(u32::MAX as u64).min(usize::MAX as u64) as usize
+    }
+
+    /// Returns the effective single-file transfer ceiling in bytes.
+    pub fn max_file_bytes(&self) -> usize {
+        Self::max_file_bytes_for_mb(self.max_file_mb)
+    }
+
+    /// Returns a `ServerConfig` populated with top-level shared settings (such as `max_file_mb`).
+    pub fn effective_server_config(&self) -> ServerConfig {
+        let mut cfg = self.server.clone();
+        cfg.max_file_bytes = Some(self.max_file_bytes());
+        cfg
+    }
+
+    /// Returns a `ClientConfig` populated with top-level shared settings (such as `max_file_mb`).
+    pub fn effective_client_config(&self) -> ClientConfig {
+        let mut cfg = self.client.clone();
+        cfg.max_file_bytes = Some(self.max_file_bytes());
+        cfg
+    }
+
     pub fn load(path: &Path) -> Result<Self> {
         let raw = fs::read_to_string(path)
             .with_context(|| format!("failed to read config file {}", path.display()))?;
-        toml::from_str(&raw)
-            .with_context(|| format!("failed to parse TOML config {}", path.display()))
+        let mut cfg: Self = toml::from_str(&raw)
+            .with_context(|| format!("failed to parse TOML config {}", path.display()))?;
+        cfg.max_file_mb = cfg.max_file_mb_clamped();
+        Ok(cfg)
     }
 
     pub fn save(&self, path: &Path) -> Result<()> {
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)?;
         }
-        let body = toml::to_string_pretty(self)?;
+        let mut normalized = self.clone();
+        normalized.max_file_mb = normalized.max_file_mb_clamped();
+        let body = toml::to_string_pretty(&normalized)?;
         fs::write(path, body)
             .with_context(|| format!("failed to write config file {}", path.display()))?;
         Ok(())
@@ -136,6 +187,9 @@ pub struct ServerConfig {
     pub motion_coalesce_us: u64,
     /// Directory storing the server's Ed25519 TLS identity.
     pub identity_dir: Option<PathBuf>,
+    /// Effective maximum file transfer size in bytes (populated from top-level `max_file_mb`).
+    #[serde(skip)]
+    pub max_file_bytes: Option<usize>,
 }
 
 impl Default for ServerConfig {
@@ -155,6 +209,7 @@ impl Default for ServerConfig {
             clipboard: true,
             motion_coalesce_us: 1000,
             identity_dir: None,
+            max_file_bytes: None,
         }
     }
 }
@@ -168,6 +223,12 @@ impl ServerConfig {
         self.identity_dir
             .clone()
             .unwrap_or_else(|| default_config_dir().join("identity"))
+    }
+
+    pub fn resolved_max_file_bytes(&self) -> usize {
+        self.max_file_bytes
+            .unwrap_or(glide_proto::DEFAULT_MAX_FILE_BYTES)
+            .min(u32::MAX as usize)
     }
 }
 
@@ -210,6 +271,9 @@ pub struct ClientConfig {
     pub clipboard: bool,
     /// Path to persist TOFU server fingerprints.
     pub tofu_store_path: Option<PathBuf>,
+    /// Effective maximum file transfer size in bytes (populated from top-level `max_file_mb`).
+    #[serde(skip)]
+    pub max_file_bytes: Option<usize>,
 }
 
 impl Default for ClientConfig {
@@ -233,6 +297,7 @@ impl Default for ClientConfig {
             key_remap: Vec::new(),
             clipboard: true,
             tofu_store_path: None,
+            max_file_bytes: None,
         }
     }
 }
@@ -243,6 +308,12 @@ impl ClientConfig {
             .clone()
             .unwrap_or_else(|| default_config_dir().join("trusted_server.fp"))
     }
+
+    pub fn resolved_max_file_bytes(&self) -> usize {
+        self.max_file_bytes
+            .unwrap_or(glide_proto::DEFAULT_MAX_FILE_BYTES)
+            .min(u32::MAX as usize)
+    }
 }
 
 #[cfg(test)]
@@ -251,7 +322,7 @@ mod tests {
 
     #[test]
     fn config_round_trips_last_role_and_auto_start() {
-        // Older configs without last_role / auto_start_on_launch parse cleanly.
+        // Older configs without last_role / auto_start_on_launch / max_file_mb parse cleanly.
         let legacy: GlideConfigFile = toml::from_str(
             r#"
             [server]
@@ -266,6 +337,8 @@ mod tests {
         assert!(!legacy.auto_start_on_launch);
         assert!(legacy.clipboard_history);
         assert!(!legacy.hide_clipboard_history);
+        assert_eq!(legacy.max_file_mb, DEFAULT_MAX_FILE_MB);
+        assert_eq!(legacy.max_file_bytes(), glide_proto::DEFAULT_MAX_FILE_BYTES);
         assert_eq!(legacy.server.edge_threshold_px, 6);
         assert!((legacy.client.sensitivity - 1.5).abs() < f32::EPSILON);
 
@@ -274,6 +347,7 @@ mod tests {
             auto_start_on_launch: true,
             clipboard_history: false,
             hide_clipboard_history: true,
+            max_file_mb: 1024,
             ..GlideConfigFile::default()
         };
         cfg.client.sensitivity = 1.35;
@@ -283,6 +357,41 @@ mod tests {
         assert!(parsed.auto_start_on_launch);
         assert!(!parsed.clipboard_history);
         assert!(parsed.hide_clipboard_history);
+        assert_eq!(parsed.max_file_mb, 1024);
+        assert_eq!(parsed.max_file_bytes(), 1024 * 1024 * 1024);
+        assert_eq!(
+            parsed.effective_server_config().resolved_max_file_bytes(),
+            1024 * 1024 * 1024
+        );
+        assert_eq!(
+            parsed.effective_client_config().resolved_max_file_bytes(),
+            1024 * 1024 * 1024
+        );
         assert!((parsed.client.sensitivity - 1.35).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn max_file_mb_clamps_safely_and_persists() {
+        assert_eq!(GlideConfigFile::clamp_max_file_mb(0), MIN_MAX_FILE_MB);
+        assert_eq!(GlideConfigFile::clamp_max_file_mb(512), 512);
+        assert_eq!(GlideConfigFile::clamp_max_file_mb(99999), MAX_MAX_FILE_MB);
+        assert_eq!(GlideConfigFile::max_file_bytes_for_mb(0), 1024 * 1024);
+        assert_eq!(
+            GlideConfigFile::max_file_bytes_for_mb(4096),
+            u32::MAX as usize
+        );
+
+        let tmp = std::env::temp_dir().join(format!(
+            "glide-cfg-max-file-{}.toml",
+            std::process::id()
+        ));
+        let cfg = GlideConfigFile {
+            max_file_mb: 8192,
+            ..GlideConfigFile::default()
+        };
+        cfg.save(&tmp).unwrap();
+        let reloaded = GlideConfigFile::load(&tmp).unwrap();
+        assert_eq!(reloaded.max_file_mb, MAX_MAX_FILE_MB);
+        let _ = std::fs::remove_file(&tmp);
     }
 }

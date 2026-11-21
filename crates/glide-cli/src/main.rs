@@ -327,7 +327,7 @@ async fn run_command(command: Command, config: Option<PathBuf>) -> Result<()> {
             no_fullscreen_lock,
             coalesce_us,
         } => {
-            let mut cfg: ServerConfig = load_config(cli_config.as_ref())?.server;
+            let mut cfg: ServerConfig = load_config(cli_config.as_ref())?.effective_server_config();
             if let Some(b) = bind {
                 cfg.bind = b;
             }
@@ -383,7 +383,7 @@ async fn run_command(command: Command, config: Option<PathBuf>) -> Result<()> {
             backend,
             no_clipboard,
         } => {
-            let mut cfg: ClientConfig = load_config(cli_config.as_ref())?.client;
+            let mut cfg: ClientConfig = load_config(cli_config.as_ref())?.effective_client_config();
             if let Some(s) = server {
                 cfg.server = Some(s);
             }

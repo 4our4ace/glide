@@ -19,8 +19,8 @@ use glide_hid::ModifierMask;
 use glide_net::discovery::spawn_server_beacon;
 use glide_net::tls::ServerIdentity;
 use glide_net::{
-    recv_bulk_on, send_clipboard_on, send_file_on, sha256_bytes, Connection, GlideServerEndpoint,
-    GlideSession,
+    recv_bulk_on_with_limit, send_clipboard_on, send_file_on_with_limit, sha256_bytes, Connection,
+    GlideServerEndpoint, GlideSession,
 };
 use glide_proto::{
     BulkTransfer, ClipboardPayload, ControlMessage, DatagramMessage, Edge, FilePayload, LockState,
@@ -28,7 +28,8 @@ use glide_proto::{
 };
 use std::collections::HashMap;
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
@@ -140,18 +141,21 @@ pub async fn run_server_with_backends(
     };
 
     let (peer_tx, mut peer_rx) = mpsc::unbounded_channel::<PeerEvent>();
+    let max_file_bytes = Arc::new(AtomicUsize::new(config.resolved_max_file_bytes()));
 
     let server_name = config.name.clone();
     let accept_tx = peer_tx.clone();
+    let accept_max_file_bytes = Arc::clone(&max_file_bytes);
     let _accept_guard = AbortOnDrop(tokio::spawn(async move {
         loop {
             match endpoint.accept().await {
                 Ok(session) => {
                     let sname = server_name.clone();
                     let tx = accept_tx.clone();
+                    let limit = Arc::clone(&accept_max_file_bytes);
                     tokio::spawn(async move {
                         if let Err(e) =
-                            handle_incoming_session(session, sname, server_scale, tx).await
+                            handle_incoming_session(session, sname, server_scale, tx, limit).await
                         {
                             warn!(error = %e, "Incoming client handshake failed");
                         }
@@ -363,6 +367,7 @@ pub async fn run_server_with_backends(
                         sync_runtime_peers(&runtime, &peers, active_remote, locked);
                     }
                     RuntimeCommand::SendFile { filename, data } => {
+                        let limit = max_file_bytes.load(Ordering::Relaxed);
                         let payload = FilePayload {
                             filename: filename.clone(),
                             sha256: sha256_bytes(&data),
@@ -375,11 +380,16 @@ pub async fn run_server_with_backends(
                             let conn = peer.conn.clone();
                             let p = payload.clone();
                             tokio::spawn(async move {
-                                if let Err(e) = send_file_on(&conn, &p).await {
+                                if let Err(e) = send_file_on_with_limit(&conn, &p, limit).await {
                                     warn!(error = %e, "Failed beaming file to client");
                                 }
                             });
                         }
+                    }
+                    RuntimeCommand::UpdateMaxFileBytes(limit) => {
+                        let effective = limit.min(u32::MAX as usize);
+                        config.max_file_bytes = Some(effective);
+                        max_file_bytes.store(effective, Ordering::Relaxed);
                     }
                     RuntimeCommand::ResendClipboard(id) => {
                         if let Some(ref rt) = runtime {
@@ -881,6 +891,7 @@ async fn handle_incoming_session(
     server_name: String,
     server_scale: f32,
     peer_tx: mpsc::UnboundedSender<PeerEvent>,
+    max_file_bytes: Arc<AtomicUsize>,
 ) -> Result<()> {
     let hello = tokio::time::timeout(Duration::from_secs(5), session.ctrl_recv.recv()).await??;
     let (peer_name, edge, os) = match hello {
@@ -942,9 +953,22 @@ async fn handle_incoming_session(
     let bulk_conn = conn.clone();
     let bulk_tx = peer_tx.clone();
     tokio::spawn(async move {
-        while let Ok(transfer) = recv_bulk_on(&bulk_conn).await {
-            if bulk_tx.send(PeerEvent::Bulk { peer_id, transfer }).is_err() {
-                break;
+        loop {
+            let limit = max_file_bytes.load(Ordering::Relaxed);
+            match recv_bulk_on_with_limit(&bulk_conn, limit).await {
+                Ok(transfer) => {
+                    if bulk_tx.send(PeerEvent::Bulk { peer_id, transfer }).is_err() {
+                        break;
+                    }
+                }
+                Err(e) => {
+                    if bulk_conn.close_reason().is_some()
+                        || e.to_string().contains("bulk uni stream closed")
+                    {
+                        break;
+                    }
+                    warn!(peer_id, error = %e, "Rejected incoming bulk transfer");
+                }
             }
         }
     });

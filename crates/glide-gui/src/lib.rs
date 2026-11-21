@@ -17,7 +17,7 @@ use glide_core::runtime::{RuntimeCommand, RuntimeState};
 use glide_core::server::run_native_server_with_runtime;
 use glide_net::discovery::{discover_servers, local_ipv4_addresses, machine_hostname};
 use glide_net::tls::ServerIdentity;
-use glide_proto::{Edge, MAX_FILE_BYTES};
+use glide_proto::Edge;
 use parking_lot::Mutex;
 use serde_json::json;
 use std::io::{Read, Write};
@@ -184,7 +184,7 @@ impl AppController {
 
         let task = match role {
             "server" => {
-                let scfg = cfg.server;
+                let scfg = cfg.effective_server_config();
                 let rt_err = rt.clone();
                 tokio::spawn(async move {
                     if let Err(e) =
@@ -200,7 +200,7 @@ impl AppController {
                 })
             }
             "client" => {
-                let ccfg = cfg.client;
+                let ccfg = cfg.effective_client_config();
                 let rt_err = rt.clone();
                 tokio::spawn(async move {
                     if let Err(e) =
@@ -240,13 +240,16 @@ impl AppController {
                 new_cfg.auto_start_on_launch = true;
             }
         }
+        new_cfg.max_file_mb = new_cfg.max_file_mb_clamped();
         new_cfg.save(&self.config_path)?;
         self.runtime.set_record_history(new_cfg.clipboard_history);
+        let max_file_bytes = new_cfg.max_file_bytes();
         let s = new_cfg.server.clone();
         let c = new_cfg.client.clone();
         *self.config.lock() = new_cfg;
 
         let locked = self.runtime.snapshot().locked;
+        self.send_cmd(RuntimeCommand::UpdateMaxFileBytes(max_file_bytes));
         self.send_cmd(RuntimeCommand::UpdateServerTuning {
             edge_threshold_px: s.edge_threshold_px,
             dead_corner_px: s.dead_corner_px,
@@ -740,7 +743,8 @@ async fn handle_http_conn(mut stream: TcpStream, ctrl: Arc<AppController>) -> Re
         return Ok(());
     }
 
-    if content_len > MAX_FILE_BYTES {
+    let max_file_bytes = ctrl.config.lock().max_file_bytes();
+    if content_len > max_file_bytes {
         write_response(
             &mut stream,
             "413 Payload Too Large",
