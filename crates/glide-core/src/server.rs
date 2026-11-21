@@ -20,7 +20,9 @@ use crate::runtime::{save_received_file, PeerSummary, RuntimeCommand, RuntimeSta
 use anyhow::Result;
 use glide_backend::dnd::{DndBackend, NoopDndBackend};
 use glide_backend::os_integration::resolve_receive_dir;
-use glide_backend::{CaptureEvent, CaptureHandle, ClipboardBackend, ClipboardHandle};
+use glide_backend::{
+    CaptureControl, CaptureEvent, CaptureHandle, ClipboardBackend, ClipboardHandle,
+};
 use glide_hid::{HidUsage, ModifierMask, MouseButton};
 use glide_net::discovery::{local_ipv4_addresses_async, spawn_server_beacon_with_refresh};
 use glide_net::tls::ServerIdentity;
@@ -71,6 +73,21 @@ struct PendingDragHandoff {
     edge: Edge,
     peer_id: u64,
     normalized_pos: f32,
+    drop_requested: bool,
+}
+
+fn cancel_pending_drag_handoff(
+    pending_drag_handoff: &mut Option<PendingDragHandoff>,
+    active_remote: Option<u64>,
+    capture_ctrl: &Arc<dyn CaptureControl>,
+    dnd: &Arc<dyn DndBackend>,
+) {
+    if let Some(pending) = pending_drag_handoff.take() {
+        dnd.set_drag_armed(false);
+        if active_remote.is_none() {
+            let _ = capture_ctrl.leave_remote(pending.edge, pending.normalized_pos);
+        }
+    }
 }
 
 struct DragHandoffReady {
@@ -168,12 +185,13 @@ pub async fn run_server_with_dnd(
     let _endpoint_guard = EndpointCloseOnDrop(endpoint.clone());
     let local_addr: SocketAddr = endpoint.local_addr();
     let fingerprint = endpoint.fingerprint().to_string();
-    let geom = capture.control.desktop_geometry();
+    let capture_ctrl: Arc<dyn CaptureControl> = Arc::from(capture.control);
+    let geom = capture_ctrl.desktop_geometry();
     let server_scale = Arc::new(AtomicU32::new(geom.primary_scale().to_bits()));
     let mut last_local_ips = local_ipv4_addresses_async().await;
     dnd.set_enabled(config.drag_drop_files);
-    capture.control.set_drag_drop_files(config.drag_drop_files);
-    capture.control.set_dnd_probe(Arc::clone(&dnd));
+    capture_ctrl.set_drag_drop_files(config.drag_drop_files);
+    capture_ctrl.set_dnd_probe(Arc::clone(&dnd));
 
     // Dedicated serial clipboard applier so OS clipboard locks (e.g. OpenClipboard / DIB->PNG)
     // apply strictly in order on the blocking pool without ever stalling the capture select! loop.
@@ -328,7 +346,6 @@ pub async fn run_server_with_dnd(
     let mut last_ip_check = Instant::now();
 
     let mut capture_events = capture.events;
-    let capture_ctrl = capture.control;
 
     let sync_runtime_peers = |rt: &Option<RuntimeState>,
                               peers: &HashMap<u64, ConnectedPeer>,
@@ -445,7 +462,12 @@ pub async fn run_server_with_dnd(
                         jump_secs = jump.as_secs_f32(),
                         "Detected sleep/wall-clock jump on server; releasing remote focus, refreshing geometry & LAN IPs, and probing peers"
                     );
-                    pending_drag_handoff = None;
+                    cancel_pending_drag_handoff(
+                        &mut pending_drag_handoff,
+                        active_remote,
+                        &capture_ctrl,
+                        &dnd,
+                    );
                     cancel_outgoing_drag(&mut outgoing_drag, &peers);
                     if let Some(pid) = active_remote.take() {
                         if let Some(peer) = peers.get(&pid) {
@@ -526,7 +548,12 @@ pub async fn run_server_with_dnd(
                             .as_ref()
                             .is_some_and(|p| p.peer_id == dead_id)
                         {
-                            pending_drag_handoff = None;
+                            cancel_pending_drag_handoff(
+                                &mut pending_drag_handoff,
+                                active_remote,
+                                &capture_ctrl,
+                                &dnd,
+                            );
                         }
                         if outgoing_drag
                             .as_ref()
@@ -632,17 +659,28 @@ pub async fn run_server_with_dnd(
                 let Some(pending) = pending_drag_handoff.as_ref() else {
                     continue;
                 };
-                if pending.gen != ready.gen
-                    || locked
-                    || edge_to_peer.get(&ready.edge) != Some(&ready.peer_id)
-                {
-                    if pending.gen == ready.gen {
-                        pending_drag_handoff = None;
-                    }
+                if pending.gen != ready.gen {
                     continue;
                 }
+                if locked
+                    || !config.drag_drop_files
+                    || edge_to_peer.get(&ready.edge) != Some(&ready.peer_id)
+                    || !peers.contains_key(&ready.peer_id)
+                {
+                    cancel_pending_drag_handoff(
+                        &mut pending_drag_handoff,
+                        active_remote,
+                        &capture_ctrl,
+                        &dnd,
+                    );
+                    continue;
+                }
+                let Some(pending) = pending_drag_handoff.take() else {
+                    continue;
+                };
                 let normalized_pos = pending.normalized_pos;
-                pending_drag_handoff = None;
+                let drop_requested = pending.drop_requested || !local_lmb_down;
+                dnd.set_drag_armed(false);
 
                 if let Some(old_pid) = active_remote.take() {
                     if old_pid != ready.peer_id {
@@ -692,7 +730,7 @@ pub async fn run_server_with_dnd(
                     outgoing_drag = Some(ActiveOutgoingDrag {
                         state: OutgoingDragState { drag_id, peer_id },
                         collecting: true,
-                        drop_requested: false,
+                        drop_requested,
                     });
                     let tx = drag_collect_tx.clone();
                     tokio::spawn(async move {
@@ -806,9 +844,6 @@ pub async fn run_server_with_dnd(
                         config.set_lock_shortcut(hotkeys.lock);
                         config.set_escape_shortcut(hotkeys.escape);
                         locked = new_locked;
-                        if locked {
-                            pending_drag_handoff = None;
-                        }
                         capture_ctrl.update_tuning(
                             edge_threshold_px,
                             dead_corner_px,
@@ -821,6 +856,14 @@ pub async fn run_server_with_dnd(
                         capture_ctrl.set_pin_media_keys_local(pin_media_keys_local);
                         capture_ctrl.set_hotkeys(hotkeys);
                         dnd.set_enabled(drag_drop_files);
+                        if locked || !drag_drop_files {
+                            cancel_pending_drag_handoff(
+                                &mut pending_drag_handoff,
+                                active_remote,
+                                &capture_ctrl,
+                                &dnd,
+                            );
+                        }
                         let edges: Vec<Edge> = edge_to_peer.keys().copied().collect();
                         dnd.set_active_edges(&edges, dead_corner_px);
                         sync_runtime_peers(&runtime, &peers, active_remote, locked, None);
@@ -839,7 +882,12 @@ pub async fn run_server_with_dnd(
                             locked,
                         );
                         if locked {
-                            pending_drag_handoff = None;
+                            cancel_pending_drag_handoff(
+                                &mut pending_drag_handoff,
+                                active_remote,
+                                &capture_ctrl,
+                                &dnd,
+                            );
                             dnd.set_drag_armed(false);
                         }
                         info!(locked, "Toggled cursor lock");
@@ -855,7 +903,12 @@ pub async fn run_server_with_dnd(
                             locked,
                         );
                         if locked {
-                            pending_drag_handoff = None;
+                            cancel_pending_drag_handoff(
+                                &mut pending_drag_handoff,
+                                active_remote,
+                                &capture_ctrl,
+                                &dnd,
+                            );
                             dnd.set_drag_armed(false);
                         }
                         info!(locked, "Updated cursor lock state");
@@ -863,11 +916,21 @@ pub async fn run_server_with_dnd(
                     }
                     RuntimeCommand::SwitchToEdge(edge)
                     | RuntimeCommand::SwitchTarget(Some(edge)) => {
-                        pending_drag_handoff = None;
-                        if let Some(&peer_id) = edge_to_peer.get(&edge) {
+                        let target_peer_id = edge_to_peer
+                            .get(&edge)
+                            .copied()
+                            .filter(|pid| peers.contains_key(pid));
+                        if let Some(peer_id) = target_peer_id {
                             if active_remote == Some(peer_id) {
+                                cancel_pending_drag_handoff(
+                                    &mut pending_drag_handoff,
+                                    active_remote,
+                                    &capture_ctrl,
+                                    &dnd,
+                                );
                                 continue;
                             }
+                            pending_drag_handoff = None;
                             cancel_outgoing_drag(&mut outgoing_drag, &peers);
                             let was_remote = active_remote.is_some();
                             if let Some(prev_pid) = active_remote {
@@ -908,10 +971,22 @@ pub async fn run_server_with_dnd(
                                 });
                                 sync_runtime_peers(&runtime, &peers, active_remote, locked, None);
                             }
+                        } else {
+                            cancel_pending_drag_handoff(
+                                &mut pending_drag_handoff,
+                                active_remote,
+                                &capture_ctrl,
+                                &dnd,
+                            );
                         }
                     }
                     RuntimeCommand::ReturnLocal | RuntimeCommand::SwitchTarget(None) => {
-                        pending_drag_handoff = None;
+                        cancel_pending_drag_handoff(
+                            &mut pending_drag_handoff,
+                            active_remote,
+                            &capture_ctrl,
+                            &dnd,
+                        );
                         cancel_outgoing_drag(&mut outgoing_drag, &peers);
                         if let Some(pid) = active_remote.take() {
                             if let Some(peer) = peers.get(&pid) {
@@ -1005,6 +1080,16 @@ pub async fn run_server_with_dnd(
                         if let Some(pid) = target_id {
                             if let Some(old_e) = peers.get(&pid).map(|p| p.edge) {
                                 if old_e != edge {
+                                    if pending_drag_handoff.as_ref().is_some_and(|p| {
+                                        p.peer_id == pid || p.edge == old_e || p.edge == edge
+                                    }) {
+                                        cancel_pending_drag_handoff(
+                                            &mut pending_drag_handoff,
+                                            active_remote,
+                                            &capture_ctrl,
+                                            &dnd,
+                                        );
+                                    }
                                     if let Some(other_id) = edge_to_peer.remove(&edge) {
                                         if other_id != pid {
                                             edge_to_peer.insert(old_e, other_id);
@@ -1057,6 +1142,9 @@ pub async fn run_server_with_dnd(
                     CaptureEvent::LocalLeftButton { pressed } => {
                         local_lmb_down = pressed;
                         if !pressed {
+                            if let Some(ref mut pending) = pending_drag_handoff {
+                                pending.drop_requested = true;
+                            }
                             dnd.set_drag_armed(false);
                             if let Some(ref mut inc) = incoming_drag {
                                 inc.request_drop_active();
@@ -1135,6 +1223,7 @@ pub async fn run_server_with_dnd(
                                         edge,
                                         peer_id,
                                         normalized_pos,
+                                        drop_requested: false,
                                     });
                                     let dnd_c = Arc::clone(&dnd);
                                     let tx = drag_handoff_tx.clone();
@@ -1213,8 +1302,13 @@ pub async fn run_server_with_dnd(
                     }
 
                     CaptureEvent::HotkeySwitch { direction } => {
-                        pending_drag_handoff = None;
                         if let Some(current_pid) = active_remote {
+                            cancel_pending_drag_handoff(
+                                &mut pending_drag_handoff,
+                                active_remote,
+                                &capture_ctrl,
+                                &dnd,
+                            );
                             // If pressing opposite direction of current remote edge, return to server with cursor memory!
                             if active_edge.is_some_and(|e| e.opposite() == direction) {
                                 cancel_outgoing_drag(&mut outgoing_drag, &peers);
@@ -1240,6 +1334,7 @@ pub async fn run_server_with_dnd(
                             }
                         } else if let Some(&peer_id) = edge_to_peer.get(&direction) {
                             if let Some(peer) = peers.get(&peer_id) {
+                                pending_drag_handoff = None;
                                 info!(peer = %peer.name, ?direction, "Hotkey jump to client (restoring cursor memory)");
                                 let lock_state = if config.sync_lock_keys {
                                     capture_ctrl.lock_state()
@@ -1262,7 +1357,21 @@ pub async fn run_server_with_dnd(
                                     lock_state,
                                 });
                                 sync_runtime_peers(&runtime, &peers, active_remote, locked, None);
+                            } else {
+                                cancel_pending_drag_handoff(
+                                    &mut pending_drag_handoff,
+                                    active_remote,
+                                    &capture_ctrl,
+                                    &dnd,
+                                );
                             }
+                        } else {
+                            cancel_pending_drag_handoff(
+                                &mut pending_drag_handoff,
+                                active_remote,
+                                &capture_ctrl,
+                                &dnd,
+                            );
                         }
                     }
 
@@ -1276,7 +1385,12 @@ pub async fn run_server_with_dnd(
                             locked,
                         );
                         if locked {
-                            pending_drag_handoff = None;
+                            cancel_pending_drag_handoff(
+                                &mut pending_drag_handoff,
+                                active_remote,
+                                &capture_ctrl,
+                                &dnd,
+                            );
                             dnd.set_drag_armed(false);
                         }
                         info!(locked, "Toggled cursor lock via shortcut");
@@ -1361,6 +1475,10 @@ pub async fn run_server_with_dnd(
                                 .reset(tokio::time::Instant::now() + retry_delay);
                         }
                         if button == MouseButton::Left && !pressed {
+                            if let Some(ref mut pending) = pending_drag_handoff {
+                                pending.drop_requested = true;
+                                continue;
+                            }
                             if let Some(ref mut out) = outgoing_drag {
                                 if out.collecting {
                                     out.drop_requested = true;
@@ -1385,12 +1503,24 @@ pub async fn run_server_with_dnd(
                     }
 
                     CaptureEvent::Key { usage, pressed } => {
-                        if pressed && usage == HidUsage::keyboard(0x29) && outgoing_drag.is_some() {
-                            if let Some(ref out) = outgoing_drag {
-                                debug!(drag_id = out.state.drag_id, "Escape pressed during drag; cancelling");
+                        if pressed && usage == HidUsage::ESCAPE {
+                            if pending_drag_handoff.is_some() {
+                                debug!("Escape pressed during pending drag handoff; cancelling");
+                                cancel_pending_drag_handoff(
+                                    &mut pending_drag_handoff,
+                                    active_remote,
+                                    &capture_ctrl,
+                                    &dnd,
+                                );
+                                continue;
                             }
-                            cancel_outgoing_drag(&mut outgoing_drag, &peers);
-                            continue;
+                            if outgoing_drag.is_some() {
+                                if let Some(ref out) = outgoing_drag {
+                                    debug!(drag_id = out.state.drag_id, "Escape pressed during drag; cancelling");
+                                }
+                                cancel_outgoing_drag(&mut outgoing_drag, &peers);
+                                continue;
+                            }
                         }
                         if let Some(retry_delay) = flush_pending_motion(
                             &peers,
@@ -1415,7 +1545,12 @@ pub async fn run_server_with_dnd(
                     }
 
                     CaptureEvent::EscapeHotkey => {
-                        pending_drag_handoff = None;
+                        cancel_pending_drag_handoff(
+                            &mut pending_drag_handoff,
+                            active_remote,
+                            &capture_ctrl,
+                            &dnd,
+                        );
                         cancel_outgoing_drag(&mut outgoing_drag, &peers);
                         if let Some(pid) = active_remote.take() {
                             if let Some(peer) = peers.get(&pid) {
@@ -1456,7 +1591,12 @@ pub async fn run_server_with_dnd(
                     }
 
                     CaptureEvent::SystemSuspended => {
-                        pending_drag_handoff = None;
+                        cancel_pending_drag_handoff(
+                            &mut pending_drag_handoff,
+                            active_remote,
+                            &capture_ctrl,
+                            &dnd,
+                        );
                         cancel_outgoing_drag(&mut outgoing_drag, &peers);
                         if let Some(pid) = active_remote.take() {
                             if let Some(peer) = peers.get(&pid) {
@@ -1487,7 +1627,12 @@ pub async fn run_server_with_dnd(
                     CaptureEvent::SystemResumed => {
                         let now = Instant::now();
                         sleep_detector.reset();
-                        pending_drag_handoff = None;
+                        cancel_pending_drag_handoff(
+                            &mut pending_drag_handoff,
+                            active_remote,
+                            &capture_ctrl,
+                            &dnd,
+                        );
                         cancel_outgoing_drag(&mut outgoing_drag, &peers);
                         info!("System resumed/unlocked; refreshing server geometry, LAN IPs, discovery beacon, and probing peers");
                         if let Some(pid) = active_remote.take() {
@@ -1545,7 +1690,12 @@ pub async fn run_server_with_dnd(
                                 .as_ref()
                                 .is_some_and(|p| p.peer_id == old_id)
                             {
-                                pending_drag_handoff = None;
+                                cancel_pending_drag_handoff(
+                                    &mut pending_drag_handoff,
+                                    active_remote,
+                                    &capture_ctrl,
+                                    &dnd,
+                                );
                             }
                             if active_remote == Some(old_id) {
                                 active_remote = None;
@@ -1633,7 +1783,14 @@ pub async fn run_server_with_dnd(
                                 }
                             }
                             ControlMessage::DragStart { drag_id, files } => {
-                                if config.drag_drop_files {
+                                if active_remote == Some(peer_id) {
+                                    debug!(
+                                        peer_id,
+                                        drag_id,
+                                        "Ignoring stale DragStart from client because focus already returned to that peer"
+                                    );
+                                    early_drag_files.remove_drag(drag_id);
+                                } else if config.drag_drop_files {
                                     debug!(peer_id, drag_id, count = files.len(), "Incoming cross-edge drag from client");
                                     if let Some(prev) = incoming_drag.take() {
                                         if !prev.drop_requested {
@@ -1724,6 +1881,18 @@ pub async fn run_server_with_dnd(
                             ControlMessage::SetEdge { edge_on_server } => {
                                 if let Some(old_e) = peers.get(&peer_id).map(|p| p.edge) {
                                     if old_e != edge_on_server {
+                                        if pending_drag_handoff.as_ref().is_some_and(|p| {
+                                            p.peer_id == peer_id
+                                                || p.edge == old_e
+                                                || p.edge == edge_on_server
+                                        }) {
+                                            cancel_pending_drag_handoff(
+                                                &mut pending_drag_handoff,
+                                                active_remote,
+                                                &capture_ctrl,
+                                                &dnd,
+                                            );
+                                        }
                                         if let Some(other_id) = edge_to_peer.remove(&edge_on_server) {
                                             if other_id != peer_id {
                                                 edge_to_peer.insert(old_e, other_id);
@@ -1881,7 +2050,12 @@ pub async fn run_server_with_dnd(
                                 .as_ref()
                                 .is_some_and(|p| p.peer_id == peer_id)
                             {
-                                pending_drag_handoff = None;
+                                cancel_pending_drag_handoff(
+                                    &mut pending_drag_handoff,
+                                    active_remote,
+                                    &capture_ctrl,
+                                    &dnd,
+                                );
                             }
                             if outgoing_drag
                                 .as_ref()
@@ -1959,6 +2133,12 @@ pub async fn run_server_with_dnd(
         }
     }
 
+    cancel_pending_drag_handoff(
+        &mut pending_drag_handoff,
+        active_remote,
+        &capture_ctrl,
+        &dnd,
+    );
     if let Some(inc) = incoming_drag.take() {
         if !inc.drop_requested {
             inc.cancel(Arc::clone(&dnd));

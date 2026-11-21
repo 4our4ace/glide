@@ -1875,8 +1875,11 @@ function formatShortcutTokens(raw, appendArrow) {
     if (lo === 'delete') return 'Del';
     return tok;
   });
-  if (appendArrow && tokens.length && tokens[tokens.length - 1].toLowerCase() !== 'arrow') {
-    tokens.push('Arrow');
+  if (appendArrow) {
+    while (tokens.length && /^arrows?$/i.test(tokens[tokens.length - 1])) {
+      tokens.pop();
+    }
+    if (tokens.length) tokens.push('Arrow');
   }
   return tokens.length ? tokens : null;
 }

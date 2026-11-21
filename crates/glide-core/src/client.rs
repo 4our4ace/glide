@@ -39,7 +39,7 @@ use std::collections::HashMap;
 use std::future::Future;
 use std::net::{IpAddr, SocketAddr};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::task::{Context as TaskContext, Poll, Waker};
 use std::time::{Duration, Instant};
@@ -552,6 +552,7 @@ async fn run_client_session_tracked(
     let mut early_drag_files = EarlyDragBuffer::default();
     let mut client_lmb_down = false;
     let mut last_drag_move_at: Option<Instant> = None;
+    let leave_gen = Arc::new(AtomicU64::new(0));
 
     let mut ping_interval = tokio::time::interval(Duration::from_millis(500));
     ping_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -1057,6 +1058,8 @@ async fn run_client_session_tracked(
                                     let limit = max_file_bytes.load(Ordering::Relaxed);
                                     focused = false;
                                     client_lmb_down = false;
+                                    let expected_gen =
+                                        leave_gen.fetch_add(1, Ordering::AcqRel).wrapping_add(1);
 
                                     if staged_paths.is_some() {
                                         // Cancel local OS drag off Tokio's async worker before releasing
@@ -1092,6 +1095,7 @@ async fn run_client_session_tracked(
                                         let conn_c = conn.clone();
                                         let ctrl_tx_c = ctrl_out_tx.clone();
                                         let rt_c = runtime.cloned();
+                                        let leave_gen_c = Arc::clone(&leave_gen);
                                         tokio::spawn(async move {
                                             let collected = tokio::task::spawn_blocking(move || {
                                                 collect_local_drag_files(&paths, limit)
@@ -1103,7 +1107,10 @@ async fn run_client_session_tracked(
                                             else {
                                                 return;
                                             };
-                                            if conn_c.close_reason().is_some() {
+                                            if leave_gen_c.load(Ordering::Acquire) != expected_gen
+                                                || conn_c.close_reason().is_some()
+                                            {
+                                                debug!("Aborting stale client DragStart because focus returned or connection closed");
                                                 return;
                                             }
                                             let drag_id = next_drag_id();
@@ -1175,6 +1182,7 @@ async fn run_client_session_tracked(
                 health_probe.mark_alive();
                 match msg {
                     ControlMessage::Enter { edge, normalized_pos, lock_state } => {
+                        leave_gen.fetch_add(1, Ordering::AcqRel);
                         focused = true;
                         last_seq = None;
                         client_lmb_down = false;
@@ -1197,6 +1205,7 @@ async fn run_client_session_tracked(
                         }
                     }
                     ControlMessage::EnterAt { norm_x, norm_y, lock_state } => {
+                        leave_gen.fetch_add(1, Ordering::AcqRel);
                         focused = true;
                         last_seq = None;
                         client_lmb_down = false;
@@ -1221,6 +1230,7 @@ async fn run_client_session_tracked(
                         let _ = injector.release_all();
                     }
                     ControlMessage::Leave { .. } => {
+                        leave_gen.fetch_add(1, Ordering::AcqRel);
                         focused = false;
                         client_lmb_down = false;
                         last_drag_move_at = None;

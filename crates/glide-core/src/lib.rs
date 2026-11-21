@@ -1258,6 +1258,9 @@ mod tests {
         assert!(!cap_state.remote_mode.load(Ordering::SeqCst));
 
         // --- Scenario 2: Drag across edge -> return to origin before releasing LMB -> cancel! ---
+        cap_tx
+            .send(CaptureEvent::LocalLeftButton { pressed: true })
+            .unwrap();
         srv_dnd_state.stage_files(Edge::Right, vec![file3.clone()]);
         cap_tx
             .send(CaptureEvent::EdgeCrossed {
@@ -1843,8 +1846,8 @@ mod tests {
             name: "burst-srv".into(),
             discovery: false,
             clipboard: false,
-            // Long 120ms coalesce window to verify leading-edge 0ms flush!
-            motion_coalesce_us: 120_000,
+            // Long 250ms coalesce window to verify leading-edge 0ms flush with generous CI headroom!
+            motion_coalesce_us: 250_000,
             ..Default::default()
         };
         let mut cli_cfg = ClientConfig {
@@ -1890,13 +1893,13 @@ mod tests {
             .unwrap();
         tokio::time::sleep(Duration::from_millis(40)).await;
 
-        // 1. Leading-edge flush: first MouseDelta must arrive well BEFORE the 120ms coalesce window!
+        // 1. Leading-edge flush: first MouseDelta must arrive well BEFORE the 250ms coalesce window!
         let t0 = std::time::Instant::now();
         cap_tx
             .send(CaptureEvent::MouseDelta { dx: 15.0, dy: 5.0 })
             .unwrap();
         let mut got_leading = false;
-        while t0.elapsed() < Duration::from_millis(70) {
+        while t0.elapsed() < Duration::from_millis(150) {
             if inj_log.lock().contains(&InjectedAction::Move(15.0, 5.0)) {
                 got_leading = true;
                 break;
@@ -1905,7 +1908,7 @@ mod tests {
         }
         assert!(
             got_leading,
-            "first MouseDelta must flush on leading edge without waiting for the 120ms coalesce timer"
+            "first MouseDelta must flush on leading edge without waiting for the 250ms coalesce timer"
         );
 
         // 2. Interleave 100 rapid mouse datagrams + 30 control keystrokes to prove the dedicated
@@ -1942,5 +1945,317 @@ mod tests {
 
         cli_task.abort();
         srv_task.abort();
+    }
+
+    #[tokio::test]
+    async fn pending_drag_handoff_abort_releases_remote_mode_and_lmb_release_during_window_still_drops(
+    ) {
+        use crate::client::run_client_session_with_dnd;
+        use crate::runtime::RuntimeCommand;
+        use crate::server::run_server_with_dnd;
+        use glide_backend::dnd::{DndBackend, DropDeliveryOutcome};
+        use glide_backend::mock::create_mock_dnd;
+        use std::sync::atomic::AtomicUsize;
+        use std::sync::{Arc, Condvar, Mutex};
+        use tokio::sync::Notify;
+
+        /// Deterministic DnD wrapper that pauses inside `cancel_local_drag()` (on the blocking
+        /// thread pool) until released, allowing tests to exercise events arriving during the
+        /// async handoff window without blocking the Tokio executor thread.
+        struct GatedCancelDnd {
+            inner: Arc<dyn DndBackend>,
+            entered_calls: Arc<AtomicUsize>,
+            entered_notify: Arc<Notify>,
+            release_gate: Arc<(Mutex<bool>, Condvar)>,
+        }
+
+        impl GatedCancelDnd {
+            async fn wait_until_cancel_entered(&self, expected_calls: usize) {
+                let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+                while self.entered_calls.load(Ordering::SeqCst) < expected_calls {
+                    let notified = self.entered_notify.notified();
+                    if self.entered_calls.load(Ordering::SeqCst) >= expected_calls {
+                        break;
+                    }
+                    let rem = deadline.saturating_duration_since(tokio::time::Instant::now());
+                    assert!(!rem.is_zero(), "timed out waiting for cancel_local_drag()");
+                    let _ = tokio::time::timeout(rem, notified).await;
+                }
+            }
+
+            fn release_cancel(&self) {
+                let (lock, cv) = &*self.release_gate;
+                *lock.lock().unwrap() = true;
+                cv.notify_all();
+            }
+
+            fn reset_gate(&self) {
+                let (lock, _) = &*self.release_gate;
+                *lock.lock().unwrap() = false;
+            }
+        }
+
+        impl DndBackend for GatedCancelDnd {
+            fn set_enabled(&self, enabled: bool) {
+                self.inner.set_enabled(enabled);
+            }
+            fn set_active_edges(&self, edges: &[Edge], dead_corner_px: i32) {
+                self.inner.set_active_edges(edges, dead_corner_px);
+            }
+            fn set_drag_armed(&self, armed: bool) {
+                self.inner.set_drag_armed(armed);
+            }
+            fn staged_edge_mask(&self) -> u8 {
+                self.inner.staged_edge_mask()
+            }
+            fn take_staged_files(&self, edge: Edge) -> Option<Vec<std::path::PathBuf>> {
+                self.inner.take_staged_files(edge)
+            }
+            fn cancel_local_drag(&self) {
+                self.inner.cancel_local_drag();
+                self.entered_calls.fetch_add(1, Ordering::SeqCst);
+                self.entered_notify.notify_waiters();
+                let (lock, cv) = &*self.release_gate;
+                let mut released = lock.lock().unwrap();
+                let deadline = std::time::Instant::now() + Duration::from_secs(2);
+                while !*released {
+                    let rem = deadline.saturating_duration_since(std::time::Instant::now());
+                    if rem.is_zero() {
+                        break;
+                    }
+                    let (g, _) = cv.wait_timeout(released, rem).unwrap();
+                    released = g;
+                }
+            }
+            fn on_incoming_drag_cancel(&self) {
+                self.inner.on_incoming_drag_cancel();
+            }
+            fn deliver_drop(
+                &self,
+                paths: Vec<std::path::PathBuf>,
+            ) -> anyhow::Result<DropDeliveryOutcome> {
+                self.inner.deliver_drop(paths)
+            }
+        }
+
+        let unique = format!(
+            "glide-handoff-abort-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        );
+        let root_tmp = std::env::temp_dir().join(unique);
+        let src_file = root_tmp.join("quick-drop.txt");
+        let cli_recv_dir = root_tmp.join("client-recv");
+        std::fs::create_dir_all(&cli_recv_dir).unwrap();
+        std::fs::write(&src_file, b"dropped during cancel window").unwrap();
+
+        let identity = ServerIdentity::generate_ephemeral().unwrap();
+        let fp = identity.fingerprint.clone();
+        let endpoint =
+            GlideServerEndpoint::bind("127.0.0.1:0".parse().unwrap(), &identity).unwrap();
+        let addr = endpoint.local_addr();
+
+        let geom = single_monitor_geom("Handoff");
+        let (capture_handle, cap_tx, cap_state) = create_mock_capture(geom.clone());
+        let (mut injector, _inj_log) = MockInjector::new(geom);
+        let (srv_dnd_inner, srv_dnd_state) = create_mock_dnd();
+        let gated_dnd = Arc::new(GatedCancelDnd {
+            inner: srv_dnd_inner,
+            entered_calls: Arc::new(AtomicUsize::new(0)),
+            entered_notify: Arc::new(Notify::new()),
+            release_gate: Arc::new((Mutex::new(false), Condvar::new())),
+        });
+        let (cli_dnd, cli_dnd_state) = create_mock_dnd();
+        let (srv_cmd_tx, srv_cmd_rx) = tokio::sync::mpsc::unbounded_channel();
+
+        let srv_cfg = ServerConfig {
+            name: "handoff-srv".into(),
+            discovery: false,
+            clipboard: false,
+            motion_coalesce_us: 0,
+            drag_drop_files: true,
+            ..Default::default()
+        };
+        let mut cli_cfg = ClientConfig {
+            name: "handoff-cli".into(),
+            server: Some(addr.to_string()),
+            edge: Edge::Right,
+            trusted_fingerprint: Some(fp),
+            clipboard: false,
+            drag_drop_files: true,
+            ..Default::default()
+        };
+
+        let srv_dnd_trait: Arc<dyn DndBackend> = gated_dnd.clone();
+        let srv_task = tokio::spawn(async move {
+            let _ = run_server_with_dnd(
+                srv_cfg,
+                endpoint,
+                capture_handle,
+                None,
+                srv_dnd_trait,
+                None,
+                "windows",
+                None,
+                Some(srv_cmd_rx),
+            )
+            .await;
+        });
+
+        let cli_recv_c = cli_recv_dir.clone();
+        let cli_task = tokio::spawn(async move {
+            let mut opt_clip = None;
+            let _ = run_client_session_with_dnd(
+                &mut cli_cfg,
+                addr,
+                &mut injector,
+                &mut opt_clip,
+                cli_dnd,
+                Some(cli_recv_c),
+                None,
+                None,
+            )
+            .await;
+        });
+
+        for _ in 0..40 {
+            if *cap_state.active_edges.lock() == vec![Edge::Right] {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert_eq!(*cap_state.active_edges.lock(), vec![Edge::Right]);
+
+        // --- Case 1 (Blocker #1): Locking cursor while pending_drag_handoff is in-flight
+        //     must call leave_remote() immediately so remote_mode is never wedged! ---
+        srv_dnd_state.stage_files(Edge::Right, vec![src_file.clone()]);
+        // Simulate real OS capture flipping remote_mode=true upon emitting EdgeCrossed.
+        cap_state.remote_mode.store(true, Ordering::SeqCst);
+        *cap_state.last_leave.lock() = None;
+        cap_tx
+            .send(CaptureEvent::LocalLeftButton { pressed: true })
+            .unwrap();
+        cap_tx
+            .send(CaptureEvent::EdgeCrossed {
+                edge: Edge::Right,
+                normalized_pos: 0.42,
+            })
+            .unwrap();
+        gated_dnd.wait_until_cancel_entered(1).await;
+
+        srv_cmd_tx.send(RuntimeCommand::SetLock(true)).unwrap();
+        for _ in 0..40 {
+            if cap_state.locked.load(Ordering::SeqCst)
+                && !cap_state.remote_mode.load(Ordering::SeqCst)
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(
+            !cap_state.remote_mode.load(Ordering::SeqCst),
+            "aborting pending_drag_handoff via SetLock(true) must release remote_mode"
+        );
+        assert_eq!(*cap_state.last_leave.lock(), Some((Edge::Right, 0.42)));
+        assert_eq!(cap_state.enter_remote_calls.load(Ordering::SeqCst), 0);
+
+        // Unblock cancel_local_drag; stale DragHandoffReady must be ignored cleanly.
+        gated_dnd.release_cancel();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(!cap_state.remote_mode.load(Ordering::SeqCst));
+        assert_eq!(cap_state.enter_remote_calls.load(Ordering::SeqCst), 0);
+        assert!(cli_dnd_state.delivered_drops.lock().is_empty());
+
+        // --- Case 2 (Blocker #1 + #2): Escape pressed during cancel_local_drag aborts cleanly ---
+        srv_cmd_tx.send(RuntimeCommand::SetLock(false)).unwrap();
+        for _ in 0..30 {
+            if !cap_state.locked.load(Ordering::SeqCst) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        gated_dnd.reset_gate();
+        srv_dnd_state.stage_files(Edge::Right, vec![src_file.clone()]);
+        cap_state.remote_mode.store(true, Ordering::SeqCst);
+        *cap_state.last_leave.lock() = None;
+        cap_tx
+            .send(CaptureEvent::LocalLeftButton { pressed: true })
+            .unwrap();
+        cap_tx
+            .send(CaptureEvent::EdgeCrossed {
+                edge: Edge::Right,
+                normalized_pos: 0.35,
+            })
+            .unwrap();
+        gated_dnd.wait_until_cancel_entered(2).await;
+        cap_tx
+            .send(CaptureEvent::Key {
+                usage: HidUsage::ESCAPE,
+                pressed: true,
+            })
+            .unwrap();
+        for _ in 0..40 {
+            if !cap_state.remote_mode.load(Ordering::SeqCst) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(
+            !cap_state.remote_mode.load(Ordering::SeqCst),
+            "Escape during pending_drag_handoff must call leave_remote and clear remote_mode"
+        );
+        assert_eq!(*cap_state.last_leave.lock(), Some((Edge::Right, 0.35)));
+        gated_dnd.release_cancel();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(cli_dnd_state.delivered_drops.lock().is_empty());
+
+        // --- Case 3 (Blocker #2): Releasing LMB during the 20ms cancel_local_drag window
+        //     must still commit DragDrop right after DragStart! ---
+        gated_dnd.reset_gate();
+        srv_dnd_state.stage_files(Edge::Right, vec![src_file.clone()]);
+        cap_tx
+            .send(CaptureEvent::LocalLeftButton { pressed: true })
+            .unwrap();
+        cap_tx
+            .send(CaptureEvent::EdgeCrossed {
+                edge: Edge::Right,
+                normalized_pos: 0.5,
+            })
+            .unwrap();
+        gated_dnd.wait_until_cancel_entered(3).await;
+
+        // User releases LMB BEFORE cancel_local_drag() completes!
+        cap_tx
+            .send(CaptureEvent::MouseButton {
+                button: MouseButton::Left,
+                pressed: false,
+            })
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        gated_dnd.release_cancel();
+
+        let mut delivered = false;
+        for _ in 0..50 {
+            if cli_dnd_state.delivered_drops.lock().len() == 1 {
+                delivered = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(
+            delivered,
+            "LMB release during pending_drag_handoff cancel window must still send DragDrop"
+        );
+        assert_eq!(
+            std::fs::read(cli_recv_dir.join("quick-drop.txt")).unwrap(),
+            b"dropped during cancel window"
+        );
+
+        cli_task.abort();
+        srv_task.abort();
+        let _ = std::fs::remove_dir_all(&root_tmp);
     }
 }

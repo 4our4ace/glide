@@ -1680,19 +1680,11 @@ impl Ui {
                     | HotkeyMods::from_modifier_mask(self.shortcut_recorder.held_phys)
                         .unwrap_or(HotkeyMods::EMPTY);
 
-                // Unmodified Escape cancels recording.
-                if key == PhysicalKeyCode::Escape && active_mods.is_empty() {
-                    self.stop_recording_shortcut();
-                    self.shortcut_recorder.swallow_key = Some(key);
-                    return true;
-                }
-
                 // Unmodified Backspace or Delete disables this shortcut slot.
                 if matches!(key, PhysicalKeyCode::Backspace | PhysicalKeyCode::Delete)
                     && active_mods.is_empty()
                 {
                     self.set_shortcut_enabled(slot, false, tx);
-                    self.stop_recording_shortcut();
                     self.shortcut_recorder.swallow_key = Some(key);
                     self.toast("Shortcut disabled", tx);
                     return true;

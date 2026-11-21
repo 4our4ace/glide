@@ -232,14 +232,11 @@ impl GlideConfigFile {
     }
 
     pub fn save(&self, path: &Path) -> Result<()> {
-        if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent)?;
-        }
         let mut normalized = self.clone();
         normalized.max_file_mb = normalized.max_file_mb_clamped();
         normalized.receive_dir = Self::normalized_receive_dir(normalized.receive_dir.as_deref());
         let body = toml::to_string_pretty(&normalized)?;
-        fs::write(path, body)
+        write_file_atomic(path, &body)
             .with_context(|| format!("failed to write config file {}", path.display()))?;
         Ok(())
     }
@@ -338,14 +335,28 @@ impl ServerConfig {
     /// Unrecognized strings log a warning and fall back cleanly to their respective defaults.
     pub fn parsed_hotkeys(&self) -> CaptureHotkeys {
         let switch_mods = match self.switch_shortcut.as_deref() {
-            Some(raw) => HotkeyMods::parse(raw).unwrap_or_else(|e| {
-                warn!(
-                    value = raw,
-                    error = %e,
-                    "Invalid server.switch_shortcut; falling back to default Ctrl+Alt"
-                );
-                Some(HotkeyMods::DEFAULT_SWITCH)
-            }),
+            Some(raw) => match HotkeyMods::parse(raw) {
+                Ok(Some(mods)) => match mods.validate_for_switch() {
+                    Ok(()) => Some(mods),
+                    Err(reason) => {
+                        warn!(
+                            value = raw,
+                            error = reason,
+                            "Invalid server.switch_shortcut; falling back to default Ctrl+Alt"
+                        );
+                        Some(HotkeyMods::DEFAULT_SWITCH)
+                    }
+                },
+                Ok(None) => None,
+                Err(e) => {
+                    warn!(
+                        value = raw,
+                        error = %e,
+                        "Invalid server.switch_shortcut; falling back to default Ctrl+Alt"
+                    );
+                    Some(HotkeyMods::DEFAULT_SWITCH)
+                }
+            },
             None if self.enable_hotkeys => Some(HotkeyMods::DEFAULT_SWITCH),
             None => None,
         };
@@ -429,9 +440,38 @@ impl ServerConfig {
         self.enable_hotkeys = true;
     }
 
-    /// Returns `true` when all three configured shortcuts match [`CaptureHotkeys::default`].
+    /// Returns `true` when all three configured shortcuts parse/validate cleanly and match
+    /// [`CaptureHotkeys::default`].
     pub fn shortcuts_are_default(&self) -> bool {
-        self.parsed_hotkeys() == CaptureHotkeys::default()
+        let switch_mods = match self.switch_shortcut.as_deref() {
+            Some(raw) => match HotkeyMods::parse(raw) {
+                Ok(Some(mods)) if mods.validate_for_switch().is_ok() => Some(mods),
+                Ok(None) => None,
+                Ok(Some(_)) | Err(_) => return false,
+            },
+            None if self.enable_hotkeys => Some(HotkeyMods::DEFAULT_SWITCH),
+            None => None,
+        };
+
+        let lock = match self.lock_shortcut.as_deref() {
+            Some(raw) => match HotkeyChord::parse(raw) {
+                Ok(chord) => chord,
+                Err(_) => return false,
+            },
+            None if self.enable_hotkeys => Some(HotkeyChord::DEFAULT_LOCK),
+            None => None,
+        };
+
+        let escape = match HotkeyChord::parse(&self.escape_key) {
+            Ok(chord) => chord,
+            Err(_) => return false,
+        };
+
+        CaptureHotkeys {
+            switch_mods,
+            lock,
+            escape,
+        } == CaptureHotkeys::default()
     }
 
     pub fn resolved_identity_dir(&self) -> PathBuf {
@@ -1262,6 +1302,24 @@ mod tests {
         assert_eq!(hk.switch_mods, Some(HotkeyMods::DEFAULT_SWITCH));
         assert_eq!(hk.lock, Some(HotkeyChord::DEFAULT_LOCK));
         assert_eq!(hk.escape, Some(HotkeyChord::DEFAULT_ESCAPE));
+        assert!(
+            !cfg.shortcuts_are_default(),
+            "corrupt shortcut strings must keep Reset Defaults visible"
+        );
+
+        // Hand-edited bare "Shift" for switch_shortcut must not hijack Shift+Arrow text selection.
+        let bare_shift = ServerConfig {
+            switch_shortcut: Some("Shift".into()),
+            ..Default::default()
+        };
+        assert_eq!(
+            bare_shift.parsed_hotkeys().switch_mods,
+            Some(HotkeyMods::DEFAULT_SWITCH)
+        );
+        assert!(
+            !bare_shift.shortcuts_are_default(),
+            "invalid bare Shift switch_shortcut must not report shortcuts_are_default() == true"
+        );
     }
 
     #[test]
