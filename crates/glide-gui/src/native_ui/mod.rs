@@ -19,7 +19,7 @@ use glide_net::discovery::{discover_servers, local_ipv4_addresses, machine_hostn
 use glide_proto::{ClipboardFormat, Edge, OsKind, MAX_FILE_BYTES};
 use rune::{App, AppHandle, AppSpec, Cx, El, Key, KeyEvent, TextEdit, Tx, WindowOptions};
 use std::path::PathBuf;
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use theme::{Palette, ThemePref};
@@ -76,7 +76,7 @@ pub struct DeskDrag {
     pub hover: Option<Edge>,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct DiscoveredPeer {
     pub name: String,
     pub os: OsKind,
@@ -84,10 +84,66 @@ pub struct DiscoveredPeer {
     pub fingerprint: String,
 }
 
+/// Tracks whether the native Rune window is currently open/visible so background
+/// loops (`spawn_runtime_bridge` and `spawn_discovery_loop`) can park with zero CPU,
+/// zero UI wakeups, and zero LAN scans while Glide is minimized to the system tray.
+struct WindowVisibility {
+    visible: AtomicBool,
+    last_pushed_rev: AtomicU64,
+    changed_tx: tokio::sync::watch::Sender<bool>,
+}
+
+impl WindowVisibility {
+    fn new(initial_visible: bool) -> Self {
+        let (changed_tx, _) = tokio::sync::watch::channel(initial_visible);
+        Self {
+            visible: AtomicBool::new(initial_visible),
+            last_pushed_rev: AtomicU64::new(0),
+            changed_tx,
+        }
+    }
+
+    fn is_visible(&self) -> bool {
+        self.visible.load(Ordering::Acquire)
+    }
+
+    /// Updates visibility and notifies parked background loops on state transitions.
+    /// Returns `true` when transitioning from hidden (`false`) to visible (`true`).
+    fn set_visible(&self, visible: bool) -> bool {
+        let prev = self.visible.swap(visible, Ordering::AcqRel);
+        if prev != visible {
+            let _ = self.changed_tx.send(visible);
+        }
+        !prev && visible
+    }
+
+    fn record_rev(&self, rev: u64) {
+        self.last_pushed_rev.fetch_max(rev, Ordering::AcqRel);
+    }
+
+    fn subscribe(&self) -> tokio::sync::watch::Receiver<bool> {
+        self.changed_tx.subscribe()
+    }
+
+    /// Pushes a fresh [`StatusSnapshot`] to the UI thread when `ctrl.runtime` has
+    /// advanced past the last revision pushed through this tracker.
+    fn push_fresh_snapshot(&self, ctrl: &AppController, handle: &AppHandle<Ui>) {
+        let cur_rev = ctrl.runtime.revision();
+        if self.last_pushed_rev.load(Ordering::Acquire) >= cur_rev {
+            return;
+        }
+        let (rev, snap) = ctrl.runtime.snapshot_with_rev();
+        self.last_pushed_rev.fetch_max(rev, Ordering::AcqRel);
+        handle.update_if(move |ui, _| ui.apply_status_if_newer(rev, snap));
+    }
+}
+
 pub struct Ui {
     ctrl: Arc<AppController>,
     rt: tokio::runtime::Handle,
     handle: Option<AppHandle<Ui>>,
+    window_vis: Arc<WindowVisibility>,
+    status_rev: u64,
 
     // Machine & environment metadata
     pub hostname: String,
@@ -131,13 +187,18 @@ pub struct Ui {
 }
 
 impl Ui {
-    fn new(ctrl: Arc<AppController>, rt: tokio::runtime::Handle) -> Self {
+    fn new(
+        ctrl: Arc<AppController>,
+        rt: tokio::runtime::Handle,
+        window_vis: Arc<WindowVisibility>,
+    ) -> Self {
         let os_kind = glide_backend::current_os_kind();
         let os_label = os_label(os_kind);
         let is_windows = matches!(os_kind, OsKind::Windows);
         let hostname = machine_hostname();
         let cfg = ctrl.config.lock().clone();
-        let status = ctrl.runtime.snapshot();
+        let (status_rev, status) = ctrl.runtime.snapshot_with_rev();
+        window_vis.record_rev(status_rev);
         let fingerprint = ctrl.fingerprint.lock().clone();
         let tray_active = ctrl.tray_active.load(Ordering::SeqCst);
         let autostart = is_autostart_enabled();
@@ -163,6 +224,8 @@ impl Ui {
             ctrl,
             rt,
             handle: None,
+            window_vis,
+            status_rev,
             hostname,
             os_kind,
             os_label,
@@ -302,6 +365,15 @@ impl Ui {
             self.dismissed_error = None;
         }
         self.status = snap;
+    }
+
+    fn apply_status_if_newer(&mut self, rev: u64, snap: StatusSnapshot) -> bool {
+        if rev <= self.status_rev {
+            return false;
+        }
+        self.status_rev = rev;
+        self.apply_status(snap);
+        true
     }
 
     // -----------------------------------------------------------------------
@@ -845,12 +917,22 @@ fn on_key(s: &mut Ui, ev: &KeyEvent, tx: &mut Tx) -> bool {
 }
 
 fn on_close(s: &mut Ui, tx: &mut Tx) {
+    s.window_vis.set_visible(false);
     // If no system tray is available, closing the window quits Glide cleanly instead of
     // leaving an invisible background process. Read the atomic directly so an async tray
     // registration that just finished is always observed.
     if !s.ctrl.tray_active.load(Ordering::SeqCst) {
         s.quit_app(tx);
     }
+}
+
+fn on_reopen(s: &mut Ui, has_visible: bool, _tx: &mut Tx) -> bool {
+    if !has_visible && s.window_vis.set_visible(true) {
+        let (rev, snap) = s.ctrl.runtime.snapshot_with_rev();
+        s.window_vis.record_rev(rev);
+        s.apply_status_if_newer(rev, snap);
+    }
+    false
 }
 
 /// Runs the native Rune window on the calling (main) thread.
@@ -898,7 +980,8 @@ pub(crate) fn run(
             ..WindowOptions::default()
         })
         .keep_running()
-        .on_close(on_close);
+        .on_close(on_close)
+        .on_reopen(on_reopen);
 
     if minimized {
         app = app.windowless();
@@ -925,26 +1008,46 @@ pub(crate) fn run(
         });
     }
 
-    #[cfg(target_os = "linux")]
-    if !glide_backend::linux_wayland::is_wayland_session() {
-        app = app.on_window(|_| {
-            glide_backend::linux_x11::window_brand::spawn_x11_window_brander(GUI_WIDTH, GUI_HEIGHT);
+    let handle = app.handle();
+    let window_vis = Arc::new(WindowVisibility::new(!minimized));
+
+    {
+        let on_win_vis = Arc::clone(&window_vis);
+        let on_win_ctrl = Arc::clone(&ctrl);
+        let on_win_handle = handle.clone();
+        app = app.on_window(move |_| {
+            if on_win_vis.set_visible(true) {
+                on_win_vis.push_fresh_snapshot(&on_win_ctrl, &on_win_handle);
+            }
+            #[cfg(target_os = "linux")]
+            if !glide_backend::linux_wayland::is_wayland_session() {
+                glide_backend::linux_x11::window_brand::spawn_x11_window_brander(
+                    GUI_WIDTH, GUI_HEIGHT,
+                );
+            }
         });
     }
-
-    let handle = app.handle();
 
     // Wire AppController hooks so the tray, `/api/show`, and Ctrl+C control this window.
     {
         let show_handle = handle.clone();
+        let show_ctrl = Arc::clone(&ctrl);
+        let show_vis = Arc::clone(&window_vis);
         let fallback_url = ctrl.url.clone();
         *ctrl.ui_show.lock() = Some(Arc::new(move || {
+            // Queue the latest snapshot BEFORE `open()` so Rune drains it on the same
+            // turn before painting the revealed window (zero stale frame on reopen).
+            if show_vis.set_visible(true) {
+                show_vis.push_fresh_snapshot(&show_ctrl, &show_handle);
+            }
             show_handle.open();
             let h = show_handle.clone();
             let url = fallback_url.clone();
+            let vis_check = Arc::clone(&show_vis);
             std::thread::spawn(move || {
                 std::thread::sleep(Duration::from_millis(1500));
                 if let Some(err) = h.window_error() {
+                    vis_check.set_visible(false);
                     warn!(error = %err, "Native window could not open; launching browser fallback");
                     let _ = launch_browser_window(&url);
                 }
@@ -958,23 +1061,35 @@ pub(crate) fn run(
 
         let tray_handle = handle.clone();
         *ctrl.ui_tray.lock() = Some(Arc::new(move |active| {
-            tray_handle.update(move |ui, _| ui.tray_active = active);
+            tray_handle.update_if(move |ui, _| {
+                if ui.tray_active == active {
+                    return false;
+                }
+                ui.tray_active = active;
+                true
+            });
         }));
     }
 
     let init_ctrl = Arc::clone(&ctrl);
     let init_rt = rt.clone();
     let init_handle = handle.clone();
+    let init_vis = Arc::clone(&window_vis);
     app = app.init(move || {
-        let mut ui = Ui::new(init_ctrl, init_rt);
+        let mut ui = Ui::new(init_ctrl, init_rt, init_vis);
         ui.handle = Some(init_handle);
         ui
     });
 
     if !headless_snap {
         spawn_background_init(Arc::clone(&ctrl), &rt, handle.clone());
-        spawn_runtime_bridge(Arc::clone(&ctrl), &rt, handle.clone());
-        spawn_discovery_loop(Arc::clone(&ctrl), &rt, handle);
+        spawn_runtime_bridge(
+            Arc::clone(&ctrl),
+            &rt,
+            handle.clone(),
+            Arc::clone(&window_vis),
+        );
+        spawn_discovery_loop(Arc::clone(&ctrl), &rt, handle, window_vis);
     }
 
     app.try_run()
@@ -996,7 +1111,13 @@ fn spawn_background_init(
     rt.spawn(async move {
         // Sync tray state once in case the background tray task finished before ui_tray was wired.
         let tray_now = ctrl.tray_active.load(Ordering::SeqCst);
-        handle.update(move |ui, _| ui.tray_active = tray_now);
+        handle.update_if(move |ui, _| {
+            if ui.tray_active == tray_now {
+                return false;
+            }
+            ui.tray_active = tray_now;
+            true
+        });
 
         let ctrl_id = Arc::clone(&ctrl);
         let fp = tokio::task::spawn_blocking(move || ctrl_id.load_identity())
@@ -1049,14 +1170,50 @@ fn spawn_runtime_bridge(
     ctrl: Arc<AppController>,
     rt: &tokio::runtime::Handle,
     handle: AppHandle<Ui>,
+    vis: Arc<WindowVisibility>,
 ) {
     let mut rx = ctrl.runtime.subscribe();
+    let mut vis_rx = vis.subscribe();
     rt.spawn(async move {
-        while let Ok(()) | Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) =
-            rx.recv().await
-        {
-            let snap = ctrl.runtime.snapshot();
-            handle.update(move |ui, _| ui.apply_status(snap));
+        loop {
+            if !vis.is_visible() {
+                // Window is hidden in the tray: park with zero wakeups and zero snapshot
+                // clones until it reopens, then coalesce all missed updates into one push.
+                if vis_rx.wait_for(|&v| v).await.is_err() {
+                    break;
+                }
+                while matches!(
+                    rx.try_recv(),
+                    Ok(()) | Err(tokio::sync::broadcast::error::TryRecvError::Lagged(_))
+                ) {}
+                if vis.is_visible() {
+                    vis.push_fresh_snapshot(&ctrl, &handle);
+                }
+                continue;
+            }
+
+            tokio::select! {
+                res = rx.recv() => {
+                    match res {
+                        Ok(()) | Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
+                            if !vis.is_visible() {
+                                continue;
+                            }
+                            while matches!(
+                                rx.try_recv(),
+                                Ok(()) | Err(tokio::sync::broadcast::error::TryRecvError::Lagged(_))
+                            ) {}
+                            vis.push_fresh_snapshot(&ctrl, &handle);
+                        }
+                        Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                    }
+                }
+                res = vis_rx.wait_for(|&v| !v) => {
+                    if res.is_err() {
+                        break;
+                    }
+                }
+            }
         }
     });
 }
@@ -1065,22 +1222,75 @@ fn spawn_discovery_loop(
     ctrl: Arc<AppController>,
     rt: &tokio::runtime::Handle,
     handle: AppHandle<Ui>,
+    vis: Arc<WindowVisibility>,
 ) {
+    let mut vis_rx = vis.subscribe();
     rt.spawn(async move {
-        let mut first = true;
+        let mut force_refresh = true;
         loop {
-            let snap = ctrl.runtime.snapshot();
-            let running = snap.mode == "server" || snap.mode == "client";
-            let connected = snap.status.starts_with("Connected");
-            if first || !running || (snap.mode == "client" && !connected) {
-                first = false;
-                let (servers, ips) = run_discovery(&ctrl).await;
-                handle.update(move |ui, _| {
-                    ui.local_ips = ips;
-                    ui.discovered = servers;
-                });
+            if !vis.is_visible() {
+                // Window is hidden in the tray: perform 0 LAN scans and 0 UI wakeups until reopened.
+                if vis_rx.wait_for(|&v| v).await.is_err() {
+                    break;
+                }
+                force_refresh = true;
             }
-            tokio::time::sleep(Duration::from_millis(4500)).await;
+
+            let (running, mode_is_client, connected) = ctrl.runtime.read(|snap| {
+                let running = snap.mode == "server" || snap.mode == "client";
+                let mode_is_client = snap.mode == "client";
+                let connected = snap.status.starts_with("Connected");
+                (running, mode_is_client, connected)
+            });
+
+            if !running || (mode_is_client && !connected) {
+                force_refresh = false;
+                tokio::select! {
+                    (servers, ips) = run_discovery(&ctrl) => {
+                        if vis.is_visible() {
+                            handle.update_if(move |ui, _| {
+                                if ui.local_ips == ips && ui.discovered == servers {
+                                    return false;
+                                }
+                                ui.local_ips = ips;
+                                ui.discovered = servers;
+                                true
+                            });
+                        }
+                    }
+                    res = vis_rx.wait_for(|&v| !v) => {
+                        if res.is_err() {
+                            break;
+                        }
+                        continue;
+                    }
+                }
+            } else if force_refresh {
+                // Running server or connected client: refresh local IPs on initial open /
+                // reopen without issuing a 2s UDP LAN broadcast scan.
+                force_refresh = false;
+                let ips = tokio::task::spawn_blocking(local_ipv4_addresses)
+                    .await
+                    .unwrap_or_default();
+                if vis.is_visible() {
+                    handle.update_if(move |ui, _| {
+                        if ui.local_ips == ips {
+                            return false;
+                        }
+                        ui.local_ips = ips;
+                        true
+                    });
+                }
+            }
+
+            tokio::select! {
+                _ = tokio::time::sleep(Duration::from_millis(4500)) => {}
+                res = vis_rx.wait_for(|&v| !v) => {
+                    if res.is_err() {
+                        break;
+                    }
+                }
+            }
         }
     });
 }
@@ -1322,3 +1532,50 @@ const SCENES: &[(&str, SceneFn)] = &[
         s.doctor_text = "OS       Linux (LinuxX11)\nDisplay  DISPLAY=:0 (screen 0)\n\n• Native X11 session detected.\n• XTest extension: OK (v2.2)\n• XInput2 extension: OK (v2.2)\n• XFixes extension: OK (v5.0)".into();
     }),
 ];
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn window_visibility_parks_when_hidden_and_wakes_on_reopen() {
+        let vis = Arc::new(WindowVisibility::new(false));
+        assert!(!vis.is_visible());
+
+        // Setting false->false is not a reopen transition.
+        assert!(!vis.set_visible(false));
+
+        let mut rx = vis.subscribe();
+        let waiter = tokio::spawn(async move {
+            rx.wait_for(|&v| v).await.is_ok()
+        });
+
+        // Give the task a chance to park while hidden.
+        tokio::task::yield_now().await;
+        assert!(!waiter.is_finished());
+
+        // Transition false->true reports reopen and wakes the parked waiter immediately.
+        assert!(vis.set_visible(true));
+        assert!(vis.is_visible());
+        assert!(!vis.set_visible(true));
+        assert!(tokio::time::timeout(Duration::from_secs(1), waiter)
+            .await
+            .expect("waiter should wake immediately on reopen")
+            .unwrap());
+
+        // Closing transitions back to hidden and wakes !v waiters.
+        let mut hide_rx = vis.subscribe();
+        let hide_waiter = tokio::spawn(async move {
+            hide_rx.wait_for(|&v| !v).await.is_ok()
+        });
+        tokio::task::yield_now().await;
+        assert!(!hide_waiter.is_finished());
+        assert!(!vis.set_visible(false));
+        assert!(!vis.is_visible());
+        assert!(tokio::time::timeout(Duration::from_secs(1), hide_waiter)
+            .await
+            .expect("hide waiter should wake on close")
+            .unwrap());
+    }
+}
+
