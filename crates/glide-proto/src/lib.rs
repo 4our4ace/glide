@@ -151,8 +151,8 @@ pub enum DatagramMessage {
 }
 
 impl DatagramMessage {
-    pub fn encode(&self) -> Bytes {
-        let mut buf = BytesMut::with_capacity(13);
+    #[inline]
+    pub fn encode_into(&self, buf: &mut BytesMut) {
         match *self {
             Self::MouseMove { seq, dx, dy } => {
                 buf.put_u8(0x01);
@@ -171,6 +171,11 @@ impl DatagramMessage {
                 buf.put_i16(dy_120);
             }
         }
+    }
+
+    pub fn encode(&self) -> Bytes {
+        let mut buf = BytesMut::with_capacity(13);
+        self.encode_into(&mut buf);
         buf.freeze()
     }
 
@@ -213,6 +218,42 @@ impl DatagramMessage {
             }
             other => Err(ProtoError::UnknownTag(other)),
         }
+    }
+}
+
+/// Reusable slab encoder for high-frequency QUIC datagrams (1000Hz mouse motion / scroll).
+///
+/// Slices 9–13 byte [`Bytes`] frames out of a single 4 KiB [`BytesMut`] slab. When previously
+/// sent datagrams have been dropped by the QUIC transport, `reserve` reclaims the existing slab
+/// in place with zero heap allocations; otherwise one allocation is amortized across ~315 packets.
+#[derive(Debug)]
+pub struct DatagramEncoder {
+    buf: BytesMut,
+}
+
+impl Default for DatagramEncoder {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl DatagramEncoder {
+    const SLAB_CAPACITY: usize = 4096;
+    const MAX_DATAGRAM_BYTES: usize = 16;
+
+    pub fn new() -> Self {
+        Self {
+            buf: BytesMut::with_capacity(Self::SLAB_CAPACITY),
+        }
+    }
+
+    #[inline]
+    pub fn encode(&mut self, msg: DatagramMessage) -> Bytes {
+        if self.buf.capacity() < Self::MAX_DATAGRAM_BYTES {
+            self.buf.reserve(Self::SLAB_CAPACITY);
+        }
+        msg.encode_into(&mut self.buf);
+        self.buf.split().freeze()
     }
 }
 
@@ -306,8 +347,7 @@ fn get_string(data: &mut &[u8]) -> Result<String, ProtoError> {
 }
 
 impl ControlMessage {
-    pub fn encode_body(&self) -> Bytes {
-        let mut buf = BytesMut::with_capacity(40);
+    pub fn encode_body_into(&self, buf: &mut BytesMut) {
         match self {
             Self::Hello {
                 version,
@@ -320,7 +360,7 @@ impl ControlMessage {
                 buf.put_u16(*version);
                 buf.put_u8(*edge_on_server as u8);
                 buf.put_u8(*os as u8);
-                put_string(&mut buf, peer_name);
+                put_string(buf, peer_name);
             }
             Self::Welcome {
                 version,
@@ -334,8 +374,8 @@ impl ControlMessage {
                 buf.put_u16(*version);
                 buf.put_u8(u8::from(*accepted));
                 buf.put_f32(*server_scale);
-                put_string(&mut buf, server_name);
-                put_string(&mut buf, reason);
+                put_string(buf, server_name);
+                put_string(buf, reason);
             }
             Self::Key { usage, pressed } => {
                 buf.put_u8(0x20);
@@ -417,14 +457,25 @@ impl ControlMessage {
                 buf.put_u64(*ts_us);
             }
         }
+    }
+
+    pub fn encode_body(&self) -> Bytes {
+        let mut buf = BytesMut::with_capacity(40);
+        self.encode_body_into(&mut buf);
         buf.freeze()
     }
 
+    pub fn encode_framed_into(&self, buf: &mut BytesMut) {
+        let start = buf.len();
+        buf.put_u32(0);
+        self.encode_body_into(buf);
+        let body_len = (buf.len() - start - 4) as u32;
+        buf[start..start + 4].copy_from_slice(&body_len.to_be_bytes());
+    }
+
     pub fn encode_framed(&self) -> Bytes {
-        let body = self.encode_body();
-        let mut out = BytesMut::with_capacity(4 + body.len());
-        out.put_u32(body.len() as u32);
-        out.put_slice(&body);
+        let mut out = BytesMut::with_capacity(44);
+        self.encode_framed_into(&mut out);
         out.freeze()
     }
 
@@ -812,6 +863,32 @@ mod tests {
             let body = msg.encode_body();
             let decoded = ControlMessage::decode_body(&body).unwrap();
             assert_eq!(decoded, msg);
+
+            let framed = msg.encode_framed();
+            assert_eq!(&framed[..4], &(body.len() as u32).to_be_bytes());
+            assert_eq!(&framed[4..], &body[..]);
+        }
+    }
+
+    #[test]
+    fn datagram_encoder_slab_roundtrip() {
+        let mut enc = DatagramEncoder::new();
+        for seq in 0..1000u32 {
+            let msg = if seq % 2 == 0 {
+                DatagramMessage::MouseMove {
+                    seq,
+                    dx: seq as f32 * 0.25,
+                    dy: -(seq as f32) * 0.5,
+                }
+            } else {
+                DatagramMessage::MouseScroll {
+                    seq,
+                    dx_120: 0,
+                    dy_120: -120,
+                }
+            };
+            let bytes = enc.encode(msg);
+            assert_eq!(DatagramMessage::decode(&bytes).unwrap(), msg);
         }
     }
 

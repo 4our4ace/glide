@@ -9,7 +9,7 @@ pub mod discovery;
 pub mod tls;
 
 use anyhow::{anyhow, Context, Result};
-use bytes::Bytes;
+use bytes::{Bytes, BytesMut};
 use glide_proto::{
     ClipboardPayload, ControlMessage, DatagramMessage, MAX_CLIPBOARD_BYTES, MAX_CONTROL_FRAME_LEN,
 };
@@ -195,8 +195,8 @@ impl GlideSession {
     fn new(conn: Connection, send: SendStream, recv: RecvStream) -> Self {
         Self {
             conn,
-            ctrl_send: ControlSender { stream: send },
-            ctrl_recv: ControlReceiver { stream: recv },
+            ctrl_send: ControlSender::new(send),
+            ctrl_recv: ControlReceiver::new(recv),
         }
     }
 
@@ -236,60 +236,69 @@ impl GlideSession {
 
 /// Sends a clipboard payload over a fresh unidirectional QUIC stream on `conn`.
 pub async fn send_clipboard_on(conn: &Connection, payload: &ClipboardPayload) -> Result<()> {
-    send_bulk_on(conn, &glide_proto::BulkTransfer::Clipboard(payload.clone())).await
-}
+    use glide_proto::BULK_KIND_CLIPBOARD;
 
-/// Sends a file payload over a fresh unidirectional QUIC stream on `conn`.
-pub async fn send_file_on(conn: &Connection, payload: &glide_proto::FilePayload) -> Result<()> {
-    send_bulk_on(conn, &glide_proto::BulkTransfer::File(payload.clone())).await
-}
-
-/// Sends a clipboard or file payload over an independent unidirectional QUIC stream.
-pub async fn send_bulk_on(conn: &Connection, transfer: &glide_proto::BulkTransfer) -> Result<()> {
-    use glide_proto::{BulkTransfer, BULK_KIND_CLIPBOARD, BULK_KIND_FILE, MAX_FILE_BYTES};
+    if payload.data.len() > MAX_CLIPBOARD_BYTES {
+        return Err(anyhow!(
+            "clipboard payload too large ({} bytes > max {})",
+            payload.data.len(),
+            MAX_CLIPBOARD_BYTES
+        ));
+    }
 
     let mut uni = conn
         .open_uni()
         .await
         .context("failed to open bulk uni stream")?;
 
-    match transfer {
-        BulkTransfer::Clipboard(payload) => {
-            if payload.data.len() > MAX_CLIPBOARD_BYTES {
-                return Err(anyhow!(
-                    "clipboard payload too large ({} bytes > max {})",
-                    payload.data.len(),
-                    MAX_CLIPBOARD_BYTES
-                ));
-            }
-            uni.write_all(&[BULK_KIND_CLIPBOARD]).await?;
-            let hdr = payload.encode_header();
-            uni.write_all(&hdr).await?;
-            uni.write_all(&payload.data).await?;
-        }
-        BulkTransfer::File(file) => {
-            if file.data.len() > MAX_FILE_BYTES {
-                return Err(anyhow!(
-                    "file payload too large ({} bytes > max {})",
-                    file.data.len(),
-                    MAX_FILE_BYTES
-                ));
-            }
-            let safe_name = glide_proto::sanitize_filename(&file.filename);
-            let name_bytes = safe_name.as_bytes();
-            let name_len = (name_bytes.len().min(u16::MAX as usize)) as u16;
-            uni.write_all(&[BULK_KIND_FILE]).await?;
-            uni.write_all(&name_len.to_be_bytes()).await?;
-            uni.write_all(&name_bytes[..name_len as usize]).await?;
-            uni.write_all(&file.sha256).await?;
-            uni.write_all(&(file.data.len() as u32).to_be_bytes())
-                .await?;
-            uni.write_all(&file.data).await?;
-        }
-    }
-
+    let mut hdr = [0u8; 1 + ClipboardPayload::HEADER_LEN];
+    hdr[0] = BULK_KIND_CLIPBOARD;
+    hdr[1..].copy_from_slice(&payload.encode_header());
+    uni.write_all(&hdr).await?;
+    uni.write_all(&payload.data).await?;
     uni.finish().context("failed finishing bulk stream")?;
     Ok(())
+}
+
+/// Sends a file payload over a fresh unidirectional QUIC stream on `conn`.
+pub async fn send_file_on(conn: &Connection, file: &glide_proto::FilePayload) -> Result<()> {
+    use glide_proto::{BULK_KIND_FILE, MAX_FILE_BYTES};
+
+    if file.data.len() > MAX_FILE_BYTES {
+        return Err(anyhow!(
+            "file payload too large ({} bytes > max {})",
+            file.data.len(),
+            MAX_FILE_BYTES
+        ));
+    }
+
+    let mut uni = conn
+        .open_uni()
+        .await
+        .context("failed to open bulk uni stream")?;
+
+    let safe_name = glide_proto::sanitize_filename(&file.filename);
+    let name_bytes = safe_name.as_bytes();
+    let name_len = (name_bytes.len().min(u16::MAX as usize)) as u16;
+
+    let mut hdr = Vec::with_capacity(1 + 2 + name_len as usize + 32 + 4);
+    hdr.push(BULK_KIND_FILE);
+    hdr.extend_from_slice(&name_len.to_be_bytes());
+    hdr.extend_from_slice(&name_bytes[..name_len as usize]);
+    hdr.extend_from_slice(&file.sha256);
+    hdr.extend_from_slice(&(file.data.len() as u32).to_be_bytes());
+    uni.write_all(&hdr).await?;
+    uni.write_all(&file.data).await?;
+    uni.finish().context("failed finishing bulk stream")?;
+    Ok(())
+}
+
+/// Sends a clipboard or file payload over an independent unidirectional QUIC stream.
+pub async fn send_bulk_on(conn: &Connection, transfer: &glide_proto::BulkTransfer) -> Result<()> {
+    match transfer {
+        glide_proto::BulkTransfer::Clipboard(payload) => send_clipboard_on(conn, payload).await,
+        glide_proto::BulkTransfer::File(file) => send_file_on(conn, file).await,
+    }
 }
 
 /// Accepts and validates the next unidirectional bulk stream (clipboard or file) on `conn`.
@@ -369,28 +378,55 @@ pub async fn recv_clipboard_on(conn: &Connection) -> Result<ClipboardPayload> {
     }
 }
 
-/// Reliable ordered control stream writer.
+/// Reliable ordered control stream writer with a reusable framing buffer.
 pub struct ControlSender {
     stream: SendStream,
+    buf: BytesMut,
 }
 
 impl ControlSender {
+    const INITIAL_CAP: usize = 64;
+    const MAX_RETAINED_CAP: usize = 4096;
+
+    fn new(stream: SendStream) -> Self {
+        Self {
+            stream,
+            buf: BytesMut::with_capacity(Self::INITIAL_CAP),
+        }
+    }
+
     pub async fn send(&mut self, msg: &ControlMessage) -> Result<()> {
-        let framed = msg.encode_framed();
-        self.stream
-            .write_all(&framed)
+        self.buf.clear();
+        msg.encode_framed_into(&mut self.buf);
+        let res = self
+            .stream
+            .write_all(&self.buf)
             .await
-            .context("failed to write control message")?;
-        Ok(())
+            .context("failed to write control message");
+        if self.buf.capacity() > Self::MAX_RETAINED_CAP {
+            self.buf = BytesMut::with_capacity(Self::INITIAL_CAP);
+        }
+        res
     }
 }
 
-/// Reliable ordered control stream reader.
+/// Reliable ordered control stream reader with a reusable decode buffer.
 pub struct ControlReceiver {
     stream: RecvStream,
+    buf: Vec<u8>,
 }
 
 impl ControlReceiver {
+    const INITIAL_CAP: usize = 64;
+    const MAX_RETAINED_CAP: usize = 4096;
+
+    fn new(stream: RecvStream) -> Self {
+        Self {
+            stream,
+            buf: Vec::with_capacity(Self::INITIAL_CAP),
+        }
+    }
+
     pub async fn recv(&mut self) -> Result<ControlMessage> {
         let mut len_buf = [0u8; 4];
         self.stream
@@ -403,12 +439,17 @@ impl ControlReceiver {
                 "control frame length {len} exceeds maximum {MAX_CONTROL_FRAME_LEN}"
             ));
         }
-        let mut body = vec![0u8; len];
+        self.buf.resize(len, 0);
         self.stream
-            .read_exact(&mut body)
+            .read_exact(&mut self.buf)
             .await
             .context("control stream closed while reading frame body")?;
-        ControlMessage::decode_body(&body).context("failed to decode control message")
+        let msg =
+            ControlMessage::decode_body(&self.buf).context("failed to decode control message")?;
+        if self.buf.capacity() > Self::MAX_RETAINED_CAP {
+            self.buf = Vec::with_capacity(Self::INITIAL_CAP);
+        }
+        Ok(msg)
     }
 }
 
