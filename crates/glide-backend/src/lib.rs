@@ -8,9 +8,12 @@ pub mod clipboard_privacy;
 pub mod dib_png;
 pub mod dnd;
 pub mod geometry;
+pub mod hotkeys;
 pub mod icon;
 pub mod mock;
 pub mod os_integration;
+
+pub use hotkeys::{CaptureHotkeys, HotkeyChord, HotkeyMods};
 
 /// User actions emitted by the native OS system tray (Windows 11 & Linux StatusNotifierItem).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -129,8 +132,8 @@ pub enum InputBackendKind {
 /// Runtime-tunable capture settings shared with OS capture threads.
 #[derive(Debug, Clone)]
 pub struct CaptureConfig {
-    /// Physical key that unconditionally returns focus to the local server desktop.
-    pub escape_key: HidUsage,
+    /// Customizable/disableable global shortcuts (screen switch, cursor lock, escape).
+    pub hotkeys: CaptureHotkeys,
     /// Pixels the user must push past an outer screen edge before switching.
     pub edge_threshold_px: i32,
     /// Corner dead-zone in pixels (prevents accidental switches on close `X` / taskbar corners).
@@ -139,8 +142,6 @@ pub struct CaptureConfig {
     pub edge_dwell_ms: u64,
     /// Pause edge switching while an exclusive fullscreen app/game has focus on the server.
     pub auto_lock_fullscreen: bool,
-    /// Enable `Ctrl + Alt + Arrow` direct screen switching and `Ctrl + Alt + L` cursor lock toggle.
-    pub enable_hotkeys: bool,
     /// Keep the server's local CapsLock / NumLock state & keyboard LEDs in sync while controlling a client.
     pub sync_lock_keys: bool,
     /// Enable cross-edge file drag-and-drop detection along active outer edges.
@@ -152,12 +153,11 @@ pub struct CaptureConfig {
 impl Default for CaptureConfig {
     fn default() -> Self {
         Self {
-            escape_key: HidUsage::SCROLL_LOCK,
+            hotkeys: CaptureHotkeys::default(),
             edge_threshold_px: 4,
             dead_corner_px: 24,
             edge_dwell_ms: 0,
             auto_lock_fullscreen: true,
-            enable_hotkeys: true,
             sync_lock_keys: true,
             drag_drop_files: true,
             pin_media_keys_local: true,
@@ -394,6 +394,10 @@ pub trait CaptureControl: Send + Sync {
     fn set_dnd_probe(&self, _dnd: Arc<dyn dnd::DndBackend>) {}
     /// Updates whether USB Consumer Control media/volume keys remain pinned to the local server OS.
     fn set_pin_media_keys_local(&self, _enabled: bool) {}
+    /// Hot-updates global capture shortcuts (screen switch, cursor lock, escape) without restarting capture.
+    fn set_hotkeys(&self, _hotkeys: CaptureHotkeys) {}
+    /// Temporarily suspends/resumes global shortcut interception (e.g. while recording a shortcut in UI).
+    fn set_hotkeys_suspended(&self, _suspended: bool) {}
     /// Enters remote mode: suppresses/grabs local input and parks/hides cursor cleanly.
     fn enter_remote(&self) -> Result<()>;
     /// Leaves remote mode: releases grab and warps cursor to `return_edge` at `normalized_pos`.
@@ -516,10 +520,14 @@ pub struct DoctorReport {
     pub notes: Vec<String>,
 }
 
-/// Performs one-time OS process initialization (e.g. Per-Monitor DPI Awareness V2 on Windows).
+/// Performs one-time OS process initialization (Per-Monitor DPI Awareness V2 and
+/// Windows 11 EcoQoS / background timer-resolution throttling opt-out on Windows).
 pub fn init_platform() {
     #[cfg(target_os = "windows")]
-    windows::init_dpi_awareness();
+    {
+        windows::init_dpi_awareness();
+        windows::init_windows_realtime_qos();
+    }
 }
 
 /// Returns the native [`OsKind`] of the current build target (detecting Wayland vs X11 on Linux).

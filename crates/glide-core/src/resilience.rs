@@ -20,15 +20,17 @@ pub const MAX_RECONNECT_DELAY: Duration = Duration::from_secs(3);
 /// declaring a half-open connection dead and forcing fast recovery.
 pub const DEFAULT_HEALTH_PROBE_TIMEOUT: Duration = Duration::from_millis(1500);
 
-/// Detects system sleep/suspend or long process stalls by monitoring both
-/// monotonic (`Instant`) and wall-clock (`SystemTime`) time.
+/// Detects system sleep/suspend or long process stalls.
 ///
-/// Why both clocks are required:
-/// - On Linux, `Instant` (`CLOCK_MONOTONIC`) **pauses during system suspend**,
+/// Platform clock behavior:
+/// - On Linux/Unix, `Instant` (`CLOCK_MONOTONIC`) **pauses during system suspend**,
 ///   so after a 10-minute lid-close sleep `Instant::elapsed()` only reports the
 ///   normal tick interval (~500ms) while `SystemTime` jumps forward by 600s.
+///   Therefore Unix builds monitor both `Instant` and `SystemTime`.
 /// - On Windows, `Instant` (`QueryPerformanceCounter`) keeps advancing across
-///   standby, so both clocks jump forward.
+///   sleep/hibernate, so `SleepDetector::check()` monitors **only** monotonic
+///   `Instant` jumps — making Windows immune to forward `w32time` NTP wall-clock
+///   steps that would otherwise trigger false-positive suspend disconnects.
 /// - Backwards NTP wall-clock steps yield `Duration::ZERO` and never cause
 ///   false positives.
 #[derive(Debug, Clone)]
@@ -70,11 +72,34 @@ impl SleepDetector {
 
     /// Checks whether a sleep/resume jump larger than `threshold` occurred since
     /// the last call, advancing internal reference timestamps.
+    ///
+    /// On Windows, checks only monotonic [`Instant`] (immune to NTP wall-clock steps).
+    /// On Unix/Linux, checks both monotonic [`Instant`] and wall-clock [`SystemTime`].
     pub fn check(&mut self) -> Option<Duration> {
-        self.check_at(Instant::now(), SystemTime::now())
+        #[cfg(target_os = "windows")]
+        {
+            self.check_monotonic_at(Instant::now())
+        }
+        #[cfg(not(target_os = "windows"))]
+        {
+            self.check_at(Instant::now(), SystemTime::now())
+        }
     }
 
-    /// Deterministic testable variant of [`SleepDetector::check`].
+    /// Deterministic testable variant checking only monotonic [`Instant`] time
+    /// (used by [`Self::check`] on Windows so NTP wall-clock steps cannot false-trigger).
+    pub fn check_monotonic_at(&mut self, now_mono: Instant) -> Option<Duration> {
+        let mono_dt = now_mono.saturating_duration_since(self.last_mono);
+        self.last_mono = now_mono;
+        if mono_dt > self.threshold {
+            Some(mono_dt)
+        } else {
+            None
+        }
+    }
+
+    /// Deterministic testable variant of [`SleepDetector::check`] comparing both
+    /// monotonic and wall-clock deltas.
     pub fn check_at(&mut self, now_mono: Instant, now_wall: SystemTime) -> Option<Duration> {
         let mono_dt = now_mono.saturating_duration_since(self.last_mono);
         let wall_dt = now_wall
@@ -257,6 +282,28 @@ mod tests {
                 mono2 + Duration::from_secs(10) + Duration::from_millis(500),
                 wall1 + Duration::from_secs(10) + Duration::from_millis(500),
             ),
+            None
+        );
+    }
+
+    #[test]
+    fn sleep_detector_monotonic_only_catches_sleep_and_ignores_wall_clock() {
+        let mono0 = Instant::now();
+        let wall0 = SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000);
+        let mut det = SleepDetector::with_times(Duration::from_secs(5), mono0, wall0);
+
+        // Normal awake tick (even if system wall clock stepped +120s via w32time NTP):
+        // monotonic-only path only inspects Instant, so zero false positive!
+        let mono1 = mono0 + Duration::from_millis(500);
+        assert_eq!(det.check_monotonic_at(mono1), None);
+
+        // Genuine Windows sleep/hibernate advances QPC/Instant by 20s -> detected!
+        let mono2 = mono1 + Duration::from_secs(20);
+        assert_eq!(det.check_monotonic_at(mono2), Some(Duration::from_secs(20)));
+
+        // Subsequent normal tick does not double-fire
+        assert_eq!(
+            det.check_monotonic_at(mono2 + Duration::from_millis(500)),
             None
         );
     }

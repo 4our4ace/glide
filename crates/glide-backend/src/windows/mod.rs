@@ -23,6 +23,11 @@ use windows_sys::Win32::Foundation::{BOOL, LPARAM, RECT};
 use windows_sys::Win32::Graphics::Gdi::{
     EnumDisplayMonitors, GetMonitorInfoW, HDC, HMONITOR, MONITORINFO, MONITORINFOEXW,
 };
+use windows_sys::Win32::System::Threading::{
+    GetCurrentProcess, ProcessPowerThrottling, SetProcessInformation,
+    PROCESS_POWER_THROTTLING_CURRENT_VERSION, PROCESS_POWER_THROTTLING_EXECUTION_SPEED,
+    PROCESS_POWER_THROTTLING_IGNORE_TIMER_RESOLUTION, PROCESS_POWER_THROTTLING_STATE,
+};
 use windows_sys::Win32::UI::HiDpi::{
     GetDpiForMonitor, SetProcessDpiAwarenessContext, DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2,
     MDT_EFFECTIVE_DPI,
@@ -39,6 +44,26 @@ const MONITORINFOF_PRIMARY: u32 = 1;
 pub fn init_dpi_awareness() {
     unsafe {
         let _ = SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
+    }
+}
+
+/// Opts this process out of Windows 11 EcoQoS (E-core efficiency throttling) and
+/// minimized/background timer-resolution throttling so 1000Hz input hooks and QUIC
+/// timers stay jitter-free even while minimized to the system tray.
+pub fn init_windows_realtime_qos() {
+    let state = PROCESS_POWER_THROTTLING_STATE {
+        Version: PROCESS_POWER_THROTTLING_CURRENT_VERSION,
+        ControlMask: PROCESS_POWER_THROTTLING_EXECUTION_SPEED
+            | PROCESS_POWER_THROTTLING_IGNORE_TIMER_RESOLUTION,
+        StateMask: 0,
+    };
+    unsafe {
+        let _ = SetProcessInformation(
+            GetCurrentProcess(),
+            ProcessPowerThrottling,
+            &state as *const PROCESS_POWER_THROTTLING_STATE as *const std::ffi::c_void,
+            size_of::<PROCESS_POWER_THROTTLING_STATE>() as u32,
+        );
     }
 }
 
@@ -95,7 +120,6 @@ unsafe extern "system" fn enum_monitor_cb(
 
 /// Queries all active Windows monitors in physical virtual desktop coordinates.
 pub fn query_desktop_geometry() -> Result<DesktopGeometry> {
-    init_dpi_awareness();
     let mut monitors: Vec<MonitorRect> = Vec::new();
     unsafe {
         EnumDisplayMonitors(

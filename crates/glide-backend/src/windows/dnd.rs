@@ -24,6 +24,7 @@ use crate::dnd::{
     format_drag_preview_label, should_defer_live_ole_drag, DndBackend, DropDeliveryOutcome,
     EdgeStripRect, StagedEdgeTracker,
 };
+use crate::geometry::DesktopGeometry;
 use crate::windows::{init_dpi_awareness, query_desktop_geometry, GLIDE_EXTRA_INFO};
 use anyhow::{anyhow, Context, Result};
 use glide_proto::{Edge, MAX_DRAG_FILES};
@@ -82,12 +83,12 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GetClientRect, GetCursorPos,
     GetMessageW, GetSystemMetrics, GetWindowLongPtrW, KillTimer, PeekMessageW, PostMessageW,
     RegisterClassW, SetLayeredWindowAttributes, SetTimer, SetWindowLongPtrW, SetWindowPos,
-    ShowWindow, TranslateMessage, GWLP_USERDATA, GWL_EXSTYLE, HWND_MESSAGE, HWND_TOPMOST,
-    LWA_ALPHA, MSG, PM_REMOVE, SM_CXVIRTUALSCREEN, SM_CYVIRTUALSCREEN, SM_XVIRTUALSCREEN,
-    SM_YVIRTUALSCREEN, SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_NOSIZE, SWP_NOZORDER, SWP_SHOWWINDOW,
-    SW_HIDE, SW_SHOW, SW_SHOWNOACTIVATE, WM_APP, WM_ERASEBKGND, WM_LBUTTONDOWN, WM_PAINT, WM_QUIT,
-    WM_TIMER, WNDCLASSW, WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST,
-    WS_EX_TRANSPARENT, WS_POPUP,
+    ShowWindow, TranslateMessage, GWLP_USERDATA, GWL_EXSTYLE, HWND_TOPMOST, LWA_ALPHA, MSG,
+    PM_REMOVE, SM_CXVIRTUALSCREEN, SM_CYVIRTUALSCREEN, SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN,
+    SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_NOSIZE, SWP_NOZORDER, SWP_SHOWWINDOW, SW_HIDE, SW_SHOW,
+    SW_SHOWNOACTIVATE, WM_APP, WM_DISPLAYCHANGE, WM_DPICHANGED, WM_ERASEBKGND, WM_LBUTTONDOWN,
+    WM_PAINT, WM_QUIT, WM_TIMER, WNDCLASSW, WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW,
+    WS_EX_TOPMOST, WS_EX_TRANSPARENT, WS_OVERLAPPED, WS_POPUP,
 };
 
 const WM_APP_SYNC_STRIPS: u32 = WM_APP + 21;
@@ -95,6 +96,7 @@ const WM_APP_HIDE_STRIPS: u32 = WM_APP + 22;
 const WM_APP_PREVIEW_SHOW: u32 = WM_APP + 23;
 const WM_APP_PREVIEW_HIDE: u32 = WM_APP + 24;
 const WM_APP_PREVIEW_MOVE: u32 = WM_APP + 25;
+const WM_APP_DISPLAY_CHANGED: u32 = WM_APP + 26;
 
 const PREVIEW_TIMER_ID: usize = 7;
 const MK_LBUTTON: u32 = 0x0001;
@@ -559,6 +561,9 @@ struct StripThreadCtx {
     ctrl_hwnd: HWND,
     strip_class: Vec<u16>,
     preview_class: Vec<u16>,
+    cached_geom: DesktopGeometry,
+    last_edges: Vec<Edge>,
+    last_dead_corner: i32,
     strips: Vec<StripWindow>,
     preview_win: Option<PreviewWindow>,
 }
@@ -578,6 +583,12 @@ unsafe extern "system" fn ctrl_wnd_proc(
     wparam: WPARAM,
     lparam: LPARAM,
 ) -> LRESULT {
+    if msg == WM_DISPLAYCHANGE || msg == WM_DPICHANGED {
+        unsafe {
+            PostMessageW(hwnd, WM_APP_DISPLAY_CHANGED, 0, 0);
+        }
+        return 0;
+    }
     unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
 }
 
@@ -821,19 +832,22 @@ fn show_or_update_preview(ctx: &mut StripThreadCtx) {
     unsafe {
         let _ = GetCursorPos(&mut pt);
     }
-    let geom = query_desktop_geometry().unwrap_or_default();
-    let scale = geom
+    if let Ok(g) = query_desktop_geometry() {
+        ctx.cached_geom = g;
+    }
+    let scale = ctx
+        .cached_geom
         .monitors
         .iter()
         .find(|m| m.contains(pt.x, pt.y))
         .map(|m| m.scale)
-        .unwrap_or_else(|| geom.primary_scale())
+        .unwrap_or_else(|| ctx.cached_geom.primary_scale())
         .clamp(1.0, 3.0);
 
     let width = (248.0 * scale).round() as i32;
     let height = (52.0 * scale).round() as i32;
     let radius = (18.0 * scale).round() as i32;
-    let (x, y) = clamp_hint_popup_pos(&geom, pt.x, pt.y, width, height);
+    let (x, y) = clamp_hint_popup_pos(&ctx.cached_geom, pt.x, pt.y, width, height);
 
     if ctx.preview_win.is_none() {
         let hinstance = unsafe { GetModuleHandleW(ptr::null()) };
@@ -906,8 +920,7 @@ fn move_preview_to_cursor(ctx: &mut StripThreadCtx) {
     if unsafe { GetCursorPos(&mut pt) } == 0 {
         return;
     }
-    let geom = query_desktop_geometry().unwrap_or_default();
-    let (x, y) = clamp_hint_popup_pos(&geom, pt.x, pt.y, pw.width, pw.height);
+    let (x, y) = clamp_hint_popup_pos(&ctx.cached_geom, pt.x, pt.y, pw.width, pw.height);
     if (x, y) != pw.last_pos {
         pw.last_pos = (x, y);
         unsafe {
@@ -974,16 +987,24 @@ fn sync_strips(ctx: &mut StripThreadCtx) {
 
     if !enabled || edges.is_empty() {
         destroy_all_strips(&mut ctx.strips);
+        ctx.last_edges.clear();
         return;
     }
 
-    let geom = match query_desktop_geometry() {
-        Ok(g) => g,
-        Err(_) => return,
-    };
+    // Only re-query display geometry when active edges or dead-corner settings actually change.
+    // Arming/disarming reuses `ctx.cached_geom` so drag-arm never stalls on display queries.
+    let config_changed = ctx.last_edges != edges || ctx.last_dead_corner != dead_corner;
+    if config_changed {
+        if let Ok(g) = query_desktop_geometry() {
+            ctx.cached_geom = g;
+        }
+        ctx.last_edges = edges.clone();
+        ctx.last_dead_corner = dead_corner;
+    }
+
     // 4px width completely covers `hit_outer_edge_guarded(..., margin_px = 2, ...)` (the 3px
     // edge band) with margin to spare so Explorer's COM DragEnter always hits before crossing.
-    let desired = compute_edge_strip_rects(&geom, &edges, dead_corner, 4);
+    let desired = compute_edge_strip_rects(&ctx.cached_geom, &edges, dead_corner, 4);
 
     let needs_rebuild = ctx.strips.len() != desired.len()
         || ctx
@@ -998,7 +1019,7 @@ fn sync_strips(ctx: &mut StripThreadCtx) {
         for rect in desired {
             let ex_style = WS_EX_LAYERED | WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE;
             // Pre-created hidden (WS_VISIBLE omitted) and COM-registered ahead of time so
-            // arming on WM_LBUTTONDOWN only needs a <1ms SetWindowPos(SWP_SHOWWINDOW).
+            // arming only needs a <1ms SetWindowPos(SWP_SHOWWINDOW).
             let hwnd = unsafe {
                 CreateWindowExW(
                     ex_style,
@@ -1129,17 +1150,20 @@ fn run_ole_strip_thread(
         RegisterClassW(&preview_wc);
     }
 
+    // Use a hidden top-level window (NOT HWND_MESSAGE) so Windows delivers WM_DISPLAYCHANGE and
+    // WM_DPICHANGED broadcasts to `ctrl_wnd_proc`, allowing us to cache `DesktopGeometry` without
+    // polling on every drag arm or 125Hz preview move. WS_VISIBLE is omitted so it stays invisible.
     let ctrl_hwnd = unsafe {
         CreateWindowExW(
-            0,
+            WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE,
             ctrl_class.as_ptr(),
             ctrl_class.as_ptr(),
+            WS_OVERLAPPED,
             0,
             0,
             0,
             0,
-            0,
-            HWND_MESSAGE,
+            ptr::null_mut(),
             ptr::null_mut(),
             hinstance,
             ptr::null(),
@@ -1161,6 +1185,9 @@ fn run_ole_strip_thread(
         ctrl_hwnd,
         strip_class,
         preview_class,
+        cached_geom: query_desktop_geometry().unwrap_or_default(),
+        last_edges: Vec::new(),
+        last_dead_corner: -1,
         strips: Vec::new(),
         preview_win: None,
     };
@@ -1170,6 +1197,13 @@ fn run_ole_strip_thread(
         if msg.hwnd == ctrl_hwnd {
             match msg.message {
                 WM_APP_SYNC_STRIPS => {
+                    sync_strips(&mut ctx);
+                    continue;
+                }
+                WM_APP_DISPLAY_CHANGED => {
+                    if let Ok(g) = query_desktop_geometry() {
+                        ctx.cached_geom = g;
+                    }
                     sync_strips(&mut ctx);
                     continue;
                 }

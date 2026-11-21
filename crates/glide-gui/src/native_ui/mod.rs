@@ -7,6 +7,9 @@ mod widgets;
 
 use crate::updater::{self, UpdateCheckState};
 use crate::{launch_browser_window, AppController, GUI_HEIGHT, GUI_WIDTH};
+use glide_backend::hotkeys::{
+    arrow_to_edge, CaptureHotkeys, HidUsage, HotkeyChord, HotkeyMods, ModifierMask,
+};
 use glide_backend::os_integration::{
     configure_elevated_task, configure_firewall, ensure_receive_dir, is_autostart_enabled,
     open_path_in_os, resolve_receive_dir, reveal_in_file_manager, set_autostart,
@@ -19,9 +22,14 @@ use glide_core::runtime::{
     read_regular_file_bounded, ClipboardHistoryEntry, FileTransferEntry, PeerSummary,
     RuntimeCommand, StatusSnapshot,
 };
-use glide_net::discovery::{discover_servers, local_ipv4_addresses, machine_hostname};
+use glide_net::discovery::{
+    discover_servers, local_ipv4_addresses, local_ipv4_addresses_async, machine_hostname,
+};
 use glide_proto::{ClipboardFormat, Edge, OsKind};
-use rune::{App, AppHandle, AppSpec, Cx, El, Key, KeyEvent, TextEdit, Tx, WindowOptions};
+use rune::{
+    App, AppHandle, AppSpec, Cx, El, Key, KeyEvent, Mods, PhysicalInput, PhysicalKeyCode, TextEdit,
+    Tx, WindowOptions,
+};
 use std::borrow::Cow;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -87,6 +95,40 @@ pub struct DiscoveredPeer {
     pub os: OsKind,
     pub addr: String,
     pub fingerprint: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ShortcutSlot {
+    Jump,
+    Lock,
+    Home,
+}
+
+impl ShortcutSlot {
+    pub const fn title(self) -> &'static str {
+        match self {
+            Self::Jump => "Jump to a side",
+            Self::Lock => "Lock current screen",
+            Self::Home => "Bring cursor home",
+        }
+    }
+
+    pub const fn recorder_key(self) -> &'static str {
+        match self {
+            Self::Jump => "sc-jump-rec",
+            Self::Lock => "sc-lock-rec",
+            Self::Home => "sc-home-rec",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct ShortcutRecorderState {
+    pub active: Option<ShortcutSlot>,
+    pub held_mods: HotkeyMods,
+    pub altgr_held: bool,
+    pub swallow_key: Option<PhysicalKeyCode>,
+    held_phys: ModifierMask,
 }
 
 /// Tracks whether the native Rune window is currently open/visible so background
@@ -197,6 +239,12 @@ pub struct Ui {
     pub dismissed_error: Option<String>,
     pub desk_drag: Option<DeskDrag>,
     pub drop_hover: bool,
+
+    // Interactive shortcut recorder + remembered non-disabled bindings
+    pub shortcut_recorder: ShortcutRecorderState,
+    pub last_switch_mods: Option<HotkeyMods>,
+    pub last_lock_chord: Option<HotkeyChord>,
+    pub last_escape_chord: Option<HotkeyChord>,
 }
 
 impl Ui {
@@ -210,6 +258,7 @@ impl Ui {
         let is_windows = matches!(os_kind, OsKind::Windows);
         let hostname = machine_hostname();
         let cfg = ctrl.config.lock().clone();
+        let parsed_hotkeys = cfg.server.parsed_hotkeys();
         let (status_rev, status) = ctrl.runtime.snapshot_with_rev();
         window_vis.record_rev(status_rev);
         let fingerprint = ctrl.fingerprint.lock().clone();
@@ -280,6 +329,10 @@ impl Ui {
             dismissed_error: None,
             desk_drag: None,
             drop_hover: false,
+            shortcut_recorder: ShortcutRecorderState::default(),
+            last_switch_mods: parsed_hotkeys.switch_mods,
+            last_lock_chord: parsed_hotkeys.lock,
+            last_escape_chord: parsed_hotkeys.escape,
         }
     }
 
@@ -1334,7 +1387,369 @@ impl Ui {
         self.toast("Cleared saved server fingerprint", tx);
     }
 
+    pub fn set_tab(&mut self, tab: Tab) {
+        if self.tab != tab {
+            self.stop_recording_shortcut();
+            self.shortcut_recorder.swallow_key = None;
+            self.tab = tab;
+        }
+    }
+
+    pub fn start_recording_shortcut(&mut self, slot: ShortcutSlot) {
+        self.shortcut_recorder.active = Some(slot);
+        self.shortcut_recorder.held_mods = HotkeyMods::EMPTY;
+        self.shortcut_recorder.altgr_held = false;
+        self.shortcut_recorder.swallow_key = None;
+        self.shortcut_recorder.held_phys = ModifierMask::EMPTY;
+        self.ctrl.set_hotkeys_suspended(true);
+    }
+
+    pub fn stop_recording_shortcut(&mut self) {
+        if self.shortcut_recorder.active.take().is_some() {
+            self.shortcut_recorder.held_mods = HotkeyMods::EMPTY;
+            self.shortcut_recorder.altgr_held = false;
+            self.shortcut_recorder.held_phys = ModifierMask::EMPTY;
+            self.ctrl.set_hotkeys_suspended(false);
+        }
+    }
+
+    fn sync_phys_mods_with_event(&mut self, mods: Mods) {
+        if !mods.ctrl && !(!cfg!(target_os = "macos") && mods.cmd) {
+            self.shortcut_recorder.held_phys.0 &=
+                !(ModifierMask::CONTROL_LEFT | ModifierMask::CONTROL_RIGHT);
+        }
+        if !mods.alt {
+            self.shortcut_recorder.held_phys.0 &= !ModifierMask::ALT_LEFT;
+        }
+        if !mods.shift {
+            self.shortcut_recorder.held_phys.0 &=
+                !(ModifierMask::SHIFT_LEFT | ModifierMask::SHIFT_RIGHT);
+        }
+        if !mods.logo && !(cfg!(target_os = "macos") && mods.cmd) {
+            self.shortcut_recorder.held_phys.0 &=
+                !(ModifierMask::META_LEFT | ModifierMask::META_RIGHT);
+        }
+    }
+
+    pub fn set_shortcut_enabled(&mut self, slot: ShortcutSlot, enabled: bool, tx: &mut Tx) {
+        let cur = self.config.server.parsed_hotkeys();
+        if !enabled {
+            match slot {
+                ShortcutSlot::Jump => {
+                    if let Some(m) = cur.switch_mods {
+                        self.last_switch_mods = Some(m);
+                    }
+                    self.config.server.set_switch_shortcut(None);
+                }
+                ShortcutSlot::Lock => {
+                    if let Some(c) = cur.lock {
+                        self.last_lock_chord = Some(c);
+                    }
+                    self.config.server.set_lock_shortcut(None);
+                }
+                ShortcutSlot::Home => {
+                    if let Some(c) = cur.escape {
+                        self.last_escape_chord = Some(c);
+                    }
+                    self.config.server.set_escape_shortcut(None);
+                }
+            }
+            if self.shortcut_recorder.active == Some(slot) {
+                self.stop_recording_shortcut();
+            }
+            self.push_config();
+            return;
+        }
+
+        self.stop_recording_shortcut();
+        match slot {
+            ShortcutSlot::Jump => {
+                let candidate = self.last_switch_mods.unwrap_or(HotkeyMods::DEFAULT_SWITCH);
+                if let Some(other) = jump_conflict(cur, candidate) {
+                    self.start_recording_shortcut(slot);
+                    tx.focus(slot.recorder_key(), false);
+                    self.toast(
+                        format!(
+                            "Already used by {} — press a new shortcut",
+                            other.title()
+                        ),
+                        tx,
+                    );
+                    return;
+                }
+                self.config.server.set_switch_shortcut(Some(candidate));
+                self.last_switch_mods = Some(candidate);
+            }
+            ShortcutSlot::Lock => {
+                let candidate = self.last_lock_chord.unwrap_or(HotkeyChord::DEFAULT_LOCK);
+                if let Some(other) = chord_conflict(slot, cur, candidate) {
+                    self.start_recording_shortcut(slot);
+                    tx.focus(slot.recorder_key(), false);
+                    self.toast(
+                        format!(
+                            "Already used by {} — press a new shortcut",
+                            other.title()
+                        ),
+                        tx,
+                    );
+                    return;
+                }
+                self.config.server.set_lock_shortcut(Some(candidate));
+                self.last_lock_chord = Some(candidate);
+            }
+            ShortcutSlot::Home => {
+                let candidate = self.last_escape_chord.unwrap_or(HotkeyChord::DEFAULT_ESCAPE);
+                if let Some(other) = chord_conflict(slot, cur, candidate) {
+                    self.start_recording_shortcut(slot);
+                    tx.focus(slot.recorder_key(), false);
+                    self.toast(
+                        format!(
+                            "Already used by {} — press a new shortcut",
+                            other.title()
+                        ),
+                        tx,
+                    );
+                    return;
+                }
+                self.config.server.set_escape_shortcut(Some(candidate));
+                self.last_escape_chord = Some(candidate);
+            }
+        }
+        self.push_config();
+    }
+
+    pub fn toggle_shortcut_slot(&mut self, slot: ShortcutSlot, tx: &mut Tx) {
+        let cur = self.config.server.parsed_hotkeys();
+        let enabled = match slot {
+            ShortcutSlot::Jump => cur.switch_mods.is_some(),
+            ShortcutSlot::Lock => cur.lock.is_some(),
+            ShortcutSlot::Home => cur.escape.is_some(),
+        };
+        self.set_shortcut_enabled(slot, !enabled, tx);
+    }
+
+    pub fn reset_shortcuts(&mut self) {
+        self.stop_recording_shortcut();
+        self.shortcut_recorder.swallow_key = None;
+        self.config.server.reset_shortcuts();
+        self.last_switch_mods = None;
+        self.last_lock_chord = None;
+        self.last_escape_chord = None;
+        self.push_config();
+    }
+
+    pub fn handle_shortcut_physical_input(
+        &mut self,
+        slot: ShortcutSlot,
+        ev: &PhysicalInput,
+        tx: &mut Tx,
+    ) -> bool {
+        match *ev {
+            PhysicalInput::FocusLost => {
+                self.shortcut_recorder.swallow_key = None;
+                if self.shortcut_recorder.active == Some(slot) {
+                    self.stop_recording_shortcut();
+                    return true;
+                }
+                false
+            }
+            PhysicalInput::Modifiers(mods) => {
+                if self.shortcut_recorder.active != Some(slot) {
+                    return false;
+                }
+                self.sync_phys_mods_with_event(mods);
+                self.shortcut_recorder.held_mods =
+                    hotkey_mods_from_rune(mods, self.shortcut_recorder.altgr_held);
+                true
+            }
+            PhysicalInput::Key {
+                key,
+                mods,
+                pressed,
+                repeat,
+            } => {
+                if self.shortcut_recorder.swallow_key == Some(key) {
+                    if !pressed {
+                        self.shortcut_recorder.swallow_key = None;
+                    }
+                    return true;
+                }
+
+                if self.shortcut_recorder.active != Some(slot) {
+                    if pressed {
+                        self.shortcut_recorder.swallow_key = None;
+                    }
+                    return false;
+                }
+
+                // Right Alt (AltGr) is reserved for international typing.
+                if key == PhysicalKeyCode::AltRight {
+                    self.shortcut_recorder.altgr_held = pressed;
+                    self.shortcut_recorder
+                        .held_phys
+                        .update(HidUsage::ALT_RIGHT, pressed);
+                    if pressed {
+                        // On Windows, AltGr synthesizes fake Ctrl+Alt — strip them from held mods.
+                        self.shortcut_recorder.held_phys.0 &= !(ModifierMask::CONTROL_LEFT
+                            | ModifierMask::CONTROL_RIGHT
+                            | ModifierMask::ALT_LEFT);
+                        self.shortcut_recorder.held_mods = hotkey_mods_from_rune(mods, true);
+                        if !repeat {
+                            self.toast("Use Left Alt — AltGr is reserved for typing", tx);
+                        }
+                    } else {
+                        self.sync_phys_mods_with_event(mods);
+                        self.shortcut_recorder.held_mods = hotkey_mods_from_rune(mods, false);
+                    }
+                    return true;
+                }
+
+                let usage = physical_key_to_hid(key);
+
+                // Modifier press/release updates live preview and waits for a trigger key.
+                if let Some(mod_usage) = usage.filter(|u| u.is_modifier()) {
+                    self.shortcut_recorder.held_phys.update(mod_usage, pressed);
+                    if self.shortcut_recorder.altgr_held {
+                        self.shortcut_recorder.held_mods = hotkey_mods_from_rune(mods, true);
+                    } else if pressed {
+                        let from_phys =
+                            HotkeyMods::from_modifier_mask(self.shortcut_recorder.held_phys)
+                                .unwrap_or(HotkeyMods::EMPTY);
+                        self.shortcut_recorder.held_mods =
+                            hotkey_mods_from_rune(mods, false) | from_phys;
+                    } else {
+                        let mut next = hotkey_mods_from_rune(mods, false);
+                        if matches!(
+                            key,
+                            PhysicalKeyCode::ControlLeft | PhysicalKeyCode::ControlRight
+                        ) && !self.shortcut_recorder.held_phys.ctrl()
+                        {
+                            next = HotkeyMods(next.bits() & !HotkeyMods::CTRL.bits());
+                        }
+                        if key == PhysicalKeyCode::AltLeft
+                            && !self
+                                .shortcut_recorder
+                                .held_phys
+                                .contains(ModifierMask::ALT_LEFT)
+                        {
+                            next = HotkeyMods(next.bits() & !HotkeyMods::ALT.bits());
+                        }
+                        if matches!(
+                            key,
+                            PhysicalKeyCode::ShiftLeft | PhysicalKeyCode::ShiftRight
+                        ) && !self.shortcut_recorder.held_phys.shift()
+                        {
+                            next = HotkeyMods(next.bits() & !HotkeyMods::SHIFT.bits());
+                        }
+                        if matches!(
+                            key,
+                            PhysicalKeyCode::SuperLeft | PhysicalKeyCode::SuperRight
+                        ) && !self.shortcut_recorder.held_phys.meta()
+                        {
+                            next = HotkeyMods(next.bits() & !HotkeyMods::SUPER.bits());
+                        }
+                        self.shortcut_recorder.held_mods = next;
+                    }
+                    return true;
+                }
+
+                if !pressed || repeat {
+                    return true;
+                }
+
+                let event_mods_empty =
+                    !mods.ctrl && !mods.alt && !mods.shift && !mods.logo && !mods.cmd;
+
+                // Unmodified Escape always cancels recording cleanly.
+                if key == PhysicalKeyCode::Escape
+                    && event_mods_empty
+                    && (self.shortcut_recorder.altgr_held
+                        || self.shortcut_recorder.held_phys == ModifierMask::EMPTY)
+                {
+                    self.stop_recording_shortcut();
+                    self.shortcut_recorder.swallow_key = Some(key);
+                    return true;
+                }
+
+                if self.shortcut_recorder.altgr_held {
+                    self.toast("Use Left Alt — AltGr is reserved for typing", tx);
+                    return true;
+                }
+
+                let active_mods = hotkey_mods_from_rune(mods, false)
+                    | HotkeyMods::from_modifier_mask(self.shortcut_recorder.held_phys)
+                        .unwrap_or(HotkeyMods::EMPTY);
+
+                // Unmodified Escape cancels recording.
+                if key == PhysicalKeyCode::Escape && active_mods.is_empty() {
+                    self.stop_recording_shortcut();
+                    self.shortcut_recorder.swallow_key = Some(key);
+                    return true;
+                }
+
+                // Unmodified Backspace or Delete disables this shortcut slot.
+                if matches!(key, PhysicalKeyCode::Backspace | PhysicalKeyCode::Delete)
+                    && active_mods.is_empty()
+                {
+                    self.set_shortcut_enabled(slot, false, tx);
+                    self.stop_recording_shortcut();
+                    self.shortcut_recorder.swallow_key = Some(key);
+                    self.toast("Shortcut disabled", tx);
+                    return true;
+                }
+
+                let Some(usage) = usage else {
+                    self.toast("Unsupported key for shortcut", tx);
+                    return true;
+                };
+
+                let current = self.config.server.parsed_hotkeys();
+                match slot {
+                    ShortcutSlot::Jump => {
+                        if arrow_to_edge(usage).is_none()
+                            || active_mods.validate_for_switch().is_err()
+                        {
+                            self.toast("Press Ctrl, Alt, or Super + any Arrow key", tx);
+                            return true;
+                        }
+                        if let Some(other) = jump_conflict(current, active_mods) {
+                            self.toast(format!("Already used by {}", other.title()), tx);
+                            return true;
+                        }
+                        self.config.server.set_switch_shortcut(Some(active_mods));
+                        self.last_switch_mods = Some(active_mods);
+                    }
+                    ShortcutSlot::Lock | ShortcutSlot::Home => {
+                        let chord = HotkeyChord::new(active_mods, usage);
+                        if let Err(reason) = chord.validate_for_lock_or_escape() {
+                            self.toast(reason, tx);
+                            return true;
+                        }
+                        if let Some(other) = chord_conflict(slot, current, chord) {
+                            self.toast(format!("Already used by {}", other.title()), tx);
+                            return true;
+                        }
+                        if slot == ShortcutSlot::Lock {
+                            self.config.server.set_lock_shortcut(Some(chord));
+                            self.last_lock_chord = Some(chord);
+                        } else {
+                            self.config.server.set_escape_shortcut(Some(chord));
+                            self.last_escape_chord = Some(chord);
+                        }
+                    }
+                }
+
+                self.push_config();
+                self.stop_recording_shortcut();
+                self.shortcut_recorder.swallow_key = Some(key);
+                true
+            }
+        }
+    }
+
     pub fn quit_app(&mut self, tx: &mut Tx) {
+        self.stop_recording_shortcut();
+        self.shortcut_recorder.swallow_key = None;
         updater::zeroize_string(&mut self.sudo_password.text);
         self.sudo_password.clear();
         if let UpdateCheckState::AwaitingSudoPassword { stage_dir, .. } = &self.update_state {
@@ -1343,6 +1758,182 @@ impl Ui {
         let _ = self.ctrl.quit_tx.send(());
         tx.quit();
     }
+}
+
+fn hotkey_mods_from_rune(mods: Mods, altgr_held: bool) -> HotkeyMods {
+    let mut out = HotkeyMods::EMPTY;
+    if !altgr_held {
+        if mods.ctrl || (!cfg!(target_os = "macos") && mods.cmd) {
+            out |= HotkeyMods::CTRL;
+        }
+        if mods.alt {
+            out |= HotkeyMods::ALT;
+        }
+    }
+    if mods.shift {
+        out |= HotkeyMods::SHIFT;
+    }
+    if mods.logo || (cfg!(target_os = "macos") && mods.cmd) {
+        out |= HotkeyMods::SUPER;
+    }
+    out
+}
+
+fn jump_conflict(current: CaptureHotkeys, candidate_mods: HotkeyMods) -> Option<ShortcutSlot> {
+    if current
+        .lock
+        .is_some_and(|c| c.mods == candidate_mods && arrow_to_edge(c.key).is_some())
+    {
+        return Some(ShortcutSlot::Lock);
+    }
+    if current
+        .escape
+        .is_some_and(|c| c.mods == candidate_mods && arrow_to_edge(c.key).is_some())
+    {
+        return Some(ShortcutSlot::Home);
+    }
+    None
+}
+
+fn chord_conflict(
+    slot: ShortcutSlot,
+    current: CaptureHotkeys,
+    candidate: HotkeyChord,
+) -> Option<ShortcutSlot> {
+    if slot == ShortcutSlot::Lock && current.escape == Some(candidate) {
+        return Some(ShortcutSlot::Home);
+    }
+    if slot == ShortcutSlot::Home && current.lock == Some(candidate) {
+        return Some(ShortcutSlot::Lock);
+    }
+    if current.switch_mods == Some(candidate.mods) && arrow_to_edge(candidate.key).is_some() {
+        return Some(ShortcutSlot::Jump);
+    }
+    None
+}
+
+pub fn physical_key_to_hid(key: PhysicalKeyCode) -> Option<HidUsage> {
+    use PhysicalKeyCode as K;
+    let usage = match key {
+        K::KeyA => HidUsage::keyboard(0x04),
+        K::KeyB => HidUsage::keyboard(0x05),
+        K::KeyC => HidUsage::keyboard(0x06),
+        K::KeyD => HidUsage::keyboard(0x07),
+        K::KeyE => HidUsage::keyboard(0x08),
+        K::KeyF => HidUsage::keyboard(0x09),
+        K::KeyG => HidUsage::keyboard(0x0A),
+        K::KeyH => HidUsage::keyboard(0x0B),
+        K::KeyI => HidUsage::keyboard(0x0C),
+        K::KeyJ => HidUsage::keyboard(0x0D),
+        K::KeyK => HidUsage::keyboard(0x0E),
+        K::KeyL => HidUsage::KEY_L,
+        K::KeyM => HidUsage::keyboard(0x10),
+        K::KeyN => HidUsage::keyboard(0x11),
+        K::KeyO => HidUsage::keyboard(0x12),
+        K::KeyP => HidUsage::keyboard(0x13),
+        K::KeyQ => HidUsage::keyboard(0x14),
+        K::KeyR => HidUsage::keyboard(0x15),
+        K::KeyS => HidUsage::keyboard(0x16),
+        K::KeyT => HidUsage::keyboard(0x17),
+        K::KeyU => HidUsage::keyboard(0x18),
+        K::KeyV => HidUsage::keyboard(0x19),
+        K::KeyW => HidUsage::keyboard(0x1A),
+        K::KeyX => HidUsage::keyboard(0x1B),
+        K::KeyY => HidUsage::keyboard(0x1C),
+        K::KeyZ => HidUsage::keyboard(0x1D),
+        K::Digit1 => HidUsage::keyboard(0x1E),
+        K::Digit2 => HidUsage::keyboard(0x1F),
+        K::Digit3 => HidUsage::keyboard(0x20),
+        K::Digit4 => HidUsage::keyboard(0x21),
+        K::Digit5 => HidUsage::keyboard(0x22),
+        K::Digit6 => HidUsage::keyboard(0x23),
+        K::Digit7 => HidUsage::keyboard(0x24),
+        K::Digit8 => HidUsage::keyboard(0x25),
+        K::Digit9 => HidUsage::keyboard(0x26),
+        K::Digit0 => HidUsage::keyboard(0x27),
+        K::Enter => HidUsage::keyboard(0x28),
+        K::Escape => HidUsage::ESCAPE,
+        K::Backspace => HidUsage::BACKSPACE,
+        K::Tab => HidUsage::keyboard(0x2B),
+        K::Space => HidUsage::keyboard(0x2C),
+        K::Minus => HidUsage::keyboard(0x2D),
+        K::Equal => HidUsage::keyboard(0x2E),
+        K::BracketLeft => HidUsage::keyboard(0x2F),
+        K::BracketRight => HidUsage::keyboard(0x30),
+        K::Backslash => HidUsage::keyboard(0x31),
+        K::Semicolon => HidUsage::keyboard(0x33),
+        K::Quote => HidUsage::keyboard(0x34),
+        K::Backquote => HidUsage::keyboard(0x35),
+        K::Comma => HidUsage::keyboard(0x36),
+        K::Period => HidUsage::keyboard(0x37),
+        K::Slash => HidUsage::keyboard(0x38),
+        K::F1 => HidUsage::keyboard(0x3A),
+        K::F2 => HidUsage::keyboard(0x3B),
+        K::F3 => HidUsage::keyboard(0x3C),
+        K::F4 => HidUsage::keyboard(0x3D),
+        K::F5 => HidUsage::keyboard(0x3E),
+        K::F6 => HidUsage::keyboard(0x3F),
+        K::F7 => HidUsage::keyboard(0x40),
+        K::F8 => HidUsage::keyboard(0x41),
+        K::F9 => HidUsage::keyboard(0x42),
+        K::F10 => HidUsage::keyboard(0x43),
+        K::F11 => HidUsage::keyboard(0x44),
+        K::F12 => HidUsage::keyboard(0x45),
+        K::PrintScreen => HidUsage::PRINT_SCREEN,
+        K::ScrollLock => HidUsage::SCROLL_LOCK,
+        K::Pause => HidUsage::PAUSE,
+        K::Insert => HidUsage::INSERT,
+        K::Home => HidUsage::HOME,
+        K::PageUp => HidUsage::PAGE_UP,
+        K::Delete => HidUsage::DELETE,
+        K::End => HidUsage::END,
+        K::PageDown => HidUsage::PAGE_DOWN,
+        K::ArrowRight => HidUsage::ARROW_RIGHT,
+        K::ArrowLeft => HidUsage::ARROW_LEFT,
+        K::ArrowDown => HidUsage::ARROW_DOWN,
+        K::ArrowUp => HidUsage::ARROW_UP,
+        K::NumpadDivide => HidUsage::keyboard(0x54),
+        K::NumpadMultiply => HidUsage::keyboard(0x55),
+        K::NumpadSubtract => HidUsage::keyboard(0x56),
+        K::NumpadAdd => HidUsage::keyboard(0x57),
+        K::NumpadEnter => HidUsage::keyboard(0x58),
+        K::Numpad1 => HidUsage::keyboard(0x59),
+        K::Numpad2 => HidUsage::keyboard(0x5A),
+        K::Numpad3 => HidUsage::keyboard(0x5B),
+        K::Numpad4 => HidUsage::keyboard(0x5C),
+        K::Numpad5 => HidUsage::keyboard(0x5D),
+        K::Numpad6 => HidUsage::keyboard(0x5E),
+        K::Numpad7 => HidUsage::keyboard(0x5F),
+        K::Numpad8 => HidUsage::keyboard(0x60),
+        K::Numpad9 => HidUsage::keyboard(0x61),
+        K::Numpad0 => HidUsage::keyboard(0x62),
+        K::NumpadDecimal => HidUsage::keyboard(0x63),
+        K::IntlBackslash => HidUsage::ISO_BACKSLASH,
+        K::ContextMenu => HidUsage::CONTEXT_MENU,
+        K::NumpadEqual => HidUsage::keyboard(0x67),
+        K::F13 => HidUsage::keyboard(0x68),
+        K::F14 => HidUsage::keyboard(0x69),
+        K::F15 => HidUsage::keyboard(0x6A),
+        K::F16 => HidUsage::keyboard(0x6B),
+        K::F17 => HidUsage::keyboard(0x6C),
+        K::F18 => HidUsage::keyboard(0x6D),
+        K::F19 => HidUsage::keyboard(0x6E),
+        K::F20 => HidUsage::keyboard(0x6F),
+        K::F21 => HidUsage::keyboard(0x70),
+        K::F22 => HidUsage::keyboard(0x71),
+        K::F23 => HidUsage::keyboard(0x72),
+        K::F24 => HidUsage::keyboard(0x73),
+        K::ControlLeft => HidUsage::CONTROL_LEFT,
+        K::ShiftLeft => HidUsage::SHIFT_LEFT,
+        K::AltLeft => HidUsage::ALT_LEFT,
+        K::SuperLeft => HidUsage::META_LEFT,
+        K::ControlRight => HidUsage::CONTROL_RIGHT,
+        K::ShiftRight => HidUsage::SHIFT_RIGHT,
+        K::AltRight => HidUsage::ALT_RIGHT,
+        K::SuperRight => HidUsage::META_RIGHT,
+        _ => return None,
+    };
+    Some(usage)
 }
 
 // ---------------------------------------------------------------------------
@@ -1385,6 +1976,8 @@ fn on_key(s: &mut Ui, ev: &KeyEvent, tx: &mut Tx) -> bool {
 }
 
 fn on_close(s: &mut Ui, tx: &mut Tx) {
+    s.stop_recording_shortcut();
+    s.shortcut_recorder.swallow_key = None;
     s.window_vis.set_visible(false);
     // If no system tray is available, closing the window quits Glide cleanly instead of
     // leaving an invisible background process. Read the atomic directly so an async tray
@@ -1785,9 +2378,7 @@ fn spawn_discovery_loop(
                 // Running server or connected client: refresh local IPs on initial open /
                 // reopen without issuing a 2s UDP LAN broadcast scan.
                 force_refresh = false;
-                let ips = tokio::task::spawn_blocking(local_ipv4_addresses)
-                    .await
-                    .unwrap_or_default();
+                let ips = local_ipv4_addresses_async().await;
                 if vis.is_visible() {
                     handle.update_if(move |ui, _| {
                         if ui.local_ips == ips {
@@ -1828,7 +2419,7 @@ async fn run_discovery(ctrl: &AppController) -> (Vec<DiscoveredPeer>, Vec<String
             fingerprint: s.fingerprint,
         })
         .collect();
-    (list, local_ipv4_addresses())
+    (list, local_ipv4_addresses_async().await)
 }
 
 fn os_label(os: OsKind) -> &'static str {
@@ -2558,6 +3149,25 @@ mod tests {
 
                 render_png(&mut rt, &format!("{scene_name}.png"));
 
+                if scene_name == "settings-light" {
+                    rt.state.config.server.set_lock_shortcut(None);
+                    rt.state
+                        .config
+                        .server
+                        .set_escape_shortcut(Some(HotkeyChord::new(
+                            HotkeyMods::EMPTY,
+                            HidUsage::keyboard(0x45),
+                        )));
+                    rt.state.start_recording_shortcut(ShortcutSlot::Jump);
+                    rt.state.shortcut_recorder.held_mods = HotkeyMods::CTRL | HotkeyMods::SHIFT;
+                    rt.invalidate();
+                    rt.frame(0.0);
+                    rt.settle_all();
+                    rt.frame(0.0);
+                    render_png(&mut rt, "settings-shortcuts-active-light.png");
+                    rt.state.stop_recording_shortcut();
+                }
+
                 if scene_name == "settings-advanced-light" {
                     // Scroll left column down so Security & firewall + Max file size are fully visible.
                     if let Some((lx, ly)) = rt.find("settings-left") {
@@ -2579,6 +3189,394 @@ mod tests {
             }
         }
     }
+
+    #[tokio::test]
+    async fn shortcuts_ui_record_disable_validate_and_reset() {
+        struct CleanupDir(PathBuf);
+        impl Drop for CleanupDir {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+
+        let click = |rt: &mut rune::Runtime<Ui>, key: &str| {
+            let (x, y) = rt
+                .find(key)
+                .unwrap_or_else(|| panic!("element `{key}` not found"));
+            rt.pointer_down(x, y);
+            rt.pointer_up(x, y);
+            rt.frame(0.0);
+            rt.settle_all();
+            rt.frame(0.0);
+        };
+
+        for is_windows in [false, true] {
+            let dir = std::env::temp_dir().join(format!(
+                "glide-ui-shortcuts-test-{}-{}",
+                std::process::id(),
+                if is_windows { "win" } else { "linux" }
+            ));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).unwrap();
+            let _cleanup = CleanupDir(dir.clone());
+
+            let (quit_tx, _quit_rx) = tokio::sync::mpsc::unbounded_channel();
+            let ctrl = Arc::new(AppController::new(
+                dir.join("config.toml"),
+                "http://127.0.0.1:0".into(),
+                quit_tx,
+            ));
+
+            // Attach a mock engine channel so we also verify SetHotkeysSuspended + UpdateServerTuning commands.
+            let (cmd_tx, mut cmd_rx) = tokio::sync::mpsc::unbounded_channel();
+            let dummy_task = tokio::spawn(async {});
+            *ctrl.engine.lock() = Some(crate::ActiveEngine {
+                task: dummy_task,
+                cmd_tx,
+            });
+
+            let vis = Arc::new(WindowVisibility::new(true));
+            let mut ui = Ui::new(ctrl.clone(), tokio::runtime::Handle::current(), vis);
+            ui.tab = Tab::Settings;
+            ui.is_windows = is_windows;
+            ui.os_kind = if is_windows {
+                OsKind::Windows
+            } else {
+                OsKind::LinuxX11
+            };
+
+            let mut rt = rune::Runtime::new(
+                ui,
+                view,
+                (GUI_WIDTH as f32, GUI_HEIGHT as f32),
+                rune::Env::new(false, 1.0),
+            );
+            rt.frame(0.0);
+            rt.settle_all();
+            rt.frame(0.0);
+
+            // Defaults: all 3 shortcuts active, Reset defaults button hidden.
+            assert!(rt.state.config.server.shortcuts_are_default());
+            assert!(rt.find("sc-reset-btn").is_none());
+
+            // 1. Toggle sc-lock-toggle OFF -> Lock becomes None, sc-reset-btn appears.
+            click(&mut rt, "sc-lock-toggle");
+            assert_eq!(rt.state.config.server.parsed_hotkeys().lock, None);
+            assert!(rt.find("sc-reset-btn").is_some());
+
+            // Toggle sc-lock-toggle back ON -> restores default Ctrl+Alt+L and hides sc-reset-btn.
+            click(&mut rt, "sc-lock-toggle");
+            assert_eq!(
+                rt.state.config.server.parsed_hotkeys().lock,
+                Some(HotkeyChord::DEFAULT_LOCK)
+            );
+            assert!(rt.find("sc-reset-btn").is_none());
+
+            // Drain commands so far.
+            while cmd_rx.try_recv().is_ok() {}
+
+            // 2. Click sc-home-rec -> enters recording mode and suspends live hotkeys.
+            click(&mut rt, "sc-home-rec");
+            assert_eq!(rt.state.shortcut_recorder.active, Some(ShortcutSlot::Home));
+            let mut saw_suspend = false;
+            while let Ok(cmd) = cmd_rx.try_recv() {
+                if matches!(cmd, RuntimeCommand::SetHotkeysSuspended(true)) {
+                    saw_suspend = true;
+                }
+            }
+            assert!(saw_suspend, "recording must suspend live hotkeys");
+
+            // Send F12 -> records F12, exits recording mode, resumes live hotkeys.
+            rt.physical_input(PhysicalInput::Key {
+                key: PhysicalKeyCode::F12,
+                mods: Mods::default(),
+                pressed: true,
+                repeat: false,
+            });
+            rt.frame(0.0);
+            assert_eq!(rt.state.shortcut_recorder.active, None);
+            assert_eq!(
+                rt.state.config.server.parsed_hotkeys().escape,
+                Some(HotkeyChord::new(HotkeyMods::EMPTY, HidUsage::keyboard(0x45)))
+            );
+            assert_eq!(
+                rt.state.shortcut_recorder.swallow_key,
+                Some(PhysicalKeyCode::F12)
+            );
+            let mut saw_resume = false;
+            let mut saw_tuning_escape_f12 = false;
+            while let Ok(cmd) = cmd_rx.try_recv() {
+                match cmd {
+                    RuntimeCommand::SetHotkeysSuspended(false) => saw_resume = true,
+                    RuntimeCommand::UpdateServerTuning { hotkeys, .. }
+                        if hotkeys.escape
+                            == Some(HotkeyChord::new(
+                                HotkeyMods::EMPTY,
+                                HidUsage::keyboard(0x45),
+                            )) =>
+                    {
+                        saw_tuning_escape_f12 = true;
+                    }
+                    _ => {}
+                }
+            }
+            assert!(saw_resume, "finishing recording must resume live hotkeys");
+            assert!(
+                saw_tuning_escape_f12,
+                "recording must push updated CaptureHotkeys to running engine"
+            );
+
+            // Releasing F12 clears swallow_key cleanly.
+            rt.physical_input(PhysicalInput::Key {
+                key: PhysicalKeyCode::F12,
+                mods: Mods::default(),
+                pressed: false,
+                repeat: false,
+            });
+            rt.frame(0.0);
+            assert_eq!(rt.state.shortcut_recorder.swallow_key, None);
+
+            // Toggling Home OFF then ON remembers custom F12 binding instead of resetting to ScrollLock.
+            click(&mut rt, "sc-home-toggle");
+            assert_eq!(rt.state.config.server.parsed_hotkeys().escape, None);
+            click(&mut rt, "sc-home-toggle");
+            assert_eq!(
+                rt.state.config.server.parsed_hotkeys().escape,
+                Some(HotkeyChord::new(HotkeyMods::EMPTY, HidUsage::keyboard(0x45)))
+            );
+
+            // 3. Click sc-jump-rec -> send Ctrl+Shift+ArrowRight -> records Ctrl+Shift.
+            click(&mut rt, "sc-jump-rec");
+            assert_eq!(rt.state.shortcut_recorder.active, Some(ShortcutSlot::Jump));
+            rt.physical_input(PhysicalInput::Key {
+                key: PhysicalKeyCode::ArrowRight,
+                mods: Mods {
+                    ctrl: true,
+                    shift: true,
+                    ..Mods::default()
+                },
+                pressed: true,
+                repeat: false,
+            });
+            rt.frame(0.0);
+            assert_eq!(rt.state.shortcut_recorder.active, None);
+            assert_eq!(
+                rt.state.config.server.parsed_hotkeys().switch_mods,
+                Some(HotkeyMods::CTRL | HotkeyMods::SHIFT)
+            );
+            rt.physical_input(PhysicalInput::Key {
+                key: PhysicalKeyCode::ArrowRight,
+                mods: Mods::default(),
+                pressed: false,
+                repeat: false,
+            });
+            rt.frame(0.0);
+
+            // Also verify Super keycap label adapts to OS (Win on Windows, Super on Linux).
+            click(&mut rt, "sc-jump-rec");
+            rt.physical_input(PhysicalInput::Key {
+                key: PhysicalKeyCode::ArrowLeft,
+                mods: Mods {
+                    logo: true,
+                    ..Mods::default()
+                },
+                pressed: true,
+                repeat: false,
+            });
+            rt.frame(0.0);
+            assert_eq!(
+                rt.state.config.server.parsed_hotkeys().switch_mods,
+                Some(HotkeyMods::SUPER)
+            );
+            let jump_label = rt
+                .elements()
+                .into_iter()
+                .find(|e| e.key.as_deref() == Some("sc-jump-rec"))
+                .and_then(|e| e.label)
+                .unwrap_or_default();
+            if is_windows {
+                assert!(
+                    jump_label.contains("Win+Arrow"),
+                    "Windows keycap should use Win, got {jump_label}"
+                );
+            } else {
+                assert!(
+                    jump_label.contains("Super+Arrow"),
+                    "Linux keycap should use Super, got {jump_label}"
+                );
+            }
+            rt.physical_input(PhysicalInput::Key {
+                key: PhysicalKeyCode::ArrowLeft,
+                mods: Mods::default(),
+                pressed: false,
+                repeat: false,
+            });
+            rt.frame(0.0);
+
+            // Re-set Jump to Ctrl+Shift for subsequent checks.
+            click(&mut rt, "sc-jump-rec");
+            rt.physical_input(PhysicalInput::Key {
+                key: PhysicalKeyCode::ArrowRight,
+                mods: Mods {
+                    ctrl: true,
+                    shift: true,
+                    ..Mods::default()
+                },
+                pressed: true,
+                repeat: false,
+            });
+            rt.frame(0.0);
+            assert_eq!(
+                rt.state.config.server.parsed_hotkeys().switch_mods,
+                Some(HotkeyMods::CTRL | HotkeyMods::SHIFT)
+            );
+
+            // 4. Click sc-lock-rec -> test rejections (Win+L, cross-slot F12, cross-slot Jump arrow, AltGr) + Escape cancel.
+            click(&mut rt, "sc-lock-rec");
+            assert_eq!(rt.state.shortcut_recorder.active, Some(ShortcutSlot::Lock));
+
+            // Win+L rejected (reserved by OS).
+            rt.physical_input(PhysicalInput::Key {
+                key: PhysicalKeyCode::KeyL,
+                mods: Mods {
+                    logo: true,
+                    ..Mods::default()
+                },
+                pressed: true,
+                repeat: false,
+            });
+            rt.frame(0.0);
+            assert_eq!(rt.state.shortcut_recorder.active, Some(ShortcutSlot::Lock));
+            assert!(
+                rt.state
+                    .active_toast()
+                    .is_some_and(|t| t.contains("Win+L")),
+                "expected Win+L rejection toast, got {:?}",
+                rt.state.active_toast()
+            );
+
+            // Cross-slot conflict: F12 is already used by Bring cursor home.
+            rt.physical_input(PhysicalInput::Key {
+                key: PhysicalKeyCode::F12,
+                mods: Mods::default(),
+                pressed: true,
+                repeat: false,
+            });
+            rt.frame(0.0);
+            assert_eq!(rt.state.shortcut_recorder.active, Some(ShortcutSlot::Lock));
+            assert!(
+                rt.state
+                    .active_toast()
+                    .is_some_and(|t| t.contains("Bring cursor home")),
+                "expected conflict toast with Home, got {:?}",
+                rt.state.active_toast()
+            );
+
+            // Cross-slot conflict: Ctrl+Shift+ArrowLeft collides with Jump (Ctrl+Shift+Arrow).
+            rt.physical_input(PhysicalInput::Key {
+                key: PhysicalKeyCode::ArrowLeft,
+                mods: Mods {
+                    ctrl: true,
+                    shift: true,
+                    ..Mods::default()
+                },
+                pressed: true,
+                repeat: false,
+            });
+            rt.frame(0.0);
+            assert_eq!(rt.state.shortcut_recorder.active, Some(ShortcutSlot::Lock));
+            assert!(
+                rt.state
+                    .active_toast()
+                    .is_some_and(|t| t.contains("Jump to a side")),
+                "expected conflict toast with Jump, got {:?}",
+                rt.state.active_toast()
+            );
+
+            // AltRight (AltGr) rejected and does not populate Ctrl/Alt in held_mods.
+            rt.physical_input(PhysicalInput::Key {
+                key: PhysicalKeyCode::AltRight,
+                mods: Mods {
+                    ctrl: true,
+                    alt: true,
+                    ..Mods::default()
+                },
+                pressed: true,
+                repeat: false,
+            });
+            rt.frame(0.0);
+            assert_eq!(rt.state.shortcut_recorder.active, Some(ShortcutSlot::Lock));
+            assert!(rt.state.shortcut_recorder.altgr_held);
+            assert_eq!(rt.state.shortcut_recorder.held_mods, HotkeyMods::EMPTY);
+            assert!(
+                rt.state
+                    .active_toast()
+                    .is_some_and(|t| t.contains("AltGr")),
+                "expected AltGr rejection toast, got {:?}",
+                rt.state.active_toast()
+            );
+
+            // Unmodified Escape cancels cleanly.
+            rt.physical_input(PhysicalInput::Key {
+                key: PhysicalKeyCode::Escape,
+                mods: Mods::default(),
+                pressed: true,
+                repeat: false,
+            });
+            rt.frame(0.0);
+            assert_eq!(rt.state.shortcut_recorder.active, None);
+            assert!(!rt.state.shortcut_recorder.altgr_held);
+            assert_eq!(
+                rt.state.config.server.parsed_hotkeys().lock,
+                Some(HotkeyChord::DEFAULT_LOCK)
+            );
+            rt.physical_input(PhysicalInput::Key {
+                key: PhysicalKeyCode::Escape,
+                mods: Mods::default(),
+                pressed: false,
+                repeat: false,
+            });
+            rt.frame(0.0);
+
+            // 5. Click sc-lock-rec -> unmodified Backspace disables Lock.
+            click(&mut rt, "sc-lock-rec");
+            assert_eq!(rt.state.shortcut_recorder.active, Some(ShortcutSlot::Lock));
+            rt.physical_input(PhysicalInput::Key {
+                key: PhysicalKeyCode::Backspace,
+                mods: Mods::default(),
+                pressed: true,
+                repeat: false,
+            });
+            rt.frame(0.0);
+            assert_eq!(rt.state.shortcut_recorder.active, None);
+            assert_eq!(rt.state.config.server.parsed_hotkeys().lock, None);
+            assert_eq!(rt.state.active_toast(), Some("Shortcut disabled"));
+
+            // 6. Verify switching tabs stops recording and resumes hotkeys.
+            click(&mut rt, "sc-home-rec");
+            assert_eq!(rt.state.shortcut_recorder.active, Some(ShortcutSlot::Home));
+            while cmd_rx.try_recv().is_ok() {}
+            click(&mut rt, "nav-Devices");
+            assert_eq!(rt.state.tab, Tab::Devices);
+            assert_eq!(rt.state.shortcut_recorder.active, None);
+            let mut resumed_on_tab_switch = false;
+            while let Ok(cmd) = cmd_rx.try_recv() {
+                if matches!(cmd, RuntimeCommand::SetHotkeysSuspended(false)) {
+                    resumed_on_tab_switch = true;
+                }
+            }
+            assert!(resumed_on_tab_switch);
+
+            // Return to Settings and click sc-reset-btn -> restores all 3 defaults.
+            click(&mut rt, "nav-Settings");
+            assert!(rt.find("sc-reset-btn").is_some());
+            click(&mut rt, "sc-reset-btn");
+            assert!(rt.state.config.server.shortcuts_are_default());
+            assert_eq!(
+                rt.state.config.server.parsed_hotkeys(),
+                CaptureHotkeys::default()
+            );
+            assert!(rt.find("sc-reset-btn").is_none());
+        }
+    }
 }
-
-

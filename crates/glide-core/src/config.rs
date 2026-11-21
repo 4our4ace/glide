@@ -2,7 +2,7 @@
 
 use anyhow::{Context, Result};
 use directories::ProjectDirs;
-use glide_backend::InputBackendKind;
+use glide_backend::{CaptureHotkeys, HotkeyChord, HotkeyMods, InputBackendKind};
 use glide_hid::HidUsage;
 use glide_net::discovery::{machine_hostname, DEFAULT_DISCOVERY_PORT};
 use glide_proto::Edge;
@@ -11,6 +11,7 @@ use std::collections::HashMap;
 use std::fs;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
+use tracing::warn;
 
 pub const DEFAULT_QUIC_PORT: u16 = 24800;
 
@@ -255,7 +256,8 @@ pub struct ServerConfig {
     pub discovery: bool,
     /// UDP port for LAN discovery (default `24801`).
     pub discovery_port: u16,
-    /// Physical key that unconditionally returns control to the server desktop.
+    /// Physical key or chord that unconditionally returns control to the server desktop
+    /// (default `"ScrollLock"`; supports chords like `"Ctrl+Alt+Escape"` or `"none"` to disable).
     pub escape_key: String,
     /// Outward push threshold in pixels at a screen border before switching.
     pub edge_threshold_px: i32,
@@ -265,8 +267,17 @@ pub struct ServerConfig {
     pub edge_dwell_ms: u64,
     /// Automatically pause edge switching while a fullscreen game/app is active.
     pub auto_lock_fullscreen: bool,
-    /// Enable `Ctrl+Alt+Arrow` direct screen switching and `Ctrl+Alt+L` cursor lock toggle.
+    /// Legacy master switch for `<Mods>+Arrow` screen switching and cursor lock toggle when
+    /// `switch_shortcut` / `lock_shortcut` are unset (`None`).
     pub enable_hotkeys: bool,
+    /// Optional modifier prefix held with an Arrow key to jump directly to a neighbor screen
+    /// (e.g. `"Ctrl+Alt"`, `"Ctrl+Shift"`, or `"none"` to disable). `None` inherits `enable_hotkeys`.
+    #[serde(default)]
+    pub switch_shortcut: Option<String>,
+    /// Optional shortcut chord to toggle cursor lock to the current screen
+    /// (e.g. `"Ctrl+Alt+L"`, `"F9"`, or `"none"` to disable). `None` inherits `enable_hotkeys`.
+    #[serde(default)]
+    pub lock_shortcut: Option<String>,
     /// Sync CapsLock and NumLock state onto clients on screen entry.
     pub sync_lock_keys: bool,
     /// Keep media, volume, and brightness keys on this PC instead of forwarding them to remote clients.
@@ -301,6 +312,8 @@ impl Default for ServerConfig {
             edge_dwell_ms: 0,
             auto_lock_fullscreen: true,
             enable_hotkeys: true,
+            switch_shortcut: None,
+            lock_shortcut: None,
             sync_lock_keys: true,
             pin_media_keys_local: true,
             clipboard: true,
@@ -314,8 +327,111 @@ impl Default for ServerConfig {
 }
 
 impl ServerConfig {
-    pub fn parsed_escape_key(&self) -> HidUsage {
-        HidUsage::from_name(&self.escape_key).unwrap_or(HidUsage::SCROLL_LOCK)
+    /// Parses configured server shortcuts into [`CaptureHotkeys`].
+    ///
+    /// - `switch_shortcut`: when `Some`, parsed via [`HotkeyMods::parse`]; when `None`, inherits
+    ///   from legacy `enable_hotkeys`.
+    /// - `lock_shortcut`: when `Some`, parsed via [`HotkeyChord::parse`]; when `None`, inherits
+    ///   from legacy `enable_hotkeys`.
+    /// - `escape_key`: parsed via [`HotkeyChord::parse`] (`"none"`/`""`/`"off"`/`"disabled"` disables it).
+    ///
+    /// Unrecognized strings log a warning and fall back cleanly to their respective defaults.
+    pub fn parsed_hotkeys(&self) -> CaptureHotkeys {
+        let switch_mods = match self.switch_shortcut.as_deref() {
+            Some(raw) => HotkeyMods::parse(raw).unwrap_or_else(|e| {
+                warn!(
+                    value = raw,
+                    error = %e,
+                    "Invalid server.switch_shortcut; falling back to default Ctrl+Alt"
+                );
+                Some(HotkeyMods::DEFAULT_SWITCH)
+            }),
+            None if self.enable_hotkeys => Some(HotkeyMods::DEFAULT_SWITCH),
+            None => None,
+        };
+
+        let lock = match self.lock_shortcut.as_deref() {
+            Some(raw) => HotkeyChord::parse(raw).unwrap_or_else(|e| {
+                warn!(
+                    value = raw,
+                    error = %e,
+                    "Invalid server.lock_shortcut; falling back to default Ctrl+Alt+L"
+                );
+                Some(HotkeyChord::DEFAULT_LOCK)
+            }),
+            None if self.enable_hotkeys => Some(HotkeyChord::DEFAULT_LOCK),
+            None => None,
+        };
+
+        let escape = HotkeyChord::parse(&self.escape_key).unwrap_or_else(|e| {
+            warn!(
+                value = %self.escape_key,
+                error = %e,
+                "Invalid server.escape_key; falling back to default ScrollLock"
+            );
+            Some(HotkeyChord::DEFAULT_ESCAPE)
+        });
+
+        CaptureHotkeys {
+            switch_mods,
+            lock,
+            escape,
+        }
+    }
+
+    /// Returns the trigger [`HidUsage`] of the configured escape shortcut, or `None` if disabled.
+    pub fn parsed_escape_key(&self) -> Option<HidUsage> {
+        self.parsed_hotkeys().escape.map(|chord| chord.key)
+    }
+
+    /// Updates the direct screen-switch modifier prefix (`None` disables it) while preserving the
+    /// effective state of `lock_shortcut` (including legacy `enable_hotkeys = false` configs).
+    pub fn set_switch_shortcut(&mut self, mods: Option<HotkeyMods>) {
+        if self.lock_shortcut.is_none() && !self.enable_hotkeys {
+            self.lock_shortcut = Some("none".into());
+        }
+        self.switch_shortcut = Some(match mods {
+            Some(m) => m.format_canonical(),
+            None => "none".into(),
+        });
+        let parsed = self.parsed_hotkeys();
+        self.enable_hotkeys = parsed.switch_mods.is_some() || parsed.lock.is_some();
+    }
+
+    /// Updates the cursor-lock toggle shortcut (`None` disables it) while preserving the
+    /// effective state of `switch_shortcut` (including legacy `enable_hotkeys = false` configs).
+    pub fn set_lock_shortcut(&mut self, chord: Option<HotkeyChord>) {
+        if self.switch_shortcut.is_none() && !self.enable_hotkeys {
+            self.switch_shortcut = Some("none".into());
+        }
+        self.lock_shortcut = Some(match chord {
+            Some(c) => c.format_canonical(),
+            None => "none".into(),
+        });
+        let parsed = self.parsed_hotkeys();
+        self.enable_hotkeys = parsed.switch_mods.is_some() || parsed.lock.is_some();
+    }
+
+    /// Updates the emergency return-home shortcut (`None` disables it).
+    pub fn set_escape_shortcut(&mut self, chord: Option<HotkeyChord>) {
+        self.escape_key = match chord {
+            Some(c) => c.format_canonical(),
+            None => "none".into(),
+        };
+    }
+
+    /// Restores all global shortcuts back to their factory defaults (`Ctrl+Alt+Arrow`,
+    /// `Ctrl+Alt+L`, and `ScrollLock`).
+    pub fn reset_shortcuts(&mut self) {
+        self.switch_shortcut = None;
+        self.lock_shortcut = None;
+        self.escape_key = "ScrollLock".into();
+        self.enable_hotkeys = true;
+    }
+
+    /// Returns `true` when all three configured shortcuts match [`CaptureHotkeys::default`].
+    pub fn shortcuts_are_default(&self) -> bool {
+        self.parsed_hotkeys() == CaptureHotkeys::default()
     }
 
     pub fn resolved_identity_dir(&self) -> PathBuf {
@@ -1042,5 +1158,148 @@ mod tests {
         // Omitting update_channel falls back cleanly to the build's own channel
         let empty_parsed: GlideConfigFile = toml::from_str("").unwrap();
         assert_eq!(empty_parsed.update_channel, UpdateChannel::build_channel());
+    }
+
+    #[test]
+    fn legacy_enable_hotkeys_false_disables_switch_and_lock_but_keeps_scroll_lock() {
+        let legacy: GlideConfigFile = toml::from_str(
+            r#"
+            [server]
+            enable_hotkeys = false
+            "#,
+        )
+        .unwrap();
+        assert_eq!(legacy.server.switch_shortcut, None);
+        assert_eq!(legacy.server.lock_shortcut, None);
+        assert!(!legacy.server.enable_hotkeys);
+
+        let hk = legacy.server.parsed_hotkeys();
+        assert_eq!(hk.switch_mods, None);
+        assert_eq!(hk.lock, None);
+        assert_eq!(hk.escape, Some(HotkeyChord::DEFAULT_ESCAPE));
+        assert_eq!(legacy.server.parsed_escape_key(), Some(HidUsage::SCROLL_LOCK));
+        assert!(!legacy.server.shortcuts_are_default());
+    }
+
+    #[test]
+    fn escape_key_supports_disabled_keywords_and_chords() {
+        for disabled in ["none", "NONE", "", "   ", "off", "disabled"] {
+            let cfg = ServerConfig {
+                escape_key: disabled.into(),
+                ..Default::default()
+            };
+            let hk = cfg.parsed_hotkeys();
+            assert_eq!(hk.escape, None, "expected '{disabled}' to disable escape");
+            assert_eq!(cfg.parsed_escape_key(), None);
+        }
+
+        let chord_cfg = ServerConfig {
+            escape_key: "Ctrl+Alt+Escape".into(),
+            ..Default::default()
+        };
+        let hk = chord_cfg.parsed_hotkeys();
+        assert_eq!(
+            hk.escape,
+            Some(HotkeyChord::new(
+                HotkeyMods::CTRL | HotkeyMods::ALT,
+                HidUsage::ESCAPE
+            ))
+        );
+        assert_eq!(chord_cfg.parsed_escape_key(), Some(HidUsage::ESCAPE));
+    }
+
+    #[test]
+    fn enabling_lock_from_legacy_disabled_config_keeps_switch_disabled() {
+        let mut legacy: GlideConfigFile = toml::from_str(
+            r#"
+            [server]
+            enable_hotkeys = false
+            "#,
+        )
+        .unwrap();
+
+        let f9 = HotkeyChord::new(HotkeyMods::EMPTY, HidUsage::from_name("F9").unwrap());
+        legacy.server.set_lock_shortcut(Some(f9));
+
+        assert_eq!(legacy.server.switch_shortcut.as_deref(), Some("none"));
+        assert_eq!(legacy.server.lock_shortcut.as_deref(), Some("F9"));
+        assert!(legacy.server.enable_hotkeys);
+
+        let hk = legacy.server.parsed_hotkeys();
+        assert_eq!(
+            hk.switch_mods, None,
+            "Jump must stay disabled when enabling Lock from legacy enable_hotkeys = false"
+        );
+        assert_eq!(hk.lock, Some(f9));
+        assert_eq!(hk.escape, Some(HotkeyChord::DEFAULT_ESCAPE));
+
+        // Symmetrically: enabling Jump from legacy enable_hotkeys = false keeps Lock disabled
+        let mut legacy2: GlideConfigFile = toml::from_str(
+            r#"
+            [server]
+            enable_hotkeys = false
+            "#,
+        )
+        .unwrap();
+        let ctrl_shift = HotkeyMods::CTRL | HotkeyMods::SHIFT;
+        legacy2.server.set_switch_shortcut(Some(ctrl_shift));
+        assert_eq!(legacy2.server.lock_shortcut.as_deref(), Some("none"));
+        assert_eq!(legacy2.server.switch_shortcut.as_deref(), Some("Ctrl+Shift"));
+        assert!(legacy2.server.enable_hotkeys);
+        assert_eq!(legacy2.server.parsed_hotkeys().switch_mods, Some(ctrl_shift));
+        assert_eq!(legacy2.server.parsed_hotkeys().lock, None);
+    }
+
+    #[test]
+    fn invalid_shortcut_strings_fall_back_cleanly_to_defaults() {
+        let cfg = ServerConfig {
+            switch_shortcut: Some("NotAMod+Bogus".into()),
+            lock_shortcut: Some("Hyper+FakeKey99".into()),
+            escape_key: "CompletelyInvalidKey".into(),
+            ..Default::default()
+        };
+        let hk = cfg.parsed_hotkeys();
+        assert_eq!(hk.switch_mods, Some(HotkeyMods::DEFAULT_SWITCH));
+        assert_eq!(hk.lock, Some(HotkeyChord::DEFAULT_LOCK));
+        assert_eq!(hk.escape, Some(HotkeyChord::DEFAULT_ESCAPE));
+    }
+
+    #[test]
+    fn shortcuts_mutators_reset_and_toml_roundtrip() {
+        let mut cfg = GlideConfigFile::default();
+        assert!(cfg.server.shortcuts_are_default());
+
+        cfg.server
+            .set_switch_shortcut(Some(HotkeyMods::CTRL | HotkeyMods::SHIFT));
+        cfg.server.set_lock_shortcut(None);
+        cfg.server.set_escape_shortcut(Some(HotkeyChord::new(
+            HotkeyMods::CTRL | HotkeyMods::ALT,
+            HidUsage::ESCAPE,
+        )));
+        assert!(!cfg.server.shortcuts_are_default());
+        assert!(cfg.server.enable_hotkeys);
+
+        let raw = toml::to_string_pretty(&cfg).unwrap();
+        assert!(raw.contains("switch_shortcut = \"Ctrl+Shift\""));
+        assert!(raw.contains("lock_shortcut = \"none\""));
+        assert!(raw.contains("escape_key = \"Ctrl+Alt+Escape\""));
+
+        let parsed: GlideConfigFile = toml::from_str(&raw).unwrap();
+        assert_eq!(parsed.server.parsed_hotkeys(), cfg.server.parsed_hotkeys());
+
+        // Disabling both switch and lock sets enable_hotkeys = false too
+        let mut both_off = parsed;
+        both_off.server.set_switch_shortcut(None);
+        both_off.server.set_escape_shortcut(None);
+        assert!(!both_off.server.enable_hotkeys);
+        assert_eq!(both_off.server.parsed_hotkeys(), CaptureHotkeys::disabled());
+
+        // Reset restores defaults cleanly
+        both_off.server.reset_shortcuts();
+        assert!(both_off.server.shortcuts_are_default());
+        assert_eq!(both_off.server.switch_shortcut, None);
+        assert_eq!(both_off.server.lock_shortcut, None);
+        assert_eq!(both_off.server.escape_key, "ScrollLock");
+        assert!(both_off.server.enable_hotkeys);
     }
 }

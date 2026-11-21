@@ -8,16 +8,19 @@
 
 use crate::dnd::DndBackend;
 use crate::geometry::DesktopGeometry;
-use crate::windows::{init_dpi_awareness, query_desktop_geometry, GLIDE_EXTRA_INFO};
+use crate::hotkeys::{AtomicHotkeySuppressor, AtomicHotkeys, HotkeyAction, HotkeyMatch};
+use crate::windows::{
+    init_dpi_awareness, init_windows_realtime_qos, query_desktop_geometry, GLIDE_EXTRA_INFO,
+};
 use crate::{
     edge_bit, is_windows_consumer_or_media_vk, is_windows_workstation_lock_chord, AtomicEdgeMask,
-    AtomicNormPoint, CaptureConfig, CaptureControl, CaptureEvent, CaptureHandle,
+    AtomicNormPoint, CaptureConfig, CaptureControl, CaptureEvent, CaptureHandle, CaptureHotkeys,
     RemoteMediaKeyTracker, WindowsPendingMeta, ALL_EDGES,
 };
 use anyhow::{anyhow, Context, Result};
 use glide_hid::{is_windows_fake_altgr_lctrl, HidUsage, ModifierMask, MouseButton, WinScan};
 use glide_proto::{Edge, LockState};
-use parking_lot::{Mutex, RwLock};
+use parking_lot::{Condvar, Mutex, RwLock};
 use std::mem::size_of;
 use std::ptr;
 use std::sync::atomic::{
@@ -66,17 +69,30 @@ const VK_SNAPSHOT_CODE: u32 = 0x2C;
 const VK_NUMLOCK_CODE: u32 = 0x90;
 const VK_RSHIFT_CODE: u32 = 0xA1;
 
+/// Minimum squared movement (8 px) from `WM_LBUTTONDOWN` origin before arming DnD edge strips.
+const DRAG_ARM_MIN_MOVE_SQ: i64 = 64;
+/// Distance (px) from an active outer edge at which an active drag arms the pre-created 4px strip.
+const DRAG_ARM_EDGE_DIST_PX: i32 = 160;
+/// Hysteresis distance (px) beyond which a retreating drag disarms the edge strip.
+const DRAG_DISARM_EDGE_DIST_PX: i32 = 220;
+
 enum LeaveTarget {
     Edge(Edge, f32),
     Point(f32, f32),
 }
 
+#[derive(Default)]
+struct GeomRefreshSignal {
+    pending: bool,
+    shutdown: bool,
+}
+
 struct HookState {
-    config: CaptureConfig,
     tx: mpsc::UnboundedSender<CaptureEvent>,
     capture_hwnd: AtomicIsize,
     active_edges: AtomicEdgeMask,
     geometry: RwLock<DesktopGeometry>,
+    geom_refresh_signal: (Mutex<GeomRefreshSignal>, Condvar),
     remote_mode: AtomicBool,
     cursor_parked: AtomicBool,
     locked: AtomicBool,
@@ -85,12 +101,17 @@ struct HookState {
     drag_drop_files: AtomicBool,
     dnd_probe: OnceLock<Arc<dyn DndBackend>>,
     lmb_down: AtomicBool,
+    lmb_down_x: AtomicI32,
+    lmb_down_y: AtomicI32,
     lmb_started_on_edge: AtomicBool,
     lmb_block_drag_arm: AtomicBool,
+    lmb_fullscreen_checked: AtomicBool,
     drag_strip_armed: AtomicBool,
     pin_media_keys_local: AtomicBool,
     forwarded_media_keys: Mutex<RemoteMediaKeyTracker>,
     pending_meta: WindowsPendingMeta,
+    hotkeys: AtomicHotkeys,
+    hotkey_suppressor: AtomicHotkeySuppressor,
     edge_threshold_px: AtomicI32,
     dead_corner_px: AtomicI32,
     edge_dwell_ms: AtomicU64,
@@ -105,7 +126,6 @@ struct HookState {
     last_raw_mouse_ms: AtomicU64,
     last_raw_reclaim_ms: AtomicU64,
     ll_moves_without_raw: AtomicU32,
-    last_geom_refresh_ms: AtomicU64,
     last_resume_emit: Mutex<Option<Instant>>,
 }
 
@@ -123,9 +143,19 @@ impl HookState {
         }
     }
 
+    /// Signals the dormant background geometry helper thread to re-query display monitors
+    /// off the low-level input hook thread (non-blocking, zero hook stalls).
+    fn request_geometry_refresh(&self) {
+        let (lock, cvar) = &self.geom_refresh_signal;
+        let mut sig = lock.lock();
+        if !sig.shutdown {
+            sig.pending = true;
+            cvar.notify_one();
+        }
+    }
+
+    /// Runs on the dormant `glide-win-geom` helper thread — never on `glide-win-capture`.
     fn refresh_geometry_now(&self) -> bool {
-        self.last_geom_refresh_ms
-            .store(self.elapsed_ms(), Ordering::Relaxed);
         let Ok(new_geom) = query_desktop_geometry() else {
             return false;
         };
@@ -157,19 +187,6 @@ impl HookState {
         changed
     }
 
-    fn maybe_refresh_geometry(&self) {
-        let now = self.elapsed_ms();
-        let prev = self.last_geom_refresh_ms.load(Ordering::Relaxed);
-        if now.saturating_sub(prev) >= 5000
-            && self
-                .last_geom_refresh_ms
-                .compare_exchange(prev, now, Ordering::Relaxed, Ordering::Relaxed)
-                .is_ok()
-        {
-            let _ = self.refresh_geometry_now();
-        }
-    }
-
     fn restore_cursor_visibly(&self) {
         let (nx, ny) = self.last_local_norm.load();
         let (x, y) = self.geometry.read().denormalize_point(nx, ny);
@@ -185,10 +202,12 @@ impl HookState {
     fn release_to_local_on_suspend(&self, reason: &str) {
         let was_remote = self.remote_mode.swap(false, Ordering::SeqCst);
         self.pending_meta.clear();
+        self.hotkey_suppressor.clear();
         self.cursor_parked.store(false, Ordering::Release);
         self.lmb_down.store(false, Ordering::SeqCst);
         self.lmb_started_on_edge.store(false, Ordering::Relaxed);
         self.lmb_block_drag_arm.store(false, Ordering::Relaxed);
+        self.lmb_fullscreen_checked.store(false, Ordering::Relaxed);
         self.mods.store(0, Ordering::Relaxed);
         self.forwarded_media_keys.lock().clear();
         self.ll_moves_without_raw.store(0, Ordering::Relaxed);
@@ -205,15 +224,17 @@ impl HookState {
         let _ = self.tx.send(CaptureEvent::SystemSuspended);
     }
 
-    /// Ensures clean local state after wake or session unlock, immediately refreshes display
-    /// geometry (monitors often change while asleep), and emits a debounced `SystemResumed`.
+    /// Ensures clean local state after wake or session unlock, queues an off-thread display
+    /// geometry refresh (monitors often change while asleep), and emits a debounced `SystemResumed`.
     fn handle_resume_or_unlock(&self, reason: &str) {
         let was_remote = self.remote_mode.swap(false, Ordering::SeqCst);
         self.pending_meta.clear();
+        self.hotkey_suppressor.clear();
         self.cursor_parked.store(false, Ordering::Release);
         self.lmb_down.store(false, Ordering::SeqCst);
         self.lmb_started_on_edge.store(false, Ordering::Relaxed);
         self.lmb_block_drag_arm.store(false, Ordering::Relaxed);
+        self.lmb_fullscreen_checked.store(false, Ordering::Relaxed);
         if was_remote {
             self.restore_cursor_visibly();
         }
@@ -224,7 +245,7 @@ impl HookState {
         self.edge_push_active.store(false, Ordering::Release);
         *self.pending_leave.lock() = None;
 
-        let _ = self.refresh_geometry_now();
+        self.request_geometry_refresh();
 
         let should_emit = {
             let mut last = self.last_resume_emit.lock();
@@ -273,9 +294,10 @@ struct WindowsCaptureControl {
 
 impl Drop for WindowsCaptureControl {
     fn drop(&mut self) {
-        // Always restore cursor & stop hook loop cleanly on shutdown
+        // Always restore cursor & stop hook loop + geometry helper cleanly on shutdown
         let was_remote = self.state.remote_mode.swap(false, Ordering::SeqCst);
         self.state.pending_meta.clear();
+        self.state.hotkey_suppressor.clear();
         self.state.cursor_parked.store(false, Ordering::Release);
         if was_remote {
             let (nx, ny) = self.state.last_local_norm.load();
@@ -283,6 +305,12 @@ impl Drop for WindowsCaptureControl {
             unsafe {
                 SetCursorPos(x, y);
             }
+        }
+        {
+            let (lock, cvar) = &self.state.geom_refresh_signal;
+            let mut sig = lock.lock();
+            sig.shutdown = true;
+            cvar.notify_all();
         }
         let hwnd = self.hwnd.swap(0, Ordering::SeqCst) as HWND;
         if !hwnd.is_null() {
@@ -353,6 +381,14 @@ impl CaptureControl for WindowsCaptureControl {
             .store(enabled, Ordering::Relaxed);
     }
 
+    fn set_hotkeys(&self, hotkeys: CaptureHotkeys) {
+        self.state.hotkeys.store(hotkeys);
+    }
+
+    fn set_hotkeys_suspended(&self, suspended: bool) {
+        self.state.hotkeys.set_suspended(suspended);
+    }
+
     fn enter_remote(&self) -> Result<()> {
         self.state.pending_meta.clear();
         // Only post WM_APP_ENTER_REMOTE when transitioning local -> remote (e.g. hotkey or UI
@@ -391,6 +427,9 @@ impl CaptureControl for WindowsCaptureControl {
         self.state.lmb_down.store(false, Ordering::SeqCst);
         self.state.lmb_started_on_edge.store(false, Ordering::Relaxed);
         self.state.lmb_block_drag_arm.store(false, Ordering::Relaxed);
+        self.state
+            .lmb_fullscreen_checked
+            .store(false, Ordering::Relaxed);
         self.state.clear_edge_push();
         // Move the cursor synchronously BEFORE flipping remote_mode=false / posting
         // WM_APP_LEAVE_REMOTE so incoming drag-and-drop (`GetCursorPos()`) immediately sees
@@ -426,6 +465,9 @@ impl CaptureControl for WindowsCaptureControl {
         self.state.lmb_down.store(false, Ordering::SeqCst);
         self.state.lmb_started_on_edge.store(false, Ordering::Relaxed);
         self.state.lmb_block_drag_arm.store(false, Ordering::Relaxed);
+        self.state
+            .lmb_fullscreen_checked
+            .store(false, Ordering::Relaxed);
         self.state.clear_edge_push();
         let moved = unsafe { SetCursorPos(x, y) } != 0;
         *self.state.pending_leave.lock() = if moved {
@@ -458,16 +500,6 @@ impl CaptureControl for WindowsCaptureControl {
 
     fn last_local_cursor_norm(&self) -> (f32, f32) {
         self.state.last_local_norm.load()
-    }
-}
-
-fn arrow_to_edge(usage: HidUsage) -> Option<Edge> {
-    match usage.raw() {
-        x if x == HidUsage::keyboard(0x50).raw() => Some(Edge::Left),
-        x if x == HidUsage::keyboard(0x4F).raw() => Some(Edge::Right),
-        x if x == HidUsage::keyboard(0x52).raw() => Some(Edge::Top),
-        x if x == HidUsage::keyboard(0x51).raw() => Some(Edge::Bottom),
-        _ => None,
     }
 }
 
@@ -594,46 +626,52 @@ unsafe extern "system" fn keyboard_ll_proc(code: i32, wparam: WPARAM, lparam: LP
                     mask.update(usage, pressed);
                     state.mods.store(mask.0, Ordering::Relaxed);
 
-                    if usage == state.config.escape_key {
-                        if pressed && remote {
-                            state.remote_mode.store(false, Ordering::SeqCst);
-                            state.pending_meta.clear();
-                            state.cursor_parked.store(false, Ordering::Release);
-                            state.forwarded_media_keys.lock().clear();
-                            let _ = state.tx.send(CaptureEvent::EscapeHotkey);
-                            return true;
-                        }
-                        return remote;
+                    // Windows' kernel (win32k) intercepts physical Win+L below WH_KEYBOARD_LL
+                    // and unconditionally locks the local Windows server regardless of hook
+                    // suppression. Never forward `L` (or any deferred bare Meta) to the remote
+                    // client on Win+L so we neither lock both machines nor leak a lone Super
+                    // tap that opens GNOME/KDE Activities.
+                    if remote && is_windows_workstation_lock_chord(mask, kb.vkCode, pressed) {
+                        state.release_to_local_on_suspend("Win+L");
+                        return true;
                     }
 
-                    // Direct screen-switch hotkeys (Ctrl + LeftAlt + Arrow) & Cursor Lock (Ctrl + LeftAlt + L).
-                    // Specifically checks ALT_LEFT (never ALT_RIGHT / AltGr) so German typing never collides!
-                    if pressed
-                        && state.config.enable_hotkeys
-                        && mask.ctrl()
-                        && mask.contains(ModifierMask::ALT_LEFT)
-                    {
-                        if let Some(direction) = arrow_to_edge(usage) {
-                            let _ = state.tx.send(CaptureEvent::HotkeySwitch { direction });
+                    match state.hotkey_suppressor.evaluate(
+                        state.hotkeys.load(),
+                        remote,
+                        prev_mask,
+                        usage,
+                        pressed,
+                    ) {
+                        HotkeyMatch::Trigger(action) => {
+                            // Clear any deferred bare Meta so a custom `Super+...` shortcut
+                            // never leaks a lone `Super` press to Linux clients.
+                            state.pending_meta.clear();
+                            match action {
+                                HotkeyAction::Escape => {
+                                    state.remote_mode.store(false, Ordering::SeqCst);
+                                    state.cursor_parked.store(false, Ordering::Release);
+                                    state.forwarded_media_keys.lock().clear();
+                                    let _ = state.tx.send(CaptureEvent::EscapeHotkey);
+                                }
+                                HotkeyAction::Switch(direction) => {
+                                    let _ = state
+                                        .tx
+                                        .send(CaptureEvent::HotkeySwitch { direction });
+                                }
+                                HotkeyAction::ToggleLock => {
+                                    let _ = state.tx.send(CaptureEvent::HotkeyToggleLock);
+                                }
+                            }
                             return true;
                         }
-                        if usage == HidUsage::keyboard(0x0F) {
-                            // KeyL
-                            let _ = state.tx.send(CaptureEvent::HotkeyToggleLock);
+                        HotkeyMatch::SuppressOnly => {
                             return true;
                         }
+                        HotkeyMatch::PassThrough => {}
                     }
 
                     if remote {
-                        // Windows' kernel (win32k) intercepts physical Win+L below WH_KEYBOARD_LL
-                        // and unconditionally locks the local Windows server regardless of hook
-                        // suppression. Never forward `L` (or any deferred bare Meta) to the remote
-                        // client on Win+L so we neither lock both machines nor leak a lone Super
-                        // tap that opens GNOME/KDE Activities.
-                        if is_windows_workstation_lock_chord(mask, kb.vkCode, pressed) {
-                            state.release_to_local_on_suspend("Win+L");
-                            return true;
-                        }
                         if usage.is_media_key()
                             && !state.forwarded_media_keys.lock().should_forward(
                                 usage,
@@ -732,37 +770,29 @@ unsafe extern "system" fn mouse_ll_proc(code: i32, wparam: WPARAM, lparam: LPARA
                         }
                         WM_LBUTTONDOWN => {
                             let edge_mask = state.active_edges.load();
-                            let (started_on_edge, fullscreen_blocked) = if edge_mask != 0 {
+                            let started_on_edge = if edge_mask != 0 {
                                 let geom = state.geometry.read();
-                                let on_edge = ALL_EDGES.iter().any(|&e| {
+                                ALL_EDGES.iter().any(|&e| {
                                     (edge_mask & edge_bit(e)) != 0
                                         && geom.distance_to_edge(e, ms.pt.x, ms.pt.y) <= 4
-                                });
-                                let fs_block = state.auto_lock_fullscreen.load(Ordering::Relaxed)
-                                    && is_foreground_fullscreen(&geom);
-                                (on_edge, fs_block)
+                                })
                             } else {
-                                (false, false)
+                                false
                             };
+                            // Record press origin and defer arming the WS_EX_TOPMOST|WS_EX_LAYERED
+                            // edge strip (and fullscreen check) until the user actually drags
+                            // >= 8 px within 160 px of an active edge — eliminating per-click
+                            // DWM/MPO composition hitches on normal clicks and fullscreen apps.
+                            state.lmb_down_x.store(ms.pt.x, Ordering::Relaxed);
+                            state.lmb_down_y.store(ms.pt.y, Ordering::Relaxed);
                             state
                                 .lmb_started_on_edge
                                 .store(started_on_edge, Ordering::Relaxed);
+                            state.lmb_block_drag_arm.store(false, Ordering::Relaxed);
                             state
-                                .lmb_block_drag_arm
-                                .store(fullscreen_blocked, Ordering::Relaxed);
+                                .lmb_fullscreen_checked
+                                .store(false, Ordering::Relaxed);
                             state.lmb_down.store(true, Ordering::SeqCst);
-                            // Arm pre-created 4px edge strips IMMEDIATELY on interior LMB down
-                            // (matching client.rs) unless a fullscreen game/app is foreground
-                            // (preserving DirectFlip / MPO zero-copy presentation).
-                            if !started_on_edge
-                                && !fullscreen_blocked
-                                && edge_mask != 0
-                                && state.drag_drop_files.load(Ordering::Relaxed)
-                                && !state.locked.load(Ordering::Relaxed)
-                                && !state.drag_strip_armed.swap(true, Ordering::SeqCst)
-                            {
-                                let _ = state.tx.send(CaptureEvent::DragStripArmed(true));
-                            }
                             let _ = state
                                 .tx
                                 .send(CaptureEvent::LocalLeftButton { pressed: true });
@@ -771,6 +801,9 @@ unsafe extern "system" fn mouse_ll_proc(code: i32, wparam: WPARAM, lparam: LPARA
                             state.lmb_down.store(false, Ordering::SeqCst);
                             state.lmb_started_on_edge.store(false, Ordering::Relaxed);
                             state.lmb_block_drag_arm.store(false, Ordering::Relaxed);
+                            state
+                                .lmb_fullscreen_checked
+                                .store(false, Ordering::Relaxed);
                             if state.drag_strip_armed.swap(false, Ordering::SeqCst) {
                                 let _ = state.tx.send(CaptureEvent::DragStripArmed(false));
                             }
@@ -918,7 +951,6 @@ fn process_local_edge_motion(state: &HookState, dx: f32, dy: f32, pt: POINT) -> 
         return false;
     }
 
-    state.maybe_refresh_geometry();
     let edge_mask = state.active_edges.load();
     if edge_mask == 0 {
         if state.drag_strip_armed.swap(false, Ordering::SeqCst) {
@@ -937,18 +969,54 @@ fn process_local_edge_motion(state: &HookState, dx: f32, dy: f32, pt: POINT) -> 
         state.lmb_down.store(false, Ordering::SeqCst);
         state.lmb_started_on_edge.store(false, Ordering::Relaxed);
         state.lmb_block_drag_arm.store(false, Ordering::Relaxed);
+        state
+            .lmb_fullscreen_checked
+            .store(false, Ordering::Relaxed);
         lmb_down = false;
     }
     let dnd_enabled = state.drag_drop_files.load(Ordering::Relaxed);
     let started_on_edge = state.lmb_started_on_edge.load(Ordering::Relaxed);
     let block_drag_arm = state.lmb_block_drag_arm.load(Ordering::Relaxed);
 
-    // Keep invisible 4px edge-strip drop targets armed for the full duration of an interior LMB
-    // hold (unless suppressed by a fullscreen foreground app) and disarm immediately once LMB
-    // releases or DnD is disabled.
+    // Lazily arm the pre-created 4px edge-strip drop targets ONLY when an interior LMB drag has
+    // moved >= 8 px from its press origin and approaches within 160 px of an active outer edge
+    // (checking fullscreen status at most once per drag hold), and disarm if retreating past
+    // 220 px or once LMB releases / DnD is disabled.
     if lmb_down && dnd_enabled && !started_on_edge && !block_drag_arm {
-        if !state.drag_strip_armed.swap(true, Ordering::SeqCst) {
-            let _ = state.tx.send(CaptureEvent::DragStripArmed(true));
+        let mut min_dist = i32::MAX;
+        for edge in ALL_EDGES {
+            if (edge_mask & edge_bit(edge)) != 0 {
+                min_dist = min_dist.min(geom.distance_to_edge(edge, pt.x, pt.y));
+            }
+        }
+        if min_dist <= DRAG_ARM_EDGE_DIST_PX {
+            if !state.drag_strip_armed.load(Ordering::Acquire) {
+                let move_dx = i64::from(pt.x) - i64::from(state.lmb_down_x.load(Ordering::Relaxed));
+                let move_dy = i64::from(pt.y) - i64::from(state.lmb_down_y.load(Ordering::Relaxed));
+                let moved_enough =
+                    move_dx.saturating_mul(move_dx) + move_dy.saturating_mul(move_dy)
+                        >= DRAG_ARM_MIN_MOVE_SQ;
+                if moved_enough {
+                    let fs_blocked = if state.auto_lock_fullscreen.load(Ordering::Relaxed)
+                        && !state.lmb_fullscreen_checked.swap(true, Ordering::Relaxed)
+                    {
+                        let fs = is_foreground_fullscreen(&geom);
+                        if fs {
+                            state.lmb_block_drag_arm.store(true, Ordering::Relaxed);
+                        }
+                        fs
+                    } else {
+                        state.lmb_block_drag_arm.load(Ordering::Relaxed)
+                    };
+                    if !fs_blocked && !state.drag_strip_armed.swap(true, Ordering::SeqCst) {
+                        let _ = state.tx.send(CaptureEvent::DragStripArmed(true));
+                    }
+                }
+            }
+        } else if min_dist > DRAG_DISARM_EDGE_DIST_PX
+            && state.drag_strip_armed.swap(false, Ordering::SeqCst)
+        {
+            let _ = state.tx.send(CaptureEvent::DragStripArmed(false));
         }
     } else if state.drag_strip_armed.swap(false, Ordering::SeqCst) {
         let _ = state.tx.send(CaptureEvent::DragStripArmed(false));
@@ -1233,7 +1301,7 @@ unsafe extern "system" fn capture_wnd_proc(
         }
         WM_DISPLAYCHANGE | WM_DPICHANGED => {
             with_hook_state(|state| {
-                state.refresh_geometry_now();
+                state.request_geometry_refresh();
             });
             0
         }
@@ -1276,6 +1344,7 @@ unsafe extern "system" fn capture_wnd_proc(
 /// Starts the Windows 11 server capture hook + Raw Input loop on a dedicated high-priority thread.
 pub fn start_windows_capture(config: CaptureConfig) -> Result<CaptureHandle> {
     init_dpi_awareness();
+    init_windows_realtime_qos();
     let geometry = query_desktop_geometry()?;
     let (tx, rx) = mpsc::unbounded_channel();
 
@@ -1289,16 +1358,21 @@ pub fn start_windows_capture(config: CaptureConfig) -> Result<CaptureHandle> {
         drag_drop_files: AtomicBool::new(config.drag_drop_files),
         dnd_probe: OnceLock::new(),
         lmb_down: AtomicBool::new(false),
+        lmb_down_x: AtomicI32::new(0),
+        lmb_down_y: AtomicI32::new(0),
         lmb_started_on_edge: AtomicBool::new(false),
         lmb_block_drag_arm: AtomicBool::new(false),
+        lmb_fullscreen_checked: AtomicBool::new(false),
         drag_strip_armed: AtomicBool::new(false),
         pin_media_keys_local: AtomicBool::new(config.pin_media_keys_local),
         forwarded_media_keys: Mutex::new(RemoteMediaKeyTracker::new()),
         pending_meta: WindowsPendingMeta::new(),
-        config,
+        hotkeys: AtomicHotkeys::new(config.hotkeys),
+        hotkey_suppressor: AtomicHotkeySuppressor::new(),
         tx,
         active_edges: AtomicEdgeMask::empty(),
         geometry: RwLock::new(geometry),
+        geom_refresh_signal: (Mutex::new(GeomRefreshSignal::default()), Condvar::new()),
         remote_mode: AtomicBool::new(false),
         cursor_parked: AtomicBool::new(false),
         locked: AtomicBool::new(false),
@@ -1313,7 +1387,6 @@ pub fn start_windows_capture(config: CaptureConfig) -> Result<CaptureHandle> {
         last_raw_mouse_ms: AtomicU64::new(0),
         last_raw_reclaim_ms: AtomicU64::new(0),
         ll_moves_without_raw: AtomicU32::new(0),
-        last_geom_refresh_ms: AtomicU64::new(0),
         last_resume_emit: Mutex::new(None),
     });
 
@@ -1370,6 +1443,31 @@ pub fn start_windows_capture(config: CaptureConfig) -> Result<CaptureHandle> {
     let hwnd_val = ready_rx
         .recv_timeout(Duration::from_secs(5))
         .context("timed out waiting for Windows capture hook thread")??;
+
+    // Dormant helper thread (0% CPU when parked on Condvar) that executes
+    // EnumDisplayMonitors / GetDpiForMonitor off the WH_MOUSE_LL/WH_KEYBOARD_LL hook thread.
+    let geom_state = Arc::clone(&state);
+    if let Err(e) = thread::Builder::new()
+        .name("glide-win-geom".into())
+        .spawn(move || {
+            let (lock, cvar) = &geom_state.geom_refresh_signal;
+            loop {
+                {
+                    let mut sig = lock.lock();
+                    while !sig.pending && !sig.shutdown {
+                        cvar.wait(&mut sig);
+                    }
+                    if sig.shutdown {
+                        break;
+                    }
+                    sig.pending = false;
+                }
+                let _ = geom_state.refresh_geometry_now();
+            }
+        })
+    {
+        warn!(error = %e, "Failed to spawn Windows geometry refresh helper thread");
+    }
 
     let control = WindowsCaptureControl {
         hwnd: AtomicIsize::new(hwnd_val),

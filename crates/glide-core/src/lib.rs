@@ -550,8 +550,12 @@ mod tests {
             .lock()
             .contains(&InjectedAction::Key(HidUsage::keyboard(0x04), true)));
 
-        // Queue a pending coalesced mouse move, let the server ingest it, then switch to Right
-        // before the 80ms coalesce timer fires.
+        // Send a leading-edge move (flushes immediately to Client A), then queue a trailing
+        // coalesced mouse move (buffered for the 80ms coalesce window) and switch to Right
+        // before the timer fires.
+        cap_tx
+            .send(CaptureEvent::MouseDelta { dx: 1.0, dy: 0.0 })
+            .unwrap();
         cap_tx
             .send(CaptureEvent::MouseDelta {
                 dx: 99.0,
@@ -1344,6 +1348,7 @@ mod tests {
                 pin_media_keys_local: true,
                 clipboard: true,
                 drag_drop_files: false,
+                hotkeys: glide_backend::CaptureHotkeys::default(),
             })
             .unwrap();
         tokio::time::sleep(Duration::from_millis(50)).await;
@@ -1685,6 +1690,257 @@ mod tests {
 
         right_task.abort();
         left_task.abort();
+        srv_task.abort();
+    }
+
+    #[tokio::test]
+    async fn live_server_tuning_hot_reloads_hotkeys_and_toggles_hotkeys_suspended() {
+        use crate::runtime::RuntimeCommand;
+        use glide_backend::{CaptureHotkeys, HotkeyChord, HotkeyMods};
+
+        let identity = ServerIdentity::generate_ephemeral().unwrap();
+        let endpoint =
+            GlideServerEndpoint::bind("127.0.0.1:0".parse().unwrap(), &identity).unwrap();
+        let (capture_handle, _cap_tx, cap_state) =
+            create_mock_capture(single_monitor_geom("HotkeysSrv"));
+        let (srv_cmd_tx, srv_cmd_rx) = tokio::sync::mpsc::unbounded_channel();
+
+        let srv_cfg = ServerConfig {
+            name: "hotkeys-srv".into(),
+            discovery: false,
+            clipboard: false,
+            ..Default::default()
+        };
+        let srv_task = tokio::spawn(async move {
+            run_server_with_backends(
+                srv_cfg,
+                endpoint,
+                capture_handle,
+                None,
+                "linux-x11",
+                None,
+                Some(srv_cmd_rx),
+            )
+            .await
+        });
+
+        // 1. Live UpdateServerTuning updates MockCaptureState.hotkeys immediately
+        let custom_hotkeys = CaptureHotkeys {
+            switch_mods: Some(HotkeyMods::CTRL | HotkeyMods::SHIFT),
+            lock: Some(HotkeyChord::new(
+                HotkeyMods::EMPTY,
+                HidUsage::from_name("F9").unwrap(),
+            )),
+            escape: Some(HotkeyChord::new(
+                HotkeyMods::CTRL | HotkeyMods::ALT,
+                HidUsage::ESCAPE,
+            )),
+        };
+        srv_cmd_tx
+            .send(RuntimeCommand::UpdateServerTuning {
+                edge_threshold_px: 4,
+                dead_corner_px: 24,
+                edge_dwell_ms: 0,
+                auto_lock_fullscreen: true,
+                locked: false,
+                sync_lock_keys: true,
+                pin_media_keys_local: true,
+                clipboard: false,
+                drag_drop_files: true,
+                hotkeys: custom_hotkeys,
+            })
+            .unwrap();
+
+        let mut updated = false;
+        for _ in 0..30 {
+            if *cap_state.hotkeys.lock() == custom_hotkeys {
+                updated = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(updated, "UpdateServerTuning must hot-reload CaptureHotkeys");
+
+        // 2. Disabling all shortcuts via UpdateServerTuning propagates cleanly
+        srv_cmd_tx
+            .send(RuntimeCommand::UpdateServerTuning {
+                edge_threshold_px: 4,
+                dead_corner_px: 24,
+                edge_dwell_ms: 0,
+                auto_lock_fullscreen: true,
+                locked: false,
+                sync_lock_keys: true,
+                pin_media_keys_local: true,
+                clipboard: false,
+                drag_drop_files: true,
+                hotkeys: CaptureHotkeys::disabled(),
+            })
+            .unwrap();
+        let mut disabled = false;
+        for _ in 0..30 {
+            if *cap_state.hotkeys.lock() == CaptureHotkeys::disabled() {
+                disabled = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(
+            disabled,
+            "UpdateServerTuning must support disabling all shortcuts live"
+        );
+
+        // 3. SetHotkeysSuspended toggles hotkeys_suspended on and off live
+        assert!(!cap_state.hotkeys_suspended.load(Ordering::SeqCst));
+        srv_cmd_tx
+            .send(RuntimeCommand::SetHotkeysSuspended(true))
+            .unwrap();
+        for _ in 0..30 {
+            if cap_state.hotkeys_suspended.load(Ordering::SeqCst) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(
+            cap_state.hotkeys_suspended.load(Ordering::SeqCst),
+            "SetHotkeysSuspended(true) must suspend capture hotkeys"
+        );
+
+        srv_cmd_tx
+            .send(RuntimeCommand::SetHotkeysSuspended(false))
+            .unwrap();
+        for _ in 0..30 {
+            if !cap_state.hotkeys_suspended.load(Ordering::SeqCst) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(
+            !cap_state.hotkeys_suspended.load(Ordering::SeqCst),
+            "SetHotkeysSuspended(false) must resume capture hotkeys"
+        );
+
+        srv_cmd_tx.send(RuntimeCommand::Shutdown).unwrap();
+        let res = tokio::time::timeout(Duration::from_millis(800), srv_task)
+            .await
+            .expect("server must shut down cleanly")
+            .unwrap();
+        assert!(res.is_ok());
+    }
+
+    #[tokio::test]
+    async fn leading_edge_coalesce_and_cancel_safe_control_stream_under_datagram_burst() {
+        let identity = ServerIdentity::generate_ephemeral().unwrap();
+        let fp = identity.fingerprint.clone();
+        let endpoint =
+            GlideServerEndpoint::bind("127.0.0.1:0".parse().unwrap(), &identity).unwrap();
+        let addr = endpoint.local_addr();
+
+        let (capture_handle, cap_tx, cap_state) =
+            create_mock_capture(single_monitor_geom("BurstSrv"));
+        let (mut injector, inj_log) = MockInjector::new(single_monitor_geom("BurstCli"));
+
+        let srv_cfg = ServerConfig {
+            name: "burst-srv".into(),
+            discovery: false,
+            clipboard: false,
+            // Long 120ms coalesce window to verify leading-edge 0ms flush!
+            motion_coalesce_us: 120_000,
+            ..Default::default()
+        };
+        let mut cli_cfg = ClientConfig {
+            name: "burst-cli".into(),
+            server: Some(addr.to_string()),
+            edge: Edge::Right,
+            trusted_fingerprint: Some(fp),
+            clipboard: false,
+            ..Default::default()
+        };
+
+        let srv_task = tokio::spawn(async move {
+            let _ = run_server_with_backends(
+                srv_cfg,
+                endpoint,
+                capture_handle,
+                None,
+                "linux-x11",
+                None,
+                None,
+            )
+            .await;
+        });
+        let cli_task = tokio::spawn(async move {
+            let mut opt_clip = None;
+            let _ = run_client_session(&mut cli_cfg, addr, &mut injector, &mut opt_clip, None, None)
+                .await;
+        });
+
+        for _ in 0..30 {
+            if *cap_state.active_edges.lock() == vec![Edge::Right] {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert_eq!(*cap_state.active_edges.lock(), vec![Edge::Right]);
+
+        cap_tx
+            .send(CaptureEvent::EdgeCrossed {
+                edge: Edge::Right,
+                normalized_pos: 0.5,
+            })
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(40)).await;
+
+        // 1. Leading-edge flush: first MouseDelta must arrive well BEFORE the 120ms coalesce window!
+        let t0 = std::time::Instant::now();
+        cap_tx
+            .send(CaptureEvent::MouseDelta { dx: 15.0, dy: 5.0 })
+            .unwrap();
+        let mut got_leading = false;
+        while t0.elapsed() < Duration::from_millis(70) {
+            if inj_log.lock().contains(&InjectedAction::Move(15.0, 5.0)) {
+                got_leading = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert!(
+            got_leading,
+            "first MouseDelta must flush on leading edge without waiting for the 120ms coalesce timer"
+        );
+
+        // 2. Interleave 100 rapid mouse datagrams + 30 control keystrokes to prove the dedicated
+        //    ctrl_recv task never drops or corrupts framed control messages under datagram load.
+        for i in 0..30u16 {
+            let _ = cap_tx.send(CaptureEvent::MouseDelta { dx: 1.0, dy: 0.0 });
+            let _ = cap_tx.send(CaptureEvent::Key {
+                usage: HidUsage::keyboard(0x04 + (i % 10)),
+                pressed: true,
+            });
+            let _ = cap_tx.send(CaptureEvent::MouseDelta { dx: 1.0, dy: 0.0 });
+            let _ = cap_tx.send(CaptureEvent::Key {
+                usage: HidUsage::keyboard(0x04 + (i % 10)),
+                pressed: false,
+            });
+        }
+
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+        loop {
+            let key_events = inj_log
+                .lock()
+                .iter()
+                .filter(|a| matches!(a, InjectedAction::Key(_, _)))
+                .count();
+            if key_events == 60 {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "expected all 60 control key events intact under concurrent datagrams, got {key_events}"
+            );
+            tokio::time::sleep(Duration::from_millis(15)).await;
+        }
+
+        cli_task.abort();
         srv_task.abort();
     }
 }

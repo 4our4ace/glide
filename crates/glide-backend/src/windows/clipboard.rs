@@ -106,9 +106,11 @@ fn with_clip_state<F, R>(f: F) -> Option<R>
 where
     F: FnOnce(&ClipState) -> R,
 {
-    let cell = GLOBAL_CLIP_STATE.get()?;
-    let guard = cell.lock();
-    guard.as_deref().map(f)
+    let state = {
+        let cell = GLOBAL_CLIP_STATE.get()?;
+        cell.lock().clone()?
+    };
+    Some(f(&state))
 }
 
 struct WindowsClipboardBackend {

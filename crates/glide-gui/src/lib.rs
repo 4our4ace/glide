@@ -15,7 +15,7 @@ use glide_core::client::run_native_client_with_runtime;
 use glide_core::config::{default_config_dir, GlideConfigFile};
 use glide_core::runtime::{RuntimeCommand, RuntimeState};
 use glide_core::server::run_native_server_with_runtime;
-use glide_net::discovery::{discover_servers, local_ipv4_addresses, machine_hostname};
+use glide_net::discovery::{discover_servers, local_ipv4_addresses_async, machine_hostname};
 use glide_net::tls::ServerIdentity;
 use glide_proto::Edge;
 use parking_lot::Mutex;
@@ -191,7 +191,9 @@ impl AppController {
             guard.auto_start_on_launch = true;
             guard.clone()
         };
-        let _ = cfg.save(&self.config_path);
+        let cfg_to_save = cfg.clone();
+        let cfg_path = self.config_path.clone();
+        let _ = tokio::task::spawn_blocking(move || cfg_to_save.save(&cfg_path)).await;
 
         let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
         let rt = self.runtime.clone();
@@ -251,6 +253,10 @@ impl AppController {
         }
     }
 
+    pub fn set_hotkeys_suspended(&self, suspended: bool) {
+        self.send_cmd(RuntimeCommand::SetHotkeysSuspended(suspended));
+    }
+
     fn apply_config(&self, mut new_cfg: GlideConfigFile) -> Result<()> {
         {
             let prev = self.config.lock();
@@ -287,6 +293,7 @@ impl AppController {
             pin_media_keys_local: s.pin_media_keys_local,
             clipboard: s.clipboard,
             drag_drop_files: s.drag_drop_files,
+            hotkeys: s.parsed_hotkeys(),
         });
         self.send_cmd(RuntimeCommand::UpdateClientTuning {
             sensitivity: c.sensitivity,
@@ -1092,16 +1099,35 @@ async fn handle_http_conn(mut stream: TcpStream, ctrl: Arc<AppController>) -> Re
 
         ("GET", "/api/state") => {
             let cfg = ctrl.config.lock().clone();
-            let fp = ctrl.load_identity();
-            let doctor = glide_backend::run_doctor().ok();
+            let ctrl_id = Arc::clone(&ctrl);
+            let (fp, doctor, autostart, local_ips) = tokio::join!(
+                async move {
+                    tokio::task::spawn_blocking(move || ctrl_id.load_identity())
+                        .await
+                        .ok()
+                        .flatten()
+                },
+                async {
+                    tokio::task::spawn_blocking(|| glide_backend::run_doctor().ok())
+                        .await
+                        .ok()
+                        .flatten()
+                },
+                async {
+                    tokio::task::spawn_blocking(is_autostart_enabled)
+                        .await
+                        .unwrap_or(false)
+                },
+                local_ipv4_addresses_async(),
+            );
             let payload = json!({
                 "version": env!("CARGO_PKG_VERSION"),
                 "config": cfg,
                 "status": ctrl.runtime.snapshot(),
                 "fingerprint": fp,
-                "autostart": is_autostart_enabled(),
+                "autostart": autostart,
                 "hostname": machine_hostname(),
-                "local_ips": local_ipv4_addresses(),
+                "local_ips": local_ips,
                 "os": format!("{:?}", glide_backend::current_os_kind()),
                 "tray_active": ctrl.tray_active.load(Ordering::SeqCst),
                 "doctor": doctor,
@@ -1118,9 +1144,11 @@ async fn handle_http_conn(mut stream: TcpStream, ctrl: Arc<AppController>) -> Re
         ("GET", "/api/discover") => {
             let port = ctrl.config.lock().client.discovery_port;
             let my_fp = ctrl.fingerprint.lock().clone();
-            let found = discover_servers(port, Duration::from_millis(2200), None, false)
-                .await
-                .unwrap_or_default();
+            let (found, local_ips) = tokio::join!(
+                discover_servers(port, Duration::from_millis(2200), None, false),
+                local_ipv4_addresses_async(),
+            );
+            let found = found.unwrap_or_default();
             let list: Vec<_> = found
                 .into_iter()
                 .filter(|s| my_fp.as_deref() != Some(s.fingerprint.as_str()))
@@ -1134,7 +1162,7 @@ async fn handle_http_conn(mut stream: TcpStream, ctrl: Arc<AppController>) -> Re
                     })
                 })
                 .collect();
-            let body = json!({ "servers": list, "local_ips": local_ipv4_addresses() }).to_string();
+            let body = json!({ "servers": list, "local_ips": local_ips }).to_string();
             write_response(&mut stream, "200 OK", "application/json", body.as_bytes()).await?;
         }
 
@@ -1146,7 +1174,12 @@ async fn handle_http_conn(mut stream: TcpStream, ctrl: Arc<AppController>) -> Re
                     new_cfg.server.identity_dir = prev.server.identity_dir.clone();
                     new_cfg.client.tofu_store_path = prev.client.tofu_store_path.clone();
                 }
-                match ctrl.apply_config(new_cfg) {
+                let ctrl_apply = Arc::clone(&ctrl);
+                let apply_res =
+                    tokio::task::spawn_blocking(move || ctrl_apply.apply_config(new_cfg))
+                        .await
+                        .unwrap_or_else(|e| Err(anyhow::anyhow!("config save failed: {e}")));
+                match apply_res {
                     Ok(()) => {
                         write_response(&mut stream, "200 OK", "application/json", br#"{"ok":true}"#)
                             .await?
@@ -1217,11 +1250,13 @@ async fn handle_http_conn(mut stream: TcpStream, ctrl: Arc<AppController>) -> Re
             };
             let peer_name = req["peer_name"].as_str().map(str::to_string);
             if let Some(edge) = edge {
-                {
+                let cfg_snapshot = {
                     let mut cfg = ctrl.config.lock();
                     cfg.client.edge = edge;
-                    let _ = cfg.save(&ctrl.config_path);
-                }
+                    cfg.clone()
+                };
+                let cfg_path = ctrl.config_path.clone();
+                let _ = tokio::task::spawn_blocking(move || cfg_snapshot.save(&cfg_path)).await;
                 ctrl.send_cmd(RuntimeCommand::MovePeerEdge { peer_name, edge });
                 write_response(&mut stream, "200 OK", "application/json", br#"{"ok":true}"#)
                     .await?;
@@ -1315,7 +1350,10 @@ async fn handle_http_conn(mut stream: TcpStream, ctrl: Arc<AppController>) -> Re
                 },
             };
             let args = format!("gui --minimized --auto-start {role}");
-            match set_autostart(enabled, &args) {
+            let res = tokio::task::spawn_blocking(move || set_autostart(enabled, &args))
+                .await
+                .unwrap_or_else(|e| Err(anyhow::anyhow!("autostart task failed: {e}")));
+            match res {
                 Ok(()) => {
                     let msg = json!({
                         "ok": true,
@@ -1339,45 +1377,67 @@ async fn handle_http_conn(mut stream: TcpStream, ctrl: Arc<AppController>) -> Re
             }
         }
 
-        ("POST", "/api/os/firewall") => match configure_firewall() {
-            Ok(m) => {
-                let msg = json!({ "ok": true, "message": m }).to_string();
-                write_response(&mut stream, "200 OK", "application/json", msg.as_bytes()).await?;
+        ("POST", "/api/os/firewall") => {
+            let res = tokio::task::spawn_blocking(configure_firewall)
+                .await
+                .unwrap_or_else(|e| Err(anyhow::anyhow!("firewall task failed: {e}")));
+            match res {
+                Ok(m) => {
+                    let msg = json!({ "ok": true, "message": m }).to_string();
+                    write_response(&mut stream, "200 OK", "application/json", msg.as_bytes())
+                        .await?;
+                }
+                Err(e) => {
+                    let msg =
+                        json!({ "error": e.to_string(), "message": e.to_string() }).to_string();
+                    write_response(
+                        &mut stream,
+                        "500 Internal Server Error",
+                        "application/json",
+                        msg.as_bytes(),
+                    )
+                    .await?;
+                }
             }
-            Err(e) => {
-                let msg = json!({ "error": e.to_string(), "message": e.to_string() }).to_string();
-                write_response(
-                    &mut stream,
-                    "500 Internal Server Error",
-                    "application/json",
-                    msg.as_bytes(),
-                )
-                .await?;
-            }
-        },
+        }
 
-        ("POST", "/api/os/elevated") => match configure_elevated_task() {
-            Ok(m) => {
-                let msg = json!({ "ok": true, "message": m }).to_string();
-                write_response(&mut stream, "200 OK", "application/json", msg.as_bytes()).await?;
+        ("POST", "/api/os/elevated") => {
+            let res = tokio::task::spawn_blocking(configure_elevated_task)
+                .await
+                .unwrap_or_else(|e| Err(anyhow::anyhow!("elevated task failed: {e}")));
+            match res {
+                Ok(m) => {
+                    let msg = json!({ "ok": true, "message": m }).to_string();
+                    write_response(&mut stream, "200 OK", "application/json", msg.as_bytes())
+                        .await?;
+                }
+                Err(e) => {
+                    let msg =
+                        json!({ "error": e.to_string(), "message": e.to_string() }).to_string();
+                    write_response(
+                        &mut stream,
+                        "500 Internal Server Error",
+                        "application/json",
+                        msg.as_bytes(),
+                    )
+                    .await?;
+                }
             }
-            Err(e) => {
-                let msg = json!({ "error": e.to_string(), "message": e.to_string() }).to_string();
-                write_response(
-                    &mut stream,
-                    "500 Internal Server Error",
-                    "application/json",
-                    msg.as_bytes(),
-                )
-                .await?;
-            }
-        },
+        }
 
         ("POST", "/api/trust/reset") => {
-            let tofu_path = ctrl.config.lock().client.resolved_tofu_path();
-            let _ = std::fs::remove_file(&tofu_path);
-            ctrl.config.lock().client.trusted_fingerprint = None;
-            let _ = ctrl.config.lock().save(&ctrl.config_path);
+            let (tofu_path, cfg_snapshot) = {
+                let mut cfg = ctrl.config.lock();
+                let tofu_path = cfg.client.resolved_tofu_path();
+                cfg.client.trusted_fingerprint = None;
+                (tofu_path, cfg.clone())
+            };
+            let cfg_path = ctrl.config_path.clone();
+            let _ = tokio::task::spawn_blocking(move || {
+                let _ = std::fs::remove_file(&tofu_path);
+                let _ = cfg_snapshot.save(&cfg_path);
+            })
+            .await;
             write_response(
                 &mut stream,
                 "200 OK",

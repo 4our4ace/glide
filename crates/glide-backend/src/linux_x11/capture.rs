@@ -2,12 +2,13 @@
 //! XRandR multi-monitor edge detection, dead-corner guards, edge dwell, and hotkeys.
 
 use crate::geometry::DesktopGeometry;
+use crate::hotkeys::{AtomicHotkeySuppressor, AtomicHotkeys, HotkeyAction, HotkeyMatch};
 use crate::linux_x11::{
     query_desktop_geometry, subscribe_randr_events, unsubscribe_randr_events, X11CursorHider,
 };
 use crate::{
     edge_bit, AtomicEdgeMask, AtomicNormPoint, CaptureConfig, CaptureControl, CaptureEvent,
-    CaptureHandle, RemoteMediaKeyTracker, ALL_EDGES,
+    CaptureHandle, CaptureHotkeys, RemoteMediaKeyTracker, ALL_EDGES,
 };
 use anyhow::{Context, Result};
 use glide_hid::{HidUsage, ModifierMask, MouseButton};
@@ -54,6 +55,7 @@ struct SharedState {
     drag_drop_files: AtomicBool,
     auto_lock_fullscreen: AtomicBool,
     pin_media_keys_local: AtomicBool,
+    hotkeys: AtomicHotkeys,
     edge_threshold_px: AtomicI32,
     dead_corner_px: AtomicI32,
     edge_dwell_ms: AtomicU64,
@@ -122,6 +124,14 @@ impl CaptureControl for X11CaptureControl {
         self.shared
             .pin_media_keys_local
             .store(enabled, Ordering::Relaxed);
+    }
+
+    fn set_hotkeys(&self, hotkeys: CaptureHotkeys) {
+        self.shared.hotkeys.store(hotkeys);
+    }
+
+    fn set_hotkeys_suspended(&self, suspended: bool) {
+        self.shared.hotkeys.set_suspended(suspended);
     }
 
     fn enter_remote(&self) -> Result<()> {
@@ -195,16 +205,6 @@ fn create_blank_cursor(conn: &RustConnection, root: Window) -> Result<Cursor> {
     conn.create_cursor(cursor, pixmap, pixmap, 0, 0, 0, 0, 0, 0, 0, 0)?;
     conn.free_pixmap(pixmap)?;
     Ok(cursor)
-}
-
-fn arrow_to_edge(usage: HidUsage) -> Option<Edge> {
-    match usage.raw() {
-        x if x == HidUsage::keyboard(0x50).raw() => Some(Edge::Left),
-        x if x == HidUsage::keyboard(0x4F).raw() => Some(Edge::Right),
-        x if x == HidUsage::keyboard(0x52).raw() => Some(Edge::Top),
-        x if x == HidUsage::keyboard(0x51).raw() => Some(Edge::Bottom),
-        _ => None,
-    }
 }
 
 fn intern_ewmh_fullscreen_atoms(conn: &RustConnection) -> EwmhFullscreenAtoms {
@@ -389,6 +389,7 @@ pub fn start_x11_capture(config: CaptureConfig) -> Result<CaptureHandle> {
         drag_drop_files: AtomicBool::new(config.drag_drop_files),
         auto_lock_fullscreen: AtomicBool::new(config.auto_lock_fullscreen),
         pin_media_keys_local: AtomicBool::new(config.pin_media_keys_local),
+        hotkeys: AtomicHotkeys::new(config.hotkeys),
         edge_threshold_px: AtomicI32::new(config.edge_threshold_px.max(1)),
         dead_corner_px: AtomicI32::new(config.dead_corner_px.max(0)),
         edge_dwell_ms: AtomicU64::new(config.edge_dwell_ms),
@@ -411,7 +412,6 @@ pub fn start_x11_capture(config: CaptureConfig) -> Result<CaptureHandle> {
                 blank_cursor,
                 wake_atom,
                 ewmh_atoms,
-                config,
                 thread_shared,
                 tx,
             );
@@ -483,7 +483,6 @@ fn run_capture_loop(
     blank_cursor: Cursor,
     wake_atom: u32,
     ewmh_atoms: EwmhFullscreenAtoms,
-    config: CaptureConfig,
     shared: Arc<SharedState>,
     tx: mpsc::UnboundedSender<CaptureEvent>,
 ) {
@@ -501,6 +500,7 @@ fn run_capture_loop(
     let mut last_ptr: Option<(i32, i32)> = None;
     let mut raw_travel: f32 = 0.0;
     let mut mods = ModifierMask::EMPTY;
+    let hotkey_suppressor = AtomicHotkeySuppressor::new();
     let mut lmb_down = false;
     let mut lmb_started_on_edge = false;
     let mut drag_strip_armed = false;
@@ -993,29 +993,34 @@ fn run_capture_loop(
                     trace!(kc, "Unmapped X11 keycode on press");
                     continue;
                 };
+                let prev_mask = mods;
                 mods.update(usage, true);
 
-                if usage == config.escape_key && remote {
-                    shared.remote_mode.store(false, Ordering::SeqCst);
-                    last_ptr = None;
-                    raw_travel = 0.0;
-                    do_ungrab(
-                        &conn,
-                        &local_geom,
-                        &mut grabbed,
-                        &mut kbd_grabbed,
-                        &mut media_tracker,
-                        &mut cursor_hider,
-                        None,
-                    );
-                    let _ = tx.send(CaptureEvent::EscapeHotkey);
-                    continue;
-                }
-
-                // Direct keyboard screen-switch (Ctrl+Alt+Arrow) & Lock toggle (Ctrl+Alt+L)
-                if config.enable_hotkeys && mods.ctrl() && mods.contains(ModifierMask::ALT_LEFT) {
-                    if let Some(dir) = arrow_to_edge(usage) {
-                        if !shared.remote_mode.load(Ordering::Acquire) {
+                match hotkey_suppressor.evaluate(
+                    shared.hotkeys.load(),
+                    remote,
+                    prev_mask,
+                    usage,
+                    true,
+                ) {
+                    HotkeyMatch::Trigger(HotkeyAction::Escape) => {
+                        shared.remote_mode.store(false, Ordering::SeqCst);
+                        last_ptr = None;
+                        raw_travel = 0.0;
+                        do_ungrab(
+                            &conn,
+                            &local_geom,
+                            &mut grabbed,
+                            &mut kbd_grabbed,
+                            &mut media_tracker,
+                            &mut cursor_hider,
+                            None,
+                        );
+                        let _ = tx.send(CaptureEvent::EscapeHotkey);
+                        continue;
+                    }
+                    HotkeyMatch::Trigger(HotkeyAction::Switch(direction)) => {
+                        if !remote {
                             if let Ok(cookie) = conn.query_pointer(root) {
                                 if let Ok(ptr) = cookie.reply() {
                                     let (nx, ny) = local_geom
@@ -1024,14 +1029,17 @@ fn run_capture_loop(
                                 }
                             }
                         }
-                        let _ = tx.send(CaptureEvent::HotkeySwitch { direction: dir });
+                        let _ = tx.send(CaptureEvent::HotkeySwitch { direction });
                         continue;
                     }
-                    if usage == HidUsage::keyboard(0x0F) {
-                        // KeyL
+                    HotkeyMatch::Trigger(HotkeyAction::ToggleLock) => {
                         let _ = tx.send(CaptureEvent::HotkeyToggleLock);
                         continue;
                     }
+                    HotkeyMatch::SuppressOnly => {
+                        continue;
+                    }
+                    HotkeyMatch::PassThrough => {}
                 }
 
                 if remote {
@@ -1058,11 +1066,21 @@ fn run_capture_loop(
                 let Some(usage) = HidUsage::from_x11_keycode(kc) else {
                     continue;
                 };
+                let prev_mask = mods;
                 mods.update(usage, false);
-                if !remote {
+                if matches!(
+                    hotkey_suppressor.evaluate(
+                        shared.hotkeys.load(),
+                        remote,
+                        prev_mask,
+                        usage,
+                        false,
+                    ),
+                    HotkeyMatch::SuppressOnly | HotkeyMatch::Trigger(_)
+                ) {
                     continue;
                 }
-                if usage == config.escape_key {
+                if !remote {
                     continue;
                 }
                 if !media_tracker.should_forward(

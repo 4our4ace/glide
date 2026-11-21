@@ -159,7 +159,7 @@ enum Command {
         #[arg(long)]
         no_clipboard: bool,
 
-        /// Local escape key to immediately return focus (default: ScrollLock)
+        /// Local escape shortcut to immediately return focus (default: ScrollLock; supports chords like "Ctrl+Alt+Escape" or "none" to disable)
         #[arg(long)]
         escape_key: Option<String>,
 
