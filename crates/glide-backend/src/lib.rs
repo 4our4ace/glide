@@ -4,6 +4,7 @@
 //! Each OS implements [`CaptureControl`], [`InputInjector`], and [`ClipboardBackend`]
 //! so `glide-core` and `glide-gui` stay 100% platform-agnostic.
 
+pub mod clipboard_privacy;
 pub mod dib_png;
 pub mod geometry;
 pub mod icon;

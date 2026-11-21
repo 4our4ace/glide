@@ -100,6 +100,9 @@ impl ClipboardBackend for WaylandClipboardBackend {
 }
 
 fn pick_best_mime(mime_types: &[String]) -> Option<(ClipboardFormat, String)> {
+    if crate::clipboard_privacy::has_sensitive_mime_type(mime_types) {
+        return None;
+    }
     // Prefer PNG images first (screenshots), then UTF-8 text.
     if let Some(m) = mime_types.iter().find(|m| m.eq_ignore_ascii_case("image/png")) {
         return Some((ClipboardFormat::ImagePng, m.clone()));
@@ -156,6 +159,12 @@ pub fn start_wayland_clipboard() -> Result<ClipboardHandle> {
                                 // doesn't immediately clobber the peer's clipboard.
                                 if first_event {
                                     first_event = false;
+                                    continue;
+                                }
+                                if crate::clipboard_privacy::has_sensitive_mime_type(&mime_types) {
+                                    debug!(
+                                        "Skipping sensitive Wayland clipboard selection (x-kde-passwordManagerHint)"
+                                    );
                                     continue;
                                 }
                                 let Some((format, mime)) = pick_best_mime(&mime_types) else {
@@ -242,5 +251,14 @@ mod tests {
                 "text/plain;charset=utf-8".to_owned()
             ))
         );
+    }
+
+    #[test]
+    fn mime_selection_skips_password_manager_hint() {
+        let secret = vec![
+            "text/plain;charset=utf-8".to_owned(),
+            "x-kde-passwordManagerHint".to_owned(),
+        ];
+        assert_eq!(pick_best_mime(&secret), None);
     }
 }

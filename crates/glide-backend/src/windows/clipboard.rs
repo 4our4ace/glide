@@ -7,6 +7,10 @@
 //!   and writes BOTH `"PNG"` AND `CF_DIB` (converting PNG -> DIB) so every Windows app
 //!   (Snipping Tool, Paint, Word, Chrome, Discord, Slack) works seamlessly with Ubuntu.
 
+use crate::clipboard_privacy::{
+    is_windows_clipboard_sensitive, WindowsPrivacyCheck, WIN_CAN_INCLUDE_HISTORY_FORMAT,
+    WIN_CLIPBOARD_VIEWER_IGNORE_FORMAT, WIN_EXCLUDE_MONITOR_FORMAT,
+};
 use crate::dib_png::{dib_to_png, png_to_dib};
 use crate::{ClipboardBackend, ClipboardHandle};
 use anyhow::{anyhow, Context, Result};
@@ -41,11 +45,51 @@ const CF_UNICODETEXT: u32 = 13;
 const CF_DIBV5: u32 = 17;
 const WM_APP_SET_CLIPBOARD: u32 = WM_APP + 10;
 
+#[derive(Clone, Copy)]
+struct PrivacyFormats {
+    exclude_monitor: u32,
+    can_include_history: u32,
+    viewer_ignore: u32,
+}
+
+impl PrivacyFormats {
+    fn register() -> Self {
+        let reg = |name: &str| -> u32 {
+            let wide: Vec<u16> = name.encode_utf16().chain(std::iter::once(0)).collect();
+            unsafe { RegisterClipboardFormatW(wide.as_ptr()) }
+        };
+        Self {
+            exclude_monitor: reg(WIN_EXCLUDE_MONITOR_FORMAT),
+            can_include_history: reg(WIN_CAN_INCLUDE_HISTORY_FORMAT),
+            viewer_ignore: reg(WIN_CLIPBOARD_VIEWER_IGNORE_FORMAT),
+        }
+    }
+
+    /// Evaluates Windows privacy clipboard formats while the clipboard is open.
+    fn is_current_clipboard_sensitive(self) -> bool {
+        let is_avail = |fmt: u32| fmt != 0 && unsafe { IsClipboardFormatAvailable(fmt) } != 0;
+        let has_exclude_monitor = is_avail(self.exclude_monitor);
+        let has_viewer_ignore = is_avail(self.viewer_ignore);
+        let can_include_raw = if is_avail(self.can_include_history) {
+            Some(read_raw_format(self.can_include_history))
+        } else {
+            None
+        };
+        let check = WindowsPrivacyCheck {
+            has_exclude_monitor,
+            has_viewer_ignore,
+            can_include_in_history: can_include_raw.as_ref().map(|opt| opt.as_deref()),
+        };
+        is_windows_clipboard_sensitive(check)
+    }
+}
+
 struct ClipState {
     tx: mpsc::UnboundedSender<ClipboardPayload>,
     pending_write: Mutex<Option<ClipboardPayload>>,
     last_remote_hash: Mutex<Option<[u8; 32]>>,
     png_format: u32,
+    privacy_formats: PrivacyFormats,
 }
 
 static GLOBAL_CLIP_STATE: OnceLock<Mutex<Option<Arc<ClipState>>>> = OnceLock::new();
@@ -125,8 +169,20 @@ fn read_raw_format(format: u32) -> Option<Vec<u8>> {
     Some(data)
 }
 
-fn read_clipboard_payload(hwnd: HWND, png_format: u32) -> Option<(ClipboardFormat, Vec<u8>)> {
+fn read_clipboard_payload(
+    hwnd: HWND,
+    png_format: u32,
+    privacy_formats: PrivacyFormats,
+) -> Option<(ClipboardFormat, Vec<u8>)> {
     if !open_clipboard_with_retry(hwnd) {
+        return None;
+    }
+
+    if privacy_formats.is_current_clipboard_sensitive() {
+        debug!("Skipping sensitive Windows clipboard entry (password manager privacy format)");
+        unsafe {
+            CloseClipboard();
+        }
         return None;
     }
 
@@ -250,7 +306,9 @@ unsafe extern "system" fn clip_wnd_proc(
     match msg {
         WM_CLIPBOARDUPDATE => {
             with_clip_state(|state| {
-                if let Some((format, data)) = read_clipboard_payload(hwnd, state.png_format) {
+                if let Some((format, data)) =
+                    read_clipboard_payload(hwnd, state.png_format, state.privacy_formats)
+                {
                     let hash = sha256_bytes(&data);
                     if *state.last_remote_hash.lock() == Some(hash) {
                         trace!("Ignoring Windows clipboard echo matching last remote hash");
@@ -286,6 +344,7 @@ unsafe extern "system" fn clip_wnd_proc(
 pub fn start_windows_clipboard() -> Result<ClipboardHandle> {
     let png_name: Vec<u16> = "PNG\0".encode_utf16().collect();
     let png_format = unsafe { RegisterClipboardFormatW(png_name.as_ptr()) };
+    let privacy_formats = PrivacyFormats::register();
 
     let (tx, rx) = mpsc::unbounded_channel();
     let state = Arc::new(ClipState {
@@ -293,6 +352,7 @@ pub fn start_windows_clipboard() -> Result<ClipboardHandle> {
         pending_write: Mutex::new(None),
         last_remote_hash: Mutex::new(None),
         png_format,
+        privacy_formats,
     });
 
     let cell = GLOBAL_CLIP_STATE.get_or_init(|| Mutex::new(None));

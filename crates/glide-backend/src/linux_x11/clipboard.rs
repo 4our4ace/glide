@@ -3,6 +3,7 @@
 //! Supports `UTF8_STRING` / `text/plain;charset=utf-8` and `image/png`, including
 //! ICCCM `INCR` chunked transfers for large payloads, with SHA-256 anti-loop protection.
 
+use crate::clipboard_privacy::{has_sensitive_x11_target, PASSWORD_MANAGER_HINT_MIME};
 use crate::{ClipboardBackend, ClipboardHandle};
 use anyhow::{Context, Result};
 use bytes::Bytes;
@@ -31,6 +32,7 @@ struct Atoms {
     text_plain_utf8: Atom,
     string: Atom,
     image_png: Atom,
+    password_manager_hint: Atom,
     incr: Atom,
     prop: Atom,
     wake: Atom,
@@ -47,6 +49,7 @@ impl Atoms {
             text_plain_utf8: intern(b"text/plain;charset=utf-8")?,
             string: AtomEnum::STRING.into(),
             image_png: intern(b"image/png")?,
+            password_manager_hint: intern(PASSWORD_MANAGER_HINT_MIME.as_bytes())?,
             incr: intern(b"INCR")?,
             prop: intern(b"GLIDE_CLIP_DATA")?,
             wake: intern(b"GLIDE_CLIP_WAKE")?,
@@ -255,16 +258,14 @@ fn run_clipboard_loop(
                             .value32()
                             .map(|iter| iter.collect())
                             .unwrap_or_default();
-                        let chosen = if offered.contains(&atoms.utf8_string) {
-                            Some((atoms.utf8_string, ClipboardFormat::TextUtf8))
-                        } else if offered.contains(&atoms.text_plain_utf8) {
-                            Some((atoms.text_plain_utf8, ClipboardFormat::TextUtf8))
-                        } else if offered.contains(&atoms.image_png) {
-                            Some((atoms.image_png, ClipboardFormat::ImagePng))
-                        } else {
-                            None
-                        };
-                        if let Some((target_atom, fmt)) = chosen {
+                        if has_sensitive_x11_target(&offered, atoms.password_manager_hint) {
+                            debug!(
+                                "Skipping sensitive X11 clipboard selection (x-kde-passwordManagerHint)"
+                            );
+                            state = ReadState::Idle;
+                        } else if let Some((target_atom, fmt)) =
+                            choose_x11_clipboard_target(&offered, &atoms)
+                        {
                             state = ReadState::AwaitingData(fmt);
                             let _ = conn.convert_selection(
                                 win,
@@ -400,5 +401,56 @@ fn run_clipboard_loop(
             }
             _ => {}
         }
+    }
+}
+
+fn choose_x11_clipboard_target(offered: &[Atom], atoms: &Atoms) -> Option<(Atom, ClipboardFormat)> {
+    if has_sensitive_x11_target(offered, atoms.password_manager_hint) {
+        return None;
+    }
+    if offered.contains(&atoms.utf8_string) {
+        Some((atoms.utf8_string, ClipboardFormat::TextUtf8))
+    } else if offered.contains(&atoms.text_plain_utf8) {
+        Some((atoms.text_plain_utf8, ClipboardFormat::TextUtf8))
+    } else if offered.contains(&atoms.image_png) {
+        Some((atoms.image_png, ClipboardFormat::ImagePng))
+    } else {
+        None
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn sample_atoms() -> Atoms {
+        Atoms {
+            clipboard: 1,
+            targets: 2,
+            utf8_string: 3,
+            text_plain_utf8: 4,
+            string: 5,
+            image_png: 6,
+            password_manager_hint: 7,
+            incr: 8,
+            prop: 9,
+            wake: 10,
+        }
+    }
+
+    #[test]
+    fn x11_target_selection_skips_password_manager_hint() {
+        let atoms = sample_atoms();
+        assert_eq!(
+            choose_x11_clipboard_target(&[atoms.utf8_string, atoms.image_png], &atoms),
+            Some((atoms.utf8_string, ClipboardFormat::TextUtf8))
+        );
+        assert_eq!(
+            choose_x11_clipboard_target(
+                &[atoms.utf8_string, atoms.password_manager_hint],
+                &atoms
+            ),
+            None
+        );
     }
 }
