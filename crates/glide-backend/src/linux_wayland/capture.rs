@@ -264,14 +264,16 @@ impl CaptureControl for WaylandCaptureControl {
     }
 
     fn enter_remote(&self) -> Result<()> {
-        self.shared.in_remote.store(true, Ordering::SeqCst);
-        self.shared.remote_gen.fetch_add(1, Ordering::AcqRel);
+        if !self.shared.in_remote.swap(true, Ordering::SeqCst) {
+            self.shared.remote_gen.fetch_add(1, Ordering::AcqRel);
+        }
         Ok(())
     }
 
     fn leave_remote(&self, return_edge: Edge, normalized_pos: f32) -> Result<()> {
-        self.shared.in_remote.store(false, Ordering::SeqCst);
-        self.shared.remote_gen.fetch_add(1, Ordering::AcqRel);
+        if self.shared.in_remote.swap(false, Ordering::SeqCst) {
+            self.shared.remote_gen.fetch_add(1, Ordering::AcqRel);
+        }
         let (x, y) = self
             .shared
             .geometry
@@ -285,8 +287,9 @@ impl CaptureControl for WaylandCaptureControl {
     }
 
     fn leave_remote_at(&self, norm_x: f32, norm_y: f32) -> Result<()> {
-        self.shared.in_remote.store(false, Ordering::SeqCst);
-        self.shared.remote_gen.fetch_add(1, Ordering::AcqRel);
+        if self.shared.in_remote.swap(false, Ordering::SeqCst) {
+            self.shared.remote_gen.fetch_add(1, Ordering::AcqRel);
+        }
         let (x, y) = self
             .shared
             .geometry
@@ -615,8 +618,9 @@ fn start_wayland_capture_blocking(config: CaptureConfig) -> Result<CaptureHandle
 
                                 if let Some(edge) = edge_opt {
                                     let norm = normalize_barrier_hit(&geom, edge, cx, cy);
-                                    shared_sig.in_remote.store(true, Ordering::SeqCst);
-                                    shared_sig.remote_gen.fetch_add(1, Ordering::AcqRel);
+                                    if !shared_sig.in_remote.swap(true, Ordering::SeqCst) {
+                                        shared_sig.remote_gen.fetch_add(1, Ordering::AcqRel);
+                                    }
                                     let _ = ev_tx_sig.send(CaptureEvent::EdgeCrossed {
                                         edge,
                                         normalized_pos: norm,
