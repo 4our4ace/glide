@@ -619,7 +619,8 @@ async fn write_response_line<W: AsyncWrite + Unpin>(
     line.push('\n');
     tokio::time::timeout(IPC_IO_TIMEOUT, async {
         writer.write_all(line.as_bytes()).await?;
-        writer.flush().await
+        writer.flush().await?;
+        writer.shutdown().await
     })
     .await
     .map_err(|_| anyhow!("IPC write timed out"))?
@@ -633,11 +634,24 @@ async fn handle_ipc_stream<S: AsyncRead + AsyncWrite + Unpin>(
     file_read_sem: Arc<tokio::sync::Semaphore>,
     pending_reads_sem: Arc<tokio::sync::Semaphore>,
 ) -> Result<()> {
-    let (reader, mut writer) = tokio::io::split(stream);
-    let line = match read_bounded_line(reader, MAX_IPC_LINE_BYTES).await {
+    let (mut reader, mut writer) = tokio::io::split(stream);
+    let line = match read_bounded_line(&mut reader, MAX_IPC_LINE_BYTES).await {
         Ok(line) => line,
         Err(e) => {
             let _ = write_response_line(&mut writer, &IpcResponse::err(e.to_string())).await;
+            // Drain a small bounded tail of unread bytes before closing so Windows Winsock does
+            // not emit a TCP RST (`WSAECONNRESET`) that discards the queued error response.
+            let mut sink = [0u8; 1024];
+            let _ = tokio::time::timeout(Duration::from_millis(50), async {
+                let mut drained = 0usize;
+                while drained < 4096 {
+                    match reader.read(&mut sink).await {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => drained += n,
+                    }
+                }
+            })
+            .await;
             return Ok(());
         }
     };
