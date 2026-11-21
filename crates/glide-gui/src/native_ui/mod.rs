@@ -18,6 +18,7 @@ use glide_core::runtime::{
 use glide_net::discovery::{discover_servers, local_ipv4_addresses, machine_hostname};
 use glide_proto::{ClipboardFormat, Edge, OsKind, MAX_FILE_BYTES};
 use rune::{App, AppHandle, AppSpec, Cx, El, Key, KeyEvent, TextEdit, Tx, WindowOptions};
+use std::borrow::Cow;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
@@ -273,18 +274,18 @@ impl Ui {
             && self.status.status.starts_with("Connected")
     }
 
-    pub fn client_server_label(&self) -> String {
+    pub fn client_server_label(&self) -> &str {
         if let Some(rest) = self.status.status.strip_prefix("Connected to ") {
-            return rest.to_owned();
+            return rest;
         }
         let target = self.status.active_target.as_str();
         if !target.is_empty() && target != "Local" && target != "Local (Controlling)" {
-            return target.to_owned();
+            return target;
         }
-        "Server".into()
+        "Server"
     }
 
-    pub fn sidebar_status_text(&self) -> String {
+    pub fn sidebar_status_text(&self) -> Cow<'_, str> {
         let raw = if self.status.status.is_empty() {
             "Idle"
         } else {
@@ -293,10 +294,10 @@ impl Ui {
         if let Some(rest) = raw.strip_prefix("Connected (") {
             if let Some(num) = rest.strip_suffix(" peer(s))") {
                 let word = if num == "1" { "client" } else { "clients" };
-                return format!("Connected · {num} {word}");
+                return Cow::Owned(format!("Connected · {num} {word}"));
             }
         }
-        raw.to_owned()
+        Cow::Borrowed(raw)
     }
 
     pub fn layout_hint(&self) -> &'static str {
@@ -396,24 +397,26 @@ impl Ui {
 
     pub fn commit_text_fields(&mut self) -> bool {
         let mut changed = false;
-        let port_raw = self.port_edit.text.trim().to_owned();
+        let port_raw = self.port_edit.text.trim();
         if port_raw != self.last_committed_port {
             if let Ok(p) = port_raw.parse::<u16>() {
                 if p >= 1024 {
                     self.config.server.bind.set_port(p);
-                    self.last_committed_port = port_raw;
+                    self.last_committed_port.clear();
+                    self.last_committed_port.push_str(port_raw);
                     changed = true;
                 }
             }
         }
-        let srv_raw = self.server_edit.text.trim().to_owned();
+        let srv_raw = self.server_edit.text.trim();
         if srv_raw != self.last_committed_server {
             self.config.client.server = if srv_raw.is_empty() {
                 None
             } else {
-                Some(srv_raw.clone())
+                Some(srv_raw.to_owned())
             };
-            self.last_committed_server = srv_raw;
+            self.last_committed_server.clear();
+            self.last_committed_server.push_str(srv_raw);
             changed = true;
         }
         changed

@@ -3,6 +3,7 @@
 use glide_core::config::default_config_dir;
 use rune::color::hex;
 use rune::Color;
+use std::sync::LazyLock;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum ThemePref {
@@ -85,74 +86,78 @@ pub struct Palette {
     pub knob_shadow: Color,
 }
 
+static DARK_PALETTE: LazyLock<Palette> = LazyLock::new(|| Palette {
+    dark: true,
+    bg: c("#1c1c1f"),
+    sidebar: c("#161618"),
+    surface: c("#232326"),
+    canvas: c("#19191c"),
+    hover: c("#2a2a2e"),
+    press: c("#323237"),
+    nav_active: c("#2c2c31"),
+    seg_bg: c("#2a2a2e"),
+    seg_active: c("#3d3d43"),
+    line: c("#2e2e33"),
+    line_2: c("#3c3c42"),
+    text: c("#f4f4f5"),
+    text_2: c("#d4d4d8"),
+    muted: c("#a1a1aa"),
+    faint: c("#6b6b74"),
+    accent: c("#3b82f6"),
+    accent_hover: c("#2f6fe0"),
+    accent_soft: c("#3b82f6").alpha(0.14),
+    accent_text: c("#7fb0ff"),
+    green: c("#22c55e"),
+    green_soft: c("#22c55e").alpha(0.14),
+    amber: c("#f59e0b"),
+    red: c("#f87171"),
+    red_soft: c("#f87171").alpha(0.12),
+    red_line: c("#f87171").alpha(0.30),
+    toast_bg: c("#f4f4f5"),
+    toast_text: c("#18181b"),
+    shadow_sm: Color::BLACK.alpha(0.30),
+    knob_shadow: Color::BLACK.alpha(0.40),
+});
+
+static LIGHT_PALETTE: LazyLock<Palette> = LazyLock::new(|| Palette {
+    dark: false,
+    bg: c("#ffffff"),
+    sidebar: c("#f7f7f8"),
+    surface: c("#ffffff"),
+    canvas: c("#f4f4f5"),
+    hover: c("#f0f0f2"),
+    press: c("#e6e6ea"),
+    nav_active: c("#e8e8eb"),
+    seg_bg: c("#ededf0"),
+    seg_active: c("#ffffff"),
+    line: c("#e7e7ea"),
+    line_2: c("#d6d6db"),
+    text: c("#18181b"),
+    text_2: c("#3f3f46"),
+    muted: c("#71717a"),
+    faint: c("#a1a1aa"),
+    accent: c("#2563eb"),
+    accent_hover: c("#1d4ed8"),
+    accent_soft: c("#eef4ff"),
+    accent_text: c("#1d4ed8"),
+    green: c("#16a34a"),
+    green_soft: c("#ecfdf3"),
+    amber: c("#d97706"),
+    red: c("#dc2626"),
+    red_soft: c("#fef2f2"),
+    red_line: c("#fecaca"),
+    toast_bg: c("#18181b"),
+    toast_text: c("#fafafa"),
+    shadow_sm: c("#101014").alpha(0.08),
+    knob_shadow: c("#101014").alpha(0.22),
+});
+
 impl Palette {
     pub fn new(dark: bool, _scale: f32) -> Self {
         if dark {
-            Self {
-                dark: true,
-                bg: c("#1c1c1f"),
-                sidebar: c("#161618"),
-                surface: c("#232326"),
-                canvas: c("#19191c"),
-                hover: c("#2a2a2e"),
-                press: c("#323237"),
-                nav_active: c("#2c2c31"),
-                seg_bg: c("#2a2a2e"),
-                seg_active: c("#3d3d43"),
-                line: c("#2e2e33"),
-                line_2: c("#3c3c42"),
-                text: c("#f4f4f5"),
-                text_2: c("#d4d4d8"),
-                muted: c("#a1a1aa"),
-                faint: c("#6b6b74"),
-                accent: c("#3b82f6"),
-                accent_hover: c("#2f6fe0"),
-                accent_soft: c("#3b82f6").alpha(0.14),
-                accent_text: c("#7fb0ff"),
-                green: c("#22c55e"),
-                green_soft: c("#22c55e").alpha(0.14),
-                amber: c("#f59e0b"),
-                red: c("#f87171"),
-                red_soft: c("#f87171").alpha(0.12),
-                red_line: c("#f87171").alpha(0.30),
-                toast_bg: c("#f4f4f5"),
-                toast_text: c("#18181b"),
-                shadow_sm: Color::BLACK.alpha(0.30),
-                knob_shadow: Color::BLACK.alpha(0.40),
-            }
+            *DARK_PALETTE
         } else {
-            Self {
-                dark: false,
-                bg: c("#ffffff"),
-                sidebar: c("#f7f7f8"),
-                surface: c("#ffffff"),
-                canvas: c("#f4f4f5"),
-                hover: c("#f0f0f2"),
-                press: c("#e6e6ea"),
-                nav_active: c("#e8e8eb"),
-                seg_bg: c("#ededf0"),
-                seg_active: c("#ffffff"),
-                line: c("#e7e7ea"),
-                line_2: c("#d6d6db"),
-                text: c("#18181b"),
-                text_2: c("#3f3f46"),
-                muted: c("#71717a"),
-                faint: c("#a1a1aa"),
-                accent: c("#2563eb"),
-                accent_hover: c("#1d4ed8"),
-                accent_soft: c("#eef4ff"),
-                accent_text: c("#1d4ed8"),
-                green: c("#16a34a"),
-                green_soft: c("#ecfdf3"),
-                amber: c("#d97706"),
-                red: c("#dc2626"),
-                red_soft: c("#fef2f2"),
-                red_line: c("#fecaca"),
-                toast_bg: c("#18181b"),
-                toast_text: c("#fafafa"),
-                shadow_sm: c("#101014").alpha(0.08),
-                knob_shadow: c("#101014").alpha(0.22),
-            }
+            *LIGHT_PALETTE
         }
     }
 }

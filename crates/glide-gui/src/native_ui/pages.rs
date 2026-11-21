@@ -14,8 +14,9 @@ use rune::{
     col, el, row, rule, spacer, text, Align, Color, Cursor, Drag, El, FileDialogOptions, Phase,
     ScrollSpec, Tx,
 };
+use std::borrow::Cow;
 
-const APP_VERSION: &str = env!("CARGO_PKG_VERSION");
+const VERSION_LABEL: &str = concat!("Glide v", env!("CARGO_PKG_VERSION"));
 
 /// Root window layout (900x640): 208px sidebar + main content + toast overlay.
 pub fn root_view(s: &Ui, p: Palette) -> El {
@@ -83,7 +84,7 @@ fn error_banner(p: Palette, msg: &str) -> El {
         .fill(p.red_soft)
         .border(1.0, p.red_line)
         .child(
-            text(msg.to_owned())
+            text(msg)
                 .font(ty::SUB_MED)
                 .color(p.red)
                 .grow(1.0)
@@ -94,7 +95,7 @@ fn error_banner(p: Palette, msg: &str) -> El {
             row()
                 .key("err-dismiss")
                 .role("button")
-                .label("Dismiss error")
+                .label_static("Dismiss error")
                 .size(22.0, 22.0)
                 .center()
                 .radius(5.0)
@@ -128,7 +129,7 @@ fn sidebar(s: &Ui, p: Palette) -> El {
                 .gap(1.0)
                 .child(text("Glide").font(ty::BRAND_TITLE).color(p.text))
                 .child(
-                    text(s.hostname.clone())
+                    text(s.hostname.as_str())
                         .font(ty::BRAND_SUB)
                         .color(p.text_2)
                         .truncate(),
@@ -142,21 +143,26 @@ fn sidebar(s: &Ui, p: Palette) -> El {
         );
 
     type NavIcon = fn(Color) -> El;
-    let nav_items: [(Tab, &'static str, NavIcon); 4] = [
-        (Tab::Devices, "Devices", icons::nav_devices),
-        (Tab::Input, "Input", icons::nav_input),
-        (Tab::Clipboard, "Clipboard & Files", icons::nav_clipboard),
-        (Tab::Settings, "Settings", icons::nav_system),
+    const NAV_ITEMS: [(Tab, &str, &str, NavIcon); 4] = [
+        (Tab::Devices, "nav-Devices", "Devices", icons::nav_devices),
+        (Tab::Input, "nav-Input", "Input", icons::nav_input),
+        (
+            Tab::Clipboard,
+            "nav-Clipboard & Files",
+            "Clipboard & Files",
+            icons::nav_clipboard,
+        ),
+        (Tab::Settings, "nav-Settings", "Settings", icons::nav_system),
     ];
 
     let mut nav = col().key("nav").w_full().gap(2.0);
-    for (tab, label, icon_fn) in nav_items {
+    for (tab, key, label, icon_fn) in NAV_ITEMS {
         let active = s.tab == tab;
         let icon_color = if active { p.text } else { p.muted };
         let mut item = row()
-            .key(format!("nav-{label}"))
+            .key(key)
             .role("tab")
-            .label(label)
+            .label_static(label)
             .checked(active)
             .w_full()
             .h(32.0)
@@ -207,7 +213,7 @@ fn sidebar(s: &Ui, p: Palette) -> El {
                 .a11y_hidden(),
         )
         .child(
-            text(status_label)
+            text(status_label.into_owned())
                 .font(ty::LABEL)
                 .color(p.text_2)
                 .grow(1.0)
@@ -266,7 +272,7 @@ fn sidebar(s: &Ui, p: Palette) -> El {
     let lock_btn = row()
         .key("lock-btn")
         .role("button")
-        .label(if locked {
+        .label_static(if locked {
             "Unlock cursor"
         } else {
             "Lock cursor"
@@ -298,7 +304,7 @@ fn sidebar(s: &Ui, p: Palette) -> El {
     let quit_btn = row()
         .key("quit-btn")
         .role("button")
-        .label("Quit Glide")
+        .label_static("Quit Glide")
         .grow(1.0)
         .h(36.0)
         .gap(6.0)
@@ -497,7 +503,7 @@ fn desk_stage(s: &Ui, p: Palette) -> El {
             "center-tile",
             (226.0, 81.0, 188.0, 124.0),
             None,
-            &server_label,
+            server_label,
             sub,
             primary_focused,
             !is_connected_client,
@@ -523,10 +529,10 @@ fn desk_stage(s: &Ui, p: Palette) -> El {
                     stage = stage.child(ghost_slot(p, edge, (x, y, w, h), false, is_hover));
                 }
                 let self_focused = is_connected_client && client_controlling;
-                let sub = match s.status.rtt_ms {
-                    Some(ms) if is_connected_client => fmt_rtt(ms),
-                    _ if is_connected_client => "Connected".into(),
-                    _ => "This PC".into(),
+                let sub: Cow<'static, str> = match s.status.rtt_ms {
+                    Some(ms) if is_connected_client => Cow::Owned(fmt_rtt(ms)),
+                    _ if is_connected_client => Cow::Borrowed("Connected"),
+                    _ => Cow::Borrowed("This PC"),
                 };
                 let (tx_x, tx_y) =
                     if let Some(d) = s.desk_drag.as_ref().filter(|d| d.moved && d.origin == edge) {
@@ -563,17 +569,17 @@ fn desk_stage(s: &Ui, p: Palette) -> El {
             } else {
                 stage = stage.child(ghost_slot(p, edge, (x, y, w, h), false, is_hover));
             }
-        } else if let Some(peer) = s.status.peers.iter().find(|pr| pr.edge == edge).cloned() {
+        } else if let Some(peer) = s.status.peers.iter().find(|pr| pr.edge == edge) {
             if is_drag_origin {
                 stage = stage.child(ghost_slot(p, edge, (x, y, w, h), false, is_hover));
             }
             let peer_focused = active_target == peer.name;
             let is_selected =
                 s.status.peers.len() > 1 && s.active_peer().is_some_and(|ap| ap.name == peer.name);
-            let sub = peer
+            let sub: Cow<'static, str> = peer
                 .rtt_ms
-                .map(fmt_rtt)
-                .unwrap_or_else(|| "Connected".into());
+                .map(|ms| Cow::Owned(fmt_rtt(ms)))
+                .unwrap_or(Cow::Borrowed("Connected"));
             let peer_name = peer.name.clone();
             let (tx_x, tx_y) =
                 if let Some(d) = s.desk_drag.as_ref().filter(|d| d.moved && d.origin == edge) {
@@ -615,7 +621,7 @@ fn desk_stage(s: &Ui, p: Palette) -> El {
                     let jy = y + if h < 70.0 { (h - jump_h) * 0.5 } else { 8.0 };
                     stage = stage.child(
                         row()
-                            .key(format!("jump-tile-{edge:?}"))
+                            .key(jump_tile_key(edge))
                             .role("button")
                             .label(format!("Jump to {}", peer.name))
                             .size(jump_w, jump_h)
@@ -773,21 +779,21 @@ fn monitor_tile(
             line = line.child(icons::os_icon(os_k, 13.0, ico_c));
         }
         line = line.child(
-            text(name.to_owned())
+            text(name)
                 .font(ty::BODY_SEMI)
                 .color(name_c)
                 .truncate(),
         );
         body = body.child(line);
         if !sub.is_empty() {
-            body = body.child(text(sub.to_owned()).font(ty::SUB).color(sub_c).truncate());
+            body = body.child(text(sub).font(ty::SUB).color(sub_c).truncate());
         }
     } else {
         if let Some(os_k) = os {
             body = body.child(el().mb(2.0).child(icons::os_icon(os_k, 15.0, ico_c)));
         }
         body = body.child(
-            text(name.to_owned())
+            text(name)
                 .font(ty::BODY_SEMI)
                 .color(name_c)
                 .align(Align::Center)
@@ -795,7 +801,7 @@ fn monitor_tile(
         );
         if !sub.is_empty() {
             body = body.child(
-                text(sub.to_owned())
+                text(sub)
                     .font(ty::SUB)
                     .color(sub_c)
                     .align(Align::Center)
@@ -838,9 +844,9 @@ fn ghost_slot(
     };
 
     let mut slot = col()
-        .key(format!("ghost-{edge:?}"))
+        .key(ghost_key(edge))
         .role("button")
-        .label(format!("Move to {}", edge_word(edge)))
+        .label_static(ghost_label(edge))
         .size(w, h)
         .absolute(x, y)
         .center()
@@ -872,7 +878,7 @@ fn server_connection_col(s: &Ui, p: Palette) -> El {
     let addr_display = if let Some(first) = s.local_ips.first() {
         row()
             .center_y()
-            .child(text(first.clone()).font(ty::MONO).color(p.text))
+            .child(text(first.as_str()).font(ty::MONO).color(p.text))
     } else {
         row().child(
             text("No network connection")
@@ -943,11 +949,7 @@ fn server_connection_col(s: &Ui, p: Palette) -> El {
         .min_w(0.0)
         .gap(8.0)
         .child(section_head(p, "conn-head", "Connection", None))
-        .child(card_rows(
-            p,
-            "conn-card",
-            vec![addr_row, port_row, disc_row],
-        ))
+        .child(card_rows(p, "conn-card", [addr_row, port_row, disc_row]))
 }
 
 fn server_clients_col(s: &Ui, p: Palette) -> El {
@@ -1107,7 +1109,7 @@ fn client_connection_col(s: &Ui, p: Palette) -> El {
         .min_w(0.0)
         .gap(8.0)
         .child(section_head(p, "client-conn-head", "Connection", None))
-        .child(card_rows(p, "client-conn-card", vec![server_row, pos_row]))
+        .child(card_rows(p, "client-conn-card", [server_row, pos_row]))
 }
 
 fn client_servers_col(s: &Ui, p: Palette) -> El {
@@ -1135,8 +1137,8 @@ fn client_servers_col(s: &Ui, p: Palette) -> El {
             .config
             .client
             .server
-            .clone()
-            .unwrap_or_else(|| "Found automatically".into());
+            .as_deref()
+            .unwrap_or("Found automatically");
         col()
             .key("connected-box")
             .w_full()
@@ -1307,7 +1309,7 @@ fn input_server_cols(s: &Ui, p: Palette) -> El {
     let dead = s.config.server.dead_corner_px;
     let dwell = s.config.server.edge_dwell_ms;
 
-    let edge_rows = vec![
+    let edge_rows = [
         slider_row(
             p,
             "srv-thresh-row",
@@ -1582,7 +1584,7 @@ fn input_client_cols(s: &Ui, p: Palette) -> El {
     let thresh = s.config.client.edge_threshold_px;
     let dead = s.config.client.dead_corner_px;
 
-    let return_rows = vec![
+    let return_rows = [
         slider_row(
             p,
             "cli-thresh-row",
@@ -1652,6 +1654,7 @@ fn input_client_cols(s: &Ui, p: Palette) -> El {
 
     // Right column: Key remapping
     let preset_btn = |key: &'static str,
+                      a11y_label: &'static str,
                       a: &'static str,
                       b: &'static str,
                       from: &'static str,
@@ -1659,7 +1662,7 @@ fn input_client_cols(s: &Ui, p: Palette) -> El {
         row()
             .key(key)
             .role("button")
-            .label(format!("{a} to {b}"))
+            .label_static(a11y_label)
             .h(24.0)
             .px(8.0)
             .gap(4.0)
@@ -1686,6 +1689,7 @@ fn input_client_cols(s: &Ui, p: Palette) -> El {
                 .gap(6.0)
                 .child(preset_btn(
                     "preset-esc",
+                    "Caps to Esc",
                     "Caps",
                     "Esc",
                     "CapsLock",
@@ -1693,6 +1697,7 @@ fn input_client_cols(s: &Ui, p: Palette) -> El {
                 ))
                 .child(preset_btn(
                     "preset-ctrl",
+                    "Caps to Ctrl",
                     "Caps",
                     "Ctrl",
                     "CapsLock",
@@ -1734,7 +1739,7 @@ fn input_client_cols(s: &Ui, p: Palette) -> El {
                     row()
                         .key(format!("remap-rm-{i}"))
                         .role("button")
-                        .label("Remove remap")
+                        .label_static("Remove remap")
                         .size(24.0, 24.0)
                         .center()
                         .radius(6.0)
@@ -1848,7 +1853,7 @@ fn clipboard_page(s: &Ui, p: Palette) -> El {
     let clip_toggle_card = card_rows(
         p,
         "clip-toggle-card",
-        vec![
+        [
             setting_row(
                 p,
                 "clip-toggle-row",
@@ -2080,7 +2085,7 @@ fn clipboard_page(s: &Ui, p: Palette) -> El {
     let dropzone = col()
         .key("dropzone")
         .role("button")
-        .label("Drop files here or browse")
+        .label_static("Drop files here or browse")
         .w_full()
         .h(132.0)
         .gap(10.0)
@@ -2355,9 +2360,9 @@ fn settings_page(s: &Ui, p: Palette) -> El {
         ));
     }
 
-    let (update_desc, update_btn) = match &s.update_state {
+    let (update_desc, update_btn): (Cow<'_, str>, El) = match &s.update_state {
         UpdateCheckState::Idle => (
-            "Check GitHub for new releases".to_owned(),
+            Cow::Borrowed("Check GitHub for new releases"),
             xs_button(
                 p,
                 "update-check-btn",
@@ -2368,7 +2373,7 @@ fn settings_page(s: &Ui, p: Palette) -> El {
             ),
         ),
         UpdateCheckState::Checking => (
-            "Checking GitHub…".to_owned(),
+            Cow::Borrowed("Checking GitHub…"),
             xs_button(
                 p,
                 "update-check-btn",
@@ -2379,7 +2384,7 @@ fn settings_page(s: &Ui, p: Palette) -> El {
             ),
         ),
         UpdateCheckState::UpToDate { latest } => (
-            format!("You're up to date ({latest})"),
+            Cow::Owned(format!("You're up to date ({latest})")),
             xs_button(
                 p,
                 "update-check-btn",
@@ -2390,7 +2395,7 @@ fn settings_page(s: &Ui, p: Palette) -> El {
             ),
         ),
         UpdateCheckState::Available { version, .. } => (
-            format!("{version} is available"),
+            Cow::Owned(format!("{version} is available")),
             xs_button(
                 p,
                 "update-download-btn",
@@ -2401,7 +2406,7 @@ fn settings_page(s: &Ui, p: Palette) -> El {
             ),
         ),
         UpdateCheckState::Error(msg) => (
-            msg.clone(),
+            Cow::Borrowed(msg.as_str()),
             xs_button(
                 p,
                 "update-retry-btn",
@@ -2426,7 +2431,7 @@ fn settings_page(s: &Ui, p: Palette) -> El {
     let advanced_toggle_card = card_rows(
         p,
         "advanced-toggle-card",
-        vec![setting_row(
+        [setting_row(
             p,
             "advanced-row",
             "Show advanced settings",
@@ -2456,11 +2461,7 @@ fn settings_page(s: &Ui, p: Palette) -> El {
                 .gap(8.0)
                 .center_y()
                 .child(icons::glide_mark(18.0, 4.5, p.accent))
-                .child(
-                    text(format!("Glide v{APP_VERSION}"))
-                        .font(ty::SUB_MED)
-                        .color(p.text_2),
-                ),
+                .child(text(VERSION_LABEL).font(ty::SUB_MED).color(p.text_2)),
         )
         .child(
             text("No account, no cloud, no internet.")
@@ -2495,18 +2496,21 @@ fn settings_page(s: &Ui, p: Palette) -> El {
             .or(s.fingerprint.as_deref())
             .unwrap_or("Not generated yet");
 
-        let trust_label = match s.config.client.trusted_fingerprint.as_deref() {
+        let trust_label: Cow<'static, str> = match s.config.client.trusted_fingerprint.as_deref() {
             Some(fp) => {
-                let short: String = fp.chars().take(18).collect();
-                format!("Trusted server: {short}…")
+                let end = fp
+                    .char_indices()
+                    .nth(18)
+                    .map_or(fp.len(), |(idx, _)| idx);
+                Cow::Owned(format!("Trusted server: {}…", &fp[..end]))
             }
-            None => "Trusts the first server it sees".into(),
+            None => Cow::Borrowed("Trusts the first server it sees"),
         };
 
         let security_card = card_rows(
             p,
             "security-card",
-            vec![
+            [
                 row()
                     .key("fp-row")
                     .w_full()
@@ -2525,7 +2529,7 @@ fn settings_page(s: &Ui, p: Palette) -> El {
                             .fill(p.canvas)
                             .border(1.0, p.line)
                             .child(
-                                text(fp_text.to_owned())
+                                text(fp_text)
                                     .w_full()
                                     .shrink()
                                     .min_w(0.0)
@@ -2554,7 +2558,7 @@ fn settings_page(s: &Ui, p: Palette) -> El {
                     .center_y()
                     .justify_between()
                     .child(
-                        text(trust_label)
+                        text(trust_label.into_owned())
                             .font(ty::SUB)
                             .color(p.muted)
                             .grow(1.0)
@@ -2619,7 +2623,7 @@ fn settings_page(s: &Ui, p: Palette) -> El {
     let shortcuts_card = card_rows(
         p,
         "shortcuts-card",
-        vec![
+        [
             setting_row(
                 p,
                 "sc-jump",
@@ -2711,7 +2715,7 @@ fn settings_page(s: &Ui, p: Palette) -> El {
                 stick_bottom: false,
             })
             .child(
-                text(s.doctor_text.clone())
+                text(s.doctor_text.as_str())
                     .w_full()
                     .font(ty::MONO_SM)
                     .color(p.text_2)
@@ -2767,6 +2771,33 @@ pub fn edge_word(edge: Edge) -> &'static str {
         Edge::Right => "right",
         Edge::Top => "top",
         Edge::Bottom => "bottom",
+    }
+}
+
+fn ghost_key(edge: Edge) -> &'static str {
+    match edge {
+        Edge::Left => "ghost-Left",
+        Edge::Right => "ghost-Right",
+        Edge::Top => "ghost-Top",
+        Edge::Bottom => "ghost-Bottom",
+    }
+}
+
+fn ghost_label(edge: Edge) -> &'static str {
+    match edge {
+        Edge::Left => "Move to left",
+        Edge::Right => "Move to right",
+        Edge::Top => "Move to top",
+        Edge::Bottom => "Move to bottom",
+    }
+}
+
+fn jump_tile_key(edge: Edge) -> &'static str {
+    match edge {
+        Edge::Left => "jump-tile-Left",
+        Edge::Right => "jump-tile-Right",
+        Edge::Top => "jump-tile-Top",
+        Edge::Bottom => "jump-tile-Bottom",
     }
 }
 
