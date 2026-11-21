@@ -7,9 +7,9 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: "Release tag to build and publish (e.g. v0.3.0)"
+        description: "Release tag to build and publish (e.g. v0.4.0)"
         required: true
-        default: "v0.3.0"
+        default: "v0.4.0"
 
 permissions:
   contents: read
@@ -34,6 +34,8 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y libxkbcommon-dev
 
       - name: Run workspace tests
+        env:
+          GLIDE_BUILD_CHANNEL: stable
         run: cargo test --workspace --locked
 
       - name: Build release binary
@@ -72,6 +74,8 @@ jobs:
         uses: Swatinem/rust-cache@v2
 
       - name: Run workspace tests
+        env:
+          GLIDE_BUILD_CHANNEL: stable
         run: cargo test --workspace --locked
 
       - name: Build standalone Windows binary (static CRT)
@@ -135,11 +139,13 @@ jobs:
           cat > release-notes.md <<EOF
           One mouse and keyboard across your Windows 11 and Linux PCs — directly over your local network, with no account and no cloud.
 
-          ### What's included
-          - **Native UI (Light & Dark mode)** — Single standalone app with drag-and-drop screen arrangement, automatic LAN discovery, live latency indicator, and system tray support.
-          - **Seamless cursor & keyboard sharing** — Clean cursor hiding on idle screens, corner guards, fullscreen game auto-lock, Caps Lock / Num Lock LED sync, German/EU ISO keyboard support, and per-PC pointer speed & key remapping.
-          - **Shared clipboard & file drop** — Sync text and screenshots (\`Win+Shift+S\`, Snipping Tool, browsers, Flameshot) in both directions with toggleable/hideable history, plus drag-and-drop LAN file transfers into \`Downloads/Glide\`.
-          - **Auto-reconnect** — Remembers whether each PC is a Server or Client and reconnects automatically on launch.
+          ### Highlights in ${TAG}
+          - **Per-user Windows \`.msi\` installer** — Clean install to \`%LOCALAPPDATA%\Programs\Glide\`, Start Menu shortcut, and Apps & Features uninstaller with no admin/UAC prompt required.
+          - **Verified in-app auto-updater (Stable & Nightly tracks)** — SHA-256 checksum-verified updates on Windows and Linux (including \`.msi\`, \`.deb\`, and standalone binaries), defaulting to Stable with a confirmation warning before opting into Nightly (Beta) builds.
+          - **Polished native UI** — Collapsible Saved servers list for one-click profile switching, crisp monochrome Settings icons, and experimental opt-in toggle for cross-edge file drag-and-drop.
+          - **Input & keyboard reliability** — Fixed \`Win+L\` lock-screen handling, local media/volume/brightness key pinning (keep media keys on the server PC), and Linux X11 fullscreen app/game auto-lock.
+          - **Clipboard & file transfers** — Automatic password-manager clipboard exclusion (Bitwarden, 1Password, KeePassXC, etc.), custom receive folder with one-click Open/Reveal actions, and configurable \`max_file_mb\` transfer limit.
+          - **Local CLI control & resilience** — Control a running session or send files from scripts/terminals with \`glide ctl\` and \`glide send\`, plus hardened sleep/wake, monitor hotplug, and LAN roaming recovery.
 
           ### Downloads
           - **Windows 11 Installer (Recommended):** Download and double-click \`glide-windows-x86_64-installer.msi\` *(per-user install to \`%LOCALAPPDATA%\Programs\Glide\`, Start Menu shortcut, Apps & Features uninstaller, no admin/UAC prompt required)*.
