@@ -19,6 +19,8 @@ pub const PROTOCOL_VERSION: u16 = 2;
 pub const MAX_CONTROL_FRAME_LEN: usize = 64 * 1024;
 pub const MAX_CLIPBOARD_BYTES: usize = 32 * 1024 * 1024;
 pub const MAX_FILE_BYTES: usize = 256 * 1024 * 1024;
+/// Maximum number of files accepted in a single cross-edge drag-and-drop operation.
+pub const MAX_DRAG_FILES: usize = 64;
 /// Payloads above this threshold use lazy `ClipboardOffer` / `ClipboardRequest`.
 pub const LAZY_CLIPBOARD_THRESHOLD: usize = 256 * 1024;
 
@@ -318,6 +320,24 @@ pub enum ControlMessage {
     Ping { ts_us: u64 },
     /// Heartbeat response echoing `ts_us`.
     Pong { ts_us: u64 },
+    /// Peer started dragging one or more local files across an active screen edge.
+    /// Followed by parallel `BulkTransfer::DragFile` streams and concluded by
+    /// `DragDrop` or `DragCancel`.
+    DragStart {
+        drag_id: u64,
+        files: Vec<DragFileInfo>,
+    },
+    /// User released the drag on the receiving screen; commit OS drop handoff for `drag_id`.
+    DragDrop { drag_id: u64 },
+    /// User cancelled the drag (e.g. returned across edge, pressed Escape, or disconnected).
+    DragCancel { drag_id: u64 },
+}
+
+/// Metadata for a single file participating in a cross-edge drag-and-drop transfer.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DragFileInfo {
+    pub filename: String,
+    pub byte_len: u64,
 }
 
 /// Sanitizes a normalized `[0.0, 1.0]` screen coordinate, replacing `NaN` or `±Infinity` with `0.5`.
@@ -469,6 +489,25 @@ impl ControlMessage {
             Self::Pong { ts_us } => {
                 buf.put_u8(0x41);
                 buf.put_u64(*ts_us);
+            }
+            Self::DragStart { drag_id, files } => {
+                buf.put_u8(0x50);
+                buf.put_u64(*drag_id);
+                let count = files.len().min(MAX_DRAG_FILES);
+                buf.put_u16(count as u16);
+                for f in files.iter().take(count) {
+                    let safe = sanitize_filename(&f.filename);
+                    put_string(buf, &safe);
+                    buf.put_u64(f.byte_len);
+                }
+            }
+            Self::DragDrop { drag_id } => {
+                buf.put_u8(0x51);
+                buf.put_u64(*drag_id);
+            }
+            Self::DragCancel { drag_id } => {
+                buf.put_u8(0x52);
+                buf.put_u64(*drag_id);
             }
         }
     }
@@ -714,6 +753,57 @@ impl ControlMessage {
                     ts_us: data.get_u64(),
                 })
             }
+            0x50 => {
+                if data.len() < 10 {
+                    return Err(ProtoError::Truncated {
+                        expected: 10,
+                        actual: data.len(),
+                    });
+                }
+                let drag_id = data.get_u64();
+                let count = data.get_u16() as usize;
+                if count > MAX_DRAG_FILES {
+                    return Err(ProtoError::FrameTooLarge {
+                        len: count,
+                        max: MAX_DRAG_FILES,
+                    });
+                }
+                let mut files = Vec::with_capacity(count);
+                for _ in 0..count {
+                    let filename = sanitize_filename(&get_string(&mut data)?);
+                    if data.len() < 8 {
+                        return Err(ProtoError::Truncated {
+                            expected: 8,
+                            actual: data.len(),
+                        });
+                    }
+                    let byte_len = data.get_u64();
+                    files.push(DragFileInfo { filename, byte_len });
+                }
+                Ok(Self::DragStart { drag_id, files })
+            }
+            0x51 => {
+                if data.len() < 8 {
+                    return Err(ProtoError::Truncated {
+                        expected: 8,
+                        actual: data.len(),
+                    });
+                }
+                Ok(Self::DragDrop {
+                    drag_id: data.get_u64(),
+                })
+            }
+            0x52 => {
+                if data.len() < 8 {
+                    return Err(ProtoError::Truncated {
+                        expected: 8,
+                        actual: data.len(),
+                    });
+                }
+                Ok(Self::DragCancel {
+                    drag_id: data.get_u64(),
+                })
+            }
             other => Err(ProtoError::UnknownTag(other)),
         }
     }
@@ -727,7 +817,7 @@ pub struct ClipboardPayload {
     pub data: Bytes,
 }
 
-/// Bulk file transfer carried on Lane C (drag-and-drop / `glide send-file`).
+/// Bulk file transfer carried on Lane C (GUI dropzone / `glide send-file`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FilePayload {
     pub filename: String,
@@ -735,15 +825,24 @@ pub struct FilePayload {
     pub data: Bytes,
 }
 
+/// Bulk file transfer associated with an active cross-edge drag-and-drop operation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DragFilePayload {
+    pub drag_id: u64,
+    pub file: FilePayload,
+}
+
 /// Lane C unidirectional QUIC stream payloads (independent of mouse & keyboard).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum BulkTransfer {
     Clipboard(ClipboardPayload),
     File(FilePayload),
+    DragFile(DragFilePayload),
 }
 
 pub const BULK_KIND_CLIPBOARD: u8 = 0x01;
 pub const BULK_KIND_FILE: u8 = 0x02;
+pub const BULK_KIND_DRAG_FILE: u8 = 0x03;
 
 /// Maximum UTF-8 byte length allowed for sanitized received filenames.
 pub const MAX_FILENAME_BYTES: usize = 200;
@@ -956,6 +1055,21 @@ mod tests {
             },
             ControlMessage::Ping { ts_us: 123_456_789 },
             ControlMessage::Pong { ts_us: 123_456_789 },
+            ControlMessage::DragStart {
+                drag_id: 77,
+                files: vec![
+                    DragFileInfo {
+                        filename: "report äöüß.pdf".into(),
+                        byte_len: 1_048_576,
+                    },
+                    DragFileInfo {
+                        filename: "photo 1.png".into(),
+                        byte_len: 42_000,
+                    },
+                ],
+            },
+            ControlMessage::DragDrop { drag_id: 77 },
+            ControlMessage::DragCancel { drag_id: 77 },
         ];
 
         for msg in samples {
@@ -989,6 +1103,38 @@ mod tests {
             let bytes = enc.encode(msg);
             assert_eq!(DatagramMessage::decode(&bytes).unwrap(), msg);
         }
+    }
+
+    #[test]
+    fn drag_start_sanitizes_filenames_and_rejects_excessive_file_count() {
+        let msg = ControlMessage::DragStart {
+            drag_id: 9,
+            files: vec![DragFileInfo {
+                filename: "../../secret.txt".into(),
+                byte_len: 128,
+            }],
+        };
+        let decoded = ControlMessage::decode_body(&msg.encode_body()).unwrap();
+        assert_eq!(
+            decoded,
+            ControlMessage::DragStart {
+                drag_id: 9,
+                files: vec![DragFileInfo {
+                    filename: "secret.txt".into(),
+                    byte_len: 128,
+                }],
+            }
+        );
+
+        // Craft a raw frame with count > MAX_DRAG_FILES and ensure decoder rejects it.
+        let mut raw = BytesMut::new();
+        raw.put_u8(0x50);
+        raw.put_u64(1);
+        raw.put_u16((MAX_DRAG_FILES + 1) as u16);
+        assert!(matches!(
+            ControlMessage::decode_body(&raw),
+            Err(ProtoError::FrameTooLarge { .. })
+        ));
     }
 
     #[test]

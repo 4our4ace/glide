@@ -92,6 +92,7 @@ pub enum RuntimeCommand {
         locked: bool,
         sync_lock_keys: bool,
         clipboard: bool,
+        drag_drop_files: bool,
     },
     UpdateClientTuning {
         sensitivity: f32,
@@ -102,6 +103,7 @@ pub enum RuntimeCommand {
         dead_corner_px: i32,
         sync_lock_keys: bool,
         clipboard: bool,
+        drag_drop_files: bool,
         key_remap: Vec<KeyRemapRule>,
     },
     ToggleLock,

@@ -735,6 +735,22 @@ impl Ui {
         self.push_config();
     }
 
+    pub fn toggle_drag_drop_files(&mut self, tx: &mut Tx) {
+        let next = !self.config.drag_drop_files;
+        self.config.drag_drop_files = next;
+        self.config.server.drag_drop_files = next;
+        self.config.client.drag_drop_files = next;
+        self.push_config();
+        self.toast(
+            if next {
+                "Edge file drag-and-drop on"
+            } else {
+                "Edge file drag-and-drop off"
+            },
+            tx,
+        );
+    }
+
     pub fn clear_clipboard_history(&mut self, tx: &mut Tx) {
         self.ctrl.runtime.clear_clipboard_history();
         self.status.clipboard_history.clear();

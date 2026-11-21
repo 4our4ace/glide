@@ -10,11 +10,17 @@
 //! - Guaranteed `release_all()` on leave or disconnect
 
 use crate::config::{compile_key_remaps, ClientConfig, DEFAULT_QUIC_PORT};
+use crate::dnd::{
+    collect_local_drag_files, next_drag_id, spawn_commit_incoming_drag, spawn_send_drag_files,
+    IncomingDragState,
+};
 use crate::resilience::{HealthProbe, ReconnectBackoff, SleepDetector};
 use crate::runtime::{save_received_file, RuntimeCommand, RuntimeState};
 use anyhow::{anyhow, Context, Result};
+use glide_backend::dnd::{DndBackend, NoopDndBackend};
 use glide_backend::os_integration::file_receive_dir;
 use glide_backend::{ClipboardHandle, InputInjector};
+use glide_hid::MouseButton;
 use glide_net::discovery::{discover_servers, local_ipv4_addresses};
 use glide_net::tls::{normalize_fingerprint, TrustMode};
 use glide_net::{
@@ -26,6 +32,8 @@ use glide_proto::{
 };
 use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
+use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::net::lookup_host;
 use tokio::sync::mpsc;
@@ -82,6 +90,7 @@ fn apply_pre_session_cmd(cmd: Option<RuntimeCommand>, config: &mut ClientConfig)
             dead_corner_px,
             sync_lock_keys,
             clipboard,
+            drag_drop_files,
             key_remap,
         }) => {
             config.sensitivity = sensitivity;
@@ -92,6 +101,7 @@ fn apply_pre_session_cmd(cmd: Option<RuntimeCommand>, config: &mut ClientConfig)
             config.dead_corner_px = dead_corner_px;
             config.sync_lock_keys = sync_lock_keys;
             config.clipboard = clipboard;
+            config.drag_drop_files = drag_drop_files;
             config.key_remap = key_remap;
             false
         }
@@ -251,7 +261,7 @@ fn build_trust_mode(config: &ClientConfig) -> TrustMode {
     }
 }
 
-/// Runs a single connected client session until disconnect or error.
+/// Runs a single connected client session until disconnect or error (using a no-op DnD backend).
 pub async fn run_client_session(
     config: &mut ClientConfig,
     server_addr: SocketAddr,
@@ -260,18 +270,55 @@ pub async fn run_client_session(
     runtime: Option<&RuntimeState>,
     cmd_rx: Option<&mut mpsc::UnboundedReceiver<RuntimeCommand>>,
 ) -> Result<()> {
-    run_client_session_tracked(config, server_addr, injector, clipboard, runtime, cmd_rx)
-        .await
-        .1
+    run_client_session_with_dnd(
+        config,
+        server_addr,
+        injector,
+        clipboard,
+        Arc::new(NoopDndBackend),
+        None,
+        runtime,
+        cmd_rx,
+    )
+    .await
+}
+
+/// Runs a single connected client session with an explicit cross-edge drag-and-drop backend.
+#[allow(clippy::too_many_arguments)]
+pub async fn run_client_session_with_dnd(
+    config: &mut ClientConfig,
+    server_addr: SocketAddr,
+    injector: &mut dyn InputInjector,
+    clipboard: &mut Option<ClipboardHandle>,
+    dnd: Arc<dyn DndBackend>,
+    receive_dir: Option<PathBuf>,
+    runtime: Option<&RuntimeState>,
+    cmd_rx: Option<&mut mpsc::UnboundedReceiver<RuntimeCommand>>,
+) -> Result<()> {
+    run_client_session_tracked(
+        config,
+        server_addr,
+        injector,
+        clipboard,
+        dnd,
+        receive_dir,
+        runtime,
+        cmd_rx,
+    )
+    .await
+    .1
 }
 
 /// Internal session runner that also reports whether the handshake completed successfully so
 /// the reconnect supervisor can reset backoff immediately after any previously healthy session.
+#[allow(clippy::too_many_arguments)]
 async fn run_client_session_tracked(
     config: &mut ClientConfig,
     server_addr: SocketAddr,
     injector: &mut dyn InputInjector,
     clipboard: &mut Option<ClipboardHandle>,
+    dnd: Arc<dyn DndBackend>,
+    receive_dir: Option<PathBuf>,
     runtime: Option<&RuntimeState>,
     mut cmd_rx: Option<&mut mpsc::UnboundedReceiver<RuntimeCommand>>,
 ) -> (bool, Result<()>) {
@@ -395,11 +442,17 @@ async fn run_client_session_tracked(
     }
 
     let mut return_edge = config.edge.opposite();
+    dnd.set_enabled(config.drag_drop_files);
+    dnd.set_active_edges(&[return_edge], config.dead_corner_px);
+    dnd.set_drag_armed(false);
+
     let mut key_remaps = compile_key_remaps(&config.key_remap);
     let mut focused = false;
     let mut last_seq: Option<u32> = None;
     let mut pending_offer_hash: Option<[u8; 32]> = None;
     let mut local_clip_cache: HashMap<[u8; 32], ClipboardPayload> = HashMap::new();
+    let mut incoming_drag: Option<IncomingDragState> = None;
+    let mut client_lmb_down = false;
 
     let mut ping_interval = tokio::time::interval(Duration::from_millis(500));
     ping_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -576,6 +629,7 @@ async fn run_client_session_tracked(
                         dead_corner_px,
                         sync_lock_keys,
                         clipboard: clip_enabled,
+                        drag_drop_files,
                         key_remap,
                     } => {
                         config.sensitivity = sensitivity;
@@ -586,8 +640,11 @@ async fn run_client_session_tracked(
                         config.dead_corner_px = dead_corner_px;
                         config.sync_lock_keys = sync_lock_keys;
                         config.clipboard = clip_enabled;
+                        config.drag_drop_files = drag_drop_files;
                         key_remaps = compile_key_remaps(&key_remap);
                         config.key_remap = key_remap;
+                        dnd.set_enabled(drag_drop_files);
+                        dnd.set_active_edges(&[return_edge], dead_corner_px);
                     }
                     RuntimeCommand::SendFile { filename, data } => {
                         let payload = FilePayload {
@@ -618,6 +675,7 @@ async fn run_client_session_tracked(
                     RuntimeCommand::MovePeerEdge { edge, .. } => {
                         config.edge = edge;
                         return_edge = edge.opposite();
+                        dnd.set_active_edges(&[return_edge], config.dead_corner_px);
                         let _ = ctrl_send
                             .send(&ControlMessage::SetEdge {
                                 edge_on_server: edge,
@@ -670,8 +728,37 @@ async fn run_client_session_tracked(
                         ) {
                             Ok(Some((edge, normalized_pos))) => {
                                 debug!(?edge, normalized_pos, "Cursor crossed return edge; handing focus back to server");
+                                // If dragging an uncommitted Server -> Client file back across the
+                                // return edge, cancel cleanly without saving or dropping.
+                                if let Some(inc) = incoming_drag.take() {
+                                    if !inc.drop_requested {
+                                        debug!(drag_id = inc.drag_id, "Cancelled uncommitted incoming drag on return-edge exit");
+                                        dnd.on_incoming_drag_cancel();
+                                    } else {
+                                        incoming_drag = Some(inc);
+                                    }
+                                }
+
+                                // Check whether the user is dragging local files from this Client
+                                // across the return edge back onto the Server!
+                                let staged_paths = if config.drag_drop_files && client_lmb_down {
+                                    dnd.take_staged_files(edge)
+                                } else {
+                                    None
+                                };
+                                let drag_files = staged_paths
+                                    .as_deref()
+                                    .map(collect_local_drag_files)
+                                    .filter(|(infos, _)| !infos.is_empty());
+                                if drag_files.is_some() {
+                                    dnd.cancel_local_drag();
+                                } else {
+                                    dnd.set_drag_armed(false);
+                                }
+
                                 let (cx, cy) = injector.cursor_norm();
                                 focused = false;
+                                client_lmb_down = false;
                                 let _ = injector.release_all();
                                 let _ = injector.leave();
                                 if let Some(rt) = runtime {
@@ -687,6 +774,25 @@ async fn run_client_session_tracked(
                                     .await
                                 {
                                     break Err(e);
+                                }
+
+                                if let Some((infos, send_list)) = drag_files {
+                                    let drag_id = next_drag_id();
+                                    if let Err(e) = ctrl_send
+                                        .send(&ControlMessage::DragStart {
+                                            drag_id,
+                                            files: infos,
+                                        })
+                                        .await
+                                    {
+                                        break Err(e);
+                                    }
+                                    spawn_send_drag_files(
+                                        conn.clone(),
+                                        drag_id,
+                                        send_list,
+                                        runtime.cloned(),
+                                    );
                                 }
                             }
                             Ok(None) => {}
@@ -715,6 +821,8 @@ async fn run_client_session_tracked(
                     ControlMessage::Enter { edge, normalized_pos, lock_state } => {
                         focused = true;
                         last_seq = None;
+                        client_lmb_down = false;
+                        dnd.set_drag_armed(false);
                         if let Err(e) = injector.enter(edge, normalized_pos) {
                             warn!(error = %e, "Failed positioning cursor on Enter");
                         }
@@ -736,6 +844,8 @@ async fn run_client_session_tracked(
                     ControlMessage::EnterAt { norm_x, norm_y, lock_state } => {
                         focused = true;
                         last_seq = None;
+                        client_lmb_down = false;
+                        dnd.set_drag_armed(false);
                         if let Err(e) = injector.enter_at(norm_x, norm_y) {
                             warn!(error = %e, "Failed positioning cursor on EnterAt");
                         }
@@ -758,10 +868,47 @@ async fn run_client_session_tracked(
                     }
                     ControlMessage::Leave { .. } => {
                         focused = false;
+                        client_lmb_down = false;
+                        dnd.set_drag_armed(false);
+                        if let Some(inc) = incoming_drag.take() {
+                            if !inc.drop_requested {
+                                dnd.on_incoming_drag_cancel();
+                            } else {
+                                incoming_drag = Some(inc);
+                            }
+                        }
                         let _ = injector.release_all();
                         let _ = injector.leave();
                         if let Some(rt) = runtime {
                             rt.update(|s| s.active_target = server_name.clone());
+                        }
+                    }
+                    ControlMessage::DragStart { drag_id, files } => {
+                        if config.drag_drop_files {
+                            debug!(drag_id, count = files.len(), "Incoming cross-edge drag from server");
+                            incoming_drag = IncomingDragState::start(drag_id, files);
+                        }
+                    }
+                    ControlMessage::DragDrop { drag_id } => {
+                        if let Some(ref mut inc) = incoming_drag {
+                            if inc.request_drop(drag_id) && inc.is_ready_to_commit() {
+                                if let Some(done) = incoming_drag.take() {
+                                    spawn_commit_incoming_drag(
+                                        done.drag_id,
+                                        done.into_files(),
+                                        receive_dir.clone(),
+                                        Arc::clone(&dnd),
+                                        runtime.cloned(),
+                                    );
+                                }
+                            }
+                        }
+                    }
+                    ControlMessage::DragCancel { drag_id } => {
+                        if incoming_drag.as_ref().is_some_and(|i| i.drag_id == drag_id) {
+                            debug!(drag_id, "Cancelled incoming cross-edge drag from server");
+                            incoming_drag = None;
+                            dnd.on_incoming_drag_cancel();
                         }
                     }
                     ControlMessage::LockSync { lock_state } => {
@@ -772,6 +919,7 @@ async fn run_client_session_tracked(
                     ControlMessage::SetEdge { edge_on_server } => {
                         config.edge = edge_on_server;
                         return_edge = edge_on_server.opposite();
+                        dnd.set_active_edges(&[return_edge], config.dead_corner_px);
                         info!(edge = ?edge_on_server, "Server repositioned this client edge live");
                     }
                     ControlMessage::Key { usage, pressed } => {
@@ -787,6 +935,24 @@ async fn run_client_session_tracked(
                     }
                     ControlMessage::Button { button, pressed } => {
                         if focused {
+                            if button == MouseButton::Left {
+                                if pressed {
+                                    let (nx, ny) = injector.cursor_norm();
+                                    let (px, py) = client_geom.denormalize_point(nx, ny);
+                                    let started_on_edge =
+                                        client_geom.distance_to_edge(return_edge, px, py) <= 4;
+                                    client_lmb_down = true;
+                                    if config.drag_drop_files
+                                        && !started_on_edge
+                                        && incoming_drag.is_none()
+                                    {
+                                        dnd.set_drag_armed(true);
+                                    }
+                                } else {
+                                    client_lmb_down = false;
+                                    dnd.set_drag_armed(false);
+                                }
+                            }
                             if let Err(e) = injector.button(button, pressed) {
                                 warn!(?button, error = %e, "Failed injecting mouse button");
                             }
@@ -842,10 +1008,15 @@ async fn run_client_session_tracked(
                         let data = file.data;
                         let byte_len = data.len();
                         let rt_clone = runtime.cloned();
+                        let rdir_override = receive_dir.clone();
                         tokio::spawn(async move {
                             let fname_for_save = filename.clone();
                             let saved = tokio::task::spawn_blocking(move || {
-                                file_receive_dir()
+                                let dir_res = match rdir_override {
+                                    Some(d) => Ok(d),
+                                    None => file_receive_dir(),
+                                };
+                                dir_res
                                     .and_then(|dir| save_received_file(&dir, &fname_for_save, &data))
                             })
                             .await;
@@ -860,6 +1031,24 @@ async fn run_client_session_tracked(
                                 Err(e) => warn!(error = %e, "Received file save task failed"),
                             }
                         });
+                    }
+                    Some(BulkTransfer::DragFile(drag_file)) => {
+                        health_probe.mark_alive();
+                        if let Some(ref mut inc) = incoming_drag {
+                            if inc.push_file(drag_file.drag_id, drag_file.file)
+                                && inc.is_ready_to_commit()
+                            {
+                                if let Some(done) = incoming_drag.take() {
+                                    spawn_commit_incoming_drag(
+                                        done.drag_id,
+                                        done.into_files(),
+                                        receive_dir.clone(),
+                                        Arc::clone(&dnd),
+                                        runtime.cloned(),
+                                    );
+                                }
+                            }
+                        }
                     }
                     None => {
                         bulk_open = false;
@@ -913,6 +1102,7 @@ async fn run_client_session_tracked(
     } else if conn.close_reason().is_none() {
         conn.close(0u32.into(), b"client disconnected");
     }
+    dnd.set_drag_armed(false);
     let _ = injector.release_all();
     let _ = injector.show_cursor();
     (true, session_result)
@@ -1006,9 +1196,32 @@ async fn wait_reconnect_delay(
 /// fast post-wake/roaming backoff reset, fingerprint-verified server roaming recovery,
 /// and responsive graceful shutdown.
 pub async fn run_client_with_backends(
+    config: ClientConfig,
+    injector: &mut dyn InputInjector,
+    clipboard: &mut Option<ClipboardHandle>,
+    runtime: Option<RuntimeState>,
+    cmd_rx: Option<mpsc::UnboundedReceiver<RuntimeCommand>>,
+) -> Result<()> {
+    run_client_with_backends_and_dnd(
+        config,
+        injector,
+        clipboard,
+        Arc::new(NoopDndBackend),
+        None,
+        runtime,
+        cmd_rx,
+    )
+    .await
+}
+
+/// Runs the Glide client reconnect supervisor with explicit DnD backend and optional receive_dir.
+#[allow(clippy::too_many_arguments)]
+pub async fn run_client_with_backends_and_dnd(
     mut config: ClientConfig,
     injector: &mut dyn InputInjector,
     clipboard: &mut Option<ClipboardHandle>,
+    dnd: Arc<dyn DndBackend>,
+    receive_dir: Option<PathBuf>,
     runtime: Option<RuntimeState>,
     mut cmd_rx: Option<mpsc::UnboundedReceiver<RuntimeCommand>>,
 ) -> Result<()> {
@@ -1068,6 +1281,8 @@ pub async fn run_client_with_backends(
                     addr,
                     injector,
                     clipboard,
+                    Arc::clone(&dnd),
+                    receive_dir.clone(),
                     runtime.as_ref(),
                     cmd_rx.as_mut(),
                 )
@@ -1251,7 +1466,17 @@ pub async fn run_native_client_with_runtime(
         None
     };
 
-    run_client_with_backends(config, injector.as_mut(), &mut clipboard, runtime, cmd_rx).await
+    let dnd = glide_backend::start_dnd();
+    run_client_with_backends_and_dnd(
+        config,
+        injector.as_mut(),
+        &mut clipboard,
+        dnd,
+        None,
+        runtime,
+        cmd_rx,
+    )
+    .await
 }
 
 /// Convenience CLI entrypoint using native OS backends.

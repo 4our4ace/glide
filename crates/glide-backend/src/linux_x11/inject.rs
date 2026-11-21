@@ -40,6 +40,7 @@ pub struct X11Injector {
     est_y: f32,
     last_pointer_sync: Instant,
     edge_push_accum: f32,
+    edge_push_start: Option<Instant>,
     // Track currently pressed keys & buttons so release_all() prevents stuck modifiers.
     pressed_keys: HashSet<u8>,
     pressed_buttons: HashSet<u8>,
@@ -85,6 +86,7 @@ impl X11Injector {
             est_y: cy as f32,
             last_pointer_sync: now,
             edge_push_accum: 0.0,
+            edge_push_start: None,
             pressed_keys: HashSet::new(),
             pressed_buttons: HashSet::new(),
         })
@@ -184,6 +186,7 @@ impl InputInjector for X11Injector {
         self.est_x = x as f32;
         self.est_y = y as f32;
         self.edge_push_accum = 0.0;
+        self.edge_push_start = None;
         self.last_pointer_sync = Instant::now();
         debug!(?edge, normalized_pos, x, y, "X11Injector entered screen");
         Ok(())
@@ -203,6 +206,7 @@ impl InputInjector for X11Injector {
         self.est_x = x as f32;
         self.est_y = y as f32;
         self.edge_push_accum = 0.0;
+        self.edge_push_start = None;
         self.last_pointer_sync = Instant::now();
         Ok(())
     }
@@ -313,13 +317,18 @@ impl InputInjector for X11Injector {
             .geometry
             .hit_outer_edge_guarded(edge, rx, ry, 2, dead_corner_px)
         {
+            let lmb_held = self.pressed_buttons.contains(&MouseButton::Left.to_x11_button());
+            let start = *self.edge_push_start.get_or_insert_with(Instant::now);
             self.edge_push_accum += outward;
-            if self.edge_push_accum >= edge_threshold_px.max(1) as f32 {
+            let drag_dwell_ok = !lmb_held || start.elapsed() >= Duration::from_millis(25);
+            if self.edge_push_accum >= edge_threshold_px.max(1) as f32 && drag_dwell_ok {
                 self.edge_push_accum = 0.0;
+                self.edge_push_start = None;
                 return Ok(Some((edge, norm)));
             }
         } else {
             self.edge_push_accum = 0.0;
+            self.edge_push_start = None;
         }
 
         Ok(None)
@@ -436,6 +445,7 @@ impl InputInjector for X11Injector {
         self.est_x = px as f32;
         self.est_y = py as f32;
         self.edge_push_accum = 0.0;
+        self.edge_push_start = None;
         debug!(px, py, "X11Injector left screen; cursor hidden & parked");
         Ok(())
     }

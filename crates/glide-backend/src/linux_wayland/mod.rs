@@ -10,6 +10,7 @@
 
 pub mod capture;
 pub mod clipboard;
+pub mod dnd;
 pub mod inject;
 
 use crate::geometry::{DesktopGeometry, MonitorRect};
@@ -554,6 +555,11 @@ pub fn run_doctor() -> Result<DoctorReport> {
         ),
         Err(e) => notes.push(format!("Wayland clipboard: unavailable ({e})")),
     }
+
+    notes.push(
+        "Cross-edge file drop (Wayland): incoming files save to Downloads/Glide & copy file URIs for Ctrl+V (Wayland restricts synthetic external drops and hidden edge overlays)"
+            .into(),
+    );
 
     if std::fs::OpenOptions::new()
         .write(true)

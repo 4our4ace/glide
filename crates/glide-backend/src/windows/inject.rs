@@ -159,6 +159,7 @@ pub struct WindowsInjector {
     rem_x: f32,
     rem_y: f32,
     edge_push_accum: f32,
+    edge_push_start: Option<Instant>,
     pressed_keys: HashSet<HidUsage>,
     pressed_buttons: HashSet<MouseButton>,
 }
@@ -181,6 +182,7 @@ impl WindowsInjector {
             rem_x: 0.0,
             rem_y: 0.0,
             edge_push_accum: 0.0,
+            edge_push_start: None,
             pressed_keys: HashSet::new(),
             pressed_buttons: HashSet::new(),
         })
@@ -304,6 +306,7 @@ impl InputInjector for WindowsInjector {
         self.rem_x = 0.0;
         self.rem_y = 0.0;
         self.edge_push_accum = 0.0;
+        self.edge_push_start = None;
         debug!(
             ?edge,
             normalized_pos, x, y, "WindowsInjector entered screen"
@@ -320,6 +323,7 @@ impl InputInjector for WindowsInjector {
         self.rem_x = 0.0;
         self.rem_y = 0.0;
         self.edge_push_accum = 0.0;
+        self.edge_push_start = None;
         Ok(())
     }
 
@@ -381,6 +385,7 @@ impl InputInjector for WindowsInjector {
 
         if outward <= 0.0 {
             self.edge_push_accum = 0.0;
+            self.edge_push_start = None;
             return Ok(None);
         }
 
@@ -390,13 +395,18 @@ impl InputInjector for WindowsInjector {
                 self.geometry
                     .hit_outer_edge_guarded(edge, pt.x, pt.y, 2, dead_corner_px)
             {
+                let lmb_held = self.pressed_buttons.contains(&MouseButton::Left);
+                let start = *self.edge_push_start.get_or_insert_with(Instant::now);
                 self.edge_push_accum += outward;
-                if self.edge_push_accum >= edge_threshold_px.max(1) as f32 {
+                let drag_dwell_ok = !lmb_held || start.elapsed() >= Duration::from_millis(25);
+                if self.edge_push_accum >= edge_threshold_px.max(1) as f32 && drag_dwell_ok {
                     self.edge_push_accum = 0.0;
+                    self.edge_push_start = None;
                     return Ok(Some((edge, norm)));
                 }
             } else {
                 self.edge_push_accum = 0.0;
+                self.edge_push_start = None;
             }
         }
 
@@ -470,6 +480,7 @@ impl InputInjector for WindowsInjector {
             SetCursorPos(px, py);
         }
         self.edge_push_accum = 0.0;
+        self.edge_push_start = None;
         Ok(())
     }
 }

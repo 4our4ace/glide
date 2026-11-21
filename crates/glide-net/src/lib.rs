@@ -305,11 +305,50 @@ pub async fn send_file_on(conn: &Connection, file: &glide_proto::FilePayload) ->
     Ok(())
 }
 
+/// Sends a cross-edge drag-and-drop file payload over a fresh unidirectional QUIC stream on `conn`.
+pub async fn send_drag_file_on(
+    conn: &Connection,
+    drag_file: &glide_proto::DragFilePayload,
+) -> Result<()> {
+    use glide_proto::{BULK_KIND_DRAG_FILE, MAX_FILE_BYTES};
+
+    let file = &drag_file.file;
+    if file.data.len() > MAX_FILE_BYTES {
+        return Err(anyhow!(
+            "file payload too large ({} bytes > max {})",
+            file.data.len(),
+            MAX_FILE_BYTES
+        ));
+    }
+
+    let mut uni = conn
+        .open_uni()
+        .await
+        .context("failed to open bulk uni stream")?;
+
+    let safe_name = glide_proto::sanitize_filename(&file.filename);
+    let name_bytes = safe_name.as_bytes();
+    let name_len = (name_bytes.len().min(u16::MAX as usize)) as u16;
+
+    let mut hdr = Vec::with_capacity(1 + 8 + 2 + name_len as usize + 32 + 4);
+    hdr.push(BULK_KIND_DRAG_FILE);
+    hdr.extend_from_slice(&drag_file.drag_id.to_be_bytes());
+    hdr.extend_from_slice(&name_len.to_be_bytes());
+    hdr.extend_from_slice(&name_bytes[..name_len as usize]);
+    hdr.extend_from_slice(&file.sha256);
+    hdr.extend_from_slice(&(file.data.len() as u32).to_be_bytes());
+    uni.write_all(&hdr).await?;
+    uni.write_all(&file.data).await?;
+    uni.finish().context("failed finishing bulk stream")?;
+    Ok(())
+}
+
 /// Sends a clipboard or file payload over an independent unidirectional QUIC stream.
 pub async fn send_bulk_on(conn: &Connection, transfer: &glide_proto::BulkTransfer) -> Result<()> {
     match transfer {
         glide_proto::BulkTransfer::Clipboard(payload) => send_clipboard_on(conn, payload).await,
         glide_proto::BulkTransfer::File(file) => send_file_on(conn, file).await,
+        glide_proto::BulkTransfer::DragFile(drag_file) => send_drag_file_on(conn, drag_file).await,
     }
 }
 
@@ -347,11 +386,45 @@ async fn read_exact_incremental<R: tokio::io::AsyncRead + Unpin>(
     Ok(data)
 }
 
-/// Reads and validates a single unidirectional bulk stream (clipboard or file).
+async fn read_file_payload(uni: &mut RecvStream) -> Result<glide_proto::FilePayload> {
+    use glide_proto::{sanitize_filename, FilePayload, MAX_FILE_BYTES};
+
+    let mut name_len_buf = [0u8; 2];
+    uni.read_exact(&mut name_len_buf).await?;
+    let name_len = u16::from_be_bytes(name_len_buf) as usize;
+    let name_raw = read_exact_incremental(uni, name_len)
+        .await
+        .context("failed reading file transfer name")?;
+    let filename = sanitize_filename(&String::from_utf8_lossy(&name_raw));
+
+    let mut sha256 = [0u8; 32];
+    uni.read_exact(&mut sha256).await?;
+    let mut len_buf = [0u8; 4];
+    uni.read_exact(&mut len_buf).await?;
+    let len = u32::from_be_bytes(len_buf) as usize;
+    if len > MAX_FILE_BYTES {
+        return Err(anyhow!(
+            "file exceeds maximum size ({len} > {MAX_FILE_BYTES})"
+        ));
+    }
+    let data = read_exact_incremental(uni, len)
+        .await
+        .context("failed reading file transfer body")?;
+    let actual_hash: [u8; 32] = Sha256::digest(&data).into();
+    if actual_hash != sha256 {
+        return Err(anyhow!("file payload SHA-256 verification failed"));
+    }
+    Ok(FilePayload {
+        filename,
+        sha256,
+        data: Bytes::from(data),
+    })
+}
+
+/// Reads and validates a single unidirectional bulk stream (clipboard, file, or drag file).
 pub async fn recv_bulk_stream(mut uni: RecvStream) -> Result<glide_proto::BulkTransfer> {
     use glide_proto::{
-        sanitize_filename, BulkTransfer, FilePayload, BULK_KIND_CLIPBOARD, BULK_KIND_FILE,
-        MAX_FILE_BYTES,
+        BulkTransfer, DragFilePayload, BULK_KIND_CLIPBOARD, BULK_KIND_DRAG_FILE, BULK_KIND_FILE,
     };
 
     let mut kind = [0u8; 1];
@@ -379,37 +452,13 @@ pub async fn recv_bulk_stream(mut uni: RecvStream) -> Result<glide_proto::BulkTr
                 data: Bytes::from(data),
             }))
         }
-        BULK_KIND_FILE => {
-            let mut name_len_buf = [0u8; 2];
-            uni.read_exact(&mut name_len_buf).await?;
-            let name_len = u16::from_be_bytes(name_len_buf) as usize;
-            let name_raw = read_exact_incremental(&mut uni, name_len)
-                .await
-                .context("failed reading file transfer name")?;
-            let filename = sanitize_filename(&String::from_utf8_lossy(&name_raw));
-
-            let mut sha256 = [0u8; 32];
-            uni.read_exact(&mut sha256).await?;
-            let mut len_buf = [0u8; 4];
-            uni.read_exact(&mut len_buf).await?;
-            let len = u32::from_be_bytes(len_buf) as usize;
-            if len > MAX_FILE_BYTES {
-                return Err(anyhow!(
-                    "file exceeds maximum size ({len} > {MAX_FILE_BYTES})"
-                ));
-            }
-            let data = read_exact_incremental(&mut uni, len)
-                .await
-                .context("failed reading file transfer body")?;
-            let actual_hash: [u8; 32] = Sha256::digest(&data).into();
-            if actual_hash != sha256 {
-                return Err(anyhow!("file payload SHA-256 verification failed"));
-            }
-            Ok(BulkTransfer::File(FilePayload {
-                filename,
-                sha256,
-                data: Bytes::from(data),
-            }))
+        BULK_KIND_FILE => Ok(BulkTransfer::File(read_file_payload(&mut uni).await?)),
+        BULK_KIND_DRAG_FILE => {
+            let mut id_buf = [0u8; 8];
+            uni.read_exact(&mut id_buf).await?;
+            let drag_id = u64::from_be_bytes(id_buf);
+            let file = read_file_payload(&mut uni).await?;
+            Ok(BulkTransfer::DragFile(DragFilePayload { drag_id, file }))
         }
         other => Err(anyhow!("unknown bulk transfer kind: 0x{other:02X}")),
     }
@@ -425,7 +474,9 @@ pub async fn recv_bulk_on(conn: &Connection) -> Result<glide_proto::BulkTransfer
 pub async fn recv_clipboard_on(conn: &Connection) -> Result<ClipboardPayload> {
     match recv_bulk_on(conn).await? {
         glide_proto::BulkTransfer::Clipboard(c) => Ok(c),
-        glide_proto::BulkTransfer::File(_) => Err(anyhow!("expected clipboard transfer, got file")),
+        glide_proto::BulkTransfer::File(_) | glide_proto::BulkTransfer::DragFile(_) => {
+            Err(anyhow!("expected clipboard transfer, got file"))
+        }
     }
 }
 
@@ -557,6 +608,17 @@ mod tests {
                 data: file_bytes,
             };
             send_file_on(&sess.conn, &file).await.unwrap();
+
+            let drag_bytes = Bytes::from_static(b"cross-edge dragged payload");
+            let drag_file = glide_proto::DragFilePayload {
+                drag_id: 99,
+                file: glide_proto::FilePayload {
+                    filename: "Büro report.pdf".into(),
+                    sha256: sha256_bytes(&drag_bytes),
+                    data: drag_bytes,
+                },
+            };
+            send_drag_file_on(&sess.conn, &drag_file).await.unwrap();
             tokio::time::sleep(Duration::from_millis(120)).await;
         });
 
@@ -593,7 +655,8 @@ mod tests {
 
         let mut got_clip = false;
         let mut got_file = false;
-        for _ in 0..2 {
+        let mut got_drag_file = false;
+        for _ in 0..3 {
             match client.recv_bulk().await.unwrap() {
                 glide_proto::BulkTransfer::Clipboard(clip) => {
                     assert_eq!(clip.format, ClipboardFormat::TextUtf8);
@@ -608,9 +671,15 @@ mod tests {
                     assert_eq!(f.data.as_ref(), b"hello file transfer");
                     got_file = true;
                 }
+                glide_proto::BulkTransfer::DragFile(df) => {
+                    assert_eq!(df.drag_id, 99);
+                    assert_eq!(df.file.filename, "Büro report.pdf");
+                    assert_eq!(df.file.data.as_ref(), b"cross-edge dragged payload");
+                    got_drag_file = true;
+                }
             }
         }
-        assert!(got_clip && got_file);
+        assert!(got_clip && got_file && got_drag_file);
 
         server_task.await.unwrap();
     }

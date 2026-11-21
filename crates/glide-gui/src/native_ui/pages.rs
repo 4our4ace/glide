@@ -1841,7 +1841,7 @@ fn clipboard_page(s: &Ui, p: Palette) -> El {
         .gap(2.0)
         .child(text("Clipboard & Files").font(ty::PAGE_TITLE).color(p.text))
         .child(
-            text("Copy on one PC, paste on the other. Text and images, both directions.")
+            text("Sync clipboard text & images, or drag files across screen edges.")
                 .font(ty::CAPTION)
                 .color(p.muted),
         );
@@ -2081,14 +2081,32 @@ fn clipboard_page(s: &Ui, p: Palette) -> El {
                 ),
         );
 
-    // Right: Send files dropzone + Recent transfers
+    // Right: Edge drag-and-drop toggle + Send files dropzone + Recent transfers
+    let dnd_toggle_card = card_rows(
+        p,
+        "dnd-toggle-card",
+        vec![setting_row(
+            p,
+            "dnd-toggle-row",
+            "Drag files across edges",
+            Some("Pull files past a screen edge"),
+            toggle(
+                p,
+                "dnd-toggle",
+                "Drag files across edges",
+                s.config.drag_drop_files,
+                |s, tx| s.toggle_drag_drop_files(tx),
+            ),
+        )],
+    );
+
     let dropzone = col()
         .key("dropzone")
         .role("button")
         .label_static("Drop files here or browse")
         .w_full()
-        .h(132.0)
-        .gap(10.0)
+        .h(102.0)
+        .gap(8.0)
         .center()
         .radius(10.0)
         .fill(if s.drop_hover {
@@ -2129,7 +2147,7 @@ fn clipboard_page(s: &Ui, p: Palette) -> El {
             );
         })
         .child(
-            el().size(34.0, 34.0)
+            el().size(32.0, 32.0)
                 .radius(8.0)
                 .fill(p.surface)
                 .border(1.0, p.line)
@@ -2237,7 +2255,13 @@ fn clipboard_page(s: &Ui, p: Palette) -> El {
                             .color(p.faint),
                     ),
                 ))
-                .child(dropzone),
+                .child(
+                    col()
+                        .w_full()
+                        .gap(10.0)
+                        .child(dnd_toggle_card)
+                        .child(dropzone),
+                ),
         )
         .child(
             col()

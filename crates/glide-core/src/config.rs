@@ -67,6 +67,9 @@ pub struct GlideConfigFile {
     /// Hide clipboard history entries behind a privacy cover until explicitly revealed.
     #[serde(default)]
     pub hide_clipboard_history: bool,
+    /// Allow dragging local files straight across active screen edges onto the other PC.
+    #[serde(default = "default_true")]
+    pub drag_drop_files: bool,
     #[serde(default)]
     pub server: ServerConfig,
     #[serde(default)]
@@ -80,6 +83,7 @@ impl Default for GlideConfigFile {
             auto_start_on_launch: false,
             clipboard_history: true,
             hide_clipboard_history: false,
+            drag_drop_files: true,
             server: ServerConfig::default(),
             client: ClientConfig::default(),
         }
@@ -132,6 +136,8 @@ pub struct ServerConfig {
     pub sync_lock_keys: bool,
     /// Enable bidirectional clipboard sharing (UTF-8 text & PNG/DIB images).
     pub clipboard: bool,
+    /// Allow dragging local files straight across active screen edges.
+    pub drag_drop_files: bool,
     /// Microseconds to coalesce high-polling-rate mouse deltas (1000 = 1000Hz max cadence; 0 = immediate).
     pub motion_coalesce_us: u64,
     /// Directory storing the server's Ed25519 TLS identity.
@@ -153,6 +159,7 @@ impl Default for ServerConfig {
             enable_hotkeys: true,
             sync_lock_keys: true,
             clipboard: true,
+            drag_drop_files: true,
             motion_coalesce_us: 1000,
             identity_dir: None,
         }
@@ -208,6 +215,8 @@ pub struct ClientConfig {
     pub key_remap: Vec<KeyRemapRule>,
     /// Enable bidirectional clipboard sharing.
     pub clipboard: bool,
+    /// Allow dragging local files straight across active screen edges.
+    pub drag_drop_files: bool,
     /// Path to persist TOFU server fingerprints.
     pub tofu_store_path: Option<PathBuf>,
 }
@@ -232,6 +241,7 @@ impl Default for ClientConfig {
             input_backend: InputBackendKind::Auto,
             key_remap: Vec::new(),
             clipboard: true,
+            drag_drop_files: true,
             tofu_store_path: None,
         }
     }
@@ -250,8 +260,8 @@ mod tests {
     use super::*;
 
     #[test]
-    fn config_round_trips_last_role_and_auto_start() {
-        // Older configs without last_role / auto_start_on_launch parse cleanly.
+    fn config_round_trips_last_role_auto_start_and_drag_drop_files() {
+        // Older configs without last_role / auto_start_on_launch / drag_drop_files parse cleanly.
         let legacy: GlideConfigFile = toml::from_str(
             r#"
             [server]
@@ -266,6 +276,9 @@ mod tests {
         assert!(!legacy.auto_start_on_launch);
         assert!(legacy.clipboard_history);
         assert!(!legacy.hide_clipboard_history);
+        assert!(legacy.drag_drop_files);
+        assert!(legacy.server.drag_drop_files);
+        assert!(legacy.client.drag_drop_files);
         assert_eq!(legacy.server.edge_threshold_px, 6);
         assert!((legacy.client.sensitivity - 1.5).abs() < f32::EPSILON);
 
@@ -274,6 +287,7 @@ mod tests {
             auto_start_on_launch: true,
             clipboard_history: false,
             hide_clipboard_history: true,
+            drag_drop_files: false,
             ..GlideConfigFile::default()
         };
         cfg.client.sensitivity = 1.35;
@@ -283,6 +297,7 @@ mod tests {
         assert!(parsed.auto_start_on_launch);
         assert!(!parsed.clipboard_history);
         assert!(parsed.hide_clipboard_history);
+        assert!(!parsed.drag_drop_files);
         assert!((parsed.client.sensitivity - 1.35).abs() < f32::EPSILON);
     }
 }

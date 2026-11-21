@@ -8,6 +8,7 @@
 
 pub mod capture;
 pub mod clipboard;
+pub mod dnd;
 pub mod inject;
 pub mod tray;
 pub mod window_brand;
