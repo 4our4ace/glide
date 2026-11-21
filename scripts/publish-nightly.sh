@@ -15,7 +15,7 @@ mkdir -p "$OUT_DIR"
 
 JOBS="${CARGO_BUILD_JOBS:-2}"
 export PATH="$HOME/.cargo/bin:$PATH"
-if [ -z "${RUSTUP_HOME:-}" ] && [ -d "$HOME/.cache/rustup" ]; then
+if [ ! -d "$(rustc --print sysroot)/lib/rustlib/x86_64-pc-windows-msvc" ] && [ -d "$HOME/.cache/rustup" ]; then
     export RUSTUP_HOME="$HOME/.cache/rustup"
 fi
 export XWIN_CACHE_DIR="${XWIN_CACHE_DIR:-$HOME/.cache/xwin}"
@@ -33,7 +33,8 @@ DEB_FILE="$(basename "$DEB_PATH")"
 
 # 2. Windows standalone static-CRT .exe via cargo-xwin
 GLIDE_BUILD_CHANNEL=nightly GLIDE_BUILD_SHA="$SHORT_SHA" \
-    CARGO_BUILD_JOBS="$JOBS" RUSTFLAGS="-C target-feature=+crt-static" \
+    CARGO_BUILD_JOBS="$JOBS" \
+    CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_RUSTFLAGS="-C target-feature=+crt-static" \
     cargo-xwin build --release --locked --bin glide --target x86_64-pc-windows-msvc
 cp target/x86_64-pc-windows-msvc/release/glide.exe "$OUT_DIR/glide-windows-x86_64.exe"
 
