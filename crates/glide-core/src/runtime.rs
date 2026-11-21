@@ -103,8 +103,10 @@ pub enum RuntimeCommand {
         key_remap: Vec<KeyRemapRule>,
     },
     ToggleLock,
+    SetLock(bool),
     SwitchToEdge(Edge),
     ReturnLocal,
+    SwitchTarget(Option<Edge>),
     MovePeerEdge {
         peer_name: Option<String>,
         edge: Edge,

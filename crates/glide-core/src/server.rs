@@ -329,8 +329,34 @@ pub async fn run_server_with_backends(
                         info!(locked, "Toggled cursor lock");
                         sync_runtime_peers(&runtime, &peers, active_remote, locked);
                     }
-                    RuntimeCommand::SwitchToEdge(edge) => {
+                    RuntimeCommand::SetLock(new_locked) => {
+                        locked = new_locked;
+                        capture_ctrl.update_tuning(
+                            config.edge_threshold_px,
+                            config.dead_corner_px,
+                            config.edge_dwell_ms,
+                            config.auto_lock_fullscreen,
+                            locked,
+                        );
+                        info!(locked, "Updated cursor lock state");
+                        sync_runtime_peers(&runtime, &peers, active_remote, locked);
+                    }
+                    RuntimeCommand::SwitchToEdge(edge)
+                    | RuntimeCommand::SwitchTarget(Some(edge)) => {
                         if let Some(&peer_id) = edge_to_peer.get(&edge) {
+                            if let Some(prev_pid) = active_remote {
+                                if prev_pid != peer_id {
+                                    if let Some(prev_peer) = peers.get(&prev_pid) {
+                                        let _ = prev_peer.ctrl_tx.send(ControlMessage::ReleaseAll);
+                                        let _ = prev_peer.ctrl_tx.send(ControlMessage::Leave {
+                                            edge: prev_peer.edge.opposite(),
+                                            normalized_pos: 0.5,
+                                            cursor_norm_x: 0.5,
+                                            cursor_norm_y: 0.5,
+                                        });
+                                    }
+                                }
+                            }
                             if let Some(peer) = peers.get(&peer_id) {
                                 let lock_state = if config.sync_lock_keys {
                                     capture_ctrl.lock_state()
@@ -351,7 +377,7 @@ pub async fn run_server_with_backends(
                             }
                         }
                     }
-                    RuntimeCommand::ReturnLocal => {
+                    RuntimeCommand::ReturnLocal | RuntimeCommand::SwitchTarget(None) => {
                         if let Some(pid) = active_remote.take() {
                             if let Some(peer) = peers.get(&pid) {
                                 let _ = peer.ctrl_tx.send(ControlMessage::ReleaseAll);

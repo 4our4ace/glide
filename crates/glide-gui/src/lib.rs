@@ -284,6 +284,26 @@ impl AppController {
     }
 }
 
+struct GuiIpcBackend(Arc<AppController>);
+
+impl glide_core::ipc::IpcBackend for GuiIpcBackend {
+    fn status(&self) -> glide_core::ipc::IpcStatus {
+        glide_core::ipc::IpcStatus::from(self.0.runtime.snapshot())
+    }
+
+    fn max_file_bytes(&self) -> usize {
+        self.0.config.lock().max_file_bytes()
+    }
+
+    fn send_command(&self, cmd: RuntimeCommand) -> Result<()> {
+        if self.0.send_cmd(cmd) {
+            Ok(())
+        } else {
+            anyhow::bail!("Glide is not currently running")
+        }
+    }
+}
+
 /// Options for launching the Glide desktop GUI.
 #[derive(Debug, Clone)]
 pub struct GuiOptions {
@@ -508,6 +528,20 @@ pub fn run_gui_blocking(opts: GuiOptions) -> Result<()> {
         None
     };
 
+    let mut ipc_handle = if !headless_snap {
+        match rt.block_on(glide_core::ipc::start_default_ipc(Arc::new(GuiIpcBackend(
+            Arc::clone(&ctrl),
+        )))) {
+            Ok(h) => Some(h),
+            Err(e) => {
+                warn!(error = %e, "Local control IPC unavailable; continuing without `glide ctl`");
+                None
+            }
+        }
+    } else {
+        None
+    };
+
     info!(%url, "Glide GUI ready");
 
     let mut server = Some(rt.spawn(serve(listener, Arc::clone(&ctrl), quit_rx)));
@@ -540,6 +574,7 @@ pub fn run_gui_blocking(opts: GuiOptions) -> Result<()> {
         }
     }
 
+    drop(ipc_handle.take());
     let _ = ctrl.quit_tx.send(());
     rt.block_on(async {
         if let Some(task) = server.take() {
