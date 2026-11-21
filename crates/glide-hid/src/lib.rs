@@ -38,11 +38,12 @@ const WIN_TO_IDX: [[u8; 256]; 2] = {
     let mut lut = [[0u8; 256]; 2];
     let mut i = 0;
     while i < KEY_TABLE.len() {
-        let w = KEY_TABLE[i].win;
-        let ext = if w.extended { 1 } else { 0 };
-        let code = w.code as usize;
-        if code < 256 {
-            lut[ext][code] = (i + 1) as u8;
+        if let Some(w) = KEY_TABLE[i].win {
+            let ext = if w.extended { 1 } else { 0 };
+            let code = w.code as usize;
+            if code < 256 {
+                lut[ext][code] = (i + 1) as u8;
+            }
         }
         i += 1;
     }
@@ -100,6 +101,11 @@ fn lookup_by_hid(usage: HidUsage) -> Option<&'static KeyEntry> {
 pub struct HidUsage(pub u32);
 
 impl HidUsage {
+    /// USB HID Usage Page for Keyboard/Keypad (`0x07`).
+    pub const PAGE_KEYBOARD: u16 = PAGE_KEYBOARD;
+    /// USB HID Usage Page for Consumer Control / Media keys (`0x0C`).
+    pub const PAGE_CONSUMER: u16 = PAGE_CONSUMER;
+
     pub const fn new(page: u16, id: u16) -> Self {
         Self(((page as u32) << 16) | (id as u32))
     }
@@ -122,6 +128,13 @@ impl HidUsage {
 
     pub const fn raw(self) -> u32 {
         self.0
+    }
+
+    /// Returns `true` if this usage belongs to USB HID Consumer Control page (`0x0C`:
+    /// volume, mute, play/pause, next/prev track, stop).
+    #[inline]
+    pub const fn is_media_key(self) -> bool {
+        self.page() == Self::PAGE_CONSUMER
     }
 
     // Well-known keys used across crates
@@ -194,13 +207,16 @@ impl HidUsage {
                 None
             };
         }
-        KEY_TABLE.iter().find(|e| e.win == scan).map(|e| e.hid)
+        KEY_TABLE
+            .iter()
+            .find(|e| e.win == Some(scan))
+            .map(|e| e.hid)
     }
 
     /// Convert to a Windows Set 1 scan code + E0 extended flag.
     #[inline]
     pub fn to_win_scan(self) -> Option<WinScan> {
-        lookup_by_hid(self).map(|e| e.win)
+        lookup_by_hid(self).and_then(|e| e.win)
     }
 
     /// Convert to macOS virtual keycode (for future macOS backend).
@@ -406,19 +422,25 @@ mod tests {
                 entry.evdev,
                 entry.name
             );
-            assert!(
-                wins.insert(entry.win),
-                "Duplicate WinScan {:?} for {}",
-                entry.win,
-                entry.name
-            );
+            if let Some(win) = entry.win {
+                assert!(
+                    wins.insert(win),
+                    "Duplicate WinScan {:?} for {}",
+                    win,
+                    entry.name
+                );
+            }
             assert!(names.insert(entry.name), "Duplicate name {}", entry.name);
 
             // Round-trip checks
             assert_eq!(HidUsage::from_evdev(entry.evdev), Some(entry.hid));
             assert_eq!(entry.hid.to_evdev(), Some(entry.evdev));
-            assert_eq!(HidUsage::from_win_scan(entry.win), Some(entry.hid));
-            assert_eq!(entry.hid.to_win_scan(), Some(entry.win));
+            if let Some(win) = entry.win {
+                assert_eq!(HidUsage::from_win_scan(win), Some(entry.hid));
+                assert_eq!(entry.hid.to_win_scan(), Some(win));
+            } else {
+                assert_eq!(entry.hid.to_win_scan(), None);
+            }
         }
     }
 
@@ -478,5 +500,36 @@ mod tests {
         assert!(!is_windows_fake_altgr_lctrl(0xA2, 0x1D));
         // Real physical Right Alt
         assert!(!is_windows_fake_altgr_lctrl(0xA5, 0x38));
+    }
+
+    #[test]
+    fn classifies_consumer_media_and_brightness_keys() {
+        for name in [
+            "AudioVolumeMute",
+            "AudioVolumeDown",
+            "AudioVolumeUp",
+            "MediaPlayPause",
+            "MediaTrackNext",
+            "MediaTrackPrev",
+            "MediaStop",
+            "BrightnessDown",
+            "BrightnessUp",
+        ] {
+            let u = HidUsage::from_name(name).expect("known media key");
+            assert!(u.is_media_key(), "{name} should be classified as media key");
+        }
+        // Brightness Decrement (0x0070) / Increment (0x006F) roundtrip with evdev 224/225 & X11 232/233
+        assert_eq!(HidUsage::from_evdev(224), Some(HidUsage::consumer(0x0070)));
+        assert_eq!(HidUsage::from_evdev(225), Some(HidUsage::consumer(0x006F)));
+        assert_eq!(HidUsage::from_x11_keycode(232), Some(HidUsage::consumer(0x0070)));
+        assert_eq!(HidUsage::from_x11_keycode(233), Some(HidUsage::consumer(0x006F)));
+        assert!(HidUsage::consumer(0x006F).is_media_key());
+        assert!(HidUsage::consumer(0x0070).is_media_key());
+
+        // Standard keyboard usages are not media keys
+        assert!(!HidUsage::ESCAPE.is_media_key());
+        assert!(!HidUsage::ALT_RIGHT.is_media_key());
+        assert!(!HidUsage::ISO_BACKSLASH.is_media_key());
+        assert!(!HidUsage::from_name("KeyA").unwrap().is_media_key());
     }
 }

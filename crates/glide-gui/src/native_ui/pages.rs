@@ -1102,14 +1102,143 @@ fn client_connection_col(s: &Ui, p: Palette) -> El {
         ),
     );
 
-    col()
+    let mut col_el = col()
         .key("client-conn-col")
         .grow(1.0)
         .shrink()
         .min_w(0.0)
-        .gap(8.0)
-        .child(section_head(p, "client-conn-head", "Connection", None))
-        .child(card_rows(p, "client-conn-card", [server_row, pos_row]))
+        .h_full()
+        .min_h(0.0)
+        .gap(10.0)
+        .child(
+            col()
+                .w_full()
+                .gap(7.0)
+                .child(section_head(p, "client-conn-head", "Connection", None))
+                .child(card_rows(p, "client-conn-card", [server_row, pos_row])),
+        );
+
+    if !s.known_servers.is_empty() {
+        let connected = s.client_connected();
+        let active_addr = s.status.local_addr.as_deref();
+        let active_fp = s
+            .status
+            .remote_fingerprint
+            .as_deref()
+            .or(s.config.client.trusted_fingerprint.as_deref())
+            .map(glide_core::config::normalize_known_fingerprint)
+            .filter(|fp| !fp.is_empty());
+        let count = s.known_servers.len();
+        let mut list = col().key("known-servers-list").w_full();
+        for (i, srv) in s.known_servers.iter().enumerate() {
+            let srv_fp = srv
+                .fingerprint
+                .as_deref()
+                .map(glide_core::config::normalize_known_fingerprint)
+                .filter(|fp| !fp.is_empty());
+            let is_active = connected
+                && match (&active_fp, &srv_fp) {
+                    (Some(cur), Some(saved)) => cur == saved,
+                    _ => active_addr == Some(srv.address.as_str()),
+                };
+            let srv_connect = srv.clone();
+            let rm_key = srv
+                .fingerprint
+                .as_deref()
+                .filter(|fp| !fp.trim().is_empty())
+                .unwrap_or(&srv.address)
+                .to_owned();
+            let action = if is_active {
+                badge(p, format!("known-active-{i}"), "Active", true, false)
+            } else {
+                button(
+                    p,
+                    format!("known-conn-{i}"),
+                    if connected { "Switch" } else { "Connect" },
+                    BtnKind::Primary,
+                    22.0,
+                    8.0,
+                    false,
+                    move |s, tx| s.connect_known_server(srv_connect.clone(), tx),
+                )
+            };
+            let rm_btn = row()
+                .key(format!("known-rm-{i}"))
+                .role("button")
+                .label(format!("Forget {}", srv.name))
+                .size(22.0, 22.0)
+                .center()
+                .radius(5.0)
+                .hover(p.hover)
+                .press(p.press)
+                .cursor(Cursor::Pointer)
+                .focusable(true)
+                .on_press_tx(move |s: &mut Ui, tx| s.forget_known_server(rm_key.clone(), tx))
+                .child(icons::close_icon(10.5, p.muted));
+
+            let item = row()
+                .key(format!("known-row-{i}"))
+                .w_full()
+                .min_h(36.0)
+                .px(10.0)
+                .py(5.0)
+                .gap(8.0)
+                .center_y()
+                .child(
+                    col()
+                        .grow(1.0)
+                        .shrink()
+                        .min_w(0.0)
+                        .gap(0.5)
+                        .child(
+                            text(srv.name.clone())
+                                .font(ty::SUB_MED)
+                                .color(p.text)
+                                .truncate(),
+                        )
+                        .child(
+                            text(srv.address.clone())
+                                .font(ty::SUB)
+                                .color(p.muted)
+                                .truncate(),
+                        ),
+                )
+                .child(row().gap(4.0).center_y().child(action).child(rm_btn));
+
+            list = list.child(item);
+            if i + 1 < count {
+                list = list.child(rule(1.0, p.line).a11y_hidden());
+            }
+        }
+
+        let scroll = col()
+            .key("known-servers-scroll")
+            .w_full()
+            .grow(1.0)
+            .min_h(0.0)
+            .scroll(ScrollSpec {
+                stick_bottom: false,
+            })
+            .child(list);
+
+        col_el = col_el.child(
+            col()
+                .key("known-servers-sec")
+                .w_full()
+                .grow(1.0)
+                .min_h(0.0)
+                .gap(6.0)
+                .child(section_head(p, "known-servers-head", "Saved servers", None))
+                .child(
+                    card(p, "known-servers-card")
+                        .grow(1.0)
+                        .min_h(0.0)
+                        .child(scroll),
+                ),
+        );
+    }
+
+    col_el
 }
 
 fn client_servers_col(s: &Ui, p: Palette) -> El {
@@ -1380,6 +1509,22 @@ fn input_server_cols(s: &Ui, p: Palette) -> El {
                 s.config.server.sync_lock_keys,
                 |s, _| {
                     s.config.server.sync_lock_keys = !s.config.server.sync_lock_keys;
+                    s.push_config();
+                },
+            ),
+        ),
+        setting_row(
+            p,
+            "srv-pin-media-row",
+            "Keep media & volume keys on this PC",
+            Some("Volume & playback keys stay local"),
+            toggle(
+                p,
+                "srv-pin-media-toggle",
+                "Keep media & volume keys on this PC",
+                s.config.server.pin_media_keys_local,
+                |s, _| {
+                    s.config.server.pin_media_keys_local = !s.config.server.pin_media_keys_local;
                     s.push_config();
                 },
             ),
@@ -2081,23 +2226,19 @@ fn clipboard_page(s: &Ui, p: Palette) -> El {
                 ),
         );
 
-    // Right: Edge drag-and-drop toggle + Send files dropzone + Recent transfers
-    let dnd_toggle_card = card_rows(
+    // Right: Edge drag-and-drop toggle + Send files dropzone + Save folder + Recent transfers
+    let dnd_row = setting_row(
         p,
-        "dnd-toggle-card",
-        vec![setting_row(
+        "dnd-toggle-row",
+        "Drag files across edges",
+        Some("Pull files past a screen edge"),
+        toggle(
             p,
-            "dnd-toggle-row",
+            "dnd-toggle",
             "Drag files across edges",
-            Some("Pull files past a screen edge"),
-            toggle(
-                p,
-                "dnd-toggle",
-                "Drag files across edges",
-                s.config.drag_drop_files,
-                |s, tx| s.toggle_drag_drop_files(tx),
-            ),
-        )],
+            s.config.drag_drop_files,
+            |s, tx| s.toggle_drag_drop_files(tx),
+        ),
     );
 
     let dropzone = col()
@@ -2105,10 +2246,10 @@ fn clipboard_page(s: &Ui, p: Palette) -> El {
         .role("button")
         .label_static("Drop files here or browse")
         .w_full()
-        .h(102.0)
-        .gap(8.0)
+        .h(78.0)
+        .gap(6.0)
         .center()
-        .radius(10.0)
+        .radius(8.0)
         .fill(if s.drop_hover {
             p.accent_soft
         } else {
@@ -2147,8 +2288,8 @@ fn clipboard_page(s: &Ui, p: Palette) -> El {
             );
         })
         .child(
-            el().size(32.0, 32.0)
-                .radius(8.0)
+            el().size(28.0, 28.0)
+                .radius(7.0)
                 .fill(p.surface)
                 .border(1.0, p.line)
                 .center()
@@ -2166,6 +2307,60 @@ fn clipboard_page(s: &Ui, p: Palette) -> El {
                 .child(text("browse").font(ty::LABEL).color(p.accent_text)),
         );
 
+    let has_custom_receive_dir = s.config.receive_dir.is_some();
+    let mut folder_btns = row().gap(5.0).center_y();
+    if has_custom_receive_dir {
+        folder_btns = folder_btns.child(xs_button(
+            p,
+            "receive-dir-reset-btn",
+            "Reset",
+            BtnKind::Ghost,
+            false,
+            |s, tx| s.reset_receive_dir(tx),
+        ));
+    }
+    folder_btns = folder_btns.child(xs_button(
+        p,
+        "receive-dir-open-btn",
+        "Open folder",
+        BtnKind::Default,
+        false,
+        |s, tx| s.open_receive_folder(tx),
+    ));
+
+    let save_folder_row = col()
+        .key("save-folder-row")
+        .w_full()
+        .px(10.0)
+        .py(8.0)
+        .gap(6.0)
+        .child(
+            row()
+                .w_full()
+                .center_y()
+                .justify_between()
+                .gap(8.0)
+                .child(text("Save folder").font(ty::SUB_MED).color(p.text_2))
+                .child(folder_btns),
+        )
+        .child(text_field(
+            p,
+            "receive-dir-input",
+            &s.receive_dir_edit,
+            None,
+            "Downloads/Glide (default)",
+            true,
+            |s| &mut s.receive_dir_edit,
+            Some(|s, _| s.commit_text_fields_and_push()),
+        ));
+
+    let transfer_card = card(p, "send-files-card")
+        .child(dnd_row)
+        .child(rule(1.0, p.line).a11y_hidden())
+        .child(el().w_full().padding(8.0).child(dropzone))
+        .child(rule(1.0, p.line).a11y_hidden())
+        .child(save_folder_row);
+
     let files_body = if s.status.recent_files.is_empty() {
         empty_box(
             p,
@@ -2179,13 +2374,13 @@ fn clipboard_page(s: &Ui, p: Palette) -> El {
         let mut items = col().key("files-items").w_full();
         for (i, f) in s.status.recent_files.iter().take(show).enumerate() {
             let sent = f.direction == "sent";
-            let row_el = row()
+            let mut row_el = row()
                 .key(format!("file-{i}"))
                 .w_full()
                 .min_h(46.0)
                 .px(12.0)
                 .py(8.0)
-                .gap(10.0)
+                .gap(8.0)
                 .center_y()
                 .child(
                     el().size(28.0, 28.0)
@@ -2217,6 +2412,35 @@ fn clipboard_page(s: &Ui, p: Palette) -> El {
                             .truncate(),
                         ),
                 );
+            if let Some(saved_path) = f.saved_path.clone() {
+                let open_path = saved_path.clone();
+                let folder_path = saved_path;
+                row_el = row_el.child(
+                    row()
+                        .gap(4.0)
+                        .center_y()
+                        .child(button(
+                            p,
+                            format!("file-open-{i}"),
+                            "Open",
+                            BtnKind::Default,
+                            24.0,
+                            7.0,
+                            false,
+                            move |s, tx| s.open_received_file(open_path.clone(), tx),
+                        ))
+                        .child(button(
+                            p,
+                            format!("file-folder-{i}"),
+                            "Folder",
+                            BtnKind::Default,
+                            24.0,
+                            7.0,
+                            false,
+                            move |s, tx| s.reveal_received_file(folder_path.clone(), tx),
+                        )),
+                );
+            }
             items = items.child(row_el);
             if i + 1 < show {
                 items = items.child(rule(1.0, p.line).a11y_hidden());
@@ -2240,28 +2464,13 @@ fn clipboard_page(s: &Ui, p: Palette) -> El {
         .min_w(0.0)
         .h_full()
         .min_h(0.0)
-        .gap(14.0)
+        .gap(12.0)
         .child(
             col()
                 .w_full()
                 .gap(7.0)
-                .child(section_head(
-                    p,
-                    "send-head",
-                    "Send files",
-                    Some(
-                        text("Saved to Downloads/Glide")
-                            .font(ty::SUB)
-                            .color(p.faint),
-                    ),
-                ))
-                .child(
-                    col()
-                        .w_full()
-                        .gap(10.0)
-                        .child(dnd_toggle_card)
-                        .child(dropzone),
-                ),
+                .child(section_head(p, "send-head", "File transfer", None))
+                .child(transfer_card),
         )
         .child(
             col()
@@ -2616,18 +2825,51 @@ fn settings_page(s: &Ui, p: Palette) -> El {
             ],
         );
 
-        left_inner = left_inner.child(
-            col()
-                .w_full()
-                .gap(7.0)
-                .child(section_head(
-                    p,
-                    "sec-head",
-                    "Security & firewall",
-                    Some(text("TLS 1.3 · fingerprint").font(ty::SUB).color(p.faint)),
-                ))
-                .child(security_card),
+        let transfers_card = card_rows(
+            p,
+            "adv-transfers-card",
+            vec![setting_row(
+                p,
+                "max-file-mb-row",
+                "Max file size",
+                Some("Single file transfer ceiling (1–4096 MB)"),
+                row()
+                    .gap(6.0)
+                    .center_y()
+                    .child(text_field(
+                        p,
+                        "max-file-mb-input",
+                        &s.max_file_mb_edit,
+                        Some(76.0),
+                        "256",
+                        true,
+                        |s| &mut s.max_file_mb_edit,
+                        Some(|s, _| s.commit_text_fields_and_push()),
+                    ))
+                    .child(text("MB").font(ty::SUB).color(p.muted)),
+            )],
         );
+
+        left_inner = left_inner
+            .child(
+                col()
+                    .w_full()
+                    .gap(7.0)
+                    .child(section_head(
+                        p,
+                        "sec-head",
+                        "Security & firewall",
+                        Some(text("TLS 1.3 · fingerprint").font(ty::SUB).color(p.faint)),
+                    ))
+                    .child(security_card),
+            )
+            .child(
+                col()
+                    .w_full()
+                    .gap(7.0)
+                    .child(section_head(p, "adv-transfers-head", "File transfers", None))
+                    .child(transfers_card),
+            );
     }
 
     let left_col = col()

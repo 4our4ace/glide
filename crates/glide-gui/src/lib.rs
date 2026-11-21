@@ -17,7 +17,7 @@ use glide_core::runtime::{RuntimeCommand, RuntimeState};
 use glide_core::server::run_native_server_with_runtime;
 use glide_net::discovery::{discover_servers, local_ipv4_addresses, machine_hostname};
 use glide_net::tls::ServerIdentity;
-use glide_proto::{Edge, MAX_FILE_BYTES};
+use glide_proto::Edge;
 use parking_lot::Mutex;
 use serde_json::json;
 use std::io::{Read, Write};
@@ -55,6 +55,9 @@ struct AppController {
     config: Mutex<GlideConfigFile>,
     runtime: RuntimeState,
     engine: Mutex<Option<ActiveEngine>>,
+    /// Serializes async `start_engine` / `stop_engine` transitions so rapid profile clicks
+    /// cannot race and orphan an active engine task.
+    engine_lock: tokio::sync::Mutex<()>,
     fingerprint: Mutex<Option<String>>,
     url: String,
     favicon_png: OnceLock<Vec<u8>>,
@@ -84,6 +87,7 @@ impl AppController {
             config: Mutex::new(cfg),
             runtime,
             engine: Mutex::new(None),
+            engine_lock: tokio::sync::Mutex::new(()),
             fingerprint: Mutex::new(None),
             url,
             favicon_png: OnceLock::new(),
@@ -141,6 +145,11 @@ impl AppController {
     }
 
     async fn stop_engine(&self) {
+        let _guard = self.engine_lock.lock().await;
+        self.stop_engine_locked().await;
+    }
+
+    async fn stop_engine_locked(&self) {
         let active = self.engine.lock().take();
         if let Some(active) = active {
             let _ = active.cmd_tx.send(RuntimeCommand::Shutdown);
@@ -160,6 +169,7 @@ impl AppController {
             s.status = "Idle".into();
             s.active_target = "Local".into();
             s.locked = false;
+            s.remote_fingerprint = None;
             s.rtt_ms = None;
             s.rtt_history.clear();
             s.peers.clear();
@@ -170,7 +180,8 @@ impl AppController {
         if role != "server" && role != "client" {
             anyhow::bail!("unknown role '{role}'");
         }
-        self.stop_engine().await;
+        let _guard = self.engine_lock.lock().await;
+        self.stop_engine_locked().await;
         let cfg = {
             let mut guard = self.config.lock();
             guard.last_role = Some(role.to_owned());
@@ -184,7 +195,7 @@ impl AppController {
 
         let task = match role {
             "server" => {
-                let mut scfg = cfg.server;
+                let mut scfg = cfg.effective_server_config();
                 scfg.drag_drop_files = cfg.drag_drop_files;
                 let rt_err = rt.clone();
                 tokio::spawn(async move {
@@ -201,8 +212,9 @@ impl AppController {
                 })
             }
             "client" => {
-                let mut ccfg = cfg.client;
+                let mut ccfg = cfg.effective_client_config();
                 ccfg.drag_drop_files = cfg.drag_drop_files;
+                ccfg.known_servers_path = Some(self.known_servers_path());
                 let rt_err = rt.clone();
                 tokio::spawn(async move {
                     if let Err(e) =
@@ -222,6 +234,10 @@ impl AppController {
 
         *self.engine.lock() = Some(ActiveEngine { task, cmd_tx });
         Ok(())
+    }
+
+    fn known_servers_path(&self) -> PathBuf {
+        glide_core::config::known_servers_path_for_config(&self.config_path)
     }
 
     fn send_cmd(&self, cmd: RuntimeCommand) -> bool {
@@ -244,13 +260,20 @@ impl AppController {
         }
         new_cfg.server.drag_drop_files = new_cfg.drag_drop_files;
         new_cfg.client.drag_drop_files = new_cfg.drag_drop_files;
+        new_cfg.max_file_mb = new_cfg.max_file_mb_clamped();
+        new_cfg.receive_dir =
+            GlideConfigFile::normalized_receive_dir(new_cfg.receive_dir.as_deref());
         new_cfg.save(&self.config_path)?;
         self.runtime.set_record_history(new_cfg.clipboard_history);
+        let max_file_bytes = new_cfg.max_file_bytes();
+        let receive_dir = new_cfg.receive_dir.clone();
         let s = new_cfg.server.clone();
         let c = new_cfg.client.clone();
         *self.config.lock() = new_cfg;
 
         let locked = self.runtime.read(|s| s.locked);
+        self.send_cmd(RuntimeCommand::UpdateMaxFileBytes(max_file_bytes));
+        self.send_cmd(RuntimeCommand::UpdateReceiveDir(receive_dir));
         self.send_cmd(RuntimeCommand::UpdateServerTuning {
             edge_threshold_px: s.edge_threshold_px,
             dead_corner_px: s.dead_corner_px,
@@ -258,6 +281,7 @@ impl AppController {
             auto_lock_fullscreen: s.auto_lock_fullscreen,
             locked,
             sync_lock_keys: s.sync_lock_keys,
+            pin_media_keys_local: s.pin_media_keys_local,
             clipboard: s.clipboard,
             drag_drop_files: s.drag_drop_files,
         });
@@ -274,6 +298,26 @@ impl AppController {
             key_remap: c.key_remap,
         });
         Ok(())
+    }
+}
+
+struct GuiIpcBackend(Arc<AppController>);
+
+impl glide_core::ipc::IpcBackend for GuiIpcBackend {
+    fn status(&self) -> glide_core::ipc::IpcStatus {
+        glide_core::ipc::IpcStatus::from(self.0.runtime.snapshot())
+    }
+
+    fn max_file_bytes(&self) -> usize {
+        self.0.config.lock().max_file_bytes()
+    }
+
+    fn send_command(&self, cmd: RuntimeCommand) -> Result<()> {
+        if self.0.send_cmd(cmd) {
+            Ok(())
+        } else {
+            anyhow::bail!("Glide is not currently running")
+        }
     }
 }
 
@@ -501,6 +545,20 @@ pub fn run_gui_blocking(opts: GuiOptions) -> Result<()> {
         None
     };
 
+    let mut ipc_handle = if !headless_snap {
+        match rt.block_on(glide_core::ipc::start_default_ipc(Arc::new(GuiIpcBackend(
+            Arc::clone(&ctrl),
+        )))) {
+            Ok(h) => Some(h),
+            Err(e) => {
+                warn!(error = %e, "Local control IPC unavailable; continuing without `glide ctl`");
+                None
+            }
+        }
+    } else {
+        None
+    };
+
     info!(%url, "Glide GUI ready");
 
     let mut server = Some(rt.spawn(serve(listener, Arc::clone(&ctrl), quit_rx)));
@@ -533,6 +591,7 @@ pub fn run_gui_blocking(opts: GuiOptions) -> Result<()> {
         }
     }
 
+    drop(ipc_handle.take());
     let _ = ctrl.quit_tx.send(());
     rt.block_on(async {
         if let Some(task) = server.take() {
@@ -864,7 +923,7 @@ async fn handle_http_conn(mut stream: TcpStream, ctrl: Arc<AppController>) -> Re
     }
 
     let max_body_bytes = if method == "POST" && path == "/api/send-file" {
-        MAX_FILE_BYTES
+        ctrl.config.lock().max_file_bytes()
     } else {
         MAX_CONTROL_BODY_BYTES
     };
@@ -887,7 +946,7 @@ async fn handle_http_conn(mut stream: TcpStream, ctrl: Arc<AppController>) -> Re
         body.extend_from_slice(&buf[body_start..body_start + take]);
     }
     if body.len() < content_len {
-        let mut tmp = vec![0u8; 64 * 1024];
+        let mut tmp = vec![0u8; (content_len - body.len()).min(64 * 1024)];
         let read_res = tokio::time::timeout(HTTP_IO_TIMEOUT, async {
             while body.len() < content_len {
                 let to_read = (content_len - body.len()).min(tmp.len());
@@ -1495,5 +1554,85 @@ mod tests {
 
         srv.await.unwrap();
         let _ = std::fs::remove_file(&tmp_cfg);
+    }
+
+    #[tokio::test]
+    async fn gui_http_enforces_route_body_limits() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let url = format!("http://127.0.0.1:{}", addr.port());
+        let tmp_cfg = std::env::temp_dir().join(format!(
+            "glide-gui-limit-test-{}.toml",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&tmp_cfg);
+        let (quit_tx, _quit_rx) = mpsc::unbounded_channel();
+        let ctrl = Arc::new(AppController::new(tmp_cfg, url, quit_tx));
+        ctrl.config.lock().max_file_mb = 4; // 4 MiB for /api/send-file
+
+        let srv_ctrl = Arc::clone(&ctrl);
+        let srv = tokio::spawn(async move {
+            for _ in 0..3 {
+                let (stream, _) = listener.accept().await.unwrap();
+                let _ = handle_http_conn(stream, Arc::clone(&srv_ctrl)).await;
+            }
+        });
+
+        // 1. Non-file route declaring > 1 MiB is rejected with 413 even when max_file_mb is 4 MiB
+        let mut s1 = TcpStream::connect(addr).await.unwrap();
+        s1.write_all(
+            format!(
+                "POST /api/config HTTP/1.1\r\nHost: 127.0.0.1:{}\r\nContent-Length: {}\r\n\r\n",
+                addr.port(),
+                2 * 1024 * 1024
+            )
+            .as_bytes(),
+        )
+        .await
+        .unwrap();
+        let mut r1 = String::new();
+        s1.read_to_string(&mut r1).await.unwrap();
+        assert!(r1.starts_with("HTTP/1.1 413 Payload Too Large"), "got: {r1}");
+
+        // 2. /api/send-file declaring > max_file_bytes (4 MiB) is rejected with 413
+        let mut s2 = TcpStream::connect(addr).await.unwrap();
+        s2.write_all(
+            format!(
+                "POST /api/send-file HTTP/1.1\r\nHost: 127.0.0.1:{}\r\nContent-Length: {}\r\n\r\n",
+                addr.port(),
+                5 * 1024 * 1024
+            )
+            .as_bytes(),
+        )
+        .await
+        .unwrap();
+        let mut r2 = String::new();
+        s2.read_to_string(&mut r2).await.unwrap();
+        assert!(r2.starts_with("HTTP/1.1 413 Payload Too Large"), "got: {r2}");
+
+        // 3. /api/send-file within max_file_bytes (e.g. 1.5 MiB) passes the body-size check
+        // (and returns 400 "Glide is not currently running" instead of 413)
+        let mut s3 = TcpStream::connect(addr).await.unwrap();
+        let payload_len = 1536 * 1024;
+        s3.write_all(
+            format!(
+                "POST /api/send-file HTTP/1.1\r\nHost: 127.0.0.1:{}\r\nX-Filename: big.bin\r\nContent-Length: {}\r\n\r\n",
+                addr.port(),
+                payload_len
+            )
+            .as_bytes(),
+        )
+        .await
+        .unwrap();
+        let chunk = vec![0x5Au8; 64 * 1024];
+        for _ in 0..(payload_len / chunk.len()) {
+            s3.write_all(&chunk).await.unwrap();
+        }
+        let mut r3 = String::new();
+        s3.read_to_string(&mut r3).await.unwrap();
+        assert!(r3.starts_with("HTTP/1.1 400 Bad Request"), "got: {r3}");
+        assert!(r3.contains("not currently running"));
+
+        srv.await.unwrap();
     }
 }

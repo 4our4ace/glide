@@ -19,14 +19,14 @@ use crate::resilience::{HealthProbe, SleepDetector};
 use crate::runtime::{save_received_file, PeerSummary, RuntimeCommand, RuntimeState};
 use anyhow::Result;
 use glide_backend::dnd::{DndBackend, NoopDndBackend};
-use glide_backend::os_integration::file_receive_dir;
+use glide_backend::os_integration::resolve_receive_dir;
 use glide_backend::{CaptureEvent, CaptureHandle, ClipboardHandle};
 use glide_hid::{HidUsage, ModifierMask, MouseButton};
 use glide_net::discovery::{local_ipv4_addresses, spawn_server_beacon_with_refresh};
 use glide_net::tls::ServerIdentity;
 use glide_net::{
-    recv_bulk_stream, send_clipboard_on, send_file_on, sha256_bytes, Connection,
-    GlideServerEndpoint, GlideSession,
+    recv_bulk_stream_with_atomic_limit, send_clipboard_on, send_file_on_with_limit, sha256_bytes,
+    Connection, GlideServerEndpoint, GlideSession,
 };
 use glide_proto::{
     BulkTransfer, ClipboardPayload, ControlMessage, DatagramMessage, Edge, FilePayload, LockState,
@@ -35,7 +35,7 @@ use glide_proto::{
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::{mpsc, Notify};
@@ -142,6 +142,7 @@ pub async fn run_server_with_dnd(
             s.local_addr = Some(local_addr.to_string());
             s.local_ips = last_local_ips.clone();
             s.fingerprint = Some(fingerprint.clone());
+            s.remote_fingerprint = None;
             s.geometry = geom.clone();
             s.last_error = None;
         });
@@ -182,15 +183,18 @@ pub async fn run_server_with_dnd(
     };
 
     let (peer_tx, mut peer_rx) = mpsc::unbounded_channel::<PeerEvent>();
+    let max_file_bytes = Arc::new(AtomicUsize::new(config.resolved_max_file_bytes()));
 
     let server_name = config.name.clone();
     let accept_tx = peer_tx.clone();
     let accept_scale = Arc::clone(&server_scale);
+    let accept_max_file_bytes = Arc::clone(&max_file_bytes);
     let _accept_guard = AbortOnDrop(tokio::spawn(async move {
         while let Some(incoming) = endpoint.accept_incoming().await {
             let sname = server_name.clone();
             let tx = accept_tx.clone();
             let scale = f32::from_bits(accept_scale.load(Ordering::Relaxed));
+            let limit = Arc::clone(&accept_max_file_bytes);
             tokio::spawn(async move {
                 let session = match tokio::time::timeout(
                     Duration::from_secs(5),
@@ -208,7 +212,7 @@ pub async fn run_server_with_dnd(
                         return;
                     }
                 };
-                if let Err(e) = handle_incoming_session(session, sname, scale, tx).await {
+                if let Err(e) = handle_incoming_session(session, sname, scale, tx, limit).await {
                     warn!(error = %e, "Incoming client handshake failed");
                 }
             });
@@ -454,6 +458,7 @@ pub async fn run_server_with_dnd(
                         auto_lock_fullscreen,
                         locked: new_locked,
                         sync_lock_keys,
+                        pin_media_keys_local,
                         clipboard: clip_enabled,
                         drag_drop_files,
                     } => {
@@ -462,6 +467,7 @@ pub async fn run_server_with_dnd(
                         config.edge_dwell_ms = edge_dwell_ms;
                         config.auto_lock_fullscreen = auto_lock_fullscreen;
                         config.sync_lock_keys = sync_lock_keys;
+                        config.pin_media_keys_local = pin_media_keys_local;
                         config.clipboard = clip_enabled;
                         config.drag_drop_files = drag_drop_files;
                         locked = new_locked;
@@ -474,6 +480,7 @@ pub async fn run_server_with_dnd(
                         );
                         capture_ctrl.set_sync_lock_keys(sync_lock_keys);
                         capture_ctrl.set_drag_drop_files(drag_drop_files);
+                        capture_ctrl.set_pin_media_keys_local(pin_media_keys_local);
                         dnd.set_enabled(drag_drop_files);
                         let edges: Vec<Edge> = edge_to_peer.keys().copied().collect();
                         dnd.set_active_edges(&edges, dead_corner_px);
@@ -494,16 +501,40 @@ pub async fn run_server_with_dnd(
                         info!(locked, "Toggled cursor lock");
                         sync_runtime_peers(&runtime, &peers, active_remote, locked);
                     }
-                    RuntimeCommand::SwitchToEdge(edge) => {
+                    RuntimeCommand::SetLock(new_locked) => {
+                        locked = new_locked;
+                        capture_ctrl.update_tuning(
+                            config.edge_threshold_px,
+                            config.dead_corner_px,
+                            config.edge_dwell_ms,
+                            config.auto_lock_fullscreen,
+                            locked,
+                        );
+                        if locked {
+                            dnd.set_drag_armed(false);
+                        }
+                        info!(locked, "Updated cursor lock state");
+                        sync_runtime_peers(&runtime, &peers, active_remote, locked);
+                    }
+                    RuntimeCommand::SwitchToEdge(edge)
+                    | RuntimeCommand::SwitchTarget(Some(edge)) => {
                         if let Some(&peer_id) = edge_to_peer.get(&edge) {
                             if active_remote == Some(peer_id) {
                                 continue;
                             }
-                            if let Some(old_pid) = active_remote.take() {
-                                if let Some(old_peer) = peers.get(&old_pid) {
-                                    let _ = old_peer.ctrl_tx.send(ControlMessage::ReleaseAll);
-                                    let _ = old_peer.ctrl_tx.send(ControlMessage::Leave {
-                                        edge: old_peer.edge.opposite(),
+                            if let Some(out) = outgoing_drag.take() {
+                                if let Some(old_peer) = peers.get(&out.peer_id) {
+                                    let _ = old_peer
+                                        .ctrl_tx
+                                        .send(ControlMessage::DragCancel { drag_id: out.drag_id });
+                                }
+                            }
+                            let was_remote = active_remote.is_some();
+                            if let Some(prev_pid) = active_remote {
+                                if let Some(prev_peer) = peers.get(&prev_pid) {
+                                    let _ = prev_peer.ctrl_tx.send(ControlMessage::ReleaseAll);
+                                    let _ = prev_peer.ctrl_tx.send(ControlMessage::Leave {
+                                        edge: prev_peer.edge.opposite(),
                                         normalized_pos: 0.5,
                                         cursor_norm_x: 0.5,
                                         cursor_norm_y: 0.5,
@@ -523,7 +554,11 @@ pub async fn run_server_with_dnd(
                                 pending_dy = 0.0;
                                 coalesce_armed = false;
                                 dnd.set_drag_armed(false);
-                                let _ = capture_ctrl.enter_remote();
+                                // Only enter remote mode on local -> remote transition so we do not
+                                // overwrite the saved local cursor position (e.g. Windows last_local_norm).
+                                if !was_remote {
+                                    let _ = capture_ctrl.enter_remote();
+                                }
                                 let (nx, ny) = peer.last_cursor_norm;
                                 let _ = peer.ctrl_tx.send(ControlMessage::EnterAt {
                                     norm_x: nx,
@@ -534,7 +569,7 @@ pub async fn run_server_with_dnd(
                             }
                         }
                     }
-                    RuntimeCommand::ReturnLocal => {
+                    RuntimeCommand::ReturnLocal | RuntimeCommand::SwitchTarget(None) => {
                         if let Some(out) = outgoing_drag.take() {
                             if let Some(peer) = peers.get(&out.peer_id) {
                                 let _ = peer
@@ -552,34 +587,60 @@ pub async fn run_server_with_dnd(
                                     cursor_norm_y: 0.5,
                                 });
                             }
+                            active_edge = None;
+                            remote_modifiers = ModifierMask::EMPTY;
+                            pending_dx = 0.0;
+                            pending_dy = 0.0;
+                            coalesce_armed = false;
+                            let (lx, ly) = capture_ctrl.last_local_cursor_norm();
+                            let _ = capture_ctrl.leave_remote_at(lx, ly);
+                            sync_runtime_peers(&runtime, &peers, active_remote, locked);
                         }
-                        active_edge = None;
-                        remote_modifiers = ModifierMask::EMPTY;
-                        pending_dx = 0.0;
-                        pending_dy = 0.0;
-                        coalesce_armed = false;
-                        let (lx, ly) = capture_ctrl.last_local_cursor_norm();
-                        let _ = capture_ctrl.leave_remote_at(lx, ly);
-                        sync_runtime_peers(&runtime, &peers, active_remote, locked);
                     }
                     RuntimeCommand::SendFile { filename, data } => {
-                        let payload = FilePayload {
-                            filename: filename.clone(),
-                            sha256: sha256_bytes(&data),
-                            data,
-                        };
-                        if let Some(ref rt) = runtime {
-                            rt.record_file("sent", filename, payload.data.len(), None);
-                        }
-                        for peer in peers.values() {
-                            let conn = peer.conn.clone();
-                            let p = payload.clone();
+                        let limit = max_file_bytes.load(Ordering::Relaxed);
+                        if data.len() > limit {
+                            warn!(
+                                file = %filename,
+                                bytes = data.len(),
+                                limit,
+                                "Refusing to send file exceeding max_file_bytes limit"
+                            );
+                        } else if peers.is_empty() {
+                            warn!(file = %filename, "Cannot send file: no connected peers");
+                        } else {
+                            let byte_len = data.len();
+                            let payload = FilePayload {
+                                filename: filename.clone(),
+                                sha256: sha256_bytes(&data),
+                                data,
+                            };
+                            let conns: Vec<Connection> =
+                                peers.values().map(|p| p.conn.clone()).collect();
+                            let rt_opt = runtime.clone();
                             tokio::spawn(async move {
-                                if let Err(e) = send_file_on(&conn, &p).await {
-                                    warn!(error = %e, "Failed beaming file to client");
+                                let mut any_sent = false;
+                                for conn in conns {
+                                    match send_file_on_with_limit(&conn, &payload, limit).await {
+                                        Ok(()) => any_sent = true,
+                                        Err(e) => warn!(error = %e, "Failed beaming file to client"),
+                                    }
+                                }
+                                if any_sent {
+                                    if let Some(rt) = rt_opt {
+                                        rt.record_file("sent", filename, byte_len, None);
+                                    }
                                 }
                             });
                         }
+                    }
+                    RuntimeCommand::UpdateMaxFileBytes(limit) => {
+                        let effective = limit.min(u32::MAX as usize);
+                        config.max_file_bytes = Some(effective);
+                        max_file_bytes.store(effective, Ordering::Relaxed);
+                    }
+                    RuntimeCommand::UpdateReceiveDir(dir) => {
+                        config.receive_dir = dir;
                     }
                     RuntimeCommand::ResendClipboard(id) => {
                         if let Some(ref rt) = runtime {
@@ -1286,12 +1347,13 @@ pub async fn run_server_with_dnd(
                                 let byte_len = data.len();
                                 let rt_clone = runtime.clone();
                                 let rdir_override = receive_dir.clone();
+                                let cfg_receive_dir = config.receive_dir.clone();
                                 tokio::spawn(async move {
                                     let fname_for_save = filename.clone();
                                     let saved = tokio::task::spawn_blocking(move || {
                                         let dir_res = match rdir_override {
                                             Some(d) => Ok(d),
-                                            None => file_receive_dir(),
+                                            None => resolve_receive_dir(cfg_receive_dir.as_deref()),
                                         };
                                         dir_res.and_then(|dir| {
                                             save_received_file(&dir, &fname_for_save, &data)
@@ -1442,6 +1504,7 @@ async fn handle_incoming_session(
     server_name: String,
     server_scale: f32,
     peer_tx: mpsc::UnboundedSender<PeerEvent>,
+    max_file_bytes: Arc<AtomicUsize>,
 ) -> Result<()> {
     let hello = tokio::time::timeout(Duration::from_secs(5), session.ctrl_recv.recv()).await??;
     let (peer_name, edge, os) = match hello {
@@ -1502,8 +1565,9 @@ async fn handle_incoming_session(
 
     let bulk_conn = conn.clone();
     let bulk_tx = peer_tx.clone();
+    let bulk_limit = Arc::clone(&max_file_bytes);
     let _bulk_guard = AbortOnDrop(tokio::spawn(async move {
-        let sem = std::sync::Arc::new(tokio::sync::Semaphore::new(4));
+        let sem = Arc::new(tokio::sync::Semaphore::new(4));
         loop {
             let uni = match bulk_conn.accept_uni().await {
                 Ok(u) => u,
@@ -1513,9 +1577,10 @@ async fn handle_incoming_session(
                 break;
             };
             let tx = bulk_tx.clone();
+            let limit = Arc::clone(&bulk_limit);
             tokio::spawn(async move {
                 let _permit = permit;
-                match recv_bulk_stream(uni).await {
+                match recv_bulk_stream_with_atomic_limit(uni, &limit).await {
                     Ok(transfer) => {
                         let _ = tx.send(PeerEvent::Bulk { peer_id, transfer });
                     }
@@ -1580,6 +1645,7 @@ pub async fn run_native_server_with_runtime(
         enable_hotkeys: config.enable_hotkeys,
         sync_lock_keys: config.sync_lock_keys,
         drag_drop_files: config.drag_drop_files,
+        pin_media_keys_local: config.pin_media_keys_local,
     })?;
 
     let clipboard = if config.clipboard {

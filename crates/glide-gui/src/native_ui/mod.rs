@@ -7,16 +7,19 @@ mod widgets;
 
 use crate::updater::{self, UpdateCheckState};
 use crate::{launch_browser_window, AppController, GUI_HEIGHT, GUI_WIDTH};
-use bytes::Bytes;
 use glide_backend::os_integration::{
-    configure_elevated_task, configure_firewall, is_autostart_enabled, set_autostart,
+    configure_elevated_task, configure_firewall, ensure_receive_dir, is_autostart_enabled,
+    open_path_in_os, resolve_receive_dir, reveal_in_file_manager, set_autostart,
 };
-use glide_core::config::{GlideConfigFile, KeyRemapRule};
+use glide_core::config::{
+    list_known_servers, remove_known_server, GlideConfigFile, KeyRemapRule, KnownServer,
+};
 use glide_core::runtime::{
-    ClipboardHistoryEntry, FileTransferEntry, PeerSummary, RuntimeCommand, StatusSnapshot,
+    read_regular_file_bounded, ClipboardHistoryEntry, FileTransferEntry, PeerSummary,
+    RuntimeCommand, StatusSnapshot,
 };
 use glide_net::discovery::{discover_servers, local_ipv4_addresses, machine_hostname};
-use glide_proto::{ClipboardFormat, Edge, OsKind, MAX_FILE_BYTES};
+use glide_proto::{ClipboardFormat, Edge, OsKind};
 use rune::{App, AppHandle, AppSpec, Cx, El, Key, KeyEvent, TextEdit, Tx, WindowOptions};
 use std::borrow::Cow;
 use std::path::PathBuf;
@@ -168,6 +171,7 @@ pub struct Ui {
     pub theme: ThemePref,
     pub selected_peer_name: Option<String>,
     pub discovered: Vec<DiscoveredPeer>,
+    pub known_servers: Vec<KnownServer>,
     pub scanning: bool,
     pub show_advanced: bool,
     pub update_state: UpdateCheckState,
@@ -175,10 +179,14 @@ pub struct Ui {
     // Editable text fields + last committed snapshots
     pub port_edit: TextEdit,
     pub server_edit: TextEdit,
+    pub max_file_mb_edit: TextEdit,
+    pub receive_dir_edit: TextEdit,
     pub remap_from: TextEdit,
     pub remap_to: TextEdit,
     last_committed_port: String,
     last_committed_server: String,
+    last_committed_max_file_mb: String,
+    last_committed_receive_dir: String,
 
     // Transient UI state
     toast: Option<(String, Option<Instant>)>,
@@ -204,6 +212,7 @@ impl Ui {
         let tray_active = ctrl.tray_active.load(Ordering::SeqCst);
         let autostart = is_autostart_enabled();
         let local_ips = local_ipv4_addresses();
+        let known_servers = list_known_servers(&ctrl.known_servers_path()).unwrap_or_default();
 
         let doctor_display = "Detecting display…".to_owned();
         let doctor_text =
@@ -211,6 +220,8 @@ impl Ui {
 
         let port_str = cfg.server.bind.port().to_string();
         let server_str = cfg.client.server.clone().unwrap_or_default();
+        let max_file_mb_str = cfg.max_file_mb_clamped().to_string();
+        let receive_dir_str = cfg.receive_dir.clone().unwrap_or_default();
         let role = if status.mode == "client" {
             Role::Client
         } else if status.mode == "server" {
@@ -244,15 +255,20 @@ impl Ui {
             theme: ThemePref::load(),
             selected_peer_name: None,
             discovered: Vec::new(),
+            known_servers,
             scanning: false,
             show_advanced: false,
             update_state: UpdateCheckState::Idle,
             port_edit: TextEdit::new(&port_str),
             server_edit: TextEdit::new(&server_str),
+            max_file_mb_edit: TextEdit::new(&max_file_mb_str),
+            receive_dir_edit: TextEdit::new(&receive_dir_str),
             remap_from: TextEdit::default(),
             remap_to: TextEdit::default(),
             last_committed_port: port_str,
             last_committed_server: server_str,
+            last_committed_max_file_mb: max_file_mb_str,
+            last_committed_receive_dir: receive_dir_str,
             toast: None,
             dismissed_error: None,
             desk_drag: None,
@@ -357,6 +373,9 @@ impl Ui {
     }
 
     fn apply_status(&mut self, snap: StatusSnapshot) {
+        let newly_connected_client = snap.mode == "client"
+            && snap.status.starts_with("Connected")
+            && (self.status.status != snap.status || self.status.local_addr != snap.local_addr);
         if snap.mode == "server" {
             self.role = Role::Server;
         } else if snap.mode == "client" {
@@ -369,6 +388,13 @@ impl Ui {
             self.dismissed_error = None;
         }
         self.status = snap;
+        if newly_connected_client {
+            self.refresh_known_servers();
+        }
+    }
+
+    pub fn refresh_known_servers(&mut self) {
+        self.known_servers = list_known_servers(&self.ctrl.known_servers_path()).unwrap_or_default();
     }
 
     fn apply_status_if_newer(&mut self, rev: u64, snap: StatusSnapshot) -> bool {
@@ -398,35 +424,102 @@ impl Ui {
         }
     }
 
-    pub fn commit_text_fields(&mut self) -> bool {
+    fn commit_text_fields_inner(&mut self, include_focused: bool) -> bool {
         let mut changed = false;
-        let port_raw = self.port_edit.text.trim();
-        if port_raw != self.last_committed_port {
-            if let Ok(p) = port_raw.parse::<u16>() {
-                if p >= 1024 {
-                    self.config.server.bind.set_port(p);
-                    self.last_committed_port.clear();
-                    self.last_committed_port.push_str(port_raw);
-                    changed = true;
+        if include_focused || !self.port_edit.focused {
+            let port_raw = self.port_edit.text.trim();
+            if port_raw != self.last_committed_port {
+                if let Ok(p) = port_raw.parse::<u16>() {
+                    if p >= 1024 {
+                        self.config.server.bind.set_port(p);
+                        self.last_committed_port.clear();
+                        self.last_committed_port.push_str(port_raw);
+                        changed = true;
+                    }
                 }
             }
         }
-        let srv_raw = self.server_edit.text.trim();
-        if srv_raw != self.last_committed_server {
-            self.config.client.server = if srv_raw.is_empty() {
-                None
-            } else {
-                Some(srv_raw.to_owned())
-            };
-            self.last_committed_server.clear();
-            self.last_committed_server.push_str(srv_raw);
-            changed = true;
+        if include_focused || !self.server_edit.focused {
+            let srv_raw = self.server_edit.text.trim();
+            if srv_raw != self.last_committed_server {
+                self.config.client.server = if srv_raw.is_empty() {
+                    None
+                } else {
+                    Some(srv_raw.to_owned())
+                };
+                self.config.client.trusted_fingerprint = None;
+                self.last_committed_server.clear();
+                self.last_committed_server.push_str(srv_raw);
+                changed = true;
+            }
+        }
+        if include_focused || !self.max_file_mb_edit.focused {
+            changed |= self.commit_max_file_mb();
+        }
+        if include_focused || !self.receive_dir_edit.focused {
+            changed |= self.commit_receive_dir();
         }
         changed
     }
 
+    pub fn commit_text_fields(&mut self) -> bool {
+        self.commit_text_fields_inner(false)
+    }
+
+    pub fn commit_all_text_fields(&mut self) -> bool {
+        self.commit_text_fields_inner(true)
+    }
+
+    pub fn commit_max_file_mb(&mut self) -> bool {
+        let raw = self.max_file_mb_edit.text.trim().to_owned();
+        if raw == self.last_committed_max_file_mb {
+            return false;
+        }
+        if let Ok(parsed) = raw.parse::<u32>() {
+            let clamped = GlideConfigFile::clamp_max_file_mb(parsed);
+            let normalized = clamped.to_string();
+            self.config.max_file_mb = clamped;
+            if self.max_file_mb_edit.text != normalized {
+                self.max_file_mb_edit = TextEdit::new(&normalized);
+            }
+            self.last_committed_max_file_mb = normalized;
+            true
+        } else {
+            let prev = self.last_committed_max_file_mb.clone();
+            self.max_file_mb_edit = TextEdit::new(&prev);
+            false
+        }
+    }
+
+    pub fn commit_receive_dir(&mut self) -> bool {
+        let raw = self.receive_dir_edit.text.trim().to_owned();
+        if raw == self.last_committed_receive_dir {
+            return false;
+        }
+        if raw.is_empty() {
+            self.config.receive_dir = None;
+            if !self.receive_dir_edit.text.is_empty() {
+                self.receive_dir_edit = TextEdit::new("");
+            }
+            self.last_committed_receive_dir.clear();
+            return true;
+        }
+        if resolve_receive_dir(Some(&raw)).is_ok() {
+            self.config.receive_dir = Some(raw.clone());
+            if self.receive_dir_edit.text != raw {
+                self.receive_dir_edit = TextEdit::new(&raw);
+            }
+            self.last_committed_receive_dir = raw;
+            true
+        } else {
+            let prev = self.last_committed_receive_dir.clone();
+            self.receive_dir_edit = TextEdit::new(&prev);
+            false
+        }
+    }
+
     pub fn commit_text_fields_and_push(&mut self) {
-        if self.commit_text_fields() {
+        if self.commit_all_text_fields() {
             self.push_config();
         }
     }
@@ -451,7 +544,7 @@ impl Ui {
             });
         } else {
             let role = self.role;
-            self.commit_text_fields();
+            self.commit_all_text_fields();
             self.config.last_role = Some(role.as_str().to_owned());
             self.config.auto_start_on_launch = true;
             self.push_config();
@@ -661,6 +754,46 @@ impl Ui {
         });
     }
 
+    pub fn connect_known_server(&mut self, srv: KnownServer, tx: &mut Tx) {
+        self.role = Role::Client;
+        self.config.last_role = Some("client".into());
+        self.config.auto_start_on_launch = true;
+        self.config.client.server = Some(srv.address.clone());
+        self.config.client.trusted_fingerprint = srv.fingerprint.clone();
+        self.config.client.edge = srv.edge;
+        self.server_edit = TextEdit::new(&srv.address);
+        self.last_committed_server = srv.address.clone();
+        self.push_config();
+        self.toast(format!("Connecting to {}…", srv.name), tx);
+
+        let ctrl = Arc::clone(&self.ctrl);
+        let handle = self.handle.clone();
+        self.rt.spawn(async move {
+            if let Err(e) = ctrl.start_engine("client").await {
+                let msg = format!("Error: {e}");
+                if let Some(h) = handle {
+                    h.update(move |s, tx| s.toast(msg, tx));
+                }
+            }
+        });
+    }
+
+    pub fn forget_known_server(&mut self, addr: String, tx: &mut Tx) {
+        let path = self.ctrl.known_servers_path();
+        match remove_known_server(&path, &addr) {
+            Ok(true) => {
+                self.refresh_known_servers();
+                self.toast("Removed saved server", tx);
+            }
+            Ok(false) => {
+                self.refresh_known_servers();
+            }
+            Err(e) => {
+                self.toast(format!("Could not remove server: {e}"), tx);
+            }
+        }
+    }
+
     pub fn add_remap_rule(&mut self, from: &str, to: &str, tx: &mut Tx) {
         let from = from.trim();
         let to = to.trim();
@@ -765,41 +898,25 @@ impl Ui {
         if paths.is_empty() {
             return;
         }
+        let max_file_bytes = self.config.max_file_bytes();
         let ctrl = Arc::clone(&self.ctrl);
         let handle = self.handle.clone();
         self.rt.spawn_blocking(move || {
             for path in paths {
-                let filename = path
+                let display_name = path
                     .file_name()
                     .and_then(|n| n.to_str())
                     .unwrap_or("glide-transfer.bin")
                     .to_owned();
                 if let Some(ref h) = handle {
-                    let msg = format!("Sending {filename}…");
+                    let msg = format!("Sending {display_name}…");
                     h.update(move |s, tx| s.toast(msg, tx));
                 }
-                match std::fs::metadata(&path) {
-                    Ok(meta) if meta.len() as usize > MAX_FILE_BYTES => {
-                        if let Some(ref h) = handle {
-                            let msg = format!("{filename} exceeds the 256 MB limit");
-                            h.update(move |s, tx| s.toast(msg, tx));
-                        }
-                        continue;
-                    }
-                    Err(e) => {
-                        if let Some(ref h) = handle {
-                            let msg = format!("Could not read {filename}: {e}");
-                            h.update(move |s, tx| s.toast(msg, tx));
-                        }
-                        continue;
-                    }
-                    Ok(_) => {}
-                }
-                match std::fs::read(&path) {
-                    Ok(data) => {
+                match read_regular_file_bounded(&path, max_file_bytes) {
+                    Ok((filename, data)) => {
                         let ok = ctrl.send_cmd(RuntimeCommand::SendFile {
                             filename: filename.clone(),
-                            data: Bytes::from(data),
+                            data,
                         });
                         if let Some(ref h) = handle {
                             let msg = if ok {
@@ -812,7 +929,7 @@ impl Ui {
                     }
                     Err(e) => {
                         if let Some(ref h) = handle {
-                            let msg = format!("Failed reading {filename}: {e}");
+                            let msg = format!("Could not send {display_name}: {e}");
                             h.update(move |s, tx| s.toast(msg, tx));
                         }
                     }
@@ -820,6 +937,57 @@ impl Ui {
             }
         });
         let _ = tx;
+    }
+
+    pub fn reset_receive_dir(&mut self, tx: &mut Tx) {
+        self.config.receive_dir = None;
+        self.receive_dir_edit = TextEdit::new("");
+        self.last_committed_receive_dir.clear();
+        self.push_config();
+        self.toast("Save folder reset to Downloads/Glide", tx);
+    }
+
+    pub fn open_receive_folder(&mut self, tx: &mut Tx) {
+        self.commit_text_fields_and_push();
+        let custom = self.config.receive_dir.clone();
+        let handle = self.handle.clone();
+        let _ = tx;
+        self.rt.spawn_blocking(move || {
+            let res =
+                ensure_receive_dir(custom.as_deref()).and_then(|dir| open_path_in_os(&dir));
+            if let Err(e) = res {
+                if let Some(h) = handle {
+                    let msg = format!("Could not open folder: {e}");
+                    h.update(move |s, tx| s.toast(msg, tx));
+                }
+            }
+        });
+    }
+
+    pub fn open_received_file(&mut self, path: String, tx: &mut Tx) {
+        let handle = self.handle.clone();
+        let _ = tx;
+        self.rt.spawn_blocking(move || {
+            if let Err(e) = open_path_in_os(std::path::Path::new(&path)) {
+                if let Some(h) = handle {
+                    let msg = format!("Could not open file: {e}");
+                    h.update(move |s, tx| s.toast(msg, tx));
+                }
+            }
+        });
+    }
+
+    pub fn reveal_received_file(&mut self, path: String, tx: &mut Tx) {
+        let handle = self.handle.clone();
+        let _ = tx;
+        self.rt.spawn_blocking(move || {
+            if let Err(e) = reveal_in_file_manager(std::path::Path::new(&path)) {
+                if let Some(h) = handle {
+                    let msg = format!("Could not open folder: {e}");
+                    h.update(move |s, tx| s.toast(msg, tx));
+                }
+            }
+        });
     }
 
     pub fn toggle_autostart(&mut self, tx: &mut Tx) {
@@ -919,8 +1087,8 @@ fn poll(s: &mut Ui, _now: f64, _tx: &mut Tx) -> bool {
         }
     }
 
-    // Commit edited Port or Server fields once they lose focus.
-    if !s.port_edit.focused && !s.server_edit.focused && s.commit_text_fields() {
+    // Commit edited Port, Server, or Advanced text fields once they lose focus.
+    if s.commit_text_fields() {
         s.push_config();
         changed = true;
     }
@@ -1434,7 +1602,7 @@ fn scene_clipboard_filled(s: &mut Ui) {
             filename: "notes.md".into(),
             bytes: 4_820,
             direction: "received".into(),
-            saved_path: None,
+            saved_path: Some("~/Downloads/Glide/notes.md".into()),
         },
     ];
 }
@@ -1473,6 +1641,27 @@ const SCENES: &[(&str, SceneFn)] = &[
     ("client-connected", |s| {
         s.theme = ThemePref::Light;
         scene_client_connected(s);
+    }),
+    ("client-profiles", |s| {
+        s.theme = ThemePref::Light;
+        scene_client_connected(s);
+        s.status.local_addr = Some("192.168.1.42:24800".into());
+        s.known_servers = vec![
+            KnownServer {
+                name: "workstation".into(),
+                address: "192.168.1.42:24800".into(),
+                fingerprint: Some("ab:cd:ef".into()),
+                edge: Edge::Right,
+                last_connected_unix: 2000,
+            },
+            KnownServer {
+                name: "studio-pc".into(),
+                address: "192.168.1.88:24800".into(),
+                fingerprint: Some("12:34:56".into()),
+                edge: Edge::Left,
+                last_connected_unix: 1000,
+            },
+        ];
     }),
     ("input-server-light", |s| {
         s.theme = ThemePref::Light;

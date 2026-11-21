@@ -21,6 +21,7 @@ pub const MAX_CLIPBOARD_BYTES: usize = 32 * 1024 * 1024;
 pub const MAX_FILE_BYTES: usize = 256 * 1024 * 1024;
 /// Maximum number of files accepted in a single cross-edge drag-and-drop operation.
 pub const MAX_DRAG_FILES: usize = 64;
+pub const DEFAULT_MAX_FILE_BYTES: usize = MAX_FILE_BYTES;
 /// Payloads above this threshold use lazy `ClipboardOffer` / `ClipboardRequest`.
 pub const LAZY_CLIPBOARD_THRESHOLD: usize = 256 * 1024;
 

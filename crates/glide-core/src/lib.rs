@@ -3,6 +3,7 @@
 pub mod client;
 pub mod config;
 pub mod dnd;
+pub mod ipc;
 pub mod resilience;
 pub mod runtime;
 pub mod server;
@@ -71,11 +72,17 @@ mod tests {
             motion_coalesce_us: 0,
             ..Default::default()
         };
+        let known_path = std::env::temp_dir().join(format!(
+            "glide-e2e-known-servers-{}.toml",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&known_path);
+
         let mut cli_cfg = ClientConfig {
             name: "ubuntu-test".into(),
             server: Some(addr.to_string()),
             edge: Edge::Right,
-            trusted_fingerprint: Some(fp),
+            trusted_fingerprint: Some(fp.clone()),
             sensitivity: 1.0,
             edge_threshold_px: 4,
             dead_corner_px: 24,
@@ -83,6 +90,7 @@ mod tests {
                 from: "CapsLock".into(),
                 to: "ControlLeft".into(),
             }],
+            known_servers_path: Some(known_path.clone()),
             ..Default::default()
         };
 
@@ -116,6 +124,13 @@ mod tests {
 
         tokio::time::sleep(Duration::from_millis(120)).await;
         assert_eq!(*cap_state.active_edges.lock(), vec![Edge::Right]);
+        let known = crate::config::list_known_servers(&known_path).unwrap();
+        assert_eq!(known.len(), 1);
+        assert_eq!(known[0].name, "win11-test");
+        assert_eq!(known[0].address, addr.to_string());
+        assert_eq!(known[0].fingerprint.as_deref(), Some(fp.as_str()));
+        assert_eq!(known[0].edge, Edge::Right);
+        let _ = std::fs::remove_file(&known_path);
 
         // 1. Lazy large clipboard (> 256 KiB): offered while client is unfocused — NOT transferred yet!
         let big_img = Bytes::from(vec![0x42u8; 300 * 1024]);
@@ -1218,12 +1233,16 @@ mod tests {
         );
         let cli_recent = cli_rt.snapshot().recent_files;
         assert!(
-            cli_recent.iter().any(|f| f.filename == "Büro Grüße äöüß.txt" && f.direction == "received"),
+            cli_recent
+                .iter()
+                .any(|f| f.filename == "Büro Grüße äöüß.txt" && f.direction == "received"),
             "received drag file should appear in RuntimeState::recent_files"
         );
         let srv_recent = srv_rt.snapshot().recent_files;
         assert!(
-            srv_recent.iter().any(|f| f.filename == "Büro Grüße äöüß.txt" && f.direction == "sent"),
+            srv_recent
+                .iter()
+                .any(|f| f.filename == "Büro Grüße äöüß.txt" && f.direction == "sent"),
             "sent drag file should appear in server RuntimeState::recent_files"
         );
 
@@ -1321,6 +1340,7 @@ mod tests {
                 auto_lock_fullscreen: true,
                 locked: false,
                 sync_lock_keys: true,
+                pin_media_keys_local: true,
                 clipboard: true,
                 drag_drop_files: false,
             })
@@ -1353,5 +1373,317 @@ mod tests {
         cli_task.abort();
         srv_task.abort();
         let _ = std::fs::remove_dir_all(&root_tmp);
+    }
+
+    #[tokio::test]
+    async fn server_to_client_file_transfer_survives_active_datagrams_and_rejects_oversized_without_recording_sent(
+    ) {
+        let identity = ServerIdentity::generate_ephemeral().unwrap();
+        let fp = identity.fingerprint.clone();
+        let endpoint =
+            GlideServerEndpoint::bind("127.0.0.1:0".parse().unwrap(), &identity).unwrap();
+        let addr = endpoint.local_addr();
+
+        let geom = DesktopGeometry::new(vec![MonitorRect {
+            name: "Disp-1".into(),
+            x: 0,
+            y: 0,
+            width: 1920,
+            height: 1080,
+            scale: 1.0,
+            primary: true,
+        }]);
+
+        let (capture_handle, cap_tx, _cap_state) = create_mock_capture(geom.clone());
+        let (mut injector, _inj_log) = MockInjector::new(geom);
+        let srv_rt = RuntimeState::new();
+        let cli_rt = RuntimeState::new();
+        let (srv_cmd_tx, srv_cmd_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (cli_cmd_tx, mut cli_cmd_rx) = tokio::sync::mpsc::unbounded_channel();
+
+        let recv_dir = std::env::temp_dir().join(format!(
+            "glide-e2e-bulk-cancel-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&recv_dir);
+
+        let srv_cfg = ServerConfig {
+            name: "bulk-srv".into(),
+            discovery: false,
+            motion_coalesce_us: 0,
+            max_file_bytes: Some(4 * 1024 * 1024),
+            ..Default::default()
+        };
+        let mut cli_cfg = ClientConfig {
+            name: "bulk-cli".into(),
+            server: Some(addr.to_string()),
+            edge: Edge::Right,
+            trusted_fingerprint: Some(fp),
+            max_file_bytes: Some(128 * 1024), // start low, raise live via UpdateMaxFileBytes!
+            receive_dir: Some(recv_dir.display().to_string()),
+            ..Default::default()
+        };
+
+        let srv_rt_c = srv_rt.clone();
+        let srv_task = tokio::spawn(async move {
+            let _ = run_server_with_backends(
+                srv_cfg,
+                endpoint,
+                capture_handle,
+                None,
+                "linux-x11",
+                Some(srv_rt_c),
+                Some(srv_cmd_rx),
+            )
+            .await;
+        });
+
+        let cli_rt_c = cli_rt.clone();
+        let cli_task = tokio::spawn(async move {
+            let mut opt_clip = None;
+            let _ = run_client_session(
+                &mut cli_cfg,
+                addr,
+                &mut injector,
+                &mut opt_clip,
+                Some(&cli_rt_c),
+                Some(&mut cli_cmd_rx),
+            )
+            .await;
+        });
+
+        tokio::time::sleep(Duration::from_millis(120)).await;
+
+        // 1. Live-update client max_file_bytes to 4 MiB so the dedicated bulk task accepts 2 MiB
+        cli_cmd_tx
+            .send(crate::runtime::RuntimeCommand::UpdateMaxFileBytes(
+                4 * 1024 * 1024,
+            ))
+            .unwrap();
+        // Enter remote mode so high-frequency datagrams stream continuously during the file transfer
+        cap_tx
+            .send(CaptureEvent::EdgeCrossed {
+                edge: Edge::Right,
+                normalized_pos: 0.5,
+            })
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        // 2. Oversized SendFile (> 4 MiB) must NOT be recorded as "sent" in server RuntimeState
+        srv_cmd_tx
+            .send(crate::runtime::RuntimeCommand::SendFile {
+                filename: "too-big.bin".into(),
+                data: Bytes::from(vec![0xFFu8; 5 * 1024 * 1024]),
+            })
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(40)).await;
+        assert!(
+            srv_rt.snapshot().recent_files.is_empty(),
+            "oversized rejected transfer must not be recorded as sent"
+        );
+
+        // 3. Send a 2 MiB file from server -> client while hammering 1000Hz datagrams!
+        let file_data: Vec<u8> = (0..(2 * 1024 * 1024)).map(|i| (i % 251) as u8).collect();
+        srv_cmd_tx
+            .send(crate::runtime::RuntimeCommand::SendFile {
+                filename: "large-payload.bin".into(),
+                data: Bytes::from(file_data.clone()),
+            })
+            .unwrap();
+
+        for _ in 0..80 {
+            let _ = cap_tx.send(CaptureEvent::MouseDelta { dx: 1.0, dy: 0.0 });
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+
+        // Wait up to 2s for the 2 MiB file to arrive intact despite datagram + timer traffic
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+        loop {
+            if !cli_rt.snapshot().recent_files.is_empty() {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "timed out waiting for server->client 2 MiB file transfer"
+            );
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+
+        let cli_files = cli_rt.snapshot().recent_files;
+        assert_eq!(cli_files.len(), 1);
+        assert_eq!(cli_files[0].direction, "received");
+        assert_eq!(cli_files[0].filename, "large-payload.bin");
+        assert_eq!(cli_files[0].bytes, file_data.len());
+        let saved = std::path::PathBuf::from(cli_files[0].saved_path.as_ref().unwrap());
+        assert_eq!(std::fs::read(&saved).unwrap(), file_data);
+
+        // Server recorded the clean sent transfer
+        let srv_files = srv_rt.snapshot().recent_files;
+        assert_eq!(srv_files.len(), 1);
+        assert_eq!(srv_files[0].direction, "sent");
+        assert_eq!(srv_files[0].filename, "large-payload.bin");
+
+        cli_task.abort();
+        srv_task.abort();
+        let _ = std::fs::remove_dir_all(&recv_dir);
+    }
+
+    #[tokio::test]
+    async fn switch_target_transitions_guard_enter_leave_and_noop_idempotency() {
+        let identity = ServerIdentity::generate_ephemeral().unwrap();
+        let fp = identity.fingerprint.clone();
+        let endpoint =
+            GlideServerEndpoint::bind("127.0.0.1:0".parse().unwrap(), &identity).unwrap();
+        let addr = endpoint.local_addr();
+
+        let geom = DesktopGeometry::new(vec![MonitorRect {
+            name: "Disp-1".into(),
+            x: 0,
+            y: 0,
+            width: 1920,
+            height: 1080,
+            scale: 1.0,
+            primary: true,
+        }]);
+
+        let (capture_handle, _cap_tx, cap_state) = create_mock_capture(geom.clone());
+        let (mut right_inj, right_log) = MockInjector::new(geom.clone());
+        let (mut left_inj, left_log) = MockInjector::new(geom);
+        let srv_rt = RuntimeState::new();
+        let (srv_cmd_tx, srv_cmd_rx) = tokio::sync::mpsc::unbounded_channel();
+
+        let srv_cfg = ServerConfig {
+            name: "switch-srv".into(),
+            discovery: false,
+            motion_coalesce_us: 0,
+            ..Default::default()
+        };
+        let mut right_cfg = ClientConfig {
+            name: "peer-right".into(),
+            server: Some(addr.to_string()),
+            edge: Edge::Right,
+            trusted_fingerprint: Some(fp.clone()),
+            ..Default::default()
+        };
+        let mut left_cfg = ClientConfig {
+            name: "peer-left".into(),
+            server: Some(addr.to_string()),
+            edge: Edge::Left,
+            trusted_fingerprint: Some(fp),
+            ..Default::default()
+        };
+
+        let srv_rt_c = srv_rt.clone();
+        let srv_task = tokio::spawn(async move {
+            let _ = run_server_with_backends(
+                srv_cfg,
+                endpoint,
+                capture_handle,
+                None,
+                "windows",
+                Some(srv_rt_c),
+                Some(srv_cmd_rx),
+            )
+            .await;
+        });
+        let right_task = tokio::spawn(async move {
+            let mut opt_clip = None;
+            let _ =
+                run_client_session(&mut right_cfg, addr, &mut right_inj, &mut opt_clip, None, None)
+                    .await;
+        });
+        let left_task = tokio::spawn(async move {
+            let mut opt_clip = None;
+            let _ =
+                run_client_session(&mut left_cfg, addr, &mut left_inj, &mut opt_clip, None, None)
+                    .await;
+        });
+
+        // Wait until both peers are registered
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+        while srv_rt.snapshot().peers.len() < 2 {
+            assert!(tokio::time::Instant::now() < deadline);
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+
+        // 1. SwitchTarget(None) while already local must NOT invoke leave_remote_at
+        srv_cmd_tx
+            .send(crate::runtime::RuntimeCommand::SwitchTarget(None))
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(40)).await;
+        assert_eq!(cap_state.leave_remote_at_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(cap_state.enter_remote_calls.load(Ordering::SeqCst), 0);
+
+        // 2. Local -> Right calls enter_remote exactly once and sends EnterAt to Right
+        srv_cmd_tx
+            .send(crate::runtime::RuntimeCommand::SwitchTarget(Some(
+                Edge::Right,
+            )))
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(60)).await;
+        assert!(cap_state.remote_mode.load(Ordering::SeqCst));
+        assert_eq!(cap_state.enter_remote_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(srv_rt.snapshot().active_target, "peer-right");
+        let right_enters_before = right_log
+            .lock()
+            .iter()
+            .filter(|a| matches!(a, InjectedAction::EnterAt(_, _)))
+            .count();
+        assert_eq!(right_enters_before, 1);
+
+        // 3. Switching to Right again while already on Right is a no-op
+        srv_cmd_tx
+            .send(crate::runtime::RuntimeCommand::SwitchTarget(Some(
+                Edge::Right,
+            )))
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(60)).await;
+        assert_eq!(cap_state.enter_remote_calls.load(Ordering::SeqCst), 1);
+        let right_enters_after = right_log
+            .lock()
+            .iter()
+            .filter(|a| matches!(a, InjectedAction::EnterAt(_, _)))
+            .count();
+        assert_eq!(right_enters_after, 1);
+
+        // 4. Right -> Left (remote -> remote) must NOT call enter_remote again!
+        srv_cmd_tx
+            .send(crate::runtime::RuntimeCommand::SwitchTarget(Some(
+                Edge::Left,
+            )))
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(60)).await;
+        assert_eq!(
+            cap_state.enter_remote_calls.load(Ordering::SeqCst),
+            1,
+            "remote -> remote switch must not re-call enter_remote()"
+        );
+        assert_eq!(srv_rt.snapshot().active_target, "peer-left");
+        assert!(right_log.lock().contains(&InjectedAction::ReleaseAll));
+        assert!(left_log
+            .lock()
+            .iter()
+            .any(|a| matches!(a, InjectedAction::EnterAt(_, _))));
+
+        // 5. ReturnLocal transitions remote -> local and calls leave_remote_at once
+        srv_cmd_tx
+            .send(crate::runtime::RuntimeCommand::ReturnLocal)
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(60)).await;
+        assert!(!cap_state.remote_mode.load(Ordering::SeqCst));
+        assert_eq!(cap_state.leave_remote_at_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(srv_rt.snapshot().active_target, "Local");
+        assert!(left_log.lock().contains(&InjectedAction::ReleaseAll));
+
+        // 6. Second ReturnLocal while already local is a no-op
+        srv_cmd_tx
+            .send(crate::runtime::RuntimeCommand::ReturnLocal)
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(40)).await;
+        assert_eq!(cap_state.leave_remote_at_calls.load(Ordering::SeqCst), 1);
+
+        right_task.abort();
+        left_task.abort();
+        srv_task.abort();
     }
 }

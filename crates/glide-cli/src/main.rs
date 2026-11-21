@@ -9,9 +9,16 @@ use anyhow::Result;
 use clap::{Parser, Subcommand, ValueEnum};
 use glide_backend::os_integration::{configure_elevated_task, configure_firewall, set_autostart};
 use glide_backend::InputBackendKind;
-use glide_core::client::run_native_client;
-use glide_core::config::{default_config_dir, ClientConfig, GlideConfigFile, ServerConfig};
-use glide_core::server::run_native_server;
+use glide_core::client::run_native_client_with_runtime;
+use glide_core::config::{
+    default_config_dir, default_known_servers_path, known_servers_path_for_config,
+    remove_known_server, ClientConfig, GlideConfigFile, KnownServersStore, ServerConfig,
+};
+use glide_core::ipc::{
+    send_default_request, start_default_ipc, DirectIpcBackend, IpcAction, SwitchDestination,
+};
+use glide_core::runtime::RuntimeState;
+use glide_core::server::run_native_server_with_runtime;
 use glide_gui::{run_gui_blocking, GuiOptions, DEFAULT_GUI_PORT};
 use glide_hid::HidUsage;
 use glide_net::discovery::{discover_servers, DEFAULT_DISCOVERY_PORT};
@@ -19,6 +26,7 @@ use glide_net::tls::ServerIdentity;
 use glide_proto::Edge;
 use std::net::SocketAddr;
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::Duration;
 use tracing_subscriber::EnvFilter;
 
@@ -37,6 +45,27 @@ impl From<CliEdge> for Edge {
             CliEdge::Right => Edge::Right,
             CliEdge::Top => Edge::Top,
             CliEdge::Bottom => Edge::Bottom,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+enum CliSwitchTarget {
+    Left,
+    Right,
+    Top,
+    Bottom,
+    Local,
+}
+
+impl From<CliSwitchTarget> for SwitchDestination {
+    fn from(value: CliSwitchTarget) -> Self {
+        match value {
+            CliSwitchTarget::Left => SwitchDestination::Left,
+            CliSwitchTarget::Right => SwitchDestination::Right,
+            CliSwitchTarget::Top => SwitchDestination::Top,
+            CliSwitchTarget::Bottom => SwitchDestination::Bottom,
+            CliSwitchTarget::Local => SwitchDestination::Local,
         }
     }
 }
@@ -149,6 +178,10 @@ enum Command {
         #[arg(long)]
         no_fullscreen_lock: bool,
 
+        /// Forward media and volume keys to the active remote client instead of keeping them local
+        #[arg(long)]
+        forward_media_keys: bool,
+
         /// Mouse delta coalescing interval in microseconds (default: 1000 = 1000Hz; 0 = immediate)
         #[arg(long)]
         coalesce_us: Option<u64>,
@@ -156,6 +189,10 @@ enum Command {
 
     /// Run as a secondary machine (receives mouse, keyboard, and clipboard from a Glide server)
     Client {
+        /// Connect to a saved server profile by name or address (from `known_servers.toml`)
+        #[arg(short, long)]
+        profile: Option<String>,
+
         /// Explicit server address (host:port). Omit to auto-discover on LAN!
         #[arg(short, long)]
         server: Option<String>,
@@ -213,6 +250,25 @@ enum Command {
         no_clipboard: bool,
     },
 
+    /// Control a running Glide session via local IPC (`status`, `lock`, `unlock`, `toggle-lock`, `switch`)
+    Ctl {
+        #[command(subcommand)]
+        action: CtlAction,
+    },
+
+    /// Beam a local file to the connected peer via a running Glide instance
+    #[command(visible_alias = "send-file")]
+    Send {
+        /// Path to the file to send
+        file: PathBuf,
+    },
+
+    /// List or manage saved server profiles (`known_servers.toml`)
+    Servers {
+        #[command(subcommand)]
+        action: Option<ServersAction>,
+    },
+
     /// Scan the local network for running Glide servers
     Discover {
         /// Scan duration in seconds (default: 3)
@@ -239,6 +295,45 @@ enum Command {
 
     /// Inspect monitors, DPI scaling, OS extensions, and German ISO HID key mappings
     Doctor,
+}
+
+#[derive(Subcommand, Debug)]
+enum CtlAction {
+    /// Show live mode, active target, lock state, peers, and RTT
+    Status {
+        /// Print raw JSON status output
+        #[arg(long)]
+        json: bool,
+    },
+    /// Lock cursor to the server screen (disable edge switching)
+    Lock,
+    /// Unlock cursor (re-enable edge switching)
+    Unlock,
+    /// Toggle cursor lock state
+    ToggleLock,
+    /// Jump cursor directly to a peer edge or back to the local server
+    Switch {
+        #[arg(value_enum)]
+        target: CliSwitchTarget,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum ServersAction {
+    /// List saved servers sorted by most recently connected (default)
+    List,
+    /// Forget a saved server by name, address, or fingerprint
+    Forget {
+        /// Server name, host:port address, or fingerprint to remove
+        target: String,
+    },
+}
+
+fn resolve_known_servers_path(config_path: Option<&PathBuf>) -> PathBuf {
+    match config_path {
+        Some(p) => known_servers_path_for_config(p),
+        None => default_known_servers_path(),
+    }
 }
 
 fn load_config(path: Option<&PathBuf>) -> Result<GlideConfigFile> {
@@ -325,10 +420,11 @@ async fn run_command(command: Command, config: Option<PathBuf>) -> Result<()> {
             dead_corner,
             edge_dwell_ms,
             no_fullscreen_lock,
+            forward_media_keys,
             coalesce_us,
         } => {
             let file_cfg = load_config(cli_config.as_ref())?;
-            let mut cfg: ServerConfig = file_cfg.server;
+            let mut cfg: ServerConfig = file_cfg.effective_server_config();
             cfg.drag_drop_files &= file_cfg.drag_drop_files;
             if let Some(b) = bind {
                 cfg.bind = b;
@@ -357,12 +453,31 @@ async fn run_command(command: Command, config: Option<PathBuf>) -> Result<()> {
             if no_fullscreen_lock {
                 cfg.auto_lock_fullscreen = false;
             }
+            if forward_media_keys {
+                cfg.pin_media_keys_local = false;
+            }
             if let Some(cu) = coalesce_us {
                 cfg.motion_coalesce_us = cu;
             }
 
+            let rt = RuntimeState::new();
+            let (cmd_tx, cmd_rx) = tokio::sync::mpsc::unbounded_channel();
+            let _ipc_guard = match start_default_ipc(Arc::new(DirectIpcBackend::new(
+                rt.clone(),
+                cmd_tx,
+                cfg.resolved_max_file_bytes(),
+            )))
+            .await
+            {
+                Ok(h) => Some(h),
+                Err(e) => {
+                    tracing::warn!(error = %e, "Local control IPC unavailable; continuing without `glide ctl`");
+                    None
+                }
+            };
+
             tokio::select! {
-                res = run_native_server(cfg) => res?,
+                res = run_native_server_with_runtime(cfg, Some(rt), Some(cmd_rx)) => res?,
                 _ = tokio::signal::ctrl_c() => {
                     tracing::info!("Shutting down Glide server (Ctrl+C)");
                 }
@@ -370,6 +485,7 @@ async fn run_command(command: Command, config: Option<PathBuf>) -> Result<()> {
         }
 
         Command::Client {
+            profile,
             server,
             server_name,
             edge,
@@ -386,8 +502,22 @@ async fn run_command(command: Command, config: Option<PathBuf>) -> Result<()> {
             no_clipboard,
         } => {
             let file_cfg = load_config(cli_config.as_ref())?;
-            let mut cfg: ClientConfig = file_cfg.client;
+            let mut cfg: ClientConfig = file_cfg.effective_client_config();
             cfg.drag_drop_files &= file_cfg.drag_drop_files;
+            let known_path = resolve_known_servers_path(cli_config.as_ref());
+            cfg.known_servers_path = Some(known_path.clone());
+            if let Some(ref query) = profile {
+                let store = KnownServersStore::load(&known_path)?;
+                let saved = store.find(query).ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "no saved server matching '{query}' in {} (run `glide servers` to list)",
+                        known_path.display()
+                    )
+                })?;
+                cfg.server = Some(saved.address.clone());
+                cfg.edge = saved.edge;
+                cfg.trusted_fingerprint = saved.fingerprint.clone();
+            }
             if let Some(s) = server {
                 cfg.server = Some(s);
             }
@@ -431,10 +561,152 @@ async fn run_command(command: Command, config: Option<PathBuf>) -> Result<()> {
                 cfg.clipboard = false;
             }
 
+            let rt = RuntimeState::new();
+            let (cmd_tx, cmd_rx) = tokio::sync::mpsc::unbounded_channel();
+            let _ipc_guard = match start_default_ipc(Arc::new(DirectIpcBackend::new(
+                rt.clone(),
+                cmd_tx,
+                cfg.resolved_max_file_bytes(),
+            )))
+            .await
+            {
+                Ok(h) => Some(h),
+                Err(e) => {
+                    tracing::warn!(error = %e, "Local control IPC unavailable; continuing without `glide ctl`");
+                    None
+                }
+            };
+
             tokio::select! {
-                res = run_native_client(cfg) => res?,
+                res = run_native_client_with_runtime(cfg, Some(rt), Some(cmd_rx)) => res?,
                 _ = tokio::signal::ctrl_c() => {
                     tracing::info!("Shutting down Glide client (Ctrl+C)");
+                }
+            }
+        }
+
+        Command::Ctl { action } => match action {
+            CtlAction::Status { json } => {
+                let resp = send_default_request(IpcAction::Status).await?;
+                if !resp.ok {
+                    anyhow::bail!("{}", resp.error.unwrap_or_else(|| "status failed".into()));
+                }
+                let st = resp
+                    .status
+                    .ok_or_else(|| anyhow::anyhow!("missing status payload in IPC response"))?;
+                if json {
+                    println!("{}", serde_json::to_string_pretty(&st)?);
+                } else {
+                    println!("Mode:          {}", st.mode);
+                    println!("Status:        {}", st.status);
+                    println!("Active target: {}", st.active_target);
+                    println!("Locked:        {}", if st.locked { "yes" } else { "no" });
+                    if let Some(rtt) = st.rtt_ms {
+                        println!("RTT:           {rtt:.1} ms");
+                    }
+                    if !st.peers.is_empty() {
+                        println!("Peers ({}):", st.peers.len());
+                        for p in &st.peers {
+                            let edge_str = format!("{:?}", p.edge).to_lowercase();
+                            let rtt_str = p
+                                .rtt_ms
+                                .map(|ms| format!("{ms:.1} ms"))
+                                .unwrap_or_else(|| "-".into());
+                            println!("  • {} ({edge_str}) — {} [RTT {rtt_str}]", p.name, p.addr);
+                        }
+                    }
+                }
+            }
+            CtlAction::Lock => {
+                let resp = send_default_request(IpcAction::Lock).await?;
+                if !resp.ok {
+                    anyhow::bail!("{}", resp.error.unwrap_or_else(|| "lock failed".into()));
+                }
+                if let Some(msg) = resp.message {
+                    println!("{msg}");
+                }
+            }
+            CtlAction::Unlock => {
+                let resp = send_default_request(IpcAction::Unlock).await?;
+                if !resp.ok {
+                    anyhow::bail!("{}", resp.error.unwrap_or_else(|| "unlock failed".into()));
+                }
+                if let Some(msg) = resp.message {
+                    println!("{msg}");
+                }
+            }
+            CtlAction::ToggleLock => {
+                let resp = send_default_request(IpcAction::ToggleLock).await?;
+                if !resp.ok {
+                    anyhow::bail!(
+                        "{}",
+                        resp.error.unwrap_or_else(|| "toggle-lock failed".into())
+                    );
+                }
+                if let Some(msg) = resp.message {
+                    println!("{msg}");
+                }
+            }
+            CtlAction::Switch { target } => {
+                let resp = send_default_request(IpcAction::Switch {
+                    target: target.into(),
+                })
+                .await?;
+                if !resp.ok {
+                    anyhow::bail!("{}", resp.error.unwrap_or_else(|| "switch failed".into()));
+                }
+                if let Some(msg) = resp.message {
+                    println!("{msg}");
+                }
+            }
+        },
+
+        Command::Send { file } => {
+            // Preserve symlink filenames rather than calling fs::canonicalize.
+            let abs = if file.is_absolute() {
+                file
+            } else {
+                std::env::current_dir()?.join(&file)
+            };
+            let resp = send_default_request(IpcAction::SendFile {
+                path: abs.display().to_string(),
+            })
+            .await?;
+            if !resp.ok {
+                anyhow::bail!("{}", resp.error.unwrap_or_else(|| "send failed".into()));
+            }
+            if let Some(msg) = resp.message {
+                println!("{msg}");
+            }
+        }
+
+        Command::Servers { action } => {
+            let known_path = resolve_known_servers_path(cli_config.as_ref());
+            match action.unwrap_or(ServersAction::List) {
+                ServersAction::List => {
+                    let servers = KnownServersStore::load(&known_path)?.list();
+                    if servers.is_empty() {
+                        println!("No saved servers yet ({}).", known_path.display());
+                        println!("Servers are saved automatically after your first client connection.");
+                    } else {
+                        println!(
+                            "{:<22} {:<24} {:<8} FINGERPRINT",
+                            "NAME", "ADDRESS", "EDGE"
+                        );
+                        println!("{}", "-".repeat(86));
+                        for s in servers {
+                            let edge_str = format!("{:?}", s.edge).to_lowercase();
+                            let fp = s.fingerprint.as_deref().unwrap_or("-");
+                            println!("{:<22} {:<24} {:<8} {}", s.name, s.address, edge_str, fp);
+                        }
+                    }
+                }
+                ServersAction::Forget { target } => {
+                    if remove_known_server(&known_path, &target)? {
+                        println!("Removed saved server '{target}'.");
+                    } else {
+                        println!("No saved server matched '{target}'.");
+                    }
                 }
             }
         }
@@ -541,4 +813,61 @@ async fn run_command(command: Command, config: Option<PathBuf>) -> Result<()> {
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_ctl_and_send_subcommands_including_send_file_alias() {
+        let cli_status = Cli::try_parse_from(["glide", "ctl", "status", "--json"]).unwrap();
+        assert!(matches!(
+            cli_status.command,
+            Some(Command::Ctl {
+                action: CtlAction::Status { json: true }
+            })
+        ));
+
+        let cli_lock = Cli::try_parse_from(["glide", "ctl", "lock"]).unwrap();
+        assert!(matches!(
+            cli_lock.command,
+            Some(Command::Ctl {
+                action: CtlAction::Lock
+            })
+        ));
+
+        let cli_unlock = Cli::try_parse_from(["glide", "ctl", "unlock"]).unwrap();
+        assert!(matches!(
+            cli_unlock.command,
+            Some(Command::Ctl {
+                action: CtlAction::Unlock
+            })
+        ));
+
+        let cli_toggle = Cli::try_parse_from(["glide", "ctl", "toggle-lock"]).unwrap();
+        assert!(matches!(
+            cli_toggle.command,
+            Some(Command::Ctl {
+                action: CtlAction::ToggleLock
+            })
+        ));
+
+        let cli_switch = Cli::try_parse_from(["glide", "ctl", "switch", "local"]).unwrap();
+        assert!(matches!(
+            cli_switch.command,
+            Some(Command::Ctl {
+                action: CtlAction::Switch {
+                    target: CliSwitchTarget::Local
+                }
+            })
+        ));
+
+        let cli_send = Cli::try_parse_from(["glide", "send", "/tmp/demo.txt"]).unwrap();
+        assert!(matches!(cli_send.command, Some(Command::Send { .. })));
+
+        // Backward-compatible alias `glide send-file`
+        let cli_send_alias = Cli::try_parse_from(["glide", "send-file", "/tmp/demo.txt"]).unwrap();
+        assert!(matches!(cli_send_alias.command, Some(Command::Send { .. })));
+    }
 }

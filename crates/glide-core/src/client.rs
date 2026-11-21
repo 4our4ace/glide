@@ -9,7 +9,10 @@
 //! - Optional Linux `/dev/uinput` hardware-native HID backend
 //! - Guaranteed `release_all()` on leave or disconnect
 
-use crate::config::{compile_key_remaps, ClientConfig, DEFAULT_QUIC_PORT};
+use crate::config::{
+    compile_key_remaps, current_unix_secs, default_known_servers_path, record_known_server,
+    ClientConfig, KnownServer, DEFAULT_QUIC_PORT,
+};
 use crate::dnd::{
     collect_local_drag_files, next_drag_id, spawn_commit_incoming_drag, spawn_send_drag_files,
     IncomingDragState,
@@ -18,13 +21,14 @@ use crate::resilience::{HealthProbe, ReconnectBackoff, SleepDetector};
 use crate::runtime::{save_received_file, RuntimeCommand, RuntimeState};
 use anyhow::{anyhow, Context, Result};
 use glide_backend::dnd::{DndBackend, NoopDndBackend};
-use glide_backend::os_integration::file_receive_dir;
+use glide_backend::os_integration::resolve_receive_dir;
 use glide_backend::{ClipboardHandle, InputInjector};
 use glide_hid::MouseButton;
 use glide_net::discovery::{discover_servers, local_ipv4_addresses};
 use glide_net::tls::{normalize_fingerprint, TrustMode};
 use glide_net::{
-    connect_client, recv_bulk_stream, send_clipboard_on, send_file_on, sha256_bytes,
+    connect_client, recv_bulk_stream_with_atomic_limit, send_clipboard_on, send_file_on_with_limit,
+    sha256_bytes,
 };
 use glide_proto::{
     BulkTransfer, ClipboardPayload, ControlMessage, DatagramMessage, FilePayload,
@@ -33,6 +37,7 @@ use glide_proto::{
 use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::net::lookup_host;
@@ -103,6 +108,14 @@ fn apply_pre_session_cmd(cmd: Option<RuntimeCommand>, config: &mut ClientConfig)
             config.clipboard = clipboard;
             config.drag_drop_files = drag_drop_files;
             config.key_remap = key_remap;
+            false
+        }
+        Some(RuntimeCommand::UpdateMaxFileBytes(limit)) => {
+            config.max_file_bytes = Some(limit.min(u32::MAX as usize));
+            false
+        }
+        Some(RuntimeCommand::UpdateReceiveDir(dir)) => {
+            config.receive_dir = dir;
             false
         }
         Some(RuntimeCommand::MovePeerEdge { edge, .. }) => {
@@ -429,6 +442,25 @@ async fn run_client_session_tracked(
     };
 
     let mut last_local_ips = local_ipv4_addresses();
+    let peer_fp = session
+        .peer_fingerprint()
+        .or_else(|| config.trusted_fingerprint.clone());
+
+    if let Some(store_path) = config.known_servers_path.clone() {
+        let entry = KnownServer {
+            name: server_name.clone(),
+            address: server_addr.to_string(),
+            fingerprint: peer_fp.clone(),
+            edge: config.edge,
+            last_connected_unix: current_unix_secs(),
+        };
+        match tokio::task::spawn_blocking(move || record_known_server(&store_path, entry)).await {
+            Ok(Ok(_)) => {}
+            Ok(Err(e)) => warn!(error = %e, "Failed saving known server profile"),
+            Err(e) => warn!(error = %e, "Known server profile save task failed"),
+        }
+    }
+
     if let Some(rt) = runtime {
         rt.update(|s| {
             s.mode = "client".into();
@@ -436,6 +468,7 @@ async fn run_client_session_tracked(
             s.active_target = server_name.clone();
             s.local_addr = Some(server_addr.to_string());
             s.local_ips = last_local_ips.clone();
+            s.remote_fingerprint = peer_fp;
             s.geometry = client_geom.clone();
             s.last_error = None;
         });
@@ -469,13 +502,15 @@ async fn run_client_session_tracked(
     let mut ctrl_send = session.ctrl_send;
     let mut ctrl_recv = session.ctrl_recv;
 
-    // Receive unidirectional bulk streams (clipboard images / files) in a dedicated task
-    // so `tokio::select!` branches (1000Hz mouse datagrams, 150ms reveal ticks, 500ms pings)
-    // never cancel an in-flight `read_exact` and silently drop the transfer.
+    // Receive unidirectional bulk streams (clipboard images / files / drag files) in a dedicated
+    // task so `tokio::select!` branches never cancel an in-flight `read_exact` and silently drop
+    // the transfer, while enforcing a live-updated `AtomicUsize` file size limit.
+    let max_file_bytes = Arc::new(AtomicUsize::new(config.resolved_max_file_bytes()));
     let (bulk_tx, mut bulk_rx) = mpsc::unbounded_channel::<BulkTransfer>();
     let bulk_conn = conn.clone();
+    let bulk_limit = Arc::clone(&max_file_bytes);
     let _bulk_guard = AbortOnDrop(tokio::spawn(async move {
-        let sem = std::sync::Arc::new(tokio::sync::Semaphore::new(4));
+        let sem = Arc::new(tokio::sync::Semaphore::new(4));
         loop {
             let uni = match bulk_conn.accept_uni().await {
                 Ok(u) => u,
@@ -488,9 +523,10 @@ async fn run_client_session_tracked(
                 break;
             };
             let tx = bulk_tx.clone();
+            let limit = Arc::clone(&bulk_limit);
             tokio::spawn(async move {
                 let _permit = permit;
-                match recv_bulk_stream(uni).await {
+                match recv_bulk_stream_with_atomic_limit(uni, &limit).await {
                     Ok(transfer) => {
                         let _ = tx.send(transfer);
                     }
@@ -647,20 +683,44 @@ async fn run_client_session_tracked(
                         dnd.set_active_edges(&[return_edge], dead_corner_px);
                     }
                     RuntimeCommand::SendFile { filename, data } => {
-                        let payload = FilePayload {
-                            filename: filename.clone(),
-                            sha256: sha256_bytes(&data),
-                            data,
-                        };
-                        if let Some(rt) = runtime {
-                            rt.record_file("sent", filename, payload.data.len(), None);
+                        let limit = max_file_bytes.load(Ordering::Relaxed);
+                        if data.len() > limit {
+                            warn!(
+                                file = %filename,
+                                bytes = data.len(),
+                                limit,
+                                "Refusing to send file exceeding max_file_bytes limit"
+                            );
+                        } else {
+                            let byte_len = data.len();
+                            let payload = FilePayload {
+                                filename: filename.clone(),
+                                sha256: sha256_bytes(&data),
+                                data,
+                            };
+                            let c = conn.clone();
+                            let rt_opt = runtime.cloned();
+                            tokio::spawn(async move {
+                                match send_file_on_with_limit(&c, &payload, limit).await {
+                                    Ok(()) => {
+                                        if let Some(rt) = rt_opt {
+                                            rt.record_file("sent", filename, byte_len, None);
+                                        }
+                                    }
+                                    Err(e) => {
+                                        warn!(error = %e, "Failed beaming file to server");
+                                    }
+                                }
+                            });
                         }
-                        let c = conn.clone();
-                        tokio::spawn(async move {
-                            if let Err(e) = send_file_on(&c, &payload).await {
-                                warn!(error = %e, "Failed beaming file to server");
-                            }
-                        });
+                    }
+                    RuntimeCommand::UpdateMaxFileBytes(limit) => {
+                        let effective = limit.min(u32::MAX as usize);
+                        config.max_file_bytes = Some(effective);
+                        max_file_bytes.store(effective, Ordering::Relaxed);
+                    }
+                    RuntimeCommand::UpdateReceiveDir(dir) => {
+                        config.receive_dir = dir;
                     }
                     RuntimeCommand::ResendClipboard(id) => {
                         if let Some(rt) = runtime {
@@ -1009,12 +1069,13 @@ async fn run_client_session_tracked(
                         let byte_len = data.len();
                         let rt_clone = runtime.cloned();
                         let rdir_override = receive_dir.clone();
+                        let cfg_receive_dir = config.receive_dir.clone();
                         tokio::spawn(async move {
                             let fname_for_save = filename.clone();
                             let saved = tokio::task::spawn_blocking(move || {
                                 let dir_res = match rdir_override {
                                     Some(d) => Ok(d),
-                                    None => file_receive_dir(),
+                                    None => resolve_receive_dir(cfg_receive_dir.as_deref()),
                                 };
                                 dir_res
                                     .and_then(|dir| save_received_file(&dir, &fname_for_save, &data))
@@ -1310,6 +1371,7 @@ pub async fn run_client_with_backends_and_dnd(
                         if let Some(ref rt) = runtime {
                             rt.update(|s| {
                                 s.status = "Reconnecting...".into();
+                                s.remote_fingerprint = None;
                                 s.last_error = Some(e.to_string());
                             });
                         }
@@ -1438,6 +1500,7 @@ pub async fn run_client_with_backends_and_dnd(
             s.mode = "stopped".into();
             s.status = "Idle".into();
             s.active_target = "Local".into();
+            s.remote_fingerprint = None;
             s.rtt_ms = None;
             s.rtt_history.clear();
         });
@@ -1447,11 +1510,14 @@ pub async fn run_client_with_backends_and_dnd(
 
 /// Runs the native Glide client with automatic LAN discovery, reconnect, and optional GUI hooks.
 pub async fn run_native_client_with_runtime(
-    config: ClientConfig,
+    mut config: ClientConfig,
     runtime: Option<RuntimeState>,
     cmd_rx: Option<mpsc::UnboundedReceiver<RuntimeCommand>>,
 ) -> Result<()> {
     glide_backend::init_platform();
+    if config.known_servers_path.is_none() {
+        config.known_servers_path = Some(default_known_servers_path());
+    }
     let mut injector = glide_backend::create_injector_with_kind(config.input_backend)?;
 
     let mut clipboard = if config.clipboard {

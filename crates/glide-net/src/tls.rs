@@ -128,6 +128,21 @@ pub fn sha256_fingerprint(der: &[u8]) -> String {
         .join(":")
 }
 
+/// Generates 32 cryptographically secure random bytes encoded as 64 lowercase hex characters.
+pub fn random_hex_token_32() -> Result<String> {
+    let mut bytes = [0u8; 32];
+    rustls::crypto::ring::default_provider()
+        .secure_random
+        .fill(&mut bytes)
+        .map_err(|_| anyhow::anyhow!("CSPRNG failed generating auth token"))?;
+    let mut out = String::with_capacity(64);
+    for b in bytes {
+        use std::fmt::Write;
+        let _ = write!(&mut out, "{b:02x}");
+    }
+    Ok(out)
+}
+
 /// Strictly validates and normalizes a SHA-256 certificate fingerprint.
 ///
 /// Accepts an optional `SHA256:` / `sha256:` prefix and optional `:` / whitespace separators,

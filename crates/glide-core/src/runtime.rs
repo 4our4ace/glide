@@ -51,6 +51,9 @@ pub struct StatusSnapshot {
     #[serde(default)]
     pub local_ips: Vec<String>,
     pub fingerprint: Option<String>,
+    /// SHA-256 fingerprint of the currently connected remote server (client mode only).
+    #[serde(default)]
+    pub remote_fingerprint: Option<String>,
     pub rtt_ms: Option<f32>,
     pub rtt_history: Vec<f32>,
     pub peers: Vec<PeerSummary>,
@@ -70,6 +73,7 @@ impl Default for StatusSnapshot {
             local_addr: None,
             local_ips: Vec::new(),
             fingerprint: None,
+            remote_fingerprint: None,
             rtt_ms: None,
             rtt_history: Vec::new(),
             peers: Vec::new(),
@@ -91,6 +95,7 @@ pub enum RuntimeCommand {
         auto_lock_fullscreen: bool,
         locked: bool,
         sync_lock_keys: bool,
+        pin_media_keys_local: bool,
         clipboard: bool,
         drag_drop_files: bool,
     },
@@ -107,8 +112,10 @@ pub enum RuntimeCommand {
         key_remap: Vec<KeyRemapRule>,
     },
     ToggleLock,
+    SetLock(bool),
     SwitchToEdge(Edge),
     ReturnLocal,
+    SwitchTarget(Option<Edge>),
     MovePeerEdge {
         peer_name: Option<String>,
         edge: Edge,
@@ -117,6 +124,8 @@ pub enum RuntimeCommand {
         filename: String,
         data: Bytes,
     },
+    UpdateMaxFileBytes(usize),
+    UpdateReceiveDir(Option<String>),
     ResendClipboard(usize),
     Shutdown,
 }
@@ -426,6 +435,73 @@ pub fn save_received_file(
     )
 }
 
+/// Reads a regular file from disk while enforcing `max_bytes` both before opening and during the
+/// actual bounded read (rejecting directories, FIFOs, devices, and files that grow past the cap).
+pub fn read_regular_file_bounded(
+    path: &std::path::Path,
+    max_bytes: usize,
+) -> anyhow::Result<(String, Bytes)> {
+    use anyhow::{anyhow, Context};
+    use std::io::Read;
+
+    if path.as_os_str().is_empty() {
+        anyhow::bail!("file path cannot be empty");
+    }
+    let meta = std::fs::metadata(path)
+        .with_context(|| format!("failed to inspect file '{}'", path.display()))?;
+    if !meta.is_file() {
+        anyhow::bail!("'{}' is not a regular file", path.display());
+    }
+    if meta.len() > max_bytes as u64 {
+        anyhow::bail!(
+            "file '{}' ({} bytes) exceeds max file transfer limit ({} bytes)",
+            path.display(),
+            meta.len(),
+            max_bytes
+        );
+    }
+
+    let file = std::fs::File::open(path)
+        .with_context(|| format!("failed to open file '{}'", path.display()))?;
+    let opened_meta = file.metadata()?;
+    if !opened_meta.is_file() {
+        anyhow::bail!("'{}' is not a regular file", path.display());
+    }
+    if opened_meta.len() > max_bytes as u64 {
+        anyhow::bail!(
+            "file '{}' ({} bytes) exceeds max file transfer limit ({} bytes)",
+            path.display(),
+            opened_meta.len(),
+            max_bytes
+        );
+    }
+
+    let initial_cap = opened_meta
+        .len()
+        .min(max_bytes as u64)
+        .min(64 * 1024) as usize;
+    let mut data = Vec::with_capacity(initial_cap);
+    file.take((max_bytes as u64).saturating_add(1))
+        .read_to_end(&mut data)
+        .with_context(|| format!("failed to read file '{}'", path.display()))?;
+    if data.len() > max_bytes {
+        anyhow::bail!(
+            "file '{}' grew beyond max file transfer limit ({} bytes)",
+            path.display(),
+            max_bytes
+        );
+    }
+
+    let filename = path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .filter(|n| !n.is_empty())
+        .ok_or_else(|| anyhow!("cannot determine filename for '{}'", path.display()))?
+        .to_owned();
+
+    Ok((filename, Bytes::from(data)))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -501,11 +577,6 @@ mod tests {
 
         let _ = std::fs::remove_dir_all(&root);
     }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
 
     #[test]
     fn revision_and_read_track_updates() {
@@ -563,5 +634,27 @@ mod tests {
             format!("{}…", "a".repeat(72))
         );
     }
-}
 
+    #[test]
+    fn read_regular_file_bounded_validates_type_and_size() {
+        let dir = unique_temp_dir("bounded-read");
+
+        // Directory is rejected as non-regular file
+        assert!(read_regular_file_bounded(&dir, 1024).is_err());
+
+        // File within limit succeeds
+        let ok_file = dir.join("sample.txt");
+        std::fs::write(&ok_file, b"hello bounded").unwrap();
+        let (name, data) = read_regular_file_bounded(&ok_file, 1024).unwrap();
+        assert_eq!(name, "sample.txt");
+        assert_eq!(&data[..], b"hello bounded");
+
+        // File exceeding limit is rejected
+        let big_file = dir.join("too-big.bin");
+        std::fs::write(&big_file, vec![0x55; 2048]).unwrap();
+        let err = read_regular_file_bounded(&big_file, 1024).unwrap_err();
+        assert!(err.to_string().contains("exceeds max file transfer limit"));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}

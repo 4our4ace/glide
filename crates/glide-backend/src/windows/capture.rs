@@ -9,8 +9,8 @@
 use crate::geometry::DesktopGeometry;
 use crate::windows::{init_dpi_awareness, query_desktop_geometry, GLIDE_EXTRA_INFO};
 use crate::{
-    edge_bit, AtomicEdgeMask, AtomicNormPoint, CaptureConfig, CaptureControl, CaptureEvent,
-    CaptureHandle, ALL_EDGES,
+    edge_bit, is_windows_consumer_or_media_vk, AtomicEdgeMask, AtomicNormPoint, CaptureConfig,
+    CaptureControl, CaptureEvent, CaptureHandle, RemoteMediaKeyTracker, ALL_EDGES,
 };
 use anyhow::{anyhow, Context, Result};
 use glide_hid::{is_windows_fake_altgr_lctrl, HidUsage, ModifierMask, MouseButton, WinScan};
@@ -76,6 +76,8 @@ struct HookState {
     lmb_down: AtomicBool,
     lmb_started_on_edge: AtomicBool,
     drag_strip_armed: AtomicBool,
+    pin_media_keys_local: AtomicBool,
+    forwarded_media_keys: Mutex<RemoteMediaKeyTracker>,
     edge_threshold_px: AtomicI32,
     dead_corner_px: AtomicI32,
     edge_dwell_ms: AtomicU64,
@@ -288,6 +290,12 @@ impl CaptureControl for WindowsCaptureControl {
         }
     }
 
+    fn set_pin_media_keys_local(&self, enabled: bool) {
+        self.state
+            .pin_media_keys_local
+            .store(enabled, Ordering::Relaxed);
+    }
+
     fn enter_remote(&self) -> Result<()> {
         self.state.remote_mode.store(true, Ordering::SeqCst);
         let hwnd = self.hwnd.load(Ordering::Acquire) as HWND;
@@ -302,6 +310,7 @@ impl CaptureControl for WindowsCaptureControl {
     fn leave_remote(&self, return_edge: Edge, normalized_pos: f32) -> Result<()> {
         *self.state.pending_leave.lock() = Some(LeaveTarget::Edge(return_edge, normalized_pos));
         self.state.remote_mode.store(false, Ordering::SeqCst);
+        self.state.forwarded_media_keys.lock().clear();
         let hwnd = self.hwnd.load(Ordering::Acquire) as HWND;
         if !hwnd.is_null() {
             unsafe {
@@ -314,6 +323,7 @@ impl CaptureControl for WindowsCaptureControl {
     fn leave_remote_at(&self, norm_x: f32, norm_y: f32) -> Result<()> {
         *self.state.pending_leave.lock() = Some(LeaveTarget::Point(norm_x, norm_y));
         self.state.remote_mode.store(false, Ordering::SeqCst);
+        self.state.forwarded_media_keys.lock().clear();
         let hwnd = self.hwnd.load(Ordering::Acquire) as HWND;
         if !hwnd.is_null() {
             unsafe {
@@ -350,6 +360,19 @@ fn arrow_to_edge(usage: HidUsage) -> Option<Edge> {
 }
 
 fn translate_ll_key(vk_code: u32, scan_code: u32, flags: u32) -> Option<HidUsage> {
+    // Handle Consumer Control / Media VKs explicitly so keyboards/headsets that send
+    // scanCode == 0 for volume/playback buttons still resolve reliably.
+    match vk_code {
+        0xAD => return Some(HidUsage::consumer(0x00E2)), // VK_VOLUME_MUTE
+        0xAE => return Some(HidUsage::consumer(0x00EA)), // VK_VOLUME_DOWN
+        0xAF => return Some(HidUsage::consumer(0x00E9)), // VK_VOLUME_UP
+        0xB0 => return Some(HidUsage::consumer(0x00B5)), // VK_MEDIA_NEXT_TRACK
+        0xB1 => return Some(HidUsage::consumer(0x00B6)), // VK_MEDIA_PREV_TRACK
+        0xB2 => return Some(HidUsage::consumer(0x00B7)), // VK_MEDIA_STOP
+        0xB3 => return Some(HidUsage::consumer(0x00CD)), // VK_MEDIA_PLAY_PAUSE
+        _ => {}
+    }
+
     let win_scan = match vk_code {
         VK_PAUSE_CODE => WinScan {
             code: 0x45,
@@ -438,6 +461,12 @@ unsafe extern "system" fn keyboard_ll_proc(code: i32, wparam: WPARAM, lparam: LP
                     }
 
                     let Some(usage) = translate_ll_key(kb.vkCode, kb.scanCode, kb.flags) else {
+                        if remote
+                            && state.pin_media_keys_local.load(Ordering::Relaxed)
+                            && is_windows_consumer_or_media_vk(kb.vkCode, kb.scanCode, kb.flags)
+                        {
+                            return false;
+                        }
                         trace!(
                             vk = kb.vkCode,
                             scan = kb.scanCode,
@@ -455,6 +484,7 @@ unsafe extern "system" fn keyboard_ll_proc(code: i32, wparam: WPARAM, lparam: LP
                     if usage == state.config.escape_key {
                         if pressed && remote {
                             state.remote_mode.store(false, Ordering::SeqCst);
+                            state.forwarded_media_keys.lock().clear();
                             let _ = state.tx.send(CaptureEvent::EscapeHotkey);
                             return true;
                         }
@@ -480,6 +510,15 @@ unsafe extern "system" fn keyboard_ll_proc(code: i32, wparam: WPARAM, lparam: LP
                     }
 
                     if remote {
+                        if usage.is_media_key()
+                            && !state.forwarded_media_keys.lock().should_forward(
+                                usage,
+                                pressed,
+                                state.pin_media_keys_local.load(Ordering::Relaxed),
+                            )
+                        {
+                            return false;
+                        }
                         let _ = state.tx.send(CaptureEvent::Key { usage, pressed });
                         // Keep the physical keyboard's CapsLock / NumLock LED and Windows'
                         // toggle state in sync with the client when lock-key sync is enabled.
@@ -920,6 +959,8 @@ pub fn start_windows_capture(config: CaptureConfig) -> Result<CaptureHandle> {
         lmb_down: AtomicBool::new(false),
         lmb_started_on_edge: AtomicBool::new(false),
         drag_strip_armed: AtomicBool::new(false),
+        pin_media_keys_local: AtomicBool::new(config.pin_media_keys_local),
+        forwarded_media_keys: Mutex::new(RemoteMediaKeyTracker::new()),
         config,
         tx,
         active_edges: AtomicEdgeMask::empty(),

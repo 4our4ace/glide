@@ -4,6 +4,7 @@
 //! Each OS implements [`CaptureControl`], [`InputInjector`], and [`ClipboardBackend`]
 //! so `glide-core` and `glide-gui` stay 100% platform-agnostic.
 
+pub mod clipboard_privacy;
 pub mod dib_png;
 pub mod dnd;
 pub mod geometry;
@@ -144,6 +145,8 @@ pub struct CaptureConfig {
     pub sync_lock_keys: bool,
     /// Enable cross-edge file drag-and-drop detection along active outer edges.
     pub drag_drop_files: bool,
+    /// Keep USB Consumer Control media/volume keys on the local server PC instead of forwarding to clients.
+    pub pin_media_keys_local: bool,
 }
 
 impl Default for CaptureConfig {
@@ -157,8 +160,89 @@ impl Default for CaptureConfig {
             enable_hotkeys: true,
             sync_lock_keys: true,
             drag_drop_files: true,
+            pin_media_keys_local: true,
         }
     }
+}
+
+/// Returns whether a physical key event should be suppressed locally and forwarded to the active
+/// remote client, taking `pin_media_keys_local` into account.
+#[inline]
+pub const fn should_forward_key_in_remote(usage: HidUsage, pin_media_keys_local: bool) -> bool {
+    !(pin_media_keys_local && usage.is_media_key())
+}
+
+/// Tracks media/consumer keys currently held down on the remote client so that toggling
+/// `pin_media_keys_local` from `false` -> `true` (or `true` -> `false`) while a media key
+/// is held still routes the matching release event to the same side (preventing stuck keys).
+#[derive(Debug, Default)]
+pub struct RemoteMediaKeyTracker {
+    forwarded: Vec<HidUsage>,
+}
+
+impl RemoteMediaKeyTracker {
+    pub const fn new() -> Self {
+        Self {
+            forwarded: Vec::new(),
+        }
+    }
+
+    /// Decides whether `usage` (`pressed`) should be forwarded to the remote client,
+    /// updating tracked forwarded media keys.
+    pub fn should_forward(
+        &mut self,
+        usage: HidUsage,
+        pressed: bool,
+        pin_media_keys_local: bool,
+    ) -> bool {
+        if !usage.is_media_key() {
+            return true;
+        }
+        if pressed {
+            if should_forward_key_in_remote(usage, pin_media_keys_local) {
+                if !self.forwarded.contains(&usage) {
+                    self.forwarded.push(usage);
+                }
+                true
+            } else {
+                // Keep routing auto-repeat presses to the remote until released if the initial
+                // press was already forwarded before `pin_media_keys_local` was toggled on.
+                self.forwarded.contains(&usage)
+            }
+        } else if let Some(idx) = self.forwarded.iter().position(|&u| u == usage) {
+            self.forwarded.swap_remove(idx);
+            true
+        } else {
+            // Release of a media key that was never forwarded to the remote stays local so
+            // local press/release stay balanced even if `pin_media_keys_local` toggled `true -> false`.
+            false
+        }
+    }
+
+    /// Returns `true` if `usage` was forwarded to the remote client and has not yet been released.
+    #[inline]
+    pub fn is_forwarded(&self, usage: HidUsage) -> bool {
+        self.forwarded.contains(&usage)
+    }
+
+    /// Clears all tracked keys (called when leaving remote mode, where the client runs `release_all`).
+    pub fn clear(&mut self) {
+        self.forwarded.clear();
+    }
+}
+
+/// Returns `true` if an unmapped Windows low-level keyboard event belongs to consumer, media,
+/// browser, app-launch, sleep, or vendor/ACPI brightness keys that should pass through locally
+/// when `pin_media_keys_local` is enabled.
+#[inline]
+pub const fn is_windows_consumer_or_media_vk(vk_code: u32, scan_code: u32, flags: u32) -> bool {
+    const LLKHF_EXTENDED_FLAG: u32 = 0x01;
+    // VK_BROWSER_BACK (0xA6) ..= VK_LAUNCH_APP2 (0xB7), VK_SLEEP (0x5F), vendor/ACPI Fn/brightness (0xFF)
+    if matches!(vk_code, 0xA6..=0xB7 | 0x5F | 0xFF) {
+        return true;
+    }
+    // Any remaining unmapped E0-extended scan code (all standard keyboard extended keys are in KEY_TABLE)
+    (flags & LLKHF_EXTENDED_FLAG) != 0 && scan_code != 0
 }
 
 /// Low-latency input events emitted by the server's OS capture thread.
@@ -215,6 +299,8 @@ pub trait CaptureControl: Send + Sync {
     fn set_sync_lock_keys(&self, _enabled: bool) {}
     /// Updates whether cross-edge file drag-and-drop assistance is enabled.
     fn set_drag_drop_files(&self, _enabled: bool) {}
+    /// Updates whether USB Consumer Control media/volume keys remain pinned to the local server OS.
+    fn set_pin_media_keys_local(&self, _enabled: bool) {}
     /// Enters remote mode: suppresses/grabs local input and parks/hides cursor cleanly.
     fn enter_remote(&self) -> Result<()>;
     /// Leaves remote mode: releases grab and warps cursor to `return_edge` at `normalized_pos`.
@@ -517,5 +603,106 @@ pub fn run_doctor() -> Result<DoctorReport> {
     #[cfg(target_os = "macos")]
     {
         macos::run_doctor()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn media_keys_stay_local_when_pinned_and_forward_when_unpinned() {
+        let media_names = [
+            "AudioVolumeMute",
+            "AudioVolumeDown",
+            "AudioVolumeUp",
+            "MediaPlayPause",
+            "MediaTrackNext",
+            "MediaTrackPrev",
+            "MediaStop",
+        ];
+        for name in media_names {
+            let usage = HidUsage::from_name(name).expect("known media key");
+            assert_eq!(usage.page(), HidUsage::PAGE_CONSUMER);
+            assert!(usage.is_media_key());
+            assert!(
+                !should_forward_key_in_remote(usage, true),
+                "{name} must stay local when pin_media_keys_local is true"
+            );
+            assert!(
+                should_forward_key_in_remote(usage, false),
+                "{name} must forward when pin_media_keys_local is false"
+            );
+        }
+
+        // Standard keyboard keys always forward regardless of pin_media_keys_local.
+        for key in [
+            HidUsage::from_name("KeyA").unwrap(),
+            HidUsage::from_name("Space").unwrap(),
+            HidUsage::ALT_RIGHT,
+            HidUsage::ISO_BACKSLASH,
+        ] {
+            assert!(!key.is_media_key());
+            assert!(should_forward_key_in_remote(key, true));
+            assert!(should_forward_key_in_remote(key, false));
+        }
+
+        // Default CaptureConfig pins media keys locally.
+        assert!(CaptureConfig::default().pin_media_keys_local);
+    }
+
+    #[test]
+    fn media_key_tracker_forwards_release_after_live_pin_toggle_and_avoids_stuck_keys() {
+        let mut tracker = RemoteMediaKeyTracker::new();
+        let vol_up = HidUsage::from_name("AudioVolumeUp").unwrap();
+        let key_a = HidUsage::from_name("KeyA").unwrap();
+
+        // Standard keys always forward without being tracked
+        assert!(tracker.should_forward(key_a, true, true));
+        assert!(tracker.should_forward(key_a, false, true));
+
+        // 1. Media key pressed with pin=false -> forwarded and tracked
+        assert!(tracker.should_forward(vol_up, true, false));
+        assert!(tracker.is_forwarded(vol_up));
+
+        // 2. Toggle pin_media_keys_local false -> true while held:
+        //    repeat press & release MUST still forward to remote (preventing stuck key!)
+        assert!(tracker.should_forward(vol_up, true, true));
+        assert!(tracker.should_forward(vol_up, false, true));
+        assert!(!tracker.is_forwarded(vol_up));
+
+        // 3. Subsequent press with pin=true stays local
+        assert!(!tracker.should_forward(vol_up, true, true));
+        assert!(!tracker.is_forwarded(vol_up));
+
+        // 4. Toggle pin_media_keys_local true -> false while held locally:
+        //    release stays local (never sends orphaned release to remote)
+        assert!(!tracker.should_forward(vol_up, false, false));
+
+        // 5. clear() resets tracked state on leaving remote mode
+        assert!(tracker.should_forward(vol_up, true, false));
+        assert!(tracker.is_forwarded(vol_up));
+        tracker.clear();
+        assert!(!tracker.is_forwarded(vol_up));
+        assert!(!tracker.should_forward(vol_up, false, true));
+    }
+
+    #[test]
+    fn windows_unmapped_consumer_and_browser_vks_are_detected() {
+        // Browser / Media / Launch VKs (0xA6..=0xB7)
+        for vk in 0xA6..=0xB7 {
+            assert!(
+                is_windows_consumer_or_media_vk(vk, 0, 0),
+                "VK 0x{vk:02X} should be recognized as consumer/media"
+            );
+        }
+        // Sleep & vendor/ACPI Fn brightness
+        assert!(is_windows_consumer_or_media_vk(0x5F, 0, 0));
+        assert!(is_windows_consumer_or_media_vk(0xFF, 0x6F, 0));
+        // Unmapped extended scan code (e.g. consumer E0 scan code with non-consumer VK)
+        assert!(is_windows_consumer_or_media_vk(0x00, 0x65, 0x01));
+        // Regular non-extended unmapped key is NOT misclassified
+        assert!(!is_windows_consumer_or_media_vk(0x41, 0x1E, 0));
+        assert!(!is_windows_consumer_or_media_vk(0x00, 0x00, 0x01));
     }
 }

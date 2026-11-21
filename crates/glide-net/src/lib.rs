@@ -10,6 +10,7 @@ pub mod tls;
 
 use anyhow::{anyhow, Context, Result};
 use bytes::{Bytes, BytesMut};
+pub use glide_proto::DEFAULT_MAX_FILE_BYTES;
 use glide_proto::{
     ClipboardPayload, ControlMessage, DatagramMessage, MAX_CLIPBOARD_BYTES, MAX_CONTROL_FRAME_LEN,
 };
@@ -216,6 +217,17 @@ impl GlideSession {
         self.conn.remote_address()
     }
 
+    /// Returns the SHA-256 fingerprint of the peer's TLS leaf certificate, if available.
+    pub fn peer_fingerprint(&self) -> Option<String> {
+        let certs = self
+            .conn
+            .peer_identity()?
+            .downcast::<Vec<rustls::pki_types::CertificateDer<'static>>>()
+            .ok()?;
+        let leaf = certs.first()?;
+        Some(tls::sha256_fingerprint(leaf.as_ref()))
+    }
+
     /// Sends a mouse delta or high-res scroll immediately as an unreliable QUIC datagram.
     #[inline]
     pub fn send_datagram(&self, msg: DatagramMessage) -> Result<()> {
@@ -243,6 +255,14 @@ impl GlideSession {
     /// Receives the next bulk payload (clipboard or file) sent over a unidirectional QUIC stream.
     pub async fn recv_bulk(&self) -> Result<glide_proto::BulkTransfer> {
         recv_bulk_on(&self.conn).await
+    }
+
+    /// Receives the next bulk payload enforcing a custom `max_file_bytes` ceiling.
+    pub async fn recv_bulk_with_limit(
+        &self,
+        max_file_bytes: usize,
+    ) -> Result<glide_proto::BulkTransfer> {
+        recv_bulk_on_with_limit(&self.conn, max_file_bytes).await
     }
 }
 
@@ -272,15 +292,25 @@ pub async fn send_clipboard_on(conn: &Connection, payload: &ClipboardPayload) ->
     Ok(())
 }
 
-/// Sends a file payload over a fresh unidirectional QUIC stream on `conn`.
+/// Sends a file payload over a fresh unidirectional QUIC stream on `conn` using `DEFAULT_MAX_FILE_BYTES`.
 pub async fn send_file_on(conn: &Connection, file: &glide_proto::FilePayload) -> Result<()> {
-    use glide_proto::{BULK_KIND_FILE, MAX_FILE_BYTES};
+    send_file_on_with_limit(conn, file, DEFAULT_MAX_FILE_BYTES).await
+}
 
-    if file.data.len() > MAX_FILE_BYTES {
+/// Sends a file payload over a fresh unidirectional QUIC stream enforcing `max_file_bytes`.
+pub async fn send_file_on_with_limit(
+    conn: &Connection,
+    file: &glide_proto::FilePayload,
+    max_file_bytes: usize,
+) -> Result<()> {
+    use glide_proto::BULK_KIND_FILE;
+
+    let effective_limit = max_file_bytes.min(u32::MAX as usize);
+    if file.data.len() > effective_limit {
         return Err(anyhow!(
             "file payload too large ({} bytes > max {})",
             file.data.len(),
-            MAX_FILE_BYTES
+            effective_limit
         ));
     }
 
@@ -305,19 +335,29 @@ pub async fn send_file_on(conn: &Connection, file: &glide_proto::FilePayload) ->
     Ok(())
 }
 
-/// Sends a cross-edge drag-and-drop file payload over a fresh unidirectional QUIC stream on `conn`.
+/// Sends a cross-edge drag-and-drop file payload over a fresh unidirectional QUIC stream using `DEFAULT_MAX_FILE_BYTES`.
 pub async fn send_drag_file_on(
     conn: &Connection,
     drag_file: &glide_proto::DragFilePayload,
 ) -> Result<()> {
-    use glide_proto::{BULK_KIND_DRAG_FILE, MAX_FILE_BYTES};
+    send_drag_file_on_with_limit(conn, drag_file, DEFAULT_MAX_FILE_BYTES).await
+}
+
+/// Sends a cross-edge drag-and-drop file payload over a fresh unidirectional QUIC stream enforcing `max_file_bytes`.
+pub async fn send_drag_file_on_with_limit(
+    conn: &Connection,
+    drag_file: &glide_proto::DragFilePayload,
+    max_file_bytes: usize,
+) -> Result<()> {
+    use glide_proto::BULK_KIND_DRAG_FILE;
 
     let file = &drag_file.file;
-    if file.data.len() > MAX_FILE_BYTES {
+    let effective_limit = max_file_bytes.min(u32::MAX as usize);
+    if file.data.len() > effective_limit {
         return Err(anyhow!(
             "file payload too large ({} bytes > max {})",
             file.data.len(),
-            MAX_FILE_BYTES
+            effective_limit
         ));
     }
 
@@ -343,12 +383,25 @@ pub async fn send_drag_file_on(
     Ok(())
 }
 
-/// Sends a clipboard or file payload over an independent unidirectional QUIC stream.
+/// Sends a clipboard or file payload over an independent unidirectional QUIC stream using `DEFAULT_MAX_FILE_BYTES`.
 pub async fn send_bulk_on(conn: &Connection, transfer: &glide_proto::BulkTransfer) -> Result<()> {
+    send_bulk_on_with_limit(conn, transfer, DEFAULT_MAX_FILE_BYTES).await
+}
+
+/// Sends a clipboard or file payload over an independent unidirectional QUIC stream enforcing `max_file_bytes`.
+pub async fn send_bulk_on_with_limit(
+    conn: &Connection,
+    transfer: &glide_proto::BulkTransfer,
+    max_file_bytes: usize,
+) -> Result<()> {
     match transfer {
         glide_proto::BulkTransfer::Clipboard(payload) => send_clipboard_on(conn, payload).await,
-        glide_proto::BulkTransfer::File(file) => send_file_on(conn, file).await,
-        glide_proto::BulkTransfer::DragFile(drag_file) => send_drag_file_on(conn, drag_file).await,
+        glide_proto::BulkTransfer::File(file) => {
+            send_file_on_with_limit(conn, file, max_file_bytes).await
+        }
+        glide_proto::BulkTransfer::DragFile(drag_file) => {
+            send_drag_file_on_with_limit(conn, drag_file, max_file_bytes).await
+        }
     }
 }
 
@@ -376,7 +429,7 @@ async fn read_exact_incremental<R: tokio::io::AsyncRead + Unpin>(
             .context("stream error while reading bulk payload")?;
         if n == 0 {
             return Err(anyhow!(
-                "bulk stream truncated: expected {declared_len} bytes, got {}",
+                "bulk stream ended early (truncated: expected {declared_len} bytes, got {})",
                 data.len()
             ));
         }
@@ -386,8 +439,11 @@ async fn read_exact_incremental<R: tokio::io::AsyncRead + Unpin>(
     Ok(data)
 }
 
-async fn read_file_payload(uni: &mut RecvStream) -> Result<glide_proto::FilePayload> {
-    use glide_proto::{sanitize_filename, FilePayload, MAX_FILE_BYTES};
+async fn read_file_payload(
+    uni: &mut RecvStream,
+    max_file_bytes: usize,
+) -> Result<glide_proto::FilePayload> {
+    use glide_proto::{sanitize_filename, FilePayload};
 
     let mut name_len_buf = [0u8; 2];
     uni.read_exact(&mut name_len_buf).await?;
@@ -402,9 +458,10 @@ async fn read_file_payload(uni: &mut RecvStream) -> Result<glide_proto::FilePayl
     let mut len_buf = [0u8; 4];
     uni.read_exact(&mut len_buf).await?;
     let len = u32::from_be_bytes(len_buf) as usize;
-    if len > MAX_FILE_BYTES {
+    let effective_limit = max_file_bytes.min(u32::MAX as usize);
+    if len > effective_limit {
         return Err(anyhow!(
-            "file exceeds maximum size ({len} > {MAX_FILE_BYTES})"
+            "file exceeds maximum size ({len} > {effective_limit})"
         ));
     }
     let data = read_exact_incremental(uni, len)
@@ -421,8 +478,28 @@ async fn read_file_payload(uni: &mut RecvStream) -> Result<glide_proto::FilePayl
     })
 }
 
-/// Reads and validates a single unidirectional bulk stream (clipboard, file, or drag file).
-pub async fn recv_bulk_stream(mut uni: RecvStream) -> Result<glide_proto::BulkTransfer> {
+/// Reads and validates a single unidirectional bulk stream (clipboard, file, or drag file)
+/// using `DEFAULT_MAX_FILE_BYTES`.
+pub async fn recv_bulk_stream(uni: RecvStream) -> Result<glide_proto::BulkTransfer> {
+    recv_bulk_stream_with_limit(uni, DEFAULT_MAX_FILE_BYTES).await
+}
+
+/// Reads and validates a single unidirectional bulk stream enforcing `max_file_bytes`.
+pub async fn recv_bulk_stream_with_limit(
+    uni: RecvStream,
+    max_file_bytes: usize,
+) -> Result<glide_proto::BulkTransfer> {
+    let limit = std::sync::atomic::AtomicUsize::new(max_file_bytes);
+    recv_bulk_stream_with_atomic_limit(uni, &limit).await
+}
+
+/// Reads and validates a single unidirectional bulk stream enforcing a live-updated
+/// `AtomicUsize` ceiling read once the stream arrives (so live `UpdateMaxFileBytes` changes
+/// apply immediately to the next transfer instead of using a stale pre-accept snapshot).
+pub async fn recv_bulk_stream_with_atomic_limit(
+    mut uni: RecvStream,
+    max_file_bytes: &std::sync::atomic::AtomicUsize,
+) -> Result<glide_proto::BulkTransfer> {
     use glide_proto::{
         BulkTransfer, DragFilePayload, BULK_KIND_CLIPBOARD, BULK_KIND_DRAG_FILE, BULK_KIND_FILE,
     };
@@ -452,22 +529,45 @@ pub async fn recv_bulk_stream(mut uni: RecvStream) -> Result<glide_proto::BulkTr
                 data: Bytes::from(data),
             }))
         }
-        BULK_KIND_FILE => Ok(BulkTransfer::File(read_file_payload(&mut uni).await?)),
+        BULK_KIND_FILE => {
+            let limit = max_file_bytes.load(std::sync::atomic::Ordering::Relaxed);
+            Ok(BulkTransfer::File(read_file_payload(&mut uni, limit).await?))
+        }
         BULK_KIND_DRAG_FILE => {
             let mut id_buf = [0u8; 8];
             uni.read_exact(&mut id_buf).await?;
             let drag_id = u64::from_be_bytes(id_buf);
-            let file = read_file_payload(&mut uni).await?;
+            let limit = max_file_bytes.load(std::sync::atomic::Ordering::Relaxed);
+            let file = read_file_payload(&mut uni, limit).await?;
             Ok(BulkTransfer::DragFile(DragFilePayload { drag_id, file }))
         }
         other => Err(anyhow!("unknown bulk transfer kind: 0x{other:02X}")),
     }
 }
 
-/// Accepts and validates the next unidirectional bulk stream (clipboard or file) on `conn`.
+/// Accepts and validates the next unidirectional bulk stream (clipboard, file, or drag file)
+/// using `DEFAULT_MAX_FILE_BYTES`.
 pub async fn recv_bulk_on(conn: &Connection) -> Result<glide_proto::BulkTransfer> {
+    recv_bulk_on_with_limit(conn, DEFAULT_MAX_FILE_BYTES).await
+}
+
+/// Accepts and validates the next unidirectional bulk stream enforcing `max_file_bytes`.
+pub async fn recv_bulk_on_with_limit(
+    conn: &Connection,
+    max_file_bytes: usize,
+) -> Result<glide_proto::BulkTransfer> {
     let uni = conn.accept_uni().await.context("bulk uni stream closed")?;
-    recv_bulk_stream(uni).await
+    recv_bulk_stream_with_limit(uni, max_file_bytes).await
+}
+
+/// Accepts and validates the next unidirectional bulk stream enforcing a live-updated
+/// `AtomicUsize` ceiling read once the stream arrives.
+pub async fn recv_bulk_on_with_atomic_limit(
+    conn: &Connection,
+    max_file_bytes: &std::sync::atomic::AtomicUsize,
+) -> Result<glide_proto::BulkTransfer> {
+    let uni = conn.accept_uni().await.context("bulk uni stream closed")?;
+    recv_bulk_stream_with_atomic_limit(uni, max_file_bytes).await
 }
 
 /// Accepts the next clipboard payload (for tests/backwards callers).
@@ -719,5 +819,149 @@ mod tests {
             .await
             .unwrap_err();
         assert!(err.to_string().contains("truncated"));
+    }
+
+    #[tokio::test]
+    async fn custom_file_size_limit_enforced_on_send_and_recv() {
+        let identity = ServerIdentity::generate_ephemeral().unwrap();
+        let fp = identity.fingerprint.clone();
+        let server = GlideServerEndpoint::bind("127.0.0.1:0".parse().unwrap(), &identity).unwrap();
+        let addr = server.local_addr();
+
+        let server_task = tokio::spawn(async move {
+            let mut sess = server.accept().await.unwrap();
+            let _hello = sess.ctrl_recv.recv().await.unwrap();
+
+            // 1. Sender refuses payload exceeding its custom 32-byte limit without opening a stream.
+            let oversized = Bytes::from(vec![0xAA; 64]);
+            let big_file = glide_proto::FilePayload {
+                filename: "too-big.bin".into(),
+                sha256: sha256_bytes(&oversized),
+                data: oversized,
+            };
+            let err = send_file_on_with_limit(&sess.conn, &big_file, 32)
+                .await
+                .unwrap_err();
+            assert!(err.to_string().contains("file payload too large"));
+
+            // 2. Sender allows 64 bytes with a 128-byte limit, while receiver only allows 32 bytes.
+            send_file_on_with_limit(&sess.conn, &big_file, 128)
+                .await
+                .unwrap();
+
+            // 3. Sender sends a 24-byte file that fits within the receiver's 32-byte limit.
+            let ok_data = Bytes::from(vec![0x55; 24]);
+            let ok_file = glide_proto::FilePayload {
+                filename: "fits.bin".into(),
+                sha256: sha256_bytes(&ok_data),
+                data: ok_data,
+            };
+            send_file_on_with_limit(&sess.conn, &ok_file, 32)
+                .await
+                .unwrap();
+
+            tokio::time::sleep(Duration::from_millis(120)).await;
+        });
+
+        let mut client = connect_client(addr, TrustMode::Pinned(fp)).await.unwrap();
+        client
+            .ctrl_send
+            .send(&ControlMessage::Hello {
+                version: PROTOCOL_VERSION,
+                peer_name: "limit-test".into(),
+                edge_on_server: Edge::Right,
+                os: OsKind::LinuxX11,
+            })
+            .await
+            .unwrap();
+
+        // First stream on the wire is 64 bytes -> rejected under 32-byte receiver limit.
+        let recv_err = client.recv_bulk_with_limit(32).await.unwrap_err();
+        assert!(recv_err.to_string().contains("exceeds maximum size"));
+
+        // Second stream on the wire is 24 bytes -> accepted under 32-byte receiver limit.
+        match client.recv_bulk_with_limit(32).await.unwrap() {
+            glide_proto::BulkTransfer::File(f) => {
+                assert_eq!(f.filename, "fits.bin");
+                assert_eq!(f.data.len(), 24);
+            }
+            other => panic!("expected file transfer, got {other:?}"),
+        }
+
+        server_task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn truncated_huge_header_does_not_oom_and_multichunk_transfer_succeeds() {
+        let identity = ServerIdentity::generate_ephemeral().unwrap();
+        let fp = identity.fingerprint.clone();
+        let server = GlideServerEndpoint::bind("127.0.0.1:0".parse().unwrap(), &identity).unwrap();
+        let addr = server.local_addr();
+
+        let server_task = tokio::spawn(async move {
+            let mut sess = server.accept().await.unwrap();
+            let _hello = sess.ctrl_recv.recv().await.unwrap();
+
+            // 1. Corrupt/truncated stream claiming u32::MAX (~4 GiB) but sending only 16 bytes
+            let mut uni = sess.conn.open_uni().await.unwrap();
+            uni.write_all(&[glide_proto::BULK_KIND_FILE]).await.unwrap();
+            let name = b"fake-4gb.bin";
+            uni.write_all(&(name.len() as u16).to_be_bytes())
+                .await
+                .unwrap();
+            uni.write_all(name).await.unwrap();
+            uni.write_all(&[0u8; 32]).await.unwrap();
+            uni.write_all(&u32::MAX.to_be_bytes()).await.unwrap();
+            uni.write_all(&[0xAB; 16]).await.unwrap();
+            uni.finish().unwrap();
+
+            // 2. Real multi-chunk (> 64 KiB) transfer of 200 KiB succeeds across incremental chunks
+            let payload_data: Vec<u8> = (0..(200 * 1024)).map(|i| (i % 251) as u8).collect();
+            let real_file = glide_proto::FilePayload {
+                filename: "multichunk.bin".into(),
+                sha256: sha256_bytes(&payload_data),
+                data: Bytes::from(payload_data),
+            };
+            send_file_on_with_limit(&sess.conn, &real_file, 1024 * 1024)
+                .await
+                .unwrap();
+
+            tokio::time::sleep(Duration::from_millis(120)).await;
+        });
+
+        let mut client = connect_client(addr, TrustMode::Pinned(fp)).await.unwrap();
+        client
+            .ctrl_send
+            .send(&ControlMessage::Hello {
+                version: PROTOCOL_VERSION,
+                peer_name: "oom-guard-test".into(),
+                edge_on_server: Edge::Right,
+                os: OsKind::LinuxX11,
+            })
+            .await
+            .unwrap();
+
+        // Allow up to 4 GiB so the length check passes and incremental reading catches the truncation
+        let err = client
+            .recv_bulk_with_limit(u32::MAX as usize)
+            .await
+            .unwrap_err();
+        assert!(
+            format!("{err:#}").contains("bulk stream ended early"),
+            "unexpected error: {err:#}"
+        );
+
+        match client.recv_bulk_with_limit(1024 * 1024).await.unwrap() {
+            glide_proto::BulkTransfer::File(f) => {
+                assert_eq!(f.filename, "multichunk.bin");
+                assert_eq!(f.data.len(), 200 * 1024);
+                assert_eq!(f.data[0], 0);
+                assert_eq!(f.data[251], 0);
+                assert_eq!(f.data[252], 1);
+            }
+            other => panic!("expected multi-chunk file, got {other:?}"),
+        }
+
+        server_task.await.unwrap();
     }
 }

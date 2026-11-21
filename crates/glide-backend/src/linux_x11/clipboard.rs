@@ -3,6 +3,7 @@
 //! Supports `UTF8_STRING` / `text/plain;charset=utf-8` and `image/png`, including
 //! ICCCM `INCR` chunked transfers for large payloads, with SHA-256 anti-loop protection.
 
+use crate::clipboard_privacy::{has_sensitive_x11_target, PASSWORD_MANAGER_HINT_MIME};
 use crate::{ClipboardBackend, ClipboardHandle};
 use anyhow::{Context, Result};
 use bytes::Bytes;
@@ -31,6 +32,7 @@ struct Atoms {
     text_plain_utf8: Atom,
     string: Atom,
     image_png: Atom,
+    password_manager_hint: Atom,
     incr: Atom,
     prop: Atom,
     wake: Atom,
@@ -43,6 +45,7 @@ impl Atoms {
         let utf8_string = conn.intern_atom(false, b"UTF8_STRING")?;
         let text_plain_utf8 = conn.intern_atom(false, b"text/plain;charset=utf-8")?;
         let image_png = conn.intern_atom(false, b"image/png")?;
+        let password_manager_hint = conn.intern_atom(false, PASSWORD_MANAGER_HINT_MIME.as_bytes())?;
         let incr = conn.intern_atom(false, b"INCR")?;
         let prop = conn.intern_atom(false, b"GLIDE_CLIP_DATA")?;
         let wake = conn.intern_atom(false, b"GLIDE_CLIP_WAKE")?;
@@ -53,6 +56,7 @@ impl Atoms {
             text_plain_utf8: text_plain_utf8.reply()?.atom,
             string: AtomEnum::STRING.into(),
             image_png: image_png.reply()?.atom,
+            password_manager_hint: password_manager_hint.reply()?.atom,
             incr: incr.reply()?.atom,
             prop: prop.reply()?.atom,
             wake: wake.reply()?.atom,
@@ -157,14 +161,40 @@ pub fn start_x11_clipboard() -> Result<ClipboardHandle> {
     })
 }
 
+#[derive(Debug, PartialEq, Eq)]
 enum ReadState {
     Idle,
-    AwaitingTargets,
-    AwaitingData(ClipboardFormat),
+    AwaitingTargets {
+        timestamp: u32,
+        expected_target: Atom,
+    },
+    AwaitingData {
+        timestamp: u32,
+        expected_target: Atom,
+        format: ClipboardFormat,
+    },
     ReceivingIncr {
         format: ClipboardFormat,
         buf: Vec<u8>,
     },
+}
+
+/// Returns `true` only if an incoming X11 `SelectionNotify` matches both the timestamp and target
+/// atom of our active `convert_selection` request (preventing stale replies from a prior owner
+/// from triggering a read of a newly copied password-manager secret).
+fn selection_notify_matches(state: &ReadState, time: u32, target: Atom) -> bool {
+    match *state {
+        ReadState::AwaitingTargets {
+            timestamp,
+            expected_target,
+        }
+        | ReadState::AwaitingData {
+            timestamp,
+            expected_target,
+            ..
+        } => time == timestamp && target == expected_target,
+        ReadState::Idle | ReadState::ReceivingIncr { .. } => false,
+    }
 }
 
 fn run_clipboard_loop(
@@ -218,23 +248,31 @@ fn run_clipboard_loop(
             }
             Event::XfixesSelectionNotify(sn) if sn.selection == atoms.clipboard => {
                 if sn.owner == win || sn.owner == x11rb::NONE {
+                    state = ReadState::Idle;
                     continue;
                 }
-                // Another local app copied something — ask for its TARGETS first.
-                state = ReadState::AwaitingTargets;
+                // Another local app copied something — ask for its TARGETS using the event's
+                // exact X11 timestamp so stale replies from earlier owners are rejected.
+                let ts = sn.timestamp;
+                state = ReadState::AwaitingTargets {
+                    timestamp: ts,
+                    expected_target: atoms.targets,
+                };
                 let _ = conn.delete_property(win, atoms.prop);
-                let _ = conn.convert_selection(
-                    win,
-                    atoms.clipboard,
-                    atoms.targets,
-                    atoms.prop,
-                    x11rb::CURRENT_TIME,
-                );
+                let _ = conn.convert_selection(win, atoms.clipboard, atoms.targets, atoms.prop, ts);
                 let _ = conn.flush();
             }
             Event::SelectionNotify(sn)
                 if sn.requestor == win && sn.selection == atoms.clipboard =>
             {
+                if !selection_notify_matches(&state, sn.time, sn.target) {
+                    trace!(
+                        time = sn.time,
+                        target = sn.target,
+                        "Ignoring stale or mismatched X11 SelectionNotify"
+                    );
+                    continue;
+                }
                 if sn.property == x11rb::NONE {
                     state = ReadState::Idle;
                     continue;
@@ -256,46 +294,37 @@ fn run_clipboard_loop(
                 };
 
                 match state {
-                    ReadState::AwaitingTargets => {
-                        let mut has_utf8 = false;
-                        let mut has_plain_utf8 = false;
-                        let mut has_png = false;
-                        if let Some(iter) = prop.value32() {
-                            for atom in iter {
-                                if atom == atoms.utf8_string {
-                                    has_utf8 = true;
-                                    break;
-                                } else if atom == atoms.text_plain_utf8 {
-                                    has_plain_utf8 = true;
-                                } else if atom == atoms.image_png {
-                                    has_png = true;
-                                }
-                            }
-                        }
-                        let chosen = if has_utf8 {
-                            Some((atoms.utf8_string, ClipboardFormat::TextUtf8))
-                        } else if has_plain_utf8 {
-                            Some((atoms.text_plain_utf8, ClipboardFormat::TextUtf8))
-                        } else if has_png {
-                            Some((atoms.image_png, ClipboardFormat::ImagePng))
-                        } else {
-                            None
-                        };
-                        if let Some((target_atom, fmt)) = chosen {
-                            state = ReadState::AwaitingData(fmt);
+                    ReadState::AwaitingTargets { timestamp, .. } => {
+                        let offered: Vec<Atom> = prop
+                            .value32()
+                            .map(|iter| iter.collect())
+                            .unwrap_or_default();
+                        if has_sensitive_x11_target(&offered, atoms.password_manager_hint) {
+                            debug!(
+                                "Skipping sensitive X11 clipboard selection (x-kde-passwordManagerHint)"
+                            );
+                            state = ReadState::Idle;
+                        } else if let Some((target_atom, fmt)) =
+                            choose_x11_clipboard_target(&offered, &atoms)
+                        {
+                            state = ReadState::AwaitingData {
+                                timestamp,
+                                expected_target: target_atom,
+                                format: fmt,
+                            };
                             let _ = conn.convert_selection(
                                 win,
                                 atoms.clipboard,
                                 target_atom,
                                 atoms.prop,
-                                x11rb::CURRENT_TIME,
+                                timestamp,
                             );
                             let _ = conn.flush();
                         } else {
                             state = ReadState::Idle;
                         }
                     }
-                    ReadState::AwaitingData(fmt) => {
+                    ReadState::AwaitingData { format: fmt, .. } => {
                         if prop.type_ == atoms.incr {
                             state = ReadState::ReceivingIncr {
                                 format: fmt,
@@ -419,5 +448,121 @@ fn run_clipboard_loop(
             }
             _ => {}
         }
+    }
+}
+
+fn choose_x11_clipboard_target(offered: &[Atom], atoms: &Atoms) -> Option<(Atom, ClipboardFormat)> {
+    if has_sensitive_x11_target(offered, atoms.password_manager_hint) {
+        return None;
+    }
+    if offered.contains(&atoms.utf8_string) {
+        Some((atoms.utf8_string, ClipboardFormat::TextUtf8))
+    } else if offered.contains(&atoms.text_plain_utf8) {
+        Some((atoms.text_plain_utf8, ClipboardFormat::TextUtf8))
+    } else if offered.contains(&atoms.image_png) {
+        Some((atoms.image_png, ClipboardFormat::ImagePng))
+    } else {
+        None
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn sample_atoms() -> Atoms {
+        Atoms {
+            clipboard: 1,
+            targets: 2,
+            utf8_string: 3,
+            text_plain_utf8: 4,
+            string: 5,
+            image_png: 6,
+            password_manager_hint: 7,
+            incr: 8,
+            prop: 9,
+            wake: 10,
+        }
+    }
+
+    #[test]
+    fn x11_target_selection_skips_password_manager_hint() {
+        let atoms = sample_atoms();
+        assert_eq!(
+            choose_x11_clipboard_target(&[atoms.utf8_string, atoms.image_png], &atoms),
+            Some((atoms.utf8_string, ClipboardFormat::TextUtf8))
+        );
+        assert_eq!(
+            choose_x11_clipboard_target(
+                &[atoms.utf8_string, atoms.password_manager_hint],
+                &atoms
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn x11_selection_notify_rejects_stale_timestamp_and_wrong_target() {
+        let atoms = sample_atoms();
+        // KeePassXC took ownership at t=200; we are waiting for its TARGETS reply
+        let awaiting_targets = ReadState::AwaitingTargets {
+            timestamp: 200,
+            expected_target: atoms.targets,
+        };
+        // Stale TARGETS reply from earlier non-sensitive App A at t=100 MUST be ignored!
+        assert!(!selection_notify_matches(
+            &awaiting_targets,
+            100,
+            atoms.targets
+        ));
+        // Wrong target at current timestamp MUST be ignored
+        assert!(!selection_notify_matches(
+            &awaiting_targets,
+            200,
+            atoms.utf8_string
+        ));
+        // Exact (timestamp, target) match is accepted
+        assert!(selection_notify_matches(
+            &awaiting_targets,
+            200,
+            atoms.targets
+        ));
+
+        // Same enforcement in AwaitingData
+        let awaiting_data = ReadState::AwaitingData {
+            timestamp: 200,
+            expected_target: atoms.utf8_string,
+            format: ClipboardFormat::TextUtf8,
+        };
+        assert!(!selection_notify_matches(
+            &awaiting_data,
+            100,
+            atoms.utf8_string
+        ));
+        assert!(!selection_notify_matches(
+            &awaiting_data,
+            200,
+            atoms.targets
+        ));
+        assert!(selection_notify_matches(
+            &awaiting_data,
+            200,
+            atoms.utf8_string
+        ));
+
+        // Idle and ReceivingIncr reject all SelectionNotify events
+        assert!(!selection_notify_matches(
+            &ReadState::Idle,
+            200,
+            atoms.targets
+        ));
+        assert!(!selection_notify_matches(
+            &ReadState::ReceivingIncr {
+                format: ClipboardFormat::TextUtf8,
+                buf: Vec::new(),
+            },
+            200,
+            atoms.utf8_string
+        ));
     }
 }
