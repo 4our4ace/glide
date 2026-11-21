@@ -74,15 +74,19 @@ unsafe extern "system" fn enum_monitor_cb(
             .unwrap_or(info.szDevice.len());
         let name = String::from_utf16_lossy(&info.szDevice[..name_end]);
 
-        monitors.push(MonitorRect {
-            name,
-            x: rc.left,
-            y: rc.top,
-            width: rc.right - rc.left,
-            height: rc.bottom - rc.top,
-            scale,
-            primary,
-        });
+        let width = rc.right - rc.left;
+        let height = rc.bottom - rc.top;
+        if width > 0 && height > 0 {
+            monitors.push(MonitorRect {
+                name,
+                x: rc.left,
+                y: rc.top,
+                width,
+                height,
+                scale,
+                primary,
+            });
+        }
     }
 
     1 // TRUE: continue enumeration
@@ -102,6 +106,9 @@ pub fn query_desktop_geometry() -> Result<DesktopGeometry> {
     }
     if monitors.is_empty() {
         return Ok(DesktopGeometry::fallback());
+    }
+    if !monitors.iter().any(|m| m.primary) {
+        monitors[0].primary = true;
     }
     Ok(DesktopGeometry::new(monitors))
 }

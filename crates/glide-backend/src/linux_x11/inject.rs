@@ -1,7 +1,10 @@
 //! X11 Client input injector using XTest (`x11rb`) with zero-roundtrip hot path.
 
 use crate::geometry::DesktopGeometry;
-use crate::linux_x11::{query_desktop_geometry, X11CursorHider};
+use crate::linux_x11::{
+    poll_randr_event, query_desktop_geometry, subscribe_randr_events, unsubscribe_randr_events,
+    X11CursorHider,
+};
 use crate::InputInjector;
 use anyhow::{Context, Result};
 use glide_hid::{HidUsage, MouseButton};
@@ -22,6 +25,8 @@ pub struct X11Injector {
     screen_num: usize,
     root: Window,
     geometry: DesktopGeometry,
+    randr_subscribed: bool,
+    last_geom_refresh: Instant,
     cursor_hider: X11CursorHider,
     parked_pos: (i32, i32),
     // Sub-pixel motion remainder accumulator so fractional deltas never get dropped.
@@ -57,6 +62,7 @@ impl X11Injector {
             "Connected X11Injector with XTest"
         );
 
+        let randr_subscribed = subscribe_randr_events(&conn, root);
         let cursor_hider = X11CursorHider::init(&conn);
         let geometry = query_desktop_geometry(&conn, screen_num)?;
         let (cx, cy) = geometry.primary_center();
@@ -66,6 +72,8 @@ impl X11Injector {
             screen_num,
             root,
             geometry,
+            randr_subscribed,
+            last_geom_refresh: Instant::now(),
             cursor_hider,
             parked_pos: (cx, cy),
             rem_x: 0.0,
@@ -79,6 +87,29 @@ impl X11Injector {
             pressed_keys: HashSet::new(),
             pressed_buttons: HashSet::new(),
         })
+    }
+
+    fn refresh_geometry_if_needed(&mut self) -> bool {
+        let randr_dirty = self.randr_subscribed && poll_randr_event(&self.conn);
+        if !randr_dirty && self.last_geom_refresh.elapsed() < Duration::from_secs(5) {
+            return false;
+        }
+        self.last_geom_refresh = Instant::now();
+        if let Ok(new_geom) = query_desktop_geometry(&self.conn, self.screen_num) {
+            if new_geom != self.geometry {
+                self.geometry = new_geom;
+                self.edge_push_accum = 0.0;
+                let (min_x, min_y, max_x, max_y) = self.geometry.bounds();
+                self.est_x = self.est_x.clamp(min_x as f32, (max_x - 1) as f32);
+                self.est_y = self.est_y.clamp(min_y as f32, (max_y - 1) as f32);
+                debug!(
+                    monitors = self.geometry.monitors.len(),
+                    randr_dirty, "X11Injector refreshed desktop geometry"
+                );
+                return true;
+            }
+        }
+        false
     }
 
     fn sync_pointer(&mut self) -> Result<(i32, i32)> {
@@ -121,12 +152,24 @@ impl InputInjector for X11Injector {
     }
 
     fn desktop_geometry(&mut self) -> Result<DesktopGeometry> {
+        let _ = poll_randr_event(&self.conn);
+        self.last_geom_refresh = Instant::now();
         self.geometry = query_desktop_geometry(&self.conn, self.screen_num)?;
         Ok(self.geometry.clone())
     }
 
+    fn poll_geometry_changed(&mut self) -> Option<DesktopGeometry> {
+        if self.refresh_geometry_if_needed() {
+            Some(self.geometry.clone())
+        } else {
+            None
+        }
+    }
+
     fn enter(&mut self, edge: Edge, normalized_pos: f32) -> Result<()> {
         // Refresh RandR geometry on every screen entry so monitor hotplug works seamlessly.
+        let _ = poll_randr_event(&self.conn);
+        self.last_geom_refresh = Instant::now();
         if let Ok(geom) = query_desktop_geometry(&self.conn, self.screen_num) {
             self.geometry = geom;
         }
@@ -150,6 +193,8 @@ impl InputInjector for X11Injector {
     }
 
     fn enter_at(&mut self, norm_x: f32, norm_y: f32) -> Result<()> {
+        let _ = poll_randr_event(&self.conn);
+        self.last_geom_refresh = Instant::now();
         if let Ok(geom) = query_desktop_geometry(&self.conn, self.screen_num) {
             self.geometry = geom;
         }
@@ -266,6 +311,7 @@ impl InputInjector for X11Injector {
             return Ok(None);
         }
 
+        self.refresh_geometry_if_needed();
         let (rx, ry) = self.sync_pointer()?;
         if let Some(norm) = self
             .geometry
@@ -383,6 +429,7 @@ impl InputInjector for X11Injector {
     }
 
     fn leave(&mut self) -> Result<()> {
+        self.refresh_geometry_if_needed();
         let (px, py) = self.geometry.primary_park_corner();
         let _ = self
             .conn
@@ -422,5 +469,9 @@ impl Drop for X11Injector {
     fn drop(&mut self) {
         let _ = self.release_all();
         let _ = self.show_cursor();
+        if self.randr_subscribed {
+            unsubscribe_randr_events(&self.conn, self.root);
+            let _ = self.conn.flush();
+        }
     }
 }

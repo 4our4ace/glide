@@ -105,6 +105,8 @@ pub enum CaptureEvent {
     HotkeySwitch { direction: Edge },
     /// Keyboard hotkey (`Ctrl+Alt+L`) toggling cursor lock to the current screen.
     HotkeyToggleLock,
+    /// Display topology, resolution, or DPI scaling changed (monitor hotplug / scale update).
+    GeometryChanged(DesktopGeometry),
 }
 
 /// Control handle to switch the OS capture backend between local and remote modes
@@ -199,6 +201,12 @@ pub trait InputInjector: Send {
     /// Checks whether the user physically moved a local mouse/touchpad while the cursor was
     /// hidden and reveals it immediately if so.
     fn reveal_if_moved_locally(&mut self) {}
+
+    /// Polls whether the OS reported a display hotplug, resolution, or DPI scaling change since
+    /// the last check, updating cached geometry and returning the new layout if it changed.
+    fn poll_geometry_changed(&mut self) -> Option<DesktopGeometry> {
+        None
+    }
 }
 
 /// Bidirectional OS clipboard backend (event-driven, zero polling).

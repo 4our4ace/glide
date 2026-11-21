@@ -17,11 +17,51 @@ use crate::DoctorReport;
 use anyhow::{Context, Result};
 use glide_proto::OsKind;
 use x11rb::connection::Connection;
-use x11rb::protocol::randr::ConnectionExt as RandrExt;
+use x11rb::protocol::randr::{ConnectionExt as RandrExt, NotifyMask};
 use x11rb::protocol::xfixes::ConnectionExt as XFixesExt;
 use x11rb::protocol::xinput::ConnectionExt as XInputExt;
+use x11rb::protocol::xproto::Window;
 use x11rb::protocol::xtest::ConnectionExt as XTestExt;
+use x11rb::protocol::Event;
 use x11rb::rust_connection::RustConnection;
+
+/// Subscribes `conn` to XRandR screen/CRTC/output change events on `root` (best-effort).
+pub fn subscribe_randr_events(conn: &RustConnection, root: Window) -> bool {
+    let mask = match conn
+        .randr_query_version(1, 2)
+        .ok()
+        .and_then(|c| c.reply().ok())
+    {
+        Some(v) if v.major_version > 1 || (v.major_version == 1 && v.minor_version >= 2) => {
+            NotifyMask::SCREEN_CHANGE | NotifyMask::CRTC_CHANGE | NotifyMask::OUTPUT_CHANGE
+        }
+        Some(_) => NotifyMask::SCREEN_CHANGE,
+        None => return false,
+    };
+    match conn.randr_select_input(root, mask) {
+        Ok(cookie) => cookie.check().is_ok(),
+        Err(_) => false,
+    }
+}
+
+/// Unsubscribes `conn` from XRandR change events on `root` (best-effort).
+pub fn unsubscribe_randr_events(conn: &RustConnection, root: Window) {
+    let _ = conn.randr_select_input(root, NotifyMask::from(0u16));
+}
+
+/// Drains queued X11 events non-blockingly and returns `true` if any XRandR layout event arrived.
+pub fn poll_randr_event(conn: &RustConnection) -> bool {
+    let mut changed = false;
+    while let Ok(Some(ev)) = conn.poll_for_event() {
+        if matches!(
+            ev,
+            Event::RandrScreenChangeNotify(_) | Event::RandrNotify(_)
+        ) {
+            changed = true;
+        }
+    }
+    changed
+}
 
 /// Queries the active multi-monitor geometry via XRandR (falling back to root screen size).
 pub fn query_desktop_geometry(conn: &RustConnection, screen_num: usize) -> Result<DesktopGeometry> {

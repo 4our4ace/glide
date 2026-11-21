@@ -9,7 +9,10 @@
 //! edge-return boundary checks.
 
 use crate::geometry::DesktopGeometry;
-use crate::linux_x11::{query_desktop_geometry, X11CursorHider};
+use crate::linux_x11::{
+    poll_randr_event, query_desktop_geometry, subscribe_randr_events, unsubscribe_randr_events,
+    X11CursorHider,
+};
 use crate::InputInjector;
 use anyhow::{anyhow, Context, Result};
 use glide_hid::{HidUsage, MouseButton};
@@ -102,6 +105,7 @@ struct X11Helper {
     conn: RustConnection,
     screen_num: usize,
     root: Window,
+    randr_subscribed: bool,
     cursor_hider: X11CursorHider,
 }
 
@@ -110,6 +114,7 @@ pub struct UinputInjector {
     x11: Option<X11Helper>,
     wayland: bool,
     geometry: DesktopGeometry,
+    last_geom_refresh: Instant,
     parked_pos: (i32, i32),
     rem_x: f32,
     rem_y: f32,
@@ -193,6 +198,7 @@ impl UinputInjector {
             let (conn, screen_num) = RustConnection::connect(None)
                 .context("failed to connect to X11 for geometry/warp")?;
             let root = conn.setup().roots[screen_num].root;
+            let randr_subscribed = subscribe_randr_events(&conn, root);
             let cursor_hider = X11CursorHider::init(&conn);
             let geometry = query_desktop_geometry(&conn, screen_num)?;
             (
@@ -200,6 +206,7 @@ impl UinputInjector {
                     conn,
                     screen_num,
                     root,
+                    randr_subscribed,
                     cursor_hider,
                 }),
                 geometry,
@@ -217,6 +224,7 @@ impl UinputInjector {
             x11,
             wayland,
             geometry,
+            last_geom_refresh: Instant::now(),
             parked_pos: (cx, cy),
             rem_x: 0.0,
             rem_y: 0.0,
@@ -269,11 +277,45 @@ impl UinputInjector {
 
     fn refresh_geometry(&mut self) -> Result<()> {
         if let Some(ref x11) = self.x11 {
+            let _ = poll_randr_event(&x11.conn);
             self.geometry = query_desktop_geometry(&x11.conn, x11.screen_num)?;
         } else if let Ok(geom) = crate::linux_wayland::query_desktop_geometry() {
             self.geometry = geom;
         }
+        self.last_geom_refresh = Instant::now();
         Ok(())
+    }
+
+    fn refresh_geometry_if_needed(&mut self) -> bool {
+        let randr_dirty = self
+            .x11
+            .as_ref()
+            .is_some_and(|x11| x11.randr_subscribed && poll_randr_event(&x11.conn));
+        let fallback = if self.x11.is_some() {
+            Duration::from_secs(5)
+        } else {
+            Duration::from_secs(3)
+        };
+        if !randr_dirty && self.last_geom_refresh.elapsed() < fallback {
+            return false;
+        }
+        self.last_geom_refresh = Instant::now();
+        let next = if let Some(ref x11) = self.x11 {
+            query_desktop_geometry(&x11.conn, x11.screen_num).ok()
+        } else {
+            crate::linux_wayland::query_desktop_geometry().ok()
+        };
+        if let Some(new_geom) = next {
+            if new_geom != self.geometry {
+                self.geometry = new_geom;
+                self.edge_push_accum = 0.0;
+                let (min_x, min_y, max_x, max_y) = self.geometry.bounds();
+                self.est_x = self.est_x.clamp(min_x as f32, (max_x - 1) as f32);
+                self.est_y = self.est_y.clamp(min_y as f32, (max_y - 1) as f32);
+                return true;
+            }
+        }
+        false
     }
 
     fn warp_to(&mut self, x: i32, y: i32) -> Result<()> {
@@ -336,6 +378,14 @@ impl InputInjector for UinputInjector {
     fn desktop_geometry(&mut self) -> Result<DesktopGeometry> {
         self.refresh_geometry()?;
         Ok(self.geometry.clone())
+    }
+
+    fn poll_geometry_changed(&mut self) -> Option<DesktopGeometry> {
+        if self.refresh_geometry_if_needed() {
+            Some(self.geometry.clone())
+        } else {
+            None
+        }
     }
 
     fn enter(&mut self, edge: Edge, normalized_pos: f32) -> Result<()> {
@@ -429,6 +479,7 @@ impl InputInjector for UinputInjector {
             return Ok(None);
         }
 
+        self.refresh_geometry_if_needed();
         let (rx, ry) = self.sync_pointer()?;
         if let Some(norm) = self
             .geometry
@@ -515,6 +566,7 @@ impl InputInjector for UinputInjector {
     }
 
     fn leave(&mut self) -> Result<()> {
+        self.refresh_geometry_if_needed();
         let (px, py) = self.geometry.primary_park_corner();
         if let Some(ref mut x11) = self.x11 {
             let _ = x11
@@ -566,6 +618,12 @@ impl Drop for UinputInjector {
     fn drop(&mut self) {
         let _ = self.release_all();
         let _ = self.show_cursor();
+        if let Some(ref x11) = self.x11 {
+            if x11.randr_subscribed {
+                unsubscribe_randr_events(&x11.conn, x11.root);
+                let _ = x11.conn.flush();
+            }
+        }
         unsafe {
             let _ = libc::ioctl(self.file.as_raw_fd(), UI_DEV_DESTROY as _);
         }

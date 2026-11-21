@@ -142,7 +142,7 @@ fn parse_zones(results: &HashMap<String, OwnedValue>) -> (DesktopGeometry, u32) 
                     width: w as i32,
                     height: h as i32,
                     scale: 1.0,
-                    primary: idx == 0,
+                    primary: monitors.is_empty(),
                 });
             }
         }
@@ -159,6 +159,7 @@ fn parse_zones(results: &HashMap<String, OwnedValue>) -> (DesktopGeometry, u32) 
 #[derive(Debug)]
 enum ControlMsg {
     UpdateBarriers,
+    RefreshZones,
     Release { x: f64, y: f64 },
     Shutdown,
 }
@@ -393,6 +394,7 @@ fn start_wayland_capture_blocking(config: CaptureConfig) -> Result<CaptureHandle
     let shared_dbus = Arc::clone(&shared);
     let ev_tx_dbus = ev_tx.clone();
     let session_dbus = session_path.clone();
+    let cmd_tx_sig = cmd_tx.clone();
     std::thread::Builder::new()
         .name("glide-wl-ic-dbus".into())
         .spawn(move || {
@@ -477,31 +479,9 @@ fn start_wayland_capture_blocking(config: CaptureConfig) -> Result<CaptureHandle
                                 shared_sig.in_remote.store(false, Ordering::SeqCst);
                             }
                             "ZonesChanged" => {
-                                if let Ok(p) = Proxy::new(
-                                    &sig_conn,
-                                    PORTAL_DEST,
-                                    PORTAL_PATH,
-                                    INPUT_CAPTURE_IFACE,
-                                ) {
-                                    let tok = next_portal_token("ic_zones");
-                                    if let Ok(r) = call_portal_request(
-                                        &sig_conn,
-                                        &tok,
-                                        Duration::from_secs(10),
-                                        || {
-                                            let mut o: HashMap<&str, Value<'_>> = HashMap::new();
-                                            opt_str(&mut o, "handle_token", &tok);
-                                            let hp: OwnedObjectPath =
-                                                p.call("GetZones", &(session_sig.as_ref(), o))?;
-                                            Ok(hp)
-                                        },
-                                    ) {
-                                        let (g, zs) = parse_zones(&r);
-                                        *shared_sig.geometry.lock() = g;
-                                        *shared_sig.zone_set.lock() = zs;
-                                        apply_barriers(&sig_conn, &p, &session_sig, &shared_sig);
-                                    }
-                                }
+                                // Serialize GetZones + SetPointerBarriers on the command thread so
+                                // this signal thread never stalls or races UpdateBarriers.
+                                let _ = cmd_tx_sig.send(ControlMsg::RefreshZones);
                             }
                             _ => {}
                         }
@@ -518,6 +498,47 @@ fn start_wayland_capture_blocking(config: CaptureConfig) -> Result<CaptureHandle
                 match cmd {
                     ControlMsg::UpdateBarriers => {
                         apply_barriers(&conn, &ctrl_proxy, &session_dbus, &shared_dbus);
+                    }
+                    ControlMsg::RefreshZones => {
+                        let tok = next_portal_token("ic_zones");
+                        match call_portal_request(
+                            &conn,
+                            &tok,
+                            Duration::from_secs(10),
+                            || {
+                                let mut o: HashMap<&str, Value<'_>> = HashMap::new();
+                                opt_str(&mut o, "handle_token", &tok);
+                                let hp: OwnedObjectPath =
+                                    ctrl_proxy.call("GetZones", &(session_dbus.as_ref(), o))?;
+                                Ok(hp)
+                            },
+                        ) {
+                            Ok(r) => {
+                                let (g, zs) = parse_zones(&r);
+                                let changed = {
+                                    let mut guard = shared_dbus.geometry.lock();
+                                    if *guard != g {
+                                        *guard = g.clone();
+                                        true
+                                    } else {
+                                        false
+                                    }
+                                };
+                                *shared_dbus.zone_set.lock() = zs;
+                                apply_barriers(&conn, &ctrl_proxy, &session_dbus, &shared_dbus);
+                                if changed {
+                                    debug!(
+                                        monitors = g.monitors.len(),
+                                        zone_set = zs,
+                                        "Wayland InputCapture refreshed zones and barriers"
+                                    );
+                                    let _ = ev_tx_dbus.send(CaptureEvent::GeometryChanged(g));
+                                }
+                            }
+                            Err(e) => {
+                                warn!(error = %e, "Wayland InputCapture GetZones after ZonesChanged failed");
+                            }
+                        }
                     }
                     ControlMsg::Release { x, y } => {
                         let mut opts: HashMap<&str, Value<'_>> = HashMap::new();

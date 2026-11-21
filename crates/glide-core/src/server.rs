@@ -28,7 +28,8 @@ use glide_proto::{
 };
 use std::collections::HashMap;
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
@@ -93,7 +94,7 @@ pub async fn run_server_with_backends(
     let local_addr: SocketAddr = endpoint.local_addr();
     let fingerprint = endpoint.fingerprint().to_string();
     let geom = capture.control.desktop_geometry();
-    let server_scale = geom.primary_scale();
+    let server_scale = Arc::new(AtomicU32::new(geom.primary_scale().to_bits()));
 
     if let Some(ref rt) = runtime {
         rt.update(|s| {
@@ -143,15 +144,17 @@ pub async fn run_server_with_backends(
 
     let server_name = config.name.clone();
     let accept_tx = peer_tx.clone();
+    let accept_scale = Arc::clone(&server_scale);
     let _accept_guard = AbortOnDrop(tokio::spawn(async move {
         loop {
             match endpoint.accept().await {
                 Ok(session) => {
                     let sname = server_name.clone();
                     let tx = accept_tx.clone();
+                    let scale = f32::from_bits(accept_scale.load(Ordering::Relaxed));
                     tokio::spawn(async move {
                         if let Err(e) =
-                            handle_incoming_session(session, sname, server_scale, tx).await
+                            handle_incoming_session(session, sname, scale, tx).await
                         {
                             warn!(error = %e, "Incoming client handshake failed");
                         }
@@ -633,6 +636,21 @@ pub async fn run_server_with_backends(
                         pending_dy = 0.0;
                         coalesce_armed = false;
                         sync_runtime_peers(&runtime, &peers, active_remote, locked);
+                    }
+
+                    CaptureEvent::GeometryChanged(new_geom) => {
+                        let new_scale = new_geom.primary_scale();
+                        server_scale.store(new_scale.to_bits(), Ordering::Relaxed);
+                        info!(
+                            monitors = new_geom.monitors.len(),
+                            primary_scale = new_scale,
+                            "Server desktop geometry updated live"
+                        );
+                        if let Some(ref rt) = runtime {
+                            rt.update(|s| {
+                                s.geometry = new_geom;
+                            });
+                        }
                     }
                 }
             }

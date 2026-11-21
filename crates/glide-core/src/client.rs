@@ -102,7 +102,7 @@ pub async fn run_client_session(
     let mut session = connect_client(server_addr, trust).await?;
 
     let client_geom = injector.desktop_geometry().unwrap_or_default();
-    let client_scale = client_geom.primary_scale();
+    let mut client_scale = client_geom.primary_scale();
 
     session
         .ctrl_send
@@ -183,6 +183,19 @@ pub async fn run_client_session(
 
         tokio::select! {
             _ = ping_interval.tick() => {
+                if let Some(new_geom) = injector.poll_geometry_changed() {
+                    client_scale = new_geom.primary_scale();
+                    info!(
+                        monitors = new_geom.monitors.len(),
+                        client_scale,
+                        "Client desktop geometry updated live"
+                    );
+                    if let Some(rt) = runtime {
+                        rt.update(|s| {
+                            s.geometry = new_geom;
+                        });
+                    }
+                }
                 if let Some(rt) = runtime {
                     let rtt_ms = conn.rtt().as_secs_f32() * 1000.0;
                     rt.record_rtt(rtt_ms);

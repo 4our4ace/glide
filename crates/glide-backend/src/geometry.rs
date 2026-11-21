@@ -41,7 +41,7 @@ impl MonitorRect {
 }
 
 /// Complete multi-monitor layout of a machine.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct DesktopGeometry {
     pub monitors: Vec<MonitorRect>,
 }
@@ -361,5 +361,65 @@ mod tests {
         let (nx, ny) = geom.normalize_point(1280, 720);
         let (rx, ry) = geom.denormalize_point(nx, ny);
         assert!((rx - 1280).abs() <= 2 && (ry - 720).abs() <= 2);
+    }
+
+    #[test]
+    fn monitor_hotplug_and_dpi_change_recompute_edges_cleanly() {
+        let single = DesktopGeometry::new(vec![MonitorRect {
+            name: "eDP-1".into(),
+            x: 0,
+            y: 0,
+            width: 1920,
+            height: 1080,
+            scale: 1.0,
+            primary: true,
+        }]);
+        assert!(single.hit_outer_edge(Edge::Right, 1919, 540, 0).is_some());
+
+        // Hotplug a 2560x1440 monitor on the right at 150% DPI
+        let dual = DesktopGeometry::new(vec![
+            MonitorRect {
+                name: "eDP-1".into(),
+                x: 0,
+                y: 0,
+                width: 1920,
+                height: 1080,
+                scale: 1.0,
+                primary: true,
+            },
+            MonitorRect {
+                name: "DP-2".into(),
+                x: 1920,
+                y: 0,
+                width: 2560,
+                height: 1440,
+                scale: 1.5,
+                primary: false,
+            },
+        ]);
+        assert_ne!(single, dual);
+        // Old right border (x=1919) is now an internal seam — must NOT trigger outer Right edge!
+        assert!(dual.hit_outer_edge(Edge::Right, 1919, 540, 0).is_none());
+        // New right border (x=4479) triggers cleanly.
+        assert!(dual.hit_outer_edge(Edge::Right, 4479, 720, 0).is_some());
+
+        // Unplugging back to single monitor clamps previously valid right-monitor coords safely inside eDP-1
+        let (rx, ry) = single.denormalize_point(0.95, 0.5);
+        assert!((0..1920).contains(&rx) && (0..1080).contains(&ry));
+        let (px, py) = single.primary_park_corner();
+        assert_eq!((px, py), (1919, 1079));
+
+        // DPI change on same resolution is detected by PartialEq and updates primary_scale()
+        let scaled = DesktopGeometry::new(vec![MonitorRect {
+            name: "eDP-1".into(),
+            x: 0,
+            y: 0,
+            width: 1920,
+            height: 1080,
+            scale: 1.5,
+            primary: true,
+        }]);
+        assert_ne!(single, scaled);
+        assert!((scaled.primary_scale() - 1.5).abs() < f32::EPSILON);
     }
 }

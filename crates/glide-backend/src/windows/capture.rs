@@ -32,13 +32,14 @@ use windows_sys::Win32::UI::Input::{
     RAWINPUTDEVICE, RAWINPUTHEADER, RIDEV_INPUTSINK, RID_INPUT, RIM_TYPEMOUSE,
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::{
-    CallNextHookEx, CreateWindowExW, DefWindowProcW, DispatchMessageW, GetClassNameW, GetCursorPos,
-    GetForegroundWindow, GetMessageW, GetWindowRect, PostMessageW, RegisterClassW, SetCursorPos,
-    SetWindowsHookExW, TranslateMessage, UnhookWindowsHookEx, HHOOK, HWND_MESSAGE, KBDLLHOOKSTRUCT,
-    LLKHF_EXTENDED, MSG, MSLLHOOKSTRUCT, WH_KEYBOARD_LL, WH_MOUSE_LL, WM_APP, WM_INPUT, WM_KEYDOWN,
-    WM_KEYUP, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MBUTTONDOWN, WM_MBUTTONUP, WM_MOUSEHWHEEL,
-    WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_QUIT, WM_RBUTTONDOWN, WM_RBUTTONUP, WM_SYSKEYDOWN, WM_SYSKEYUP,
-    WM_XBUTTONDOWN, WM_XBUTTONUP, WNDCLASSW, XBUTTON1, XBUTTON2,
+    CallNextHookEx, CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW,
+    GetClassNameW, GetCursorPos, GetForegroundWindow, GetMessageW, GetWindowRect, PostMessageW,
+    RegisterClassW, SetCursorPos, SetWindowsHookExW, TranslateMessage, UnhookWindowsHookEx, HHOOK,
+    KBDLLHOOKSTRUCT, LLKHF_EXTENDED, MSG, MSLLHOOKSTRUCT, WH_KEYBOARD_LL, WH_MOUSE_LL, WM_APP,
+    WM_DISPLAYCHANGE, WM_DPICHANGED, WM_INPUT, WM_KEYDOWN, WM_KEYUP, WM_LBUTTONDOWN, WM_LBUTTONUP,
+    WM_MBUTTONDOWN, WM_MBUTTONUP, WM_MOUSEHWHEEL, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_QUIT,
+    WM_RBUTTONDOWN, WM_RBUTTONUP, WM_SYSKEYDOWN, WM_SYSKEYUP, WM_XBUTTONDOWN, WM_XBUTTONUP,
+    WNDCLASSW, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_OVERLAPPED, XBUTTON1, XBUTTON2,
 };
 
 const WM_APP_ENTER_REMOTE: u32 = WM_APP + 1;
@@ -82,6 +83,36 @@ impl HookState {
         self.start_instant.elapsed().as_millis() as u64
     }
 
+    fn refresh_geometry_now(&self) -> bool {
+        self.last_geom_refresh_ms
+            .store(self.elapsed_ms(), Ordering::Relaxed);
+        let Ok(new_geom) = query_desktop_geometry() else {
+            return false;
+        };
+        let changed = {
+            let mut geom = self.geometry.lock();
+            if *geom != new_geom {
+                *geom = new_geom.clone();
+                true
+            } else {
+                false
+            }
+        };
+        if changed {
+            *self.edge_push.lock() = (None, 0.0, None);
+            if self.remote_mode.load(Ordering::Acquire) {
+                self.park_cursor_invisibly();
+            }
+            debug!(
+                monitors = new_geom.monitors.len(),
+                primary_scale = new_geom.primary_scale(),
+                "Refreshed Windows desktop geometry"
+            );
+            let _ = self.tx.send(CaptureEvent::GeometryChanged(new_geom));
+        }
+        changed
+    }
+
     fn maybe_refresh_geometry(&self) {
         let now = self.elapsed_ms();
         let prev = self.last_geom_refresh_ms.load(Ordering::Relaxed);
@@ -91,9 +122,7 @@ impl HookState {
                 .compare_exchange(prev, now, Ordering::Relaxed, Ordering::Relaxed)
                 .is_ok()
         {
-            if let Ok(geom) = query_desktop_geometry() {
-                *self.geometry.lock() = geom;
-            }
+            let _ = self.refresh_geometry_now();
         }
     }
 
@@ -653,6 +682,12 @@ unsafe extern "system" fn capture_wnd_proc(
             });
             0
         }
+        WM_DISPLAYCHANGE | WM_DPICHANGED => {
+            with_hook_state(|state| {
+                state.refresh_geometry_now();
+            });
+            0
+        }
         _ => unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) },
     }
 }
@@ -717,6 +752,7 @@ pub fn start_windows_capture(config: CaptureConfig) -> Result<CaptureHandle> {
                         if !ms_hook.is_null() {
                             UnhookWindowsHookEx(ms_hook);
                         }
+                        DestroyWindow(hwnd);
                     }
                 }
                 Err(e) => {
@@ -763,17 +799,21 @@ fn init_capture_window_and_hooks() -> Result<(HWND, HHOOK, HHOOK)> {
         RegisterClassW(&wc);
     }
 
+    // Use a hidden top-level window (NOT HWND_MESSAGE): message-only windows never receive
+    // broadcast notifications like WM_DISPLAYCHANGE or WM_POWERBROADCAST. Because WS_VISIBLE
+    // is omitted and ShowWindow is never called, the window remains invisible and never appears
+    // in the taskbar or Alt+Tab.
     let hwnd = unsafe {
         CreateWindowExW(
-            0,
+            WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE,
             class_name.as_ptr(),
             class_name.as_ptr(),
+            WS_OVERLAPPED,
             0,
             0,
             0,
             0,
-            0,
-            HWND_MESSAGE,
+            ptr::null_mut(),
             ptr::null_mut(),
             hinstance,
             ptr::null(),
@@ -790,12 +830,18 @@ fn init_capture_window_and_hooks() -> Result<(HWND, HHOOK, HHOOK)> {
         hwndTarget: hwnd,
     };
     if unsafe { RegisterRawInputDevices(&rid, 1, size_of::<RAWINPUTDEVICE>() as u32) } == 0 {
+        unsafe {
+            DestroyWindow(hwnd);
+        }
         return Err(anyhow!("RegisterRawInputDevices failed for mouse"));
     }
 
     let kb_hook =
         unsafe { SetWindowsHookExW(WH_KEYBOARD_LL, Some(keyboard_ll_proc), hinstance, 0) };
     if kb_hook.is_null() {
+        unsafe {
+            DestroyWindow(hwnd);
+        }
         return Err(anyhow!("SetWindowsHookExW(WH_KEYBOARD_LL) failed"));
     }
 
@@ -803,6 +849,7 @@ fn init_capture_window_and_hooks() -> Result<(HWND, HHOOK, HHOOK)> {
     if ms_hook.is_null() {
         unsafe {
             UnhookWindowsHookEx(kb_hook);
+            DestroyWindow(hwnd);
         }
         return Err(anyhow!("SetWindowsHookExW(WH_MOUSE_LL) failed"));
     }
