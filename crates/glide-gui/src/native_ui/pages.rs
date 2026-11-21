@@ -66,6 +66,8 @@ pub fn root_view(s: &Ui, p: Palette) -> El {
             username,
             error.as_deref(),
         ));
+    } else if s.show_nightly_warning {
+        root = root.child(nightly_warning_modal(p));
     }
 
     if let Some(msg) = s.active_toast() {
@@ -83,6 +85,95 @@ pub fn root_view(s: &Ui, p: Palette) -> El {
     }
 
     root
+}
+
+fn nightly_warning_modal(p: Palette) -> El {
+    let beta_pill = row()
+        .key("nightly-warn-beta-pill")
+        .h(20.0)
+        .px(7.0)
+        .center()
+        .radius(10.0)
+        .fill(p.amber.alpha(if p.dark { 0.16 } else { 0.12 }))
+        .border(1.0, p.amber.alpha(if p.dark { 0.34 } else { 0.28 }))
+        .child(text("Beta").font(ty::BADGE).color(p.amber));
+
+    let header = row()
+        .key("nightly-warn-header")
+        .w_full()
+        .gap(8.0)
+        .center_y()
+        .child(
+            el().size(26.0, 26.0)
+                .radius(7.0)
+                .fill(p.amber.alpha(if p.dark { 0.16 } else { 0.12 }))
+                .border(1.0, p.amber.alpha(if p.dark { 0.34 } else { 0.28 }))
+                .center()
+                .a11y_hidden()
+                .child(icons::update_channel_icon(p.amber)),
+        )
+        .child(
+            text("Switch to Nightly (Beta)?")
+                .font(ty::BRAND_TITLE)
+                .color(p.text),
+        )
+        .child(spacer())
+        .child(beta_pill);
+
+    let dialog = col()
+        .key("nightly-warning-modal")
+        .w(410.0)
+        .px(20.0)
+        .py(18.0)
+        .gap(12.0)
+        .radius(12.0)
+        .fill(p.surface)
+        .border(1.0, p.line_2)
+        .shadow(10.0, 28.0, Color::BLACK.alpha(0.32))
+        .modal_tx::<Ui>(true, |ui, _| ui.cancel_switch_to_nightly())
+        .child(header)
+        .child(
+            text("Nightly builds include the latest features and fixes before full testing and may occasionally have rough edges or regressions. You can switch back to Stable anytime.")
+                .w_full()
+                .font(ty::SUB)
+                .color(p.text_2)
+                .wrap(),
+        )
+        .child(
+            row()
+                .key("nightly-warn-actions")
+                .w_full()
+                .pt(2.0)
+                .gap(8.0)
+                .child(spacer())
+                .child(button(
+                    p,
+                    "nightly-warn-cancel",
+                    "Stay on Stable",
+                    BtnKind::Default,
+                    30.0,
+                    14.0,
+                    false,
+                    |ui, _| ui.cancel_switch_to_nightly(),
+                ))
+                .child(button(
+                    p,
+                    "nightly-warn-confirm",
+                    "Switch to Nightly",
+                    BtnKind::Primary,
+                    30.0,
+                    14.0,
+                    false,
+                    |ui, tx| ui.confirm_switch_to_nightly(tx),
+                )),
+        );
+
+    row()
+        .key("nightly-warning-backdrop")
+        .pin(Some(0.0), Some(0.0), Some(0.0), Some(0.0))
+        .center()
+        .fill(Color::BLACK.alpha(0.42))
+        .child(dialog)
 }
 
 fn sudo_password_modal(
