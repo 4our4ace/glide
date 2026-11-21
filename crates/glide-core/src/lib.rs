@@ -328,4 +328,113 @@ mod tests {
         cli_task.abort();
         srv_task.abort();
     }
+
+    #[tokio::test]
+    async fn large_bulk_clipboard_survives_concurrent_mouse_datagrams() {
+        let identity = ServerIdentity::generate_ephemeral().unwrap();
+        let fp = identity.fingerprint.clone();
+        let endpoint =
+            GlideServerEndpoint::bind("127.0.0.1:0".parse().unwrap(), &identity).unwrap();
+        let addr = endpoint.local_addr();
+
+        let (capture_handle, cap_tx, cap_state) =
+            create_mock_capture(DesktopGeometry::fallback());
+        let (srv_clip, srv_clip_tx, _) = create_mock_clipboard();
+        let (cli_clip, _, cli_clip_rx) = create_mock_clipboard();
+        let (mut injector, _) = MockInjector::new(DesktopGeometry::fallback());
+
+        let srv_cfg = ServerConfig {
+            name: "srv-bulk".into(),
+            discovery: false,
+            motion_coalesce_us: 0,
+            ..Default::default()
+        };
+        let mut cli_cfg = ClientConfig {
+            name: "cli-bulk".into(),
+            server: Some(addr.to_string()),
+            edge: Edge::Right,
+            trusted_fingerprint: Some(fp),
+            ..Default::default()
+        };
+
+        let srv_task = tokio::spawn(async move {
+            let _ = run_server_with_backends(
+                srv_cfg,
+                endpoint,
+                capture_handle,
+                Some(srv_clip),
+                "linux-x11",
+                None,
+                None,
+            )
+            .await;
+        });
+
+        let cli_task = tokio::spawn(async move {
+            let mut opt_clip = Some(cli_clip);
+            let _ = run_client_session(
+                &mut cli_cfg,
+                addr,
+                &mut injector,
+                &mut opt_clip,
+                None,
+                None,
+            )
+            .await;
+        });
+
+        for _ in 0..30 {
+            if *cap_state.active_edges.lock() == vec![Edge::Right] {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert_eq!(*cap_state.active_edges.lock(), vec![Edge::Right]);
+
+        // Enter remote mode so mouse datagrams are actively processed by client select!.
+        cap_tx
+            .send(CaptureEvent::EdgeCrossed {
+                edge: Edge::Right,
+                normalized_pos: 0.5,
+            })
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(40)).await;
+
+        // Send a 4 MiB clipboard payload (multi-packet QUIC uni stream) while blasting
+        // rapid mouse deltas that would previously cancel recv_bulk_on inside select!.
+        let big = Bytes::from(vec![0xABu8; 4 * 1024 * 1024]);
+        let expected_hash = sha256_bytes(&big);
+        srv_clip_tx
+            .send(ClipboardPayload {
+                format: ClipboardFormat::ImagePng,
+                sha256: expected_hash,
+                data: big,
+            })
+            .unwrap();
+
+        for _ in 0..200 {
+            let _ = cap_tx.send(CaptureEvent::MouseDelta { dx: 1.0, dy: 0.0 });
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+
+        let mut received = false;
+        for _ in 0..50 {
+            if cli_clip_rx
+                .lock()
+                .iter()
+                .any(|p| p.sha256 == expected_hash && p.data.len() == 4 * 1024 * 1024)
+            {
+                received = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(
+            received,
+            "4 MiB clipboard transfer must complete intact despite concurrent mouse datagrams"
+        );
+
+        cli_task.abort();
+        srv_task.abort();
+    }
 }

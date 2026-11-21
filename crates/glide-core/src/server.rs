@@ -19,8 +19,8 @@ use glide_hid::ModifierMask;
 use glide_net::discovery::spawn_server_beacon;
 use glide_net::tls::ServerIdentity;
 use glide_net::{
-    recv_bulk_on, send_clipboard_on, send_file_on, sha256_bytes, Connection, GlideServerEndpoint,
-    GlideSession,
+    recv_bulk_stream, send_clipboard_on, send_file_on, sha256_bytes, Connection,
+    GlideServerEndpoint, GlideSession,
 };
 use glide_proto::{
     BulkTransfer, ClipboardPayload, ControlMessage, DatagramMessage, Edge, FilePayload, LockState,
@@ -948,13 +948,30 @@ async fn handle_incoming_session(
 
     let bulk_conn = conn.clone();
     let bulk_tx = peer_tx.clone();
-    tokio::spawn(async move {
-        while let Ok(transfer) = recv_bulk_on(&bulk_conn).await {
-            if bulk_tx.send(PeerEvent::Bulk { peer_id, transfer }).is_err() {
+    let _bulk_guard = AbortOnDrop(tokio::spawn(async move {
+        let sem = std::sync::Arc::new(tokio::sync::Semaphore::new(4));
+        loop {
+            let uni = match bulk_conn.accept_uni().await {
+                Ok(u) => u,
+                Err(_) => break,
+            };
+            let Ok(permit) = sem.clone().acquire_owned().await else {
                 break;
-            }
+            };
+            let tx = bulk_tx.clone();
+            tokio::spawn(async move {
+                let _permit = permit;
+                match recv_bulk_stream(uni).await {
+                    Ok(transfer) => {
+                        let _ = tx.send(PeerEvent::Bulk { peer_id, transfer });
+                    }
+                    Err(e) => {
+                        warn!(peer_id, error = %e, "Failed receiving bulk stream from client");
+                    }
+                }
+            });
         }
-    });
+    }));
 
     let _ = peer_tx.send(PeerEvent::Connected {
         peer: ConnectedPeer {

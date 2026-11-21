@@ -16,7 +16,9 @@ use glide_backend::os_integration::file_receive_dir;
 use glide_backend::{ClipboardHandle, InputInjector};
 use glide_net::discovery::discover_servers;
 use glide_net::tls::TrustMode;
-use glide_net::{connect_client, recv_bulk_on, send_clipboard_on, send_file_on, sha256_bytes};
+use glide_net::{
+    connect_client, recv_bulk_stream, send_clipboard_on, send_file_on, sha256_bytes,
+};
 use glide_proto::{
     BulkTransfer, ClipboardPayload, ControlMessage, DatagramMessage, FilePayload,
     LAZY_CLIPBOARD_THRESHOLD, PROTOCOL_VERSION,
@@ -27,6 +29,13 @@ use std::time::Duration;
 use tokio::net::lookup_host;
 use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
+
+struct AbortOnDrop(tokio::task::JoinHandle<()>);
+impl Drop for AbortOnDrop {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
 
 /// Resolves the target server socket address either from explicit `config.server`
 /// or by auto-discovering a running Glide server on the local network.
@@ -172,6 +181,40 @@ pub async fn run_client_session(
     let conn = session.conn;
     let mut ctrl_send = session.ctrl_send;
     let mut ctrl_recv = session.ctrl_recv;
+
+    // Receive unidirectional bulk streams (clipboard images / files) in a dedicated task
+    // so `tokio::select!` branches (1000Hz mouse datagrams, 150ms reveal ticks, 500ms pings)
+    // never cancel an in-flight `read_exact` and silently drop the transfer.
+    let (bulk_tx, mut bulk_rx) = mpsc::unbounded_channel::<BulkTransfer>();
+    let bulk_conn = conn.clone();
+    let _bulk_guard = AbortOnDrop(tokio::spawn(async move {
+        let sem = std::sync::Arc::new(tokio::sync::Semaphore::new(4));
+        loop {
+            let uni = match bulk_conn.accept_uni().await {
+                Ok(u) => u,
+                Err(e) => {
+                    debug!(error = %e, "Remote bulk uni-stream loop ended");
+                    break;
+                }
+            };
+            let Ok(permit) = sem.clone().acquire_owned().await else {
+                break;
+            };
+            let tx = bulk_tx.clone();
+            tokio::spawn(async move {
+                let _permit = permit;
+                match recv_bulk_stream(uni).await {
+                    Ok(transfer) => {
+                        let _ = tx.send(transfer);
+                    }
+                    Err(e) => {
+                        warn!(error = %e, "Failed receiving bulk transfer from server");
+                    }
+                }
+            });
+        }
+    }));
+    let mut bulk_open = true;
 
     let session_result: Result<()> = loop {
         let dpi_mult = if config.auto_dpi_scale {
@@ -450,9 +493,9 @@ pub async fn run_client_session(
                 }
             }
 
-            remote_bulk = recv_bulk_on(&conn) => {
+            remote_bulk = bulk_rx.recv(), if bulk_open => {
                 match remote_bulk {
-                    Ok(BulkTransfer::Clipboard(payload)) => {
+                    Some(BulkTransfer::Clipboard(payload)) => {
                         if config.clipboard {
                             if let Some(rt) = runtime {
                                 rt.record_clipboard("received", &payload);
@@ -465,7 +508,7 @@ pub async fn run_client_session(
                             }
                         }
                     }
-                    Ok(BulkTransfer::File(file)) => {
+                    Some(BulkTransfer::File(file)) => {
                         match file_receive_dir()
                             .and_then(|dir| save_received_file(&dir, &file.filename, &file.data))
                         {
@@ -478,8 +521,8 @@ pub async fn run_client_session(
                             Err(e) => warn!(error = %e, "Failed saving received file"),
                         }
                     }
-                    Err(e) => {
-                        debug!(error = %e, "Remote bulk uni-stream loop ended");
+                    None => {
+                        bulk_open = false;
                     }
                 }
             }

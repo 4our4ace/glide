@@ -304,14 +304,12 @@ pub async fn send_bulk_on(conn: &Connection, transfer: &glide_proto::BulkTransfe
     Ok(())
 }
 
-/// Accepts and validates the next unidirectional bulk stream (clipboard or file) on `conn`.
-pub async fn recv_bulk_on(conn: &Connection) -> Result<glide_proto::BulkTransfer> {
+/// Reads and validates a single unidirectional bulk stream (clipboard or file).
+pub async fn recv_bulk_stream(mut uni: RecvStream) -> Result<glide_proto::BulkTransfer> {
     use glide_proto::{
         sanitize_filename, BulkTransfer, FilePayload, BULK_KIND_CLIPBOARD, BULK_KIND_FILE,
         MAX_FILE_BYTES,
     };
-
-    let mut uni = conn.accept_uni().await.context("bulk uni stream closed")?;
 
     let mut kind = [0u8; 1];
     uni.read_exact(&mut kind)
@@ -371,6 +369,12 @@ pub async fn recv_bulk_on(conn: &Connection) -> Result<glide_proto::BulkTransfer
         }
         other => Err(anyhow!("unknown bulk transfer kind: 0x{other:02X}")),
     }
+}
+
+/// Accepts and validates the next unidirectional bulk stream (clipboard or file) on `conn`.
+pub async fn recv_bulk_on(conn: &Connection) -> Result<glide_proto::BulkTransfer> {
+    let uni = conn.accept_uni().await.context("bulk uni stream closed")?;
+    recv_bulk_stream(uni).await
 }
 
 /// Accepts the next clipboard payload (for tests/backwards callers).
