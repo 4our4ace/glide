@@ -320,9 +320,6 @@ pub fn path_to_file_uri(path: &Path) -> Option<String> {
     }
     #[cfg(not(unix))]
     {
-        if !path.is_absolute() {
-            return None;
-        }
         encode_file_uri_str(path.to_str()?)
     }
 }

@@ -927,7 +927,7 @@ mod tests {
         let real_id = ServerIdentity::generate_ephemeral().unwrap();
         let real_fp = real_id.fingerprint.clone();
         let real_ep =
-            GlideServerEndpoint::bind("127.0.0.1:0".parse().unwrap(), &real_id).unwrap();
+            GlideServerEndpoint::bind("0.0.0.0:0".parse().unwrap(), &real_id).unwrap();
 
         // 2. Start a decoy endpoint with a DIFFERENT identity on a stale address so the client's
         //    first explicit attempt fails immediately (simulating old DHCP IP taken by another host).

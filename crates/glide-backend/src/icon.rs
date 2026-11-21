@@ -348,9 +348,12 @@ mod tests {
     #[test]
     fn embedded_svgs_match_assets() {
         let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/../../assets/logo");
-        let color = std::fs::read_to_string(format!("{dir}/glide.svg")).expect("glide.svg");
+        let color = std::fs::read_to_string(format!("{dir}/glide.svg"))
+            .expect("glide.svg")
+            .replace("\r\n", "\n");
         let symbolic = std::fs::read_to_string(format!("{dir}/glide-symbolic.svg"))
-            .expect("glide-symbolic.svg");
+            .expect("glide-symbolic.svg")
+            .replace("\r\n", "\n");
         assert_eq!(color, GLIDE_ICON_SVG);
         assert_eq!(symbolic, GLIDE_SYMBOLIC_SVG);
     }
