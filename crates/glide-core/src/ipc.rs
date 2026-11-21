@@ -223,11 +223,20 @@ pub fn default_ipc_endpoint_path() -> PathBuf {
     default_config_dir().join("ctl.endpoint")
 }
 
+/// Maximum concurrent IPC client connections accepted simultaneously.
+pub const MAX_CONCURRENT_IPC_CONNS: usize = 16;
+/// Maximum concurrent blocking file reads from IPC `SendFile` requests.
+pub const MAX_CONCURRENT_FILE_READS: usize = 2;
+/// Maximum queued background IPC file-read tasks.
+const MAX_QUEUED_FILE_READS: usize = 16;
+
 /// Handle to a running local IPC server; aborts the listener and cleans up socket/endpoint files on [`Drop`].
 pub struct IpcServerHandle {
     task: tokio::task::JoinHandle<()>,
     cleanup_path: PathBuf,
     expected_token: Option<String>,
+    #[cfg(unix)]
+    socket_identity: Option<(u64, u64)>,
     tcp_addr: Option<SocketAddr>,
 }
 
@@ -256,9 +265,88 @@ impl Drop for IpcServerHandle {
                 }
             }
         } else {
-            let _ = fs::remove_file(&self.cleanup_path);
+            #[cfg(unix)]
+            if let Some((expected_dev, expected_ino)) = self.socket_identity {
+                use std::os::unix::fs::MetadataExt;
+                if let Ok(meta) = fs::symlink_metadata(&self.cleanup_path) {
+                    if meta.dev() == expected_dev && meta.ino() == expected_ino {
+                        let _ = fs::remove_file(&self.cleanup_path);
+                    }
+                }
+            }
+            #[cfg(not(unix))]
+            {
+                let _ = fs::remove_file(&self.cleanup_path);
+            }
         }
     }
+}
+
+fn ensure_ipc_parent_not_symlink(parent: &Path) -> Result<()> {
+    if let Ok(meta) = fs::symlink_metadata(parent) {
+        if meta.file_type().is_symlink() {
+            anyhow::bail!("refusing to use symlink IPC directory {}", parent.display());
+        }
+        if !meta.is_dir() {
+            anyhow::bail!("IPC parent path {} is not a directory", parent.display());
+        }
+    }
+    fs::create_dir_all(parent)
+        .with_context(|| format!("failed to create IPC directory {}", parent.display()))?;
+    let meta = fs::symlink_metadata(parent)
+        .with_context(|| format!("failed to inspect IPC directory {}", parent.display()))?;
+    if meta.file_type().is_symlink() || !meta.is_dir() {
+        anyhow::bail!(
+            "refusing to use non-directory or symlink IPC parent {}",
+            parent.display()
+        );
+    }
+    Ok(())
+}
+
+static ENDPOINT_TMP_SEQ: AtomicUsize = AtomicUsize::new(0);
+
+fn write_endpoint_file_atomic(endpoint_path: &Path, encoded: &str) -> Result<()> {
+    use std::io::Write;
+    let parent = endpoint_path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let fname = endpoint_path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("ctl.endpoint");
+    let seq = ENDPOINT_TMP_SEQ.fetch_add(1, Ordering::Relaxed);
+    let tmp_path = parent.join(format!(".{fname}.tmp.{}.{seq}", std::process::id()));
+
+    let mut opts = fs::OpenOptions::new();
+    opts.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600);
+    }
+    let write_res = (|| -> std::io::Result<()> {
+        let mut f = opts.open(&tmp_path)?;
+        f.write_all(encoded.as_bytes())?;
+        f.flush()?;
+        Ok(())
+    })();
+    if let Err(e) = write_res {
+        let _ = fs::remove_file(&tmp_path);
+        return Err(e)
+            .with_context(|| format!("failed to write temp IPC endpoint {}", tmp_path.display()));
+    }
+    if let Err(e) = fs::rename(&tmp_path, endpoint_path) {
+        let _ = fs::remove_file(&tmp_path);
+        return Err(e).with_context(|| {
+            format!(
+                "failed to atomically replace IPC endpoint {}",
+                endpoint_path.display()
+            )
+        });
+    }
+    Ok(())
 }
 
 /// Starts the platform-default local IPC server:
@@ -281,18 +369,17 @@ pub async fn start_unix(
     socket_path: PathBuf,
     backend: Arc<dyn IpcBackend>,
 ) -> Result<IpcServerHandle> {
-    use std::os::unix::fs::{FileTypeExt, PermissionsExt};
+    use std::os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt};
     use tokio::net::{UnixListener, UnixStream};
 
-    if let Some(parent) = socket_path.parent() {
-        fs::create_dir_all(parent)
-            .with_context(|| format!("failed to create IPC directory {}", parent.display()))?;
+    if let Some(parent) = socket_path.parent().filter(|p| !p.as_os_str().is_empty()) {
+        ensure_ipc_parent_not_symlink(parent)?;
         fs::set_permissions(parent, fs::Permissions::from_mode(0o700))
             .with_context(|| format!("failed to set 0700 permissions on {}", parent.display()))?;
     }
 
     if let Ok(meta) = fs::symlink_metadata(&socket_path) {
-        if !meta.file_type().is_socket() {
+        if meta.file_type().is_symlink() || !meta.file_type().is_socket() {
             anyhow::bail!(
                 "refusing to overwrite non-socket file at {}",
                 socket_path.display()
@@ -326,22 +413,55 @@ pub async fn start_unix(
             socket_path.display()
         )
     })?;
+    let bound_meta = fs::symlink_metadata(&socket_path)
+        .with_context(|| format!("failed to stat bound IPC socket {}", socket_path.display()))?;
+    let socket_identity = Some((bound_meta.dev(), bound_meta.ino()));
+
+    let conn_sem = Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_IPC_CONNS));
+    let file_read_sem = Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_FILE_READS));
+    let pending_reads_sem = Arc::new(tokio::sync::Semaphore::new(MAX_QUEUED_FILE_READS));
+    let expected_uid = unsafe { libc::geteuid() };
 
     debug!(path = %socket_path.display(), "Glide local IPC server listening (Unix socket)");
     let task = tokio::spawn(async move {
         loop {
+            let Ok(conn_permit) = Arc::clone(&conn_sem).acquire_owned().await else {
+                break;
+            };
             match listener.accept().await {
                 Ok((stream, _)) => {
+                    match stream.peer_cred() {
+                        Ok(cred) if cred.uid() == expected_uid => {}
+                        Ok(cred) => {
+                            warn!(
+                                peer_uid = cred.uid(),
+                                expected_uid,
+                                "Rejected IPC Unix connection from mismatched UID"
+                            );
+                            drop(conn_permit);
+                            continue;
+                        }
+                        Err(e) => {
+                            warn!(error = %e, "Rejected IPC Unix connection: failed reading peer_cred");
+                            drop(conn_permit);
+                            continue;
+                        }
+                    }
                     let b = Arc::clone(&backend);
+                    let rsem = Arc::clone(&file_read_sem);
+                    let qsem = Arc::clone(&pending_reads_sem);
                     tokio::spawn(async move {
-                        if let Err(e) = handle_ipc_stream(stream, b, None).await {
+                        let _permit = conn_permit;
+                        if let Err(e) = handle_ipc_stream(stream, b, None, rsem, qsem).await {
                             debug!(error = %e, "IPC Unix connection ended");
                         }
                     });
                 }
                 Err(e) => {
-                    warn!(error = %e, "IPC Unix accept error");
-                    break;
+                    warn!(error = %e, "IPC Unix accept error; retrying shortly");
+                    drop(conn_permit);
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                    continue;
                 }
             }
         }
@@ -351,23 +471,65 @@ pub async fn start_unix(
         task,
         cleanup_path: socket_path,
         expected_token: None,
+        socket_identity,
         tcp_addr: None,
     })
 }
 
 /// Starts a loopback-only (`127.0.0.1:0`) TCP IPC server guarded by a 32-byte random hex auth token
-/// written to `endpoint_path`.
+/// atomically written to `endpoint_path`.
 pub async fn start_tcp_with_token(
     endpoint_path: PathBuf,
     backend: Arc<dyn IpcBackend>,
 ) -> Result<IpcServerHandle> {
-    if let Some(parent) = endpoint_path.parent() {
-        fs::create_dir_all(parent)
-            .with_context(|| format!("failed to create IPC directory {}", parent.display()))?;
+    if let Some(parent) = endpoint_path.parent().filter(|p| !p.as_os_str().is_empty()) {
+        ensure_ipc_parent_not_symlink(parent)?;
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
             let _ = fs::set_permissions(parent, fs::Permissions::from_mode(0o700));
+        }
+    }
+
+    if let Ok(meta) = fs::symlink_metadata(&endpoint_path) {
+        if meta.file_type().is_symlink() {
+            anyhow::bail!(
+                "refusing to overwrite symlink IPC endpoint at {}",
+                endpoint_path.display()
+            );
+        }
+        if !meta.file_type().is_file() {
+            anyhow::bail!(
+                "refusing to overwrite non-file IPC endpoint at {}",
+                endpoint_path.display()
+            );
+        }
+        // Probe whether another live Glide IPC instance already owns this endpoint file.
+        if let Ok(raw) = fs::read_to_string(&endpoint_path) {
+            if let Ok(existing) = serde_json::from_str::<EndpointFile>(&raw) {
+                let probe_addr = SocketAddr::from(([127, 0, 0, 1], existing.port));
+                let alive = matches!(
+                    tokio::time::timeout(
+                        Duration::from_millis(250),
+                        send_tcp_request(
+                            probe_addr,
+                            &IpcRequest {
+                                token: Some(existing.token),
+                                action: IpcAction::Status,
+                            },
+                        ),
+                    )
+                    .await,
+                    Ok(Ok(resp)) if resp.ok
+                );
+                if alive {
+                    anyhow::bail!(
+                        "another Glide IPC server is already listening at {} (port {})",
+                        endpoint_path.display(),
+                        existing.port
+                    );
+                }
+            }
         }
     }
 
@@ -381,31 +543,37 @@ pub async fn start_tcp_with_token(
         token: token.clone(),
     };
     let encoded = serde_json::to_string_pretty(&ep)?;
-    fs::write(&endpoint_path, encoded)
-        .with_context(|| format!("failed to write IPC endpoint file {}", endpoint_path.display()))?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let _ = fs::set_permissions(&endpoint_path, fs::Permissions::from_mode(0o600));
-    }
+    write_endpoint_file_atomic(&endpoint_path, &encoded)?;
+
+    let conn_sem = Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_IPC_CONNS));
+    let file_read_sem = Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_FILE_READS));
+    let pending_reads_sem = Arc::new(tokio::sync::Semaphore::new(MAX_QUEUED_FILE_READS));
 
     debug!(%addr, path = %endpoint_path.display(), "Glide local IPC server listening (loopback TCP)");
     let expected = Arc::new(token.clone());
     let task = tokio::spawn(async move {
         loop {
+            let Ok(conn_permit) = Arc::clone(&conn_sem).acquire_owned().await else {
+                break;
+            };
             match listener.accept().await {
                 Ok((stream, _peer)) => {
                     let b = Arc::clone(&backend);
                     let tok = Arc::clone(&expected);
+                    let rsem = Arc::clone(&file_read_sem);
+                    let qsem = Arc::clone(&pending_reads_sem);
                     tokio::spawn(async move {
-                        if let Err(e) = handle_ipc_stream(stream, b, Some(tok)).await {
+                        let _permit = conn_permit;
+                        if let Err(e) = handle_ipc_stream(stream, b, Some(tok), rsem, qsem).await {
                             debug!(error = %e, "IPC TCP connection ended");
                         }
                     });
                 }
                 Err(e) => {
-                    warn!(error = %e, "IPC TCP accept error");
-                    break;
+                    warn!(error = %e, "IPC TCP accept error; retrying shortly");
+                    drop(conn_permit);
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                    continue;
                 }
             }
         }
@@ -415,6 +583,8 @@ pub async fn start_tcp_with_token(
         task,
         cleanup_path: endpoint_path,
         expected_token: Some(token),
+        #[cfg(unix)]
+        socket_identity: None,
         tcp_addr: Some(addr),
     })
 }
@@ -460,6 +630,8 @@ async fn handle_ipc_stream<S: AsyncRead + AsyncWrite + Unpin>(
     stream: S,
     backend: Arc<dyn IpcBackend>,
     expected_token: Option<Arc<String>>,
+    file_read_sem: Arc<tokio::sync::Semaphore>,
+    pending_reads_sem: Arc<tokio::sync::Semaphore>,
 ) -> Result<()> {
     let (reader, mut writer) = tokio::io::split(stream);
     let line = match read_bounded_line(reader, MAX_IPC_LINE_BYTES).await {
@@ -490,11 +662,16 @@ async fn handle_ipc_stream<S: AsyncRead + AsyncWrite + Unpin>(
         }
     }
 
-    let resp = dispatch_action(req.action, backend).await;
+    let resp = dispatch_action(req.action, backend, file_read_sem, pending_reads_sem).await;
     write_response_line(&mut writer, &resp).await
 }
 
-async fn dispatch_action(action: IpcAction, backend: Arc<dyn IpcBackend>) -> IpcResponse {
+async fn dispatch_action(
+    action: IpcAction,
+    backend: Arc<dyn IpcBackend>,
+    file_read_sem: Arc<tokio::sync::Semaphore>,
+    pending_reads_sem: Arc<tokio::sync::Semaphore>,
+) -> IpcResponse {
     match action {
         IpcAction::Status => IpcResponse::ok_status(backend.status()),
 
@@ -551,10 +728,7 @@ async fn dispatch_action(action: IpcAction, backend: Arc<dyn IpcBackend>) -> Ipc
             let edge = target.to_edge();
             if let Some(e) = edge {
                 if !st.peers.iter().any(|p| p.edge == e) {
-                    return IpcResponse::err(format!(
-                        "no connected peer on {:?} edge",
-                        e
-                    ));
+                    return IpcResponse::err(format!("no connected peer on {:?} edge", e));
                 }
             }
             match backend.send_command(RuntimeCommand::SwitchTarget(edge)) {
@@ -571,29 +745,94 @@ async fn dispatch_action(action: IpcAction, backend: Arc<dyn IpcBackend>) -> Ipc
 
         IpcAction::SendFile { path } => {
             let st = backend.status();
-            if st.mode != "server" && st.mode != "client" {
-                return IpcResponse::err("Glide is not currently running");
+            match st.mode.as_str() {
+                "server" => {
+                    if st.peers.is_empty() {
+                        return IpcResponse::err("cannot send file: no connected peers");
+                    }
+                }
+                "client" => {
+                    if !st.status.starts_with("Connected") {
+                        return IpcResponse::err(
+                            "cannot send file: client is not connected to a server",
+                        );
+                    }
+                }
+                _ => return IpcResponse::err("Glide is not currently running"),
             }
+
             let max_bytes = backend.max_file_bytes();
             let path_buf = PathBuf::from(path);
-            let read_res =
-                tokio::task::spawn_blocking(move || read_regular_file_bounded(&path_buf, max_bytes))
-                    .await;
-            let (filename, data) = match read_res {
-                Ok(Ok(pair)) => pair,
-                Ok(Err(e)) => return IpcResponse::err(e.to_string()),
-                Err(e) => return IpcResponse::err(format!("file read task failed: {e}")),
-            };
-            let byte_len = data.len();
-            match backend.send_command(RuntimeCommand::SendFile {
-                filename: filename.clone(),
-                data,
-            }) {
-                Ok(()) => IpcResponse::ok_message(format!(
-                    "Queued '{filename}' ({byte_len} bytes) for transfer"
-                )),
-                Err(e) => IpcResponse::err(e.to_string()),
+            if path_buf.as_os_str().is_empty() {
+                return IpcResponse::err("file path cannot be empty");
             }
+            let filename = match path_buf
+                .file_name()
+                .and_then(|n| n.to_str())
+                .filter(|n| !n.is_empty())
+            {
+                Some(name) => name.to_owned(),
+                None => {
+                    return IpcResponse::err(format!(
+                        "cannot determine filename for '{}'",
+                        path_buf.display()
+                    ));
+                }
+            };
+            let meta = match fs::metadata(&path_buf) {
+                Ok(m) => m,
+                Err(e) => {
+                    return IpcResponse::err(format!(
+                        "failed to inspect file '{}': {e}",
+                        path_buf.display()
+                    ));
+                }
+            };
+            if !meta.is_file() {
+                return IpcResponse::err(format!(
+                    "'{}' is not a regular file",
+                    path_buf.display()
+                ));
+            }
+            let byte_len = meta.len();
+            if byte_len > max_bytes as u64 {
+                return IpcResponse::err(format!(
+                    "file '{}' ({byte_len} bytes) exceeds max file transfer limit ({max_bytes} bytes)",
+                    path_buf.display()
+                ));
+            }
+
+            let Ok(queue_permit) = pending_reads_sem.try_acquire_owned() else {
+                return IpcResponse::err(
+                    "too many file transfers already queued; try again shortly",
+                );
+            };
+            let bg_backend = Arc::clone(&backend);
+            tokio::spawn(async move {
+                let _queue_permit = queue_permit;
+                let Ok(_read_permit) = file_read_sem.acquire_owned().await else {
+                    return;
+                };
+                match tokio::task::spawn_blocking(move || {
+                    read_regular_file_bounded(&path_buf, max_bytes)
+                })
+                .await
+                {
+                    Ok(Ok((filename, data))) => {
+                        if let Err(e) =
+                            bg_backend.send_command(RuntimeCommand::SendFile { filename, data })
+                        {
+                            warn!(error = %e, "Failed dispatching queued IPC SendFile command");
+                        }
+                    }
+                    Ok(Err(e)) => warn!(error = %e, "Failed reading queued IPC file transfer"),
+                    Err(e) => warn!(error = %e, "IPC file read blocking task failed"),
+                }
+            });
+
+            IpcResponse::ok_message(format!(
+                "Queued '{filename}' ({byte_len} bytes) for transfer"
+            ))
         }
     }
 }
@@ -932,6 +1171,190 @@ mod tests {
 
         drop(handle);
         assert!(!sock_path.exists());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn tcp_endpoint_refuses_clobber_and_replaces_stale() {
+        let dir = std::env::temp_dir().join(format!(
+            "glide-ipc-tcp-clobber-{}-{}",
+            std::process::id(),
+            current_test_nonce()
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        let ep_path = dir.join("ctl.endpoint");
+
+        let (backend1, _rt1, _rx1) = make_test_backend("server", 4096);
+        let handle1 = start_tcp_with_token(ep_path.clone(), backend1)
+            .await
+            .unwrap();
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let ep_mode = fs::metadata(&ep_path).unwrap().permissions().mode() & 0o777;
+            assert_eq!(ep_mode, 0o600);
+        }
+
+        // Second instance against a live TCP endpoint MUST refuse to clobber it
+        let (backend2, _rt2, _rx2) = make_test_backend("server", 4096);
+        let clobber_err = match start_tcp_with_token(ep_path.clone(), backend2).await {
+            Ok(_) => panic!("expected live TCP endpoint clobber protection to error"),
+            Err(e) => e,
+        };
+        assert!(clobber_err.to_string().contains("already listening"));
+
+        // First server still answers with its original token
+        let st = send_tcp_endpoint_request(&ep_path, IpcAction::Status)
+            .await
+            .unwrap();
+        assert!(st.ok);
+
+        let stale_port = handle1.tcp_addr().unwrap().port();
+        drop(handle1);
+        assert!(!ep_path.exists());
+
+        // Write a stale endpoint pointing to the now-closed port -> new server replaces it cleanly
+        fs::write(
+            &ep_path,
+            serde_json::to_string(&EndpointFile {
+                port: stale_port,
+                token: "deadbeef".repeat(8),
+            })
+            .unwrap(),
+        )
+        .unwrap();
+        let (backend3, _rt3, _rx3) = make_test_backend("server", 4096);
+        let handle3 = start_tcp_with_token(ep_path.clone(), backend3)
+            .await
+            .unwrap();
+        assert!(send_tcp_endpoint_request(&ep_path, IpcAction::Status)
+            .await
+            .unwrap()
+            .ok);
+        drop(handle3);
+
+        // Symlink at endpoint_path is refused on Unix
+        #[cfg(unix)]
+        {
+            let target = dir.join("real.txt");
+            fs::write(&target, b"do not overwrite").unwrap();
+            std::os::unix::fs::symlink(&target, &ep_path).unwrap();
+            let (backend4, _rt4, _rx4) = make_test_backend("server", 4096);
+            assert!(start_tcp_with_token(ep_path.clone(), backend4)
+                .await
+                .is_err());
+            assert_eq!(fs::read(&target).unwrap(), b"do not overwrite");
+        }
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn send_file_rejects_zero_peers_and_disconnected_client() {
+        let dir = std::env::temp_dir().join(format!(
+            "glide-ipc-send-reject-{}-{}",
+            std::process::id(),
+            current_test_nonce()
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let ep_path = dir.join("ctl.endpoint");
+        let file_path = dir.join("note.txt");
+        fs::write(&file_path, b"payload").unwrap();
+
+        // 1. Server with 0 connected peers rejects SendFile immediately
+        let (backend, rt, mut cmd_rx) = make_test_backend("server", 4096);
+        rt.update(|s| {
+            s.peers.clear();
+            s.status = "Listening (waiting for client)".into();
+        });
+        let handle = start_tcp_with_token(ep_path.clone(), backend)
+            .await
+            .unwrap();
+
+        let resp_zero = send_tcp_endpoint_request(
+            &ep_path,
+            IpcAction::SendFile {
+                path: file_path.display().to_string(),
+            },
+        )
+        .await
+        .unwrap();
+        assert!(!resp_zero.ok);
+        assert!(resp_zero.error.unwrap().contains("no connected peers"));
+        assert!(cmd_rx.try_recv().is_err());
+
+        // 2. Client while reconnecting / disconnected rejects SendFile immediately
+        rt.update(|s| {
+            s.mode = "client".into();
+            s.status = "Reconnecting...".into();
+        });
+        let resp_disc = send_tcp_endpoint_request(
+            &ep_path,
+            IpcAction::SendFile {
+                path: file_path.display().to_string(),
+            },
+        )
+        .await
+        .unwrap();
+        assert!(!resp_disc.ok);
+        assert!(resp_disc.error.unwrap().contains("not connected"));
+        assert!(cmd_rx.try_recv().is_err());
+
+        // 3. Connected client accepts SendFile and queues async read
+        rt.update(|s| {
+            s.mode = "client".into();
+            s.status = "Connected to workstation".into();
+        });
+        let resp_ok = send_tcp_endpoint_request(
+            &ep_path,
+            IpcAction::SendFile {
+                path: file_path.display().to_string(),
+            },
+        )
+        .await
+        .unwrap();
+        assert!(resp_ok.ok);
+        assert!(resp_ok.message.unwrap().starts_with("Queued 'note.txt'"));
+        match tokio::time::timeout(Duration::from_secs(2), cmd_rx.recv())
+            .await
+            .unwrap()
+        {
+            Some(RuntimeCommand::SendFile { filename, data }) => {
+                assert_eq!(filename, "note.txt");
+                assert_eq!(&data[..], b"payload");
+            }
+            other => panic!("expected SendFile command, got {other:?}"),
+        }
+
+        drop(handle);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn unix_socket_drop_does_not_unlink_replaced_inode() {
+        let dir = std::env::temp_dir().join(format!(
+            "glide-ipc-unix-ino-{}-{}",
+            std::process::id(),
+            current_test_nonce()
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        let sock_path = dir.join("ctl.sock");
+        let (backend, _rt, _rx) = make_test_backend("server", 4096);
+        let handle = start_unix(sock_path.clone(), backend).await.unwrap();
+
+        // Simulate external replacement of the path with a new inode
+        fs::remove_file(&sock_path).unwrap();
+        fs::write(&sock_path, b"new-owner").unwrap();
+
+        drop(handle);
+        assert!(
+            sock_path.exists(),
+            "dropping stale handle must not unlink replaced inode"
+        );
+        assert_eq!(fs::read(&sock_path).unwrap(), b"new-owner");
         let _ = fs::remove_dir_all(&dir);
     }
 

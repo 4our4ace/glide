@@ -512,9 +512,7 @@ async fn run_command(command: Command, config: Option<PathBuf>) -> Result<()> {
                 })?;
                 cfg.server = Some(saved.address.clone());
                 cfg.edge = saved.edge;
-                if saved.fingerprint.is_some() {
-                    cfg.trusted_fingerprint = saved.fingerprint.clone();
-                }
+                cfg.trusted_fingerprint = saved.fingerprint.clone();
             }
             if let Some(s) = server {
                 cfg.server = Some(s);
@@ -660,15 +658,12 @@ async fn run_command(command: Command, config: Option<PathBuf>) -> Result<()> {
         },
 
         Command::Send { file } => {
-            let abs = std::fs::canonicalize(&file).unwrap_or_else(|_| {
-                if file.is_absolute() {
-                    file.clone()
-                } else {
-                    std::env::current_dir()
-                        .map(|cwd| cwd.join(&file))
-                        .unwrap_or_else(|_| file.clone())
-                }
-            });
+            // Preserve symlink filenames rather than calling fs::canonicalize.
+            let abs = if file.is_absolute() {
+                file
+            } else {
+                std::env::current_dir()?.join(&file)
+            };
             let resp = send_default_request(IpcAction::SendFile {
                 path: abs.display().to_string(),
             })

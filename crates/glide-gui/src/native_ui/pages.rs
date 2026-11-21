@@ -1119,12 +1119,33 @@ fn client_connection_col(s: &Ui, p: Palette) -> El {
     if !s.known_servers.is_empty() {
         let connected = s.client_connected();
         let active_addr = s.status.local_addr.as_deref();
+        let active_fp = s
+            .status
+            .remote_fingerprint
+            .as_deref()
+            .or(s.config.client.trusted_fingerprint.as_deref())
+            .map(glide_core::config::normalize_known_fingerprint)
+            .filter(|fp| !fp.is_empty());
         let count = s.known_servers.len();
         let mut list = col().key("known-servers-list").w_full();
         for (i, srv) in s.known_servers.iter().enumerate() {
-            let is_active = connected && active_addr == Some(srv.address.as_str());
+            let srv_fp = srv
+                .fingerprint
+                .as_deref()
+                .map(glide_core::config::normalize_known_fingerprint)
+                .filter(|fp| !fp.is_empty());
+            let is_active = connected
+                && match (&active_fp, &srv_fp) {
+                    (Some(cur), Some(saved)) => cur == saved,
+                    _ => active_addr == Some(srv.address.as_str()),
+                };
             let srv_connect = srv.clone();
-            let rm_addr = srv.address.clone();
+            let rm_key = srv
+                .fingerprint
+                .as_deref()
+                .filter(|fp| !fp.trim().is_empty())
+                .unwrap_or(&srv.address)
+                .to_owned();
             let action = if is_active {
                 badge(p, format!("known-active-{i}"), "Active", true, false)
             } else {
@@ -1150,7 +1171,7 @@ fn client_connection_col(s: &Ui, p: Palette) -> El {
                 .press(p.press)
                 .cursor(Cursor::Pointer)
                 .focusable(true)
-                .on_press_tx(move |s: &mut Ui, tx| s.forget_known_server(rm_addr.clone(), tx))
+                .on_press_tx(move |s: &mut Ui, tx| s.forget_known_server(rm_key.clone(), tx))
                 .child(icons::close_icon(10.5, p.muted));
 
             let item = row()

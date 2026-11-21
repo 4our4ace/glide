@@ -10,7 +10,7 @@ use glide_hid::{HidUsage, MouseButton};
 use glide_proto::{ClipboardPayload, Edge, LockState, OsKind};
 use parking_lot::Mutex;
 use std::collections::HashSet;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 use tokio::sync::mpsc;
 
@@ -20,6 +20,8 @@ pub struct MockCaptureState {
     pub remote_mode: AtomicBool,
     pub locked: AtomicBool,
     pub pin_media_keys_local: AtomicBool,
+    pub enter_remote_calls: AtomicUsize,
+    pub leave_remote_at_calls: AtomicUsize,
     pub last_leave: Mutex<Option<(Edge, f32)>>,
     pub last_leave_at: Mutex<Option<(f32, f32)>>,
     pub lock_state: Mutex<LockState>,
@@ -53,6 +55,7 @@ impl CaptureControl for MockCaptureControl {
     }
 
     fn enter_remote(&self) -> Result<()> {
+        self.state.enter_remote_calls.fetch_add(1, Ordering::SeqCst);
         self.state.remote_mode.store(true, Ordering::SeqCst);
         Ok(())
     }
@@ -64,6 +67,9 @@ impl CaptureControl for MockCaptureControl {
     }
 
     fn leave_remote_at(&self, norm_x: f32, norm_y: f32) -> Result<()> {
+        self.state
+            .leave_remote_at_calls
+            .fetch_add(1, Ordering::SeqCst);
         self.state.remote_mode.store(false, Ordering::SeqCst);
         *self.state.last_leave_at.lock() = Some((norm_x, norm_y));
         Ok(())

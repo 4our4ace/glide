@@ -370,6 +370,7 @@ impl Ui {
                 } else {
                     Some(srv_raw.clone())
                 };
+                self.config.client.trusted_fingerprint = None;
                 self.last_committed_server = srv_raw;
                 changed = true;
             }

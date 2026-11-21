@@ -55,6 +55,9 @@ struct AppController {
     config: Mutex<GlideConfigFile>,
     runtime: RuntimeState,
     engine: Mutex<Option<ActiveEngine>>,
+    /// Serializes async `start_engine` / `stop_engine` transitions so rapid profile clicks
+    /// cannot race and orphan an active engine task.
+    engine_lock: tokio::sync::Mutex<()>,
     fingerprint: Mutex<Option<String>>,
     url: String,
     favicon_png: OnceLock<Vec<u8>>,
@@ -84,6 +87,7 @@ impl AppController {
             config: Mutex::new(cfg),
             runtime,
             engine: Mutex::new(None),
+            engine_lock: tokio::sync::Mutex::new(()),
             fingerprint: Mutex::new(None),
             url,
             favicon_png: OnceLock::new(),
@@ -141,6 +145,11 @@ impl AppController {
     }
 
     async fn stop_engine(&self) {
+        let _guard = self.engine_lock.lock().await;
+        self.stop_engine_locked().await;
+    }
+
+    async fn stop_engine_locked(&self) {
         let active = self.engine.lock().take();
         if let Some(active) = active {
             let _ = active.cmd_tx.send(RuntimeCommand::Shutdown);
@@ -160,6 +169,7 @@ impl AppController {
             s.status = "Idle".into();
             s.active_target = "Local".into();
             s.locked = false;
+            s.remote_fingerprint = None;
             s.rtt_ms = None;
             s.rtt_history.clear();
             s.peers.clear();
@@ -170,7 +180,8 @@ impl AppController {
         if role != "server" && role != "client" {
             anyhow::bail!("unknown role '{role}'");
         }
-        self.stop_engine().await;
+        let _guard = self.engine_lock.lock().await;
+        self.stop_engine_locked().await;
         let cfg = {
             let mut guard = self.config.lock();
             guard.last_role = Some(role.to_owned());

@@ -102,6 +102,7 @@ pub async fn run_server_with_backends(
             s.active_target = "Local".into();
             s.local_addr = Some(local_addr.to_string());
             s.fingerprint = Some(fingerprint.clone());
+            s.remote_fingerprint = None;
             s.geometry = geom.clone();
             s.last_error = None;
         });
@@ -344,17 +345,19 @@ pub async fn run_server_with_backends(
                     RuntimeCommand::SwitchToEdge(edge)
                     | RuntimeCommand::SwitchTarget(Some(edge)) => {
                         if let Some(&peer_id) = edge_to_peer.get(&edge) {
+                            if active_remote == Some(peer_id) {
+                                continue;
+                            }
+                            let was_remote = active_remote.is_some();
                             if let Some(prev_pid) = active_remote {
-                                if prev_pid != peer_id {
-                                    if let Some(prev_peer) = peers.get(&prev_pid) {
-                                        let _ = prev_peer.ctrl_tx.send(ControlMessage::ReleaseAll);
-                                        let _ = prev_peer.ctrl_tx.send(ControlMessage::Leave {
-                                            edge: prev_peer.edge.opposite(),
-                                            normalized_pos: 0.5,
-                                            cursor_norm_x: 0.5,
-                                            cursor_norm_y: 0.5,
-                                        });
-                                    }
+                                if let Some(prev_peer) = peers.get(&prev_pid) {
+                                    let _ = prev_peer.ctrl_tx.send(ControlMessage::ReleaseAll);
+                                    let _ = prev_peer.ctrl_tx.send(ControlMessage::Leave {
+                                        edge: prev_peer.edge.opposite(),
+                                        normalized_pos: 0.5,
+                                        cursor_norm_x: 0.5,
+                                        cursor_norm_y: 0.5,
+                                    });
                                 }
                             }
                             if let Some(peer) = peers.get(&peer_id) {
@@ -366,7 +369,14 @@ pub async fn run_server_with_backends(
                                 active_remote = Some(peer_id);
                                 active_edge = Some(edge);
                                 remote_modifiers = ModifierMask::EMPTY;
-                                let _ = capture_ctrl.enter_remote();
+                                pending_dx = 0.0;
+                                pending_dy = 0.0;
+                                coalesce_armed = false;
+                                // Only enter remote mode on local -> remote transition so we do not
+                                // overwrite the saved local cursor position (e.g. Windows last_local_norm).
+                                if !was_remote {
+                                    let _ = capture_ctrl.enter_remote();
+                                }
                                 let (nx, ny) = peer.last_cursor_norm;
                                 let _ = peer.ctrl_tx.send(ControlMessage::EnterAt {
                                     norm_x: nx,
@@ -388,11 +398,15 @@ pub async fn run_server_with_backends(
                                     cursor_norm_y: 0.5,
                                 });
                             }
+                            active_edge = None;
+                            remote_modifiers = ModifierMask::EMPTY;
+                            pending_dx = 0.0;
+                            pending_dy = 0.0;
+                            coalesce_armed = false;
+                            let (lx, ly) = capture_ctrl.last_local_cursor_norm();
+                            let _ = capture_ctrl.leave_remote_at(lx, ly);
+                            sync_runtime_peers(&runtime, &peers, active_remote, locked);
                         }
-                        active_edge = None;
-                        let (lx, ly) = capture_ctrl.last_local_cursor_norm();
-                        let _ = capture_ctrl.leave_remote_at(lx, ly);
-                        sync_runtime_peers(&runtime, &peers, active_remote, locked);
                     }
                     RuntimeCommand::SendFile { filename, data } => {
                         let limit = max_file_bytes.load(Ordering::Relaxed);

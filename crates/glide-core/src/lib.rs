@@ -408,4 +408,163 @@ mod tests {
         srv_task.abort();
         let _ = std::fs::remove_dir_all(&recv_dir);
     }
+
+    #[tokio::test]
+    async fn switch_target_transitions_guard_enter_leave_and_noop_idempotency() {
+        let identity = ServerIdentity::generate_ephemeral().unwrap();
+        let fp = identity.fingerprint.clone();
+        let endpoint =
+            GlideServerEndpoint::bind("127.0.0.1:0".parse().unwrap(), &identity).unwrap();
+        let addr = endpoint.local_addr();
+
+        let geom = DesktopGeometry::new(vec![MonitorRect {
+            name: "Disp-1".into(),
+            x: 0,
+            y: 0,
+            width: 1920,
+            height: 1080,
+            scale: 1.0,
+            primary: true,
+        }]);
+
+        let (capture_handle, _cap_tx, cap_state) = create_mock_capture(geom.clone());
+        let (mut right_inj, right_log) = MockInjector::new(geom.clone());
+        let (mut left_inj, left_log) = MockInjector::new(geom);
+        let srv_rt = RuntimeState::new();
+        let (srv_cmd_tx, srv_cmd_rx) = tokio::sync::mpsc::unbounded_channel();
+
+        let srv_cfg = ServerConfig {
+            name: "switch-srv".into(),
+            discovery: false,
+            motion_coalesce_us: 0,
+            ..Default::default()
+        };
+        let mut right_cfg = ClientConfig {
+            name: "peer-right".into(),
+            server: Some(addr.to_string()),
+            edge: Edge::Right,
+            trusted_fingerprint: Some(fp.clone()),
+            ..Default::default()
+        };
+        let mut left_cfg = ClientConfig {
+            name: "peer-left".into(),
+            server: Some(addr.to_string()),
+            edge: Edge::Left,
+            trusted_fingerprint: Some(fp),
+            ..Default::default()
+        };
+
+        let srv_rt_c = srv_rt.clone();
+        let srv_task = tokio::spawn(async move {
+            let _ = run_server_with_backends(
+                srv_cfg,
+                endpoint,
+                capture_handle,
+                None,
+                "windows",
+                Some(srv_rt_c),
+                Some(srv_cmd_rx),
+            )
+            .await;
+        });
+        let right_task = tokio::spawn(async move {
+            let mut opt_clip = None;
+            let _ =
+                run_client_session(&mut right_cfg, addr, &mut right_inj, &mut opt_clip, None, None)
+                    .await;
+        });
+        let left_task = tokio::spawn(async move {
+            let mut opt_clip = None;
+            let _ =
+                run_client_session(&mut left_cfg, addr, &mut left_inj, &mut opt_clip, None, None)
+                    .await;
+        });
+
+        // Wait until both peers are registered
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+        while srv_rt.snapshot().peers.len() < 2 {
+            assert!(tokio::time::Instant::now() < deadline);
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+
+        // 1. SwitchTarget(None) while already local must NOT invoke leave_remote_at
+        srv_cmd_tx
+            .send(crate::runtime::RuntimeCommand::SwitchTarget(None))
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(40)).await;
+        assert_eq!(cap_state.leave_remote_at_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(cap_state.enter_remote_calls.load(Ordering::SeqCst), 0);
+
+        // 2. Local -> Right calls enter_remote exactly once and sends EnterAt to Right
+        srv_cmd_tx
+            .send(crate::runtime::RuntimeCommand::SwitchTarget(Some(
+                Edge::Right,
+            )))
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(60)).await;
+        assert!(cap_state.remote_mode.load(Ordering::SeqCst));
+        assert_eq!(cap_state.enter_remote_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(srv_rt.snapshot().active_target, "peer-right");
+        let right_enters_before = right_log
+            .lock()
+            .iter()
+            .filter(|a| matches!(a, InjectedAction::EnterAt(_, _)))
+            .count();
+        assert_eq!(right_enters_before, 1);
+
+        // 3. Switching to Right again while already on Right is a no-op
+        srv_cmd_tx
+            .send(crate::runtime::RuntimeCommand::SwitchTarget(Some(
+                Edge::Right,
+            )))
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(60)).await;
+        assert_eq!(cap_state.enter_remote_calls.load(Ordering::SeqCst), 1);
+        let right_enters_after = right_log
+            .lock()
+            .iter()
+            .filter(|a| matches!(a, InjectedAction::EnterAt(_, _)))
+            .count();
+        assert_eq!(right_enters_after, 1);
+
+        // 4. Right -> Left (remote -> remote) must NOT call enter_remote again!
+        srv_cmd_tx
+            .send(crate::runtime::RuntimeCommand::SwitchTarget(Some(
+                Edge::Left,
+            )))
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(60)).await;
+        assert_eq!(
+            cap_state.enter_remote_calls.load(Ordering::SeqCst),
+            1,
+            "remote -> remote switch must not re-call enter_remote()"
+        );
+        assert_eq!(srv_rt.snapshot().active_target, "peer-left");
+        assert!(right_log.lock().contains(&InjectedAction::ReleaseAll));
+        assert!(left_log
+            .lock()
+            .iter()
+            .any(|a| matches!(a, InjectedAction::EnterAt(_, _))));
+
+        // 5. ReturnLocal transitions remote -> local and calls leave_remote_at once
+        srv_cmd_tx
+            .send(crate::runtime::RuntimeCommand::ReturnLocal)
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(60)).await;
+        assert!(!cap_state.remote_mode.load(Ordering::SeqCst));
+        assert_eq!(cap_state.leave_remote_at_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(srv_rt.snapshot().active_target, "Local");
+        assert!(left_log.lock().contains(&InjectedAction::ReleaseAll));
+
+        // 6. Second ReturnLocal while already local is a no-op
+        srv_cmd_tx
+            .send(crate::runtime::RuntimeCommand::ReturnLocal)
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(40)).await;
+        assert_eq!(cap_state.leave_remote_at_calls.load(Ordering::SeqCst), 1);
+
+        right_task.abort();
+        left_task.abort();
+        srv_task.abort();
+    }
 }

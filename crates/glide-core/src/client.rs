@@ -159,19 +159,22 @@ pub async fn run_client_session(
         }
     };
 
-    if let Some(ref store_path) = config.known_servers_path {
-        let peer_fp = session
-            .peer_fingerprint()
-            .or_else(|| config.trusted_fingerprint.clone());
+    let peer_fp = session
+        .peer_fingerprint()
+        .or_else(|| config.trusted_fingerprint.clone());
+
+    if let Some(store_path) = config.known_servers_path.clone() {
         let entry = KnownServer {
             name: server_name.clone(),
             address: server_addr.to_string(),
-            fingerprint: peer_fp,
+            fingerprint: peer_fp.clone(),
             edge: config.edge,
             last_connected_unix: current_unix_secs(),
         };
-        if let Err(e) = record_known_server(store_path, entry) {
-            warn!(error = %e, "Failed saving known server profile");
+        match tokio::task::spawn_blocking(move || record_known_server(&store_path, entry)).await {
+            Ok(Ok(_)) => {}
+            Ok(Err(e)) => warn!(error = %e, "Failed saving known server profile"),
+            Err(e) => warn!(error = %e, "Known server profile save task failed"),
         }
     }
 
@@ -181,6 +184,7 @@ pub async fn run_client_session(
             s.status = format!("Connected to {server_name}");
             s.active_target = server_name.clone();
             s.local_addr = Some(server_addr.to_string());
+            s.remote_fingerprint = peer_fp;
             s.geometry = client_geom.clone();
             s.last_error = None;
         });
@@ -677,6 +681,7 @@ pub async fn run_native_client_with_runtime(
                         if let Some(ref rt) = runtime {
                             rt.update(|s| {
                                 s.status = "Reconnecting...".into();
+                                s.remote_fingerprint = None;
                                 s.last_error = Some(e.to_string());
                             });
                         }

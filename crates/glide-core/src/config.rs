@@ -425,15 +425,13 @@ impl KnownServersStore {
         Ok(store)
     }
 
-    /// Saves `known_servers.toml` sorted by most recently connected and capped at `MAX_KNOWN_SERVERS`.
+    /// Saves `known_servers.toml` atomically (temp file in same directory + rename),
+    /// sorted by most recently connected and capped at `MAX_KNOWN_SERVERS`.
     pub fn save(&self, path: &Path) -> Result<()> {
-        if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent)?;
-        }
         let mut normalized = self.clone();
         normalized.normalize();
         let body = toml::to_string_pretty(&normalized)?;
-        fs::write(path, body)
+        write_file_atomic(path, &body)
             .with_context(|| format!("failed to write known servers store {}", path.display()))?;
         Ok(())
     }
@@ -470,14 +468,28 @@ impl KnownServersStore {
             .map(|fp| fp.trim().to_owned())
             .filter(|fp| !fp.is_empty());
 
+        let entry_fp_norm = entry
+            .fingerprint
+            .as_deref()
+            .map(normalize_known_fingerprint)
+            .filter(|fp| !fp.is_empty());
+
         let mut preserved_fp: Option<String> = None;
         self.servers.retain(|existing| {
-            let fp_match = match (&entry.fingerprint, &existing.fingerprint) {
-                (Some(a), Some(b)) => a.eq_ignore_ascii_case(b),
-                _ => false,
+            let existing_fp_norm = existing
+                .fingerprint
+                .as_deref()
+                .map(normalize_known_fingerprint)
+                .filter(|fp| !fp.is_empty());
+
+            // When both entries have fingerprints, deduplicate ONLY by normalized fingerprint so
+            // two distinct servers on different LANs sharing the same RFC1918 IP never clobber
+            // each other. Deduplicate by address only when at least one entry lacks a fingerprint.
+            let should_replace = match (&entry_fp_norm, &existing_fp_norm) {
+                (Some(a), Some(b)) => a == b,
+                _ => existing.address.eq_ignore_ascii_case(&entry.address),
             };
-            let addr_match = existing.address.eq_ignore_ascii_case(&entry.address);
-            if fp_match || addr_match {
+            if should_replace {
                 if entry.fingerprint.is_none() && preserved_fp.is_none() {
                     preserved_fp = existing.fingerprint.clone();
                 }
@@ -492,8 +504,9 @@ impl KnownServersStore {
         self.servers.push(entry);
     }
 
-    /// Inserts or updates a server entry (deduplicating by fingerprint or address),
-    /// sorted by most recently connected and capped at `MAX_KNOWN_SERVERS`.
+    /// Inserts or updates a server entry (deduplicating by normalized fingerprint when both entries
+    /// have fingerprints, or by address when at least one lacks a fingerprint), sorted by most
+    /// recently connected and capped at `MAX_KNOWN_SERVERS`.
     pub fn upsert(&mut self, mut entry: KnownServer) {
         if entry.last_connected_unix == 0 {
             entry.last_connected_unix = current_unix_secs();
@@ -509,12 +522,13 @@ impl KnownServersStore {
         out.servers
     }
 
-    /// Finds a saved server by exact case-insensitive name first, then address.
+    /// Finds a saved server by exact case-insensitive name first, then address, then normalized fingerprint.
     pub fn find(&self, query: &str) -> Option<&KnownServer> {
         let q = query.trim();
         if q.is_empty() {
             return None;
         }
+        let q_fp = normalize_known_fingerprint(q);
         self.servers
             .iter()
             .find(|s| s.name.eq_ignore_ascii_case(q))
@@ -523,30 +537,84 @@ impl KnownServersStore {
                     .iter()
                     .find(|s| s.address.eq_ignore_ascii_case(q))
             })
+            .or_else(|| {
+                if q_fp.is_empty() {
+                    None
+                } else {
+                    self.servers.iter().find(|s| {
+                        s.fingerprint
+                            .as_deref()
+                            .is_some_and(|fp| normalize_known_fingerprint(fp) == q_fp)
+                    })
+                }
+            })
     }
 
-    /// Removes any saved server matching `address_or_name` (case-insensitive on address, name, or fingerprint).
+    /// Removes any saved server matching `address_or_name` (by normalized fingerprint, address, or name).
     pub fn remove(&mut self, address_or_name: &str) -> bool {
         let q = address_or_name.trim();
         if q.is_empty() {
             return false;
         }
+        let q_fp = normalize_known_fingerprint(q);
         let before = self.servers.len();
         self.servers.retain(|s| {
-            !s.address.eq_ignore_ascii_case(q)
-                && !s.name.eq_ignore_ascii_case(q)
-                && !s
-                    .fingerprint
+            let fp_match = !q_fp.is_empty()
+                && s.fingerprint
                     .as_deref()
-                    .is_some_and(|fp| fp.eq_ignore_ascii_case(q))
+                    .is_some_and(|fp| normalize_known_fingerprint(fp) == q_fp);
+            !fp_match && !s.address.eq_ignore_ascii_case(q) && !s.name.eq_ignore_ascii_case(q)
         });
         self.servers.len() != before
     }
 }
 
-/// Upserts a server profile into `known_servers.toml` at `path` and persists it.
+static ATOMIC_WRITE_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Atomically writes `content` to `path` via a unique temporary file in the same directory + rename.
+fn write_file_atomic(path: &Path, content: &str) -> Result<()> {
+    let parent = path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    fs::create_dir_all(parent)?;
+    let seq = ATOMIC_WRITE_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let fname = path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("glide");
+    let tmp_path = parent.join(format!(".{fname}.tmp.{}.{seq}", std::process::id()));
+    if let Err(e) = fs::write(&tmp_path, content) {
+        let _ = fs::remove_file(&tmp_path);
+        return Err(e).with_context(|| format!("failed to write temp file {}", tmp_path.display()));
+    }
+    if let Err(e) = fs::rename(&tmp_path, path) {
+        let _ = fs::remove_file(&tmp_path);
+        return Err(e)
+            .with_context(|| format!("failed to atomically replace {}", path.display()));
+    }
+    Ok(())
+}
+
+/// Normalizes a server fingerprint for comparison (strips optional `SHA256:` prefix, colons,
+/// and whitespace, and lowercases ASCII characters).
+pub fn normalize_known_fingerprint(fp: &str) -> String {
+    let trimmed = fp.trim();
+    let stripped = trimmed
+        .strip_prefix("SHA256:")
+        .or_else(|| trimmed.strip_prefix("sha256:"))
+        .unwrap_or(trimmed);
+    stripped
+        .chars()
+        .filter(|c| *c != ':' && !c.is_whitespace())
+        .map(|c| c.to_ascii_lowercase())
+        .collect()
+}
+
+/// Upserts a server profile into `known_servers.toml` at `path` and persists it atomically.
+/// Parse or I/O errors are propagated rather than silently wiping existing saved profiles.
 pub fn record_known_server(path: &Path, entry: KnownServer) -> Result<KnownServersStore> {
-    let mut store = KnownServersStore::load(path).unwrap_or_default();
+    let mut store = KnownServersStore::load(path)?;
     store.upsert(entry);
     store.save(path)?;
     Ok(store)
@@ -806,5 +874,75 @@ mod tests {
         assert_eq!(list_known_servers(&tmp).unwrap().len(), MAX_KNOWN_SERVERS - 1);
 
         let _ = std::fs::remove_file(&tmp);
+    }
+
+    #[test]
+    fn known_servers_same_ip_distinct_fingerprints_do_not_clobber_each_other() {
+        let mut store = KnownServersStore::default();
+        store.upsert(KnownServer {
+            name: "home-desktop".into(),
+            address: "192.168.1.10:24800".into(),
+            fingerprint: Some("aa:bb:cc:dd".into()),
+            edge: Edge::Right,
+            last_connected_unix: 1000,
+        });
+        store.upsert(KnownServer {
+            name: "office-desktop".into(),
+            address: "192.168.1.10:24800".into(),
+            fingerprint: Some("11:22:33:44".into()),
+            edge: Edge::Left,
+            last_connected_unix: 2000,
+        });
+
+        // Both servers sharing 192.168.1.10:24800 must coexist!
+        assert_eq!(store.servers.len(), 2);
+        assert_eq!(store.servers[0].name, "office-desktop");
+        assert_eq!(store.servers[1].name, "home-desktop");
+
+        // Normalized fingerprint update (no colons, uppercase, SHA256: prefix) deduplicates home-desktop only
+        store.upsert(KnownServer {
+            name: "home-desktop-renamed".into(),
+            address: "192.168.1.10:24800".into(),
+            fingerprint: Some("SHA256:AABBCCDD".into()),
+            edge: Edge::Top,
+            last_connected_unix: 3000,
+        });
+        assert_eq!(store.servers.len(), 2);
+        assert_eq!(store.servers[0].name, "home-desktop-renamed");
+        assert_eq!(store.servers[1].name, "office-desktop");
+
+        // Removing by fingerprint removes ONLY that entry, leaving the other server on the same IP intact
+        assert!(store.remove("11:22:33:44"));
+        assert_eq!(store.servers.len(), 1);
+        assert_eq!(store.servers[0].name, "home-desktop-renamed");
+    }
+
+    #[test]
+    fn record_known_server_propagates_corrupt_toml_without_clobbering_file() {
+        let tmp = std::env::temp_dir().join(format!(
+            "glide-known-corrupt-test-{}.toml",
+            std::process::id()
+        ));
+        let corrupt_body = "[[servers]\nname = \"broken\n";
+        fs::write(&tmp, corrupt_body).unwrap();
+
+        let err = record_known_server(
+            &tmp,
+            KnownServer {
+                name: "new-pc".into(),
+                address: "192.168.1.50:24800".into(),
+                fingerprint: Some("ab:cd".into()),
+                edge: Edge::Right,
+                last_connected_unix: 500,
+            },
+        )
+        .unwrap_err();
+        assert!(
+            format!("{err:#}").contains("failed to parse known servers store"),
+            "unexpected error: {err:#}"
+        );
+        // Existing corrupt file must NOT be wiped or overwritten!
+        assert_eq!(fs::read_to_string(&tmp).unwrap(), corrupt_body);
+        let _ = fs::remove_file(&tmp);
     }
 }

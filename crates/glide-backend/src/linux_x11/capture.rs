@@ -18,8 +18,8 @@ use x11rb::connection::Connection;
 use x11rb::protocol::xinput::{self, ConnectionExt as XInputExt, EventMask, Fp3232, XIEventMask};
 use x11rb::protocol::xproto::{
     Allow, AtomEnum, ClientMessageData, ClientMessageEvent, ConnectionExt as XProtoExt,
-    CreateWindowAux, Cursor, EventMask as CoreEventMask, GrabMode, GrabStatus, Window, WindowClass,
-    CLIENT_MESSAGE_EVENT,
+    CreateWindowAux, Cursor, EventMask as CoreEventMask, GetPropertyReply, GrabMode, GrabStatus,
+    Window, WindowClass, CLIENT_MESSAGE_EVENT,
 };
 use x11rb::protocol::Event;
 use x11rb::rust_connection::RustConnection;
@@ -213,12 +213,32 @@ fn intern_ewmh_fullscreen_atoms(conn: &RustConnection) -> EwmhFullscreenAtoms {
     }
 }
 
-/// Extracts a 32-bit window ID from an X11 `WINDOW` property reply, ignoring `None` (`0`) and `root`.
-fn parse_window_id_from_property(format: u8, raw: &[u8], root: Window) -> Option<Window> {
-    if format != 32 || raw.len() < 4 {
-        return None;
+const FULLSCREEN_CACHE_TTL: Duration = Duration::from_millis(75);
+
+/// Caches `_NET_WM_STATE_FULLSCREEN` queries for 75 ms so edge-panning or edge-dwelling
+/// does not flood the X11 server with thousands of synchronous round-trips per second.
+#[derive(Debug, Default)]
+struct FullscreenCache {
+    cached: Option<(Instant, bool)>,
+}
+
+impl FullscreenCache {
+    fn check_with<F: FnOnce() -> bool>(&mut self, now: Instant, query: F) -> bool {
+        if let Some((at, value)) = self.cached {
+            if now.saturating_duration_since(at) < FULLSCREEN_CACHE_TTL {
+                return value;
+            }
+        }
+        let value = query();
+        self.cached = Some((now, value));
+        value
     }
-    let win = u32::from_ne_bytes([raw[0], raw[1], raw[2], raw[3]]);
+}
+
+/// Extracts a 32-bit window ID from an X11 `WINDOW` property reply via `value32()`,
+/// ignoring `None` (`0`) and `root`.
+fn parse_window_id_from_reply(reply: &GetPropertyReply, root: Window) -> Option<Window> {
+    let win = reply.value32()?.next()?;
     if win == x11rb::NONE || win == root {
         None
     } else {
@@ -226,24 +246,9 @@ fn parse_window_id_from_property(format: u8, raw: &[u8], root: Window) -> Option
     }
 }
 
-/// Parses a 32-bit X11 `ATOM[]` property buffer into a list of atom IDs.
-fn parse_atoms_from_property(format: u8, raw: &[u8]) -> Vec<u32> {
-    if format != 32 {
-        return Vec::new();
-    }
-    raw.chunks_exact(4)
-        .map(|chunk| u32::from_ne_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
-        .collect()
-}
-
-/// Returns `true` if a `_NET_WM_STATE` atom slice advertises `_NET_WM_STATE_FULLSCREEN`.
-fn wm_state_has_fullscreen(atoms: &[u32], fullscreen_atom: u32) -> bool {
-    fullscreen_atom != x11rb::NONE && atoms.contains(&fullscreen_atom)
-}
-
-/// Returns `true` if a `_NET_WM_WINDOW_TYPE` atom slice marks the window as a desktop shell window.
-fn wm_window_type_is_desktop(types: &[u32], desktop_atom: u32) -> bool {
-    desktop_atom != x11rb::NONE && types.contains(&desktop_atom)
+/// Returns `true` if a 32-bit X11 `ATOM[]` property reply contains `needle` via `value32()`.
+fn reply_contains_atom(reply: &GetPropertyReply, needle: u32) -> bool {
+    needle != x11rb::NONE && reply.value32().is_some_and(|mut it| it.any(|a| a == needle))
 }
 
 /// Checks whether the currently active X11 window advertises `_NET_WM_STATE_FULLSCREEN`.
@@ -270,9 +275,7 @@ fn is_active_window_fullscreen(
     let Ok(active_reply) = active_cookie.reply() else {
         return false;
     };
-    let Some(active_win) =
-        parse_window_id_from_property(active_reply.format, &active_reply.value, root)
-    else {
+    let Some(active_win) = parse_window_id_from_reply(&active_reply, root) else {
         return false;
     };
 
@@ -286,8 +289,7 @@ fn is_active_window_fullscreen(
             16,
         ) {
             if let Ok(type_reply) = type_cookie.reply() {
-                let win_types = parse_atoms_from_property(type_reply.format, &type_reply.value);
-                if wm_window_type_is_desktop(&win_types, atoms.net_wm_window_type_desktop) {
+                if reply_contains_atom(&type_reply, atoms.net_wm_window_type_desktop) {
                     return false;
                 }
             }
@@ -302,8 +304,7 @@ fn is_active_window_fullscreen(
     let Ok(state_reply) = state_cookie.reply() else {
         return false;
     };
-    let state_atoms = parse_atoms_from_property(state_reply.format, &state_reply.value);
-    wm_state_has_fullscreen(&state_atoms, atoms.net_wm_state_fullscreen)
+    reply_contains_atom(&state_reply, atoms.net_wm_state_fullscreen)
 }
 
 /// Starts the X11 server input capture loop on a dedicated OS thread.
@@ -480,6 +481,7 @@ fn run_capture_loop(
     let mut last_local_query = Instant::now();
     let mut mods = ModifierMask::EMPTY;
     let mut media_tracker = RemoteMediaKeyTracker::new();
+    let mut fullscreen_cache = FullscreenCache::default();
 
     let do_grab = |conn: &RustConnection,
                    shared: &SharedState,
@@ -675,9 +677,12 @@ fn run_capture_loop(
                                 dead_corner,
                             ) {
                                 // Only query EWMH _NET_WM_STATE_FULLSCREEN when the cursor actually
-                                // touches an active outer edge (zero 1000Hz mid-screen overhead).
+                                // touches an active outer edge, cached for 75 ms to avoid spamming
+                                // X11 round-trips while panning or dwelling along a border.
                                 if shared.auto_lock_fullscreen.load(Ordering::Relaxed)
-                                    && is_active_window_fullscreen(&conn, root, ewmh_atoms)
+                                    && fullscreen_cache.check_with(Instant::now(), || {
+                                        is_active_window_fullscreen(&conn, root, ewmh_atoms)
+                                    })
                                 {
                                     edge_push_edge = None;
                                     edge_push_accum = 0.0;
@@ -900,25 +905,42 @@ mod tests {
         out
     }
 
+    fn make_reply(format: u8, value: Vec<u8>) -> GetPropertyReply {
+        let value_len = match format {
+            8 => value.len() as u32,
+            16 => (value.len() / 2) as u32,
+            32 => (value.len() / 4) as u32,
+            _ => 0,
+        };
+        GetPropertyReply {
+            format,
+            sequence: 0,
+            length: 0,
+            type_: 0,
+            bytes_after: 0,
+            value_len,
+            value,
+        }
+    }
+
     #[test]
     fn parses_net_wm_state_atoms_and_detects_fullscreen() {
         const ATOM_ABOVE: u32 = 301;
         const ATOM_FULLSCREEN: u32 = 302;
         const ATOM_FOCUSED: u32 = 303;
 
-        let raw_fs = encode_u32s(&[ATOM_ABOVE, ATOM_FULLSCREEN, ATOM_FOCUSED]);
-        let atoms_fs = parse_atoms_from_property(32, &raw_fs);
-        assert_eq!(atoms_fs, vec![ATOM_ABOVE, ATOM_FULLSCREEN, ATOM_FOCUSED]);
-        assert!(wm_state_has_fullscreen(&atoms_fs, ATOM_FULLSCREEN));
+        let reply_fs = make_reply(32, encode_u32s(&[ATOM_ABOVE, ATOM_FULLSCREEN, ATOM_FOCUSED]));
+        assert!(reply_contains_atom(&reply_fs, ATOM_FULLSCREEN));
+        assert!(!reply_contains_atom(&reply_fs, x11rb::NONE));
 
-        let raw_windowed = encode_u32s(&[ATOM_ABOVE, ATOM_FOCUSED]);
-        let atoms_win = parse_atoms_from_property(32, &raw_windowed);
-        assert!(!wm_state_has_fullscreen(&atoms_win, ATOM_FULLSCREEN));
+        let reply_win = make_reply(32, encode_u32s(&[ATOM_ABOVE, ATOM_FOCUSED]));
+        assert!(!reply_contains_atom(&reply_win, ATOM_FULLSCREEN));
 
         // Non-32-bit format or empty/missing EWMH atom gracefully returns false
-        assert!(parse_atoms_from_property(8, &raw_fs).is_empty());
-        assert!(parse_atoms_from_property(0, &[]).is_empty());
-        assert!(!wm_state_has_fullscreen(&atoms_fs, x11rb::NONE));
+        let reply_8bit = make_reply(8, encode_u32s(&[ATOM_FULLSCREEN]));
+        assert!(!reply_contains_atom(&reply_8bit, ATOM_FULLSCREEN));
+        let reply_empty = make_reply(0, Vec::new());
+        assert!(!reply_contains_atom(&reply_empty, ATOM_FULLSCREEN));
     }
 
     #[test]
@@ -927,23 +949,23 @@ mod tests {
         const APP_WIN: Window = 0x0240_0007;
 
         assert_eq!(
-            parse_window_id_from_property(32, &encode_u32s(&[APP_WIN]), ROOT),
+            parse_window_id_from_reply(&make_reply(32, encode_u32s(&[APP_WIN])), ROOT),
             Some(APP_WIN)
         );
         // Ignore None (0) and root window
         assert_eq!(
-            parse_window_id_from_property(32, &encode_u32s(&[x11rb::NONE]), ROOT),
+            parse_window_id_from_reply(&make_reply(32, encode_u32s(&[x11rb::NONE])), ROOT),
             None
         );
         assert_eq!(
-            parse_window_id_from_property(32, &encode_u32s(&[ROOT]), ROOT),
+            parse_window_id_from_reply(&make_reply(32, encode_u32s(&[ROOT])), ROOT),
             None
         );
         // Ignore malformed / missing properties
-        assert_eq!(parse_window_id_from_property(0, &[], ROOT), None);
-        assert_eq!(parse_window_id_from_property(32, &[1, 2], ROOT), None);
+        assert_eq!(parse_window_id_from_reply(&make_reply(0, Vec::new()), ROOT), None);
+        assert_eq!(parse_window_id_from_reply(&make_reply(32, vec![1, 2]), ROOT), None);
         assert_eq!(
-            parse_window_id_from_property(16, &encode_u32s(&[APP_WIN]), ROOT),
+            parse_window_id_from_reply(&make_reply(16, encode_u32s(&[APP_WIN])), ROOT),
             None
         );
     }
@@ -953,12 +975,38 @@ mod tests {
         const ATOM_NORMAL: u32 = 401;
         const ATOM_DESKTOP: u32 = 402;
 
-        assert!(wm_window_type_is_desktop(
-            &[ATOM_NORMAL, ATOM_DESKTOP],
-            ATOM_DESKTOP
-        ));
-        assert!(!wm_window_type_is_desktop(&[ATOM_NORMAL], ATOM_DESKTOP));
-        assert!(!wm_window_type_is_desktop(&[ATOM_DESKTOP], x11rb::NONE));
+        let desktop_reply = make_reply(32, encode_u32s(&[ATOM_NORMAL, ATOM_DESKTOP]));
+        let normal_reply = make_reply(32, encode_u32s(&[ATOM_NORMAL]));
+        assert!(reply_contains_atom(&desktop_reply, ATOM_DESKTOP));
+        assert!(!reply_contains_atom(&normal_reply, ATOM_DESKTOP));
+        assert!(!reply_contains_atom(&desktop_reply, x11rb::NONE));
+    }
+
+    #[test]
+    fn fullscreen_cache_reuses_result_within_ttl_and_refreshes_after() {
+        let mut cache = FullscreenCache::default();
+        let t0 = Instant::now();
+        let mut calls = 0usize;
+
+        assert!(cache.check_with(t0, || {
+            calls += 1;
+            true
+        }));
+        assert_eq!(calls, 1);
+
+        // Within 75 ms TTL, cached result is returned without invoking the X11 query
+        assert!(cache.check_with(t0 + Duration::from_millis(50), || {
+            calls += 1;
+            false
+        }));
+        assert_eq!(calls, 1);
+
+        // At/after 75 ms TTL, query runs again and updates cached value
+        assert!(!cache.check_with(t0 + FULLSCREEN_CACHE_TTL, || {
+            calls += 1;
+            false
+        }));
+        assert_eq!(calls, 2);
     }
 
     #[test]
