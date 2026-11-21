@@ -113,7 +113,7 @@ sudo apt install ./glide_0.3.0_amd64.deb
 ## FAQ
 
 ### Does Glide need an account or internet connection?
-No. Glide talks directly between your PCs over your local network (Wi-Fi or Ethernet) with end-to-end encryption enabled automatically. (You can optionally click **Check** in *Settings → Updates* whenever you want to check GitHub for a newer release.)
+No. Glide talks directly between your PCs over your local network (Wi-Fi or Ethernet) with end-to-end encryption enabled automatically. On the default **Stable** channel, Glide never connects to the internet unless you click **Check** in *Settings → Updates*. You can also opt into the **Nightly** channel in Settings to test the latest dev builds with SHA-256 verified one-click **Update & Restart** (and switch back to **Stable** anytime).
 
 ### Does copying screenshots work between Windows and Linux?
 Yes. Screenshots from Windows `Win+Shift+S`, Snipping Tool, Paint, browsers, and Linux tools like Flameshot convert and paste cleanly in both directions. Passwords copied from password managers marked concealed/exclude-from-history are skipped automatically.
@@ -163,6 +163,10 @@ glide ctl switch local
 
 # Beam a file to the connected PC from the terminal
 glide send ./build.tar.gz
+
+# Check or switch update channels from the terminal (SHA-256 verified)
+glide update --channel nightly
+glide update --channel stable
 
 # LAN discovery & system check
 glide discover

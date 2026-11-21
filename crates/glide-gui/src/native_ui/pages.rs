@@ -9,14 +9,13 @@ use super::widgets::{
 use super::{DeskDrag, DragKind, Role, Tab, Ui};
 use crate::updater::UpdateCheckState;
 use glide_backend::InputBackendKind;
+use glide_core::config::UpdateChannel;
 use glide_proto::{ClipboardFormat, Edge, OsKind};
 use rune::{
     col, el, row, rule, spacer, text, Align, Color, Cursor, Drag, El, FileDialogOptions, Phase,
     ScrollSpec, Tx,
 };
 use std::borrow::Cow;
-
-const VERSION_LABEL: &str = concat!("Glide v", env!("CARGO_PKG_VERSION"));
 
 /// Root window layout (900x640): 208px sidebar + main content + toast overlay.
 pub fn root_view(s: &Ui, p: Palette) -> El {
@@ -221,7 +220,44 @@ fn sidebar(s: &Ui, p: Palette) -> El {
                 .truncate(),
         );
 
-    let mut foot = col().key("side-foot").w_full().gap(10.0).child(status_row);
+    let mut foot = col().key("side-foot").w_full().gap(10.0);
+
+    if let UpdateCheckState::Available(avail) = &s.update_state {
+        let banner_label = if avail.is_channel_switch {
+            format!("Switch · {}", avail.short_label)
+        } else {
+            format!("Update · {}", avail.short_label)
+        };
+        let update_pill = row()
+            .key("side-update-pill")
+            .role("button")
+            .label(format!("Update available: {}", avail.version))
+            .w_full()
+            .h(30.0)
+            .px(10.0)
+            .gap(7.0)
+            .center_y()
+            .radius(7.0)
+            .fill(p.accent.alpha(0.11))
+            .border(1.0, p.accent.alpha(0.32))
+            .hover(p.accent.alpha(0.18))
+            .press(p.accent.alpha(0.24))
+            .cursor(Cursor::Pointer)
+            .focusable(true)
+            .on_press(|s: &mut Ui| s.tab = Tab::Settings)
+            .child(el().size(6.0, 6.0).radius(3.0).fill(p.accent).a11y_hidden())
+            .child(
+                text(banner_label)
+                    .font(ty::SUB_MED)
+                    .color(p.accent)
+                    .grow(1.0)
+                    .shrink()
+                    .truncate(),
+            );
+        foot = foot.child(update_pill);
+    }
+
+    foot = foot.child(status_row);
 
     if running {
         if let Some(rtt) = s.status.rtt_ms {
@@ -2599,9 +2635,34 @@ fn settings_page(s: &Ui, p: Palette) -> El {
         ));
     }
 
+    let channel_desc = match s.config.update_channel {
+        UpdateChannel::Stable => "Official tested releases",
+        UpdateChannel::Nightly => "Dev builds · auto-checks",
+    };
+    general_rows.push(setting_row(
+        p,
+        "update-channel-row",
+        "Update channel",
+        Some(channel_desc),
+        segmented(
+            p,
+            "update-channel-seg",
+            &[
+                (UpdateChannel::Stable, "Stable"),
+                (UpdateChannel::Nightly, "Nightly"),
+            ],
+            s.config.update_channel,
+            true,
+            |s, ch, tx| s.set_update_channel(ch, tx),
+        ),
+    ));
+
     let (update_desc, update_btn): (Cow<'_, str>, El) = match &s.update_state {
         UpdateCheckState::Idle => (
-            Cow::Borrowed("Check GitHub for new releases"),
+            Cow::Borrowed(match s.config.update_channel {
+                UpdateChannel::Stable => "Check GitHub for new releases",
+                UpdateChannel::Nightly => "Check GitHub for the latest nightly build",
+            }),
             xs_button(
                 p,
                 "update-check-btn",
@@ -2633,15 +2694,60 @@ fn settings_page(s: &Ui, p: Palette) -> El {
                 |s, tx| s.check_for_updates(tx),
             ),
         ),
-        UpdateCheckState::Available { version, .. } => (
-            Cow::Owned(format!("{version} is available")),
+        UpdateCheckState::Available(avail) => {
+            let desc = if avail.is_channel_switch {
+                format!("Switch to {}", avail.version)
+            } else {
+                format!("{} is available", avail.version)
+            };
+            let btn = if avail.can_self_update() {
+                xs_button(
+                    p,
+                    "update-install-btn",
+                    if avail.is_channel_switch {
+                        "Switch & Restart"
+                    } else {
+                        "Update & Restart"
+                    },
+                    BtnKind::Primary,
+                    false,
+                    |s, tx| s.install_update(tx),
+                )
+            } else {
+                xs_button(
+                    p,
+                    "update-download-btn",
+                    "Download",
+                    BtnKind::Primary,
+                    false,
+                    |s, tx| s.open_update_download(tx),
+                )
+            };
+            (Cow::Owned(desc), btn)
+        }
+        UpdateCheckState::Downloading {
+            version,
+            progress_pct,
+        } => (
+            Cow::Owned(format!("Downloading {version}… {progress_pct}%")),
             xs_button(
                 p,
-                "update-download-btn",
-                "Download",
-                BtnKind::Primary,
-                false,
-                |s, tx| s.open_update_download(tx),
+                "update-progress-btn",
+                "Updating…",
+                BtnKind::Default,
+                true,
+                |_, _| {},
+            ),
+        ),
+        UpdateCheckState::Installing { version } => (
+            Cow::Owned(format!("Verifying & installing {version}…")),
+            xs_button(
+                p,
+                "update-install-progress-btn",
+                "Installing…",
+                BtnKind::Default,
+                true,
+                |_, _| {},
             ),
         ),
         UpdateCheckState::Error(msg) => (
@@ -2687,6 +2793,7 @@ fn settings_page(s: &Ui, p: Palette) -> El {
         )],
     );
 
+    let version_label = UpdateChannel::build_display_label(env!("CARGO_PKG_VERSION"));
     let version_foot = row()
         .key("version-foot")
         .w_full()
@@ -2700,7 +2807,7 @@ fn settings_page(s: &Ui, p: Palette) -> El {
                 .gap(8.0)
                 .center_y()
                 .child(icons::glide_mark(18.0, 4.5, p.accent))
-                .child(text(VERSION_LABEL).font(ty::SUB_MED).color(p.text_2)),
+                .child(text(version_label).font(ty::SUB_MED).color(p.text_2)),
         )
         .child(
             text("No account, no cloud, no internet.")

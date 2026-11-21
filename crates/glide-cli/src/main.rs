@@ -13,6 +13,7 @@ use glide_core::client::run_native_client_with_runtime;
 use glide_core::config::{
     default_config_dir, default_known_servers_path, known_servers_path_for_config,
     remove_known_server, ClientConfig, GlideConfigFile, KnownServersStore, ServerConfig,
+    UpdateChannel,
 };
 use glide_core::ipc::{
     send_default_request, start_default_ipc, DirectIpcBackend, IpcAction, SwitchDestination,
@@ -293,8 +294,34 @@ enum Command {
         action: SetupAction,
     },
 
+    /// Check for and install verified Glide updates from the Stable or Nightly channel
+    Update {
+        /// Override update channel (`stable` or `nightly`) and save as default
+        #[arg(long, value_enum)]
+        channel: Option<CliUpdateChannel>,
+
+        /// Check only without downloading or installing
+        #[arg(long)]
+        check: bool,
+    },
+
     /// Inspect monitors, DPI scaling, OS extensions, and German ISO HID key mappings
     Doctor,
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+enum CliUpdateChannel {
+    Stable,
+    Nightly,
+}
+
+impl From<CliUpdateChannel> for UpdateChannel {
+    fn from(value: CliUpdateChannel) -> Self {
+        match value {
+            CliUpdateChannel::Stable => UpdateChannel::Stable,
+            CliUpdateChannel::Nightly => UpdateChannel::Nightly,
+        }
+    }
 }
 
 #[derive(Subcommand, Debug)]
@@ -375,6 +402,7 @@ fn main() -> Result<()> {
     attach_parent_console_if_cli();
 
     glide_backend::init_platform();
+    glide_gui::updater::cleanup_old_binary();
     let cli = Cli::parse();
     init_logging(cli.verbose);
 
@@ -765,6 +793,79 @@ async fn run_command(command: Command, config: Option<PathBuf>) -> Result<()> {
             SetupAction::ElevatedTask => println!("{}", configure_elevated_task()?),
         },
 
+        Command::Update { channel, check } => {
+            let mut cfg = load_config(cli_config.as_ref())?;
+            let target_channel = match channel {
+                Some(ch) => {
+                    let mapped: UpdateChannel = ch.into();
+                    cfg.update_channel = mapped;
+                    let cfg_path = cli_config
+                        .clone()
+                        .unwrap_or_else(|| default_config_dir().join("glide.toml"));
+                    let _ = cfg.save(&cfg_path);
+                    mapped
+                }
+                None => cfg.update_channel,
+            };
+
+            let current_ver = env!("CARGO_PKG_VERSION");
+            println!(
+                "Current build: {}",
+                UpdateChannel::build_display_label(current_ver)
+            );
+            println!("Checking {} channel on GitHub…", target_channel.label());
+
+            match glide_gui::updater::check_release(target_channel, current_ver) {
+                glide_gui::updater::UpdateCheckState::UpToDate { latest } => {
+                    println!("Already up to date ({latest}).");
+                }
+                glide_gui::updater::UpdateCheckState::Available(avail) => {
+                    if avail.is_channel_switch {
+                        println!(
+                            "Ready to switch to {} ({}).",
+                            avail.version,
+                            target_channel.label()
+                        );
+                    } else {
+                        println!("Update available: {}.", avail.version);
+                    }
+                    if check {
+                        return Ok(());
+                    }
+                    if !avail.can_self_update() {
+                        anyhow::bail!(
+                            "Release {} does not include a verifiable package for this platform. Download manually at {}",
+                            avail.version,
+                            avail.html_url
+                        );
+                    }
+                    let mut last_printed = 0u8;
+                    let exe = glide_gui::updater::download_and_install_update(
+                        &avail,
+                        current_ver,
+                        true,
+                        |pct| {
+                            if pct == 100 || pct >= last_printed.saturating_add(10) {
+                                last_printed = pct;
+                                println!("Downloading {}… {pct}%", avail.version);
+                            }
+                        },
+                        || println!("SHA-256 verified. Installing {}…", avail.version),
+                    )
+                    .map_err(|e| anyhow::anyhow!("{e}"))?;
+                    println!(
+                        "Successfully updated Glide to {} ({}).",
+                        avail.version,
+                        exe.display()
+                    );
+                }
+                glide_gui::updater::UpdateCheckState::Error(msg) => {
+                    anyhow::bail!("{msg}");
+                }
+                _ => {}
+            }
+        }
+
         Command::Doctor => {
             let report = glide_backend::run_doctor()?;
             println!("Glide Doctor");
@@ -869,5 +970,15 @@ mod tests {
         // Backward-compatible alias `glide send-file`
         let cli_send_alias = Cli::try_parse_from(["glide", "send-file", "/tmp/demo.txt"]).unwrap();
         assert!(matches!(cli_send_alias.command, Some(Command::Send { .. })));
+
+        let cli_update =
+            Cli::try_parse_from(["glide", "update", "--channel", "nightly", "--check"]).unwrap();
+        assert!(matches!(
+            cli_update.command,
+            Some(Command::Update {
+                channel: Some(CliUpdateChannel::Nightly),
+                check: true
+            })
+        ));
     }
 }

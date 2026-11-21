@@ -33,7 +33,7 @@ use tokio::task::JoinHandle;
 use tracing::{debug, info, warn};
 
 mod native_ui;
-pub(crate) mod updater;
+pub mod updater;
 
 const UI_HTML: &str = include_str!("ui.html");
 const FONT_INTER: &[u8] = include_bytes!("../assets/fonts/inter.woff2");
@@ -63,6 +63,8 @@ struct AppController {
     favicon_png: OnceLock<Vec<u8>>,
     tray_active: AtomicBool,
     quit_tx: mpsc::UnboundedSender<()>,
+    /// Optional executable path to relaunch cleanly after full shutdown (used by self-updater).
+    relaunch_after_exit: Mutex<Option<PathBuf>>,
     /// Shows the native window (installed by `native_ui` while its event loop runs).
     ui_show: Mutex<Option<Hook>>,
     /// Quits the native window's event loop.
@@ -93,6 +95,7 @@ impl AppController {
             favicon_png: OnceLock::new(),
             tray_active: AtomicBool::new(false),
             quit_tx,
+            relaunch_after_exit: Mutex::new(None),
             ui_show: Mutex::new(None),
             ui_quit: Mutex::new(None),
             ui_tray: Mutex::new(None),
@@ -447,6 +450,7 @@ async fn serve(
 pub fn run_gui_blocking(opts: GuiOptions) -> Result<()> {
     let launch_t0 = std::time::Instant::now();
     glide_backend::init_platform();
+    updater::cleanup_old_binary();
 
     let Some(std_listener) = bind_or_focus_existing(opts.port, opts.minimized)? else {
         return Ok(());
@@ -609,6 +613,12 @@ pub fn run_gui_blocking(opts: GuiOptions) -> Result<()> {
         }
     });
     rt.shutdown_timeout(Duration::from_millis(300));
+    let relaunch_exe = ctrl.relaunch_after_exit.lock().take();
+    if let Some(exe) = relaunch_exe {
+        if let Err(e) = updater::spawn_relaunch(&exe, opts.config_path.as_deref()) {
+            warn!(error = %e, "Failed relaunching Glide after update");
+        }
+    }
     Ok(())
 }
 

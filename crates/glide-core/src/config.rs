@@ -51,12 +51,71 @@ pub const DEFAULT_MAX_FILE_MB: u32 = 256;
 pub const MIN_MAX_FILE_MB: u32 = 1;
 pub const MAX_MAX_FILE_MB: u32 = 4096;
 
+/// Short 7-character git commit SHA embedded at compile time (or `"unknown"`).
+pub const BUILD_SHA: &str = env!("GLIDE_BUILD_SHA");
+
+/// Build channel string embedded at compile time (`"stable"` or `"nightly"`).
+pub const BUILD_CHANNEL_STR: &str = env!("GLIDE_BUILD_CHANNEL");
+
+/// Release track used by the in-app updater and `glide update`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum UpdateChannel {
+    /// Official versioned releases (`v0.3.0`, `v0.4.0`, ...).
+    #[default]
+    Stable,
+    /// Rolling development builds published from the `nightly` branch.
+    Nightly,
+}
+
+impl UpdateChannel {
+    /// Returns the release channel that this binary was compiled for.
+    pub const fn build_channel() -> Self {
+        match BUILD_CHANNEL_STR.as_bytes() {
+            b"nightly" => Self::Nightly,
+            _ => Self::Stable,
+        }
+    }
+
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Stable => "stable",
+            Self::Nightly => "nightly",
+        }
+    }
+
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Stable => "Stable",
+            Self::Nightly => "Nightly",
+        }
+    }
+
+    /// Human-readable footer/version string identifying both semver and nightly commit SHA.
+    pub fn build_display_label(pkg_version: &str) -> String {
+        match Self::build_channel() {
+            Self::Stable => format!("Glide v{pkg_version}"),
+            Self::Nightly => {
+                if BUILD_SHA != "unknown" {
+                    format!("Glide v{pkg_version}-nightly ({BUILD_SHA})")
+                } else {
+                    format!("Glide v{pkg_version}-nightly")
+                }
+            }
+        }
+    }
+}
+
 fn default_true() -> bool {
     true
 }
 
 fn default_max_file_mb() -> u32 {
     DEFAULT_MAX_FILE_MB
+}
+
+fn default_update_channel() -> UpdateChannel {
+    UpdateChannel::build_channel()
 }
 
 /// Top-level `glide.toml` file supporting both `[server]` and `[client]` sections
@@ -84,6 +143,9 @@ pub struct GlideConfigFile {
     /// Optional custom folder for received files (defaults to `Downloads/Glide` when `None`).
     #[serde(default)]
     pub receive_dir: Option<String>,
+    /// Preferred update channel (`"stable"` or `"nightly"`). Defaults to the build's own channel.
+    #[serde(default = "default_update_channel")]
+    pub update_channel: UpdateChannel,
     #[serde(default)]
     pub server: ServerConfig,
     #[serde(default)]
@@ -100,6 +162,7 @@ impl Default for GlideConfigFile {
             drag_drop_files: true,
             max_file_mb: DEFAULT_MAX_FILE_MB,
             receive_dir: None,
+            update_channel: default_update_channel(),
             server: ServerConfig::default(),
             client: ClientConfig::default(),
         }
@@ -959,5 +1022,25 @@ mod tests {
         // Existing corrupt file must NOT be wiped or overwritten!
         assert_eq!(fs::read_to_string(&tmp).unwrap(), corrupt_body);
         let _ = fs::remove_file(&tmp);
+    }
+
+    #[test]
+    fn update_channel_roundtrips_in_config_toml() {
+        let mut cfg = GlideConfigFile::default();
+        assert_eq!(cfg.update_channel, UpdateChannel::build_channel());
+
+        cfg.update_channel = UpdateChannel::Nightly;
+        let toml_str = toml::to_string_pretty(&cfg).unwrap();
+        assert!(toml_str.contains("update_channel = \"nightly\""));
+        let parsed: GlideConfigFile = toml::from_str(&toml_str).unwrap();
+        assert_eq!(parsed.update_channel, UpdateChannel::Nightly);
+
+        let stable_parsed: GlideConfigFile =
+            toml::from_str("update_channel = \"stable\"\n").unwrap();
+        assert_eq!(stable_parsed.update_channel, UpdateChannel::Stable);
+
+        // Omitting update_channel falls back cleanly to the build's own channel
+        let empty_parsed: GlideConfigFile = toml::from_str("").unwrap();
+        assert_eq!(empty_parsed.update_channel, UpdateChannel::build_channel());
     }
 }

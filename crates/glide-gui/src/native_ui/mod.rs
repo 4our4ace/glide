@@ -13,6 +13,7 @@ use glide_backend::os_integration::{
 };
 use glide_core::config::{
     list_known_servers, remove_known_server, GlideConfigFile, KeyRemapRule, KnownServer,
+    UpdateChannel,
 };
 use glide_core::runtime::{
     read_regular_file_bounded, ClipboardHistoryEntry, FileTransferEntry, PeerSummary,
@@ -652,25 +653,55 @@ impl Ui {
         self.toast(format!("Copied {addr}"), tx);
     }
 
-    pub fn check_for_updates(&mut self, tx: &mut Tx) {
-        if matches!(self.update_state, UpdateCheckState::Checking) {
+    pub fn set_update_channel(&mut self, channel: UpdateChannel, tx: &mut Tx) {
+        if self.config.update_channel == channel {
             return;
         }
+        if matches!(
+            self.update_state,
+            UpdateCheckState::Downloading { .. } | UpdateCheckState::Installing { .. }
+        ) {
+            return;
+        }
+        self.config.update_channel = channel;
+        self.push_config();
+        self.update_state = UpdateCheckState::Idle;
+        self.check_for_updates(tx);
+    }
+
+    pub fn check_for_updates(&mut self, tx: &mut Tx) {
+        if matches!(
+            self.update_state,
+            UpdateCheckState::Checking
+                | UpdateCheckState::Downloading { .. }
+                | UpdateCheckState::Installing { .. }
+        ) {
+            return;
+        }
+        let channel = self.config.update_channel;
         self.update_state = UpdateCheckState::Checking;
         let handle = self.handle.clone();
         let current = env!("CARGO_PKG_VERSION");
         self.rt.spawn(async move {
-            let state = tokio::task::spawn_blocking(move || updater::check_latest_release(current))
-                .await
-                .unwrap_or_else(|_| UpdateCheckState::Error("Update check failed".into()));
+            let state =
+                tokio::task::spawn_blocking(move || updater::check_release(channel, current))
+                    .await
+                    .unwrap_or_else(|_| UpdateCheckState::Error("Update check failed".into()));
             if let Some(h) = handle {
                 h.update(move |s, tx| {
+                    if s.config.update_channel != channel {
+                        return;
+                    }
                     match &state {
                         UpdateCheckState::UpToDate { latest } => {
                             s.toast(format!("Glide {latest} is up to date"), tx);
                         }
-                        UpdateCheckState::Available { version, .. } => {
-                            s.toast(format!("Glide {version} is available"), tx);
+                        UpdateCheckState::Available(avail) => {
+                            if avail.is_channel_switch {
+                                s.toast(format!("Ready to switch to Glide {}", avail.version), tx);
+                            } else {
+                                s.toast(format!("Glide {} is available", avail.version), tx);
+                            }
                         }
                         UpdateCheckState::Error(msg) => {
                             s.toast(msg.clone(), tx);
@@ -684,9 +715,96 @@ impl Ui {
         let _ = tx;
     }
 
+    pub fn install_update(&mut self, tx: &mut Tx) {
+        let avail = match &self.update_state {
+            UpdateCheckState::Available(avail) => (**avail).clone(),
+            _ => return,
+        };
+        if !avail.can_self_update() {
+            self.open_update_download(tx);
+            return;
+        }
+
+        let version = avail.version.clone();
+        self.update_state = UpdateCheckState::Downloading {
+            version: version.clone(),
+            progress_pct: 0,
+        };
+        self.toast(format!("Downloading Glide {version}…"), tx);
+
+        let handle = self.handle.clone();
+        let ctrl = Arc::clone(&self.ctrl);
+        let current = env!("CARGO_PKG_VERSION");
+        self.rt.spawn(async move {
+            let h_prog = handle.clone();
+            let v_prog = version.clone();
+            let h_inst = handle.clone();
+            let v_inst = version.clone();
+
+            let res = tokio::task::spawn_blocking(move || {
+                updater::download_and_install_update(
+                    &avail,
+                    current,
+                    false,
+                    move |pct| {
+                        if let Some(ref h) = h_prog {
+                            let ver = v_prog.clone();
+                            h.update_if(move |s, _| {
+                                if let UpdateCheckState::Downloading { progress_pct, .. } =
+                                    &mut s.update_state
+                                {
+                                    if *progress_pct == pct {
+                                        return false;
+                                    }
+                                    *progress_pct = pct;
+                                    true
+                                } else {
+                                    s.update_state = UpdateCheckState::Downloading {
+                                        version: ver,
+                                        progress_pct: pct,
+                                    };
+                                    true
+                                }
+                            });
+                        }
+                    },
+                    move || {
+                        if let Some(ref h) = h_inst {
+                            let ver = v_inst.clone();
+                            h.update(move |s, _| {
+                                s.update_state = UpdateCheckState::Installing { version: ver };
+                            });
+                        }
+                    },
+                )
+            })
+            .await
+            .unwrap_or_else(|_| Err("Update task panicked".into()));
+
+            match res {
+                Ok(relaunch_exe) => {
+                    *ctrl.relaunch_after_exit.lock() = Some(relaunch_exe);
+                    if let Some(h) = handle {
+                        h.update(move |s, tx| {
+                            s.quit_app(tx);
+                        });
+                    }
+                }
+                Err(msg) => {
+                    if let Some(h) = handle {
+                        h.update(move |s, tx| {
+                            s.toast(msg.clone(), tx);
+                            s.update_state = UpdateCheckState::Error(msg);
+                        });
+                    }
+                }
+            }
+        });
+    }
+
     pub fn open_update_download(&mut self, tx: &mut Tx) {
         let url = match &self.update_state {
-            UpdateCheckState::Available { url, .. } => url.clone(),
+            UpdateCheckState::Available(avail) => avail.html_url.clone(),
             _ => updater::RELEASES_PAGE_URL.to_owned(),
         };
         match updater::open_url(&url) {
@@ -1353,6 +1471,39 @@ fn spawn_background_init(
             ui.doctor_display = doctor_display;
             ui.doctor_text = doctor_text;
         });
+
+        // Automatically check for new dev builds on launch ONLY when opted into the Nightly track.
+        // Stable stays 100% offline unless the user clicks Check.
+        if ctrl.config.lock().update_channel == UpdateChannel::Nightly {
+            tokio::time::sleep(Duration::from_millis(1500)).await;
+            let current = env!("CARGO_PKG_VERSION");
+            if let Ok(state) = tokio::task::spawn_blocking(move || {
+                updater::check_release(UpdateChannel::Nightly, current)
+            })
+            .await
+            {
+                handle.update_if(move |ui, tx| {
+                    if ui.config.update_channel != UpdateChannel::Nightly
+                        || !matches!(ui.update_state, UpdateCheckState::Idle)
+                    {
+                        return false;
+                    }
+                    match state {
+                        UpdateCheckState::Available(avail) => {
+                            let label = avail.version.clone();
+                            ui.update_state = UpdateCheckState::Available(avail);
+                            ui.toast(format!("Glide {label} is available"), tx);
+                            true
+                        }
+                        UpdateCheckState::UpToDate { latest } => {
+                            ui.update_state = UpdateCheckState::UpToDate { latest };
+                            true
+                        }
+                        _ => false,
+                    }
+                });
+            }
+        }
     });
 }
 
@@ -1741,6 +1892,33 @@ const SCENES: &[(&str, SceneFn)] = &[
         s.fingerprint = Some("ab:cd:ef:01:23:45:67:89:ab:cd:ef:01:23:45:67:89:ab:cd:ef:01:23:45:67:89:ab:cd:ef:01:23:45:67:89".into());
         s.doctor_display = "DISPLAY=:0 (screen 0)".into();
         s.doctor_text = "OS       Linux (LinuxX11)\nDisplay  DISPLAY=:0 (screen 0)\n\n• Native X11 session detected.\n• XTest extension: OK (v2.2)\n• XInput2 extension: OK (v2.2)\n• XFixes extension: OK (v5.0)".into();
+    }),
+    ("settings-update-ready", |s| {
+        s.theme = ThemePref::Light;
+        s.tab = Tab::Settings;
+        s.is_windows = true;
+        s.os_kind = OsKind::Windows;
+        s.os_label = "Windows";
+        s.hostname = "gaming-workstation".into();
+        s.config.update_channel = UpdateChannel::Nightly;
+        s.update_state = UpdateCheckState::Available(Box::new(updater::AvailableUpdate {
+            channel: UpdateChannel::Nightly,
+            version: "nightly (7b68d47)".into(),
+            short_label: "nightly 7b68d47".into(),
+            html_url: updater::RELEASES_PAGE_URL.into(),
+            is_channel_switch: false,
+            binary_asset: Some(updater::UpdateAsset {
+                name: "glide-windows-x86_64.exe".into(),
+                download_url: format!("{}nightly/glide-windows-x86_64.exe", updater::ASSET_URL_PREFIX),
+                size: 21_788_672,
+            }),
+            deb_asset: Some(updater::UpdateAsset {
+                name: "glide_0.3.0_amd64.deb".into(),
+                download_url: format!("{}nightly/glide_0.3.0_amd64.deb", updater::ASSET_URL_PREFIX),
+                size: 10_384_704,
+            }),
+            checksums_url: Some(format!("{}nightly/SHA256SUMS.txt", updater::ASSET_URL_PREFIX)),
+        }));
     }),
 ];
 

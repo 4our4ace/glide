@@ -1,0 +1,165 @@
+name: Nightly Build
+
+on:
+  push:
+    branches:
+      - nightly
+  workflow_dispatch:
+
+concurrency:
+  group: nightly-release
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  build-linux:
+    name: Build Linux Nightly (Ubuntu 22.04)
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Cargo dependencies
+        uses: Swatinem/rust-cache@v2
+
+      - name: Install Linux link dependency
+        run: sudo apt-get update && sudo apt-get install -y libxkbcommon-dev
+
+      - name: Run workspace tests
+        env:
+          GLIDE_BUILD_CHANNEL: nightly
+          GLIDE_BUILD_SHA: ${{ github.sha }}
+        run: cargo test --workspace --locked
+
+      - name: Build release binary
+        env:
+          GLIDE_BUILD_CHANNEL: nightly
+          GLIDE_BUILD_SHA: ${{ github.sha }}
+        run: cargo build --release --locked --bin glide
+
+      - name: Package .deb and stage artifacts
+        run: |
+          mkdir -p release-artifacts
+          cp target/release/glide release-artifacts/glide-linux-x86_64
+          ./scripts/build-deb.sh target/release/glide
+          cp dist/glide_*_amd64.deb release-artifacts/
+          ls -lh release-artifacts/
+
+      - name: Upload Linux artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: linux-nightly-artifacts
+          path: release-artifacts/*
+
+  build-windows:
+    name: Build Windows Nightly (x86_64)
+    runs-on: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Cargo dependencies
+        uses: Swatinem/rust-cache@v2
+
+      - name: Run workspace tests
+        env:
+          GLIDE_BUILD_CHANNEL: nightly
+          GLIDE_BUILD_SHA: ${{ github.sha }}
+        run: cargo test --workspace --locked
+
+      - name: Build standalone Windows binary (static CRT)
+        env:
+          GLIDE_BUILD_CHANNEL: nightly
+          GLIDE_BUILD_SHA: ${{ github.sha }}
+          RUSTFLAGS: "-C target-feature=+crt-static"
+        run: cargo build --release --locked --bin glide
+
+      - name: Stage Windows artifact
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path release-artifacts | Out-Null
+          Copy-Item target\release\glide.exe release-artifacts\glide-windows-x86_64.exe
+          Get-ChildItem release-artifacts
+
+      - name: Upload Windows artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-nightly-artifacts
+          path: release-artifacts/*
+
+  publish:
+    name: Publish Rolling Nightly Prerelease
+    needs: [build-linux, build-windows]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout (for commit log & tag update)
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 20
+
+      - name: Download build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: release-assets
+          merge-multiple: true
+
+      - name: Generate SHA256SUMS.txt
+        run: |
+          (cd release-assets && sha256sum glide-windows-x86_64.exe glide-linux-x86_64 glide_*_amd64.deb > SHA256SUMS.txt)
+          ls -lh release-assets/
+          cat release-assets/SHA256SUMS.txt
+
+      - name: Update rolling nightly tag and prerelease
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          SHORT_SHA="$(git rev-parse --short=7 HEAD)"
+          RECENT_COMMITS="$(git log -n 10 --pretty=format:'- `%h` %s')"
+          DEB_FILE="$(basename release-assets/glide_*_amd64.deb)"
+
+          git tag -f nightly HEAD
+          git push -f origin refs/tags/nightly
+
+          cat > nightly-notes.md <<EOF
+          Rolling development build from the \`nightly\` branch.
+
+          Commit: \`${SHORT_SHA}\`
+
+          Switch to **Settings → Update channel → Nightly** inside Glide to receive automatic update alerts and one-click verified **Update & Restart** (or switch back to **Stable** anytime).
+
+          ### Recent commits
+          ${RECENT_COMMITS}
+
+          ### Downloads
+          - **Windows 11:** \`glide-windows-x86_64.exe\` *(standalone — no installer or extra DLLs needed)*
+          - **Ubuntu / Debian Linux (X11 & Wayland):** \`${DEB_FILE}\`
+          - **Linux standalone binary:** \`glide-linux-x86_64\`
+          - **Checksums:** \`SHA256SUMS.txt\`
+          EOF
+
+          if gh release view nightly -R "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release upload nightly release-assets/* -R "$GITHUB_REPOSITORY" --clobber
+            gh release edit nightly \
+              -R "$GITHUB_REPOSITORY" \
+              --title "Glide Nightly (${SHORT_SHA})" \
+              --notes-file nightly-notes.md \
+              --prerelease \
+              --latest=false
+          else
+            gh release create nightly release-assets/* \
+              -R "$GITHUB_REPOSITORY" \
+              --title "Glide Nightly (${SHORT_SHA})" \
+              --notes-file nightly-notes.md \
+              --prerelease \
+              --latest=false
+          fi
