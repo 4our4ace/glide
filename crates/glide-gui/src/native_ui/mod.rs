@@ -298,6 +298,9 @@ impl Ui {
         } else if snap.mode == "client" {
             self.role = Role::Client;
         }
+        if !snap.local_ips.is_empty() {
+            self.local_ips = snap.local_ips.clone();
+        }
         if snap.last_error.is_none() {
             self.dismissed_error = None;
         }

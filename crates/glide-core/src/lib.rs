@@ -2,6 +2,7 @@
 
 pub mod client;
 pub mod config;
+pub mod resilience;
 pub mod runtime;
 pub mod server;
 
@@ -239,5 +240,470 @@ mod tests {
 
         cli_task.abort();
         srv_task.abort();
+    }
+
+    fn single_monitor_geom(name: &str) -> DesktopGeometry {
+        DesktopGeometry::new(vec![MonitorRect {
+            name: name.into(),
+            x: 0,
+            y: 0,
+            width: 1920,
+            height: 1080,
+            scale: 1.0,
+            primary: true,
+        }])
+    }
+
+    #[tokio::test]
+    async fn server_and_client_survive_suspend_resume_with_health_probe_and_clean_shutdown() {
+        use crate::client::run_client_with_backends;
+        use crate::runtime::RuntimeCommand;
+        use std::sync::Arc;
+        use tokio::sync::mpsc;
+
+        let identity = ServerIdentity::generate_ephemeral().unwrap();
+        let fp = identity.fingerprint.clone();
+        let endpoint =
+            GlideServerEndpoint::bind("127.0.0.1:0".parse().unwrap(), &identity).unwrap();
+        let addr = endpoint.local_addr();
+
+        let (capture_handle, cap_tx, cap_state) = create_mock_capture(single_monitor_geom("Srv"));
+        let (mut injector, inj_log) = MockInjector::new(single_monitor_geom("Cli"));
+        let resumed_flag = Arc::clone(&injector.resumed_flag);
+
+        let srv_rt = RuntimeState::new();
+        let cli_rt = RuntimeState::new();
+        let (srv_cmd_tx, srv_cmd_rx) = mpsc::unbounded_channel();
+        let (cli_cmd_tx, cli_cmd_rx) = mpsc::unbounded_channel();
+
+        let srv_cfg = ServerConfig {
+            name: "srv-resilience".into(),
+            discovery: false,
+            motion_coalesce_us: 0,
+            ..Default::default()
+        };
+        let cli_cfg = ClientConfig {
+            name: "cli-resilience".into(),
+            server: Some(addr.to_string()),
+            edge: Edge::Right,
+            trusted_fingerprint: Some(fp),
+            clipboard: false,
+            ..Default::default()
+        };
+
+        let srv_rt_c = srv_rt.clone();
+        let srv_task = tokio::spawn(async move {
+            run_server_with_backends(
+                srv_cfg,
+                endpoint,
+                capture_handle,
+                None,
+                "linux-x11",
+                Some(srv_rt_c),
+                Some(srv_cmd_rx),
+            )
+            .await
+        });
+
+        let cli_rt_c = cli_rt.clone();
+        let cli_task = tokio::spawn(async move {
+            let mut no_clip = None;
+            run_client_with_backends(
+                cli_cfg,
+                &mut injector,
+                &mut no_clip,
+                Some(cli_rt_c),
+                Some(cli_cmd_rx),
+            )
+            .await
+        });
+
+        // Wait for initial connection
+        for _ in 0..30 {
+            if srv_rt.snapshot().peers.len() == 1
+                && cli_rt.snapshot().status.starts_with("Connected")
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert_eq!(srv_rt.snapshot().peers.len(), 1);
+        assert!(cli_rt.snapshot().status.starts_with("Connected"));
+
+        // Enter remote and hold a key, then simulate OS suspend
+        cap_tx
+            .send(CaptureEvent::EdgeCrossed {
+                edge: Edge::Right,
+                normalized_pos: 0.5,
+            })
+            .unwrap();
+        cap_tx
+            .send(CaptureEvent::Key {
+                usage: HidUsage::CONTROL_LEFT,
+                pressed: true,
+            })
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(80)).await;
+        assert!(cap_state.remote_mode.load(Ordering::SeqCst));
+
+        cap_tx.send(CaptureEvent::SystemSuspended).unwrap();
+        tokio::time::sleep(Duration::from_millis(80)).await;
+        assert!(!cap_state.remote_mode.load(Ordering::SeqCst));
+        assert!(inj_log.lock().contains(&InjectedAction::ReleaseAll));
+        assert!(inj_log
+            .lock()
+            .contains(&InjectedAction::Key(HidUsage::CONTROL_LEFT, false)));
+
+        // Trigger SystemResumed on BOTH server and client -> both arm 1.5s HealthProbes and send Ping!
+        cap_tx.send(CaptureEvent::SystemResumed).unwrap();
+        resumed_flag.store(true, Ordering::SeqCst);
+
+        // Wait > 1.5s HealthProbe timeout to prove Ping/Pong cleared probes on BOTH sides
+        tokio::time::sleep(Duration::from_millis(1900)).await;
+        assert_eq!(
+            srv_rt.snapshot().peers.len(),
+            1,
+            "healthy peer must survive post-resume health probe"
+        );
+        assert!(
+            cli_rt.snapshot().status.starts_with("Connected"),
+            "healthy client must survive post-resume health probe: {}",
+            cli_rt.snapshot().status
+        );
+
+        // Graceful Shutdown on both ends must finish promptly
+        cli_cmd_tx.send(RuntimeCommand::Shutdown).unwrap();
+        srv_cmd_tx.send(RuntimeCommand::Shutdown).unwrap();
+        let cli_res = tokio::time::timeout(Duration::from_millis(800), cli_task)
+            .await
+            .expect("client must exit cleanly on Shutdown")
+            .unwrap();
+        let srv_res = tokio::time::timeout(Duration::from_millis(800), srv_task)
+            .await
+            .expect("server must exit cleanly on Shutdown")
+            .unwrap();
+        assert!(cli_res.is_ok());
+        assert!(srv_res.is_ok());
+    }
+
+    #[tokio::test]
+    async fn server_evicts_unresponsive_peer_after_resume_health_probe_timeout() {
+        use crate::runtime::RuntimeCommand;
+        use glide_net::connect_client;
+        use glide_net::tls::TrustMode;
+        use glide_proto::{ControlMessage, OsKind, PROTOCOL_VERSION};
+        use tokio::sync::mpsc;
+
+        let identity = ServerIdentity::generate_ephemeral().unwrap();
+        let fp = identity.fingerprint.clone();
+        let endpoint =
+            GlideServerEndpoint::bind("127.0.0.1:0".parse().unwrap(), &identity).unwrap();
+        let addr = endpoint.local_addr();
+
+        let (capture_handle, cap_tx, cap_state) = create_mock_capture(single_monitor_geom("Srv"));
+        let srv_rt = RuntimeState::new();
+        let (srv_cmd_tx, srv_cmd_rx) = mpsc::unbounded_channel();
+
+        let srv_cfg = ServerConfig {
+            name: "srv-evict".into(),
+            discovery: false,
+            ..Default::default()
+        };
+        let srv_rt_c = srv_rt.clone();
+        let srv_task = tokio::spawn(async move {
+            run_server_with_backends(
+                srv_cfg,
+                endpoint,
+                capture_handle,
+                None,
+                "linux-x11",
+                Some(srv_rt_c),
+                Some(srv_cmd_rx),
+            )
+            .await
+        });
+
+        // Connect a silent client that completes handshake but never answers Ping
+        let mut silent_peer = connect_client(addr, TrustMode::Pinned(fp)).await.unwrap();
+        silent_peer
+            .ctrl_send
+            .send(&ControlMessage::Hello {
+                version: PROTOCOL_VERSION,
+                peer_name: "silent-peer".into(),
+                edge_on_server: Edge::Right,
+                os: OsKind::LinuxX11,
+            })
+            .await
+            .unwrap();
+        let _welcome = silent_peer.ctrl_recv.recv().await.unwrap();
+
+        for _ in 0..20 {
+            if srv_rt.snapshot().peers.len() == 1 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert_eq!(srv_rt.snapshot().peers.len(), 1);
+        assert_eq!(*cap_state.active_edges.lock(), vec![Edge::Right]);
+
+        // Trigger SystemResumed on server -> sends Ping and starts 1.5s HealthProbe
+        let started = std::time::Instant::now();
+        cap_tx.send(CaptureEvent::SystemResumed).unwrap();
+
+        // Server must evict the silent peer before QUIC's 4s idle timeout
+        let mut evicted = false;
+        while started.elapsed() < Duration::from_millis(2800) {
+            if srv_rt.snapshot().peers.is_empty() {
+                evicted = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert!(
+            evicted,
+            "server should evict peer that ignores post-resume Ping within ~1.5-2s"
+        );
+        assert!(cap_state.active_edges.lock().is_empty());
+
+        drop(silent_peer);
+        srv_cmd_tx.send(RuntimeCommand::Shutdown).unwrap();
+        let res = tokio::time::timeout(Duration::from_millis(800), srv_task)
+            .await
+            .expect("server must shut down cleanly")
+            .unwrap();
+        assert!(res.is_ok());
+    }
+
+    #[tokio::test]
+    async fn client_fails_fast_when_server_ignores_post_resume_health_ping() {
+        use glide_proto::{ControlMessage, PROTOCOL_VERSION};
+        use std::sync::Arc;
+
+        let identity = ServerIdentity::generate_ephemeral().unwrap();
+        let fp = identity.fingerprint.clone();
+        let endpoint =
+            GlideServerEndpoint::bind("127.0.0.1:0".parse().unwrap(), &identity).unwrap();
+        let addr = endpoint.local_addr();
+
+        // Silent server: finishes Welcome handshake, then holds QUIC alive without answering Ping
+        let silent_server = tokio::spawn(async move {
+            let mut session = endpoint.accept().await.unwrap();
+            let _hello = session.ctrl_recv.recv().await.unwrap();
+            session
+                .ctrl_send
+                .send(&ControlMessage::Welcome {
+                    version: PROTOCOL_VERSION,
+                    server_name: "silent-srv".into(),
+                    accepted: true,
+                    reason: String::new(),
+                    server_scale: 1.0,
+                })
+                .await
+                .unwrap();
+            // Keep connection alive longer than the 1.5s HealthProbe timeout
+            tokio::time::sleep(Duration::from_secs(5)).await;
+            drop(session);
+            endpoint.close();
+        });
+
+        let (mut injector, _) = MockInjector::new(single_monitor_geom("Cli"));
+        let resumed_flag = Arc::clone(&injector.resumed_flag);
+        let cli_rt = RuntimeState::new();
+        let mut cli_cfg = ClientConfig {
+            name: "cli-probe".into(),
+            server: Some(addr.to_string()),
+            edge: Edge::Right,
+            trusted_fingerprint: Some(fp),
+            clipboard: false,
+            ..Default::default()
+        };
+
+        let cli_rt_c = cli_rt.clone();
+        let cli_task = tokio::spawn(async move {
+            let mut no_clip = None;
+            run_client_session(
+                &mut cli_cfg,
+                addr,
+                &mut injector,
+                &mut no_clip,
+                Some(&cli_rt_c),
+                None,
+            )
+            .await
+        });
+
+        for _ in 0..30 {
+            if cli_rt.snapshot().status.starts_with("Connected") {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(30)).await;
+        }
+        assert!(cli_rt.snapshot().status.starts_with("Connected"));
+
+        let started = std::time::Instant::now();
+        resumed_flag.store(true, Ordering::SeqCst);
+
+        let err = tokio::time::timeout(Duration::from_millis(2800), cli_task)
+            .await
+            .expect("client must fail fast on unanswered post-resume Ping")
+            .unwrap()
+            .expect_err("expected health probe timeout error");
+        assert!(
+            err.to_string().contains("health ping"),
+            "unexpected error: {err}"
+        );
+        assert!(
+            started.elapsed() < Duration::from_millis(2800),
+            "should fail well before 4s QUIC idle timeout"
+        );
+        silent_server.abort();
+    }
+
+    #[tokio::test]
+    async fn client_supervisor_recovers_roamed_pinned_server_and_shuts_down_cleanly() {
+        use crate::client::run_client_with_backends;
+        use crate::runtime::RuntimeCommand;
+        use tokio::sync::mpsc;
+
+        // 1. Start the real server with LAN discovery enabled on a dedicated test port
+        let real_id = ServerIdentity::generate_ephemeral().unwrap();
+        let real_fp = real_id.fingerprint.clone();
+        let real_ep =
+            GlideServerEndpoint::bind("127.0.0.1:0".parse().unwrap(), &real_id).unwrap();
+
+        // 2. Start a decoy endpoint with a DIFFERENT identity on a stale address so the client's
+        //    first explicit attempt fails immediately (simulating old DHCP IP taken by another host).
+        let decoy_id = ServerIdentity::generate_ephemeral().unwrap();
+        let decoy_ep =
+            GlideServerEndpoint::bind("127.0.0.1:0".parse().unwrap(), &decoy_id).unwrap();
+        let stale_addr = decoy_ep.local_addr();
+        let decoy_ep_clone = decoy_ep.clone();
+        let decoy_task = tokio::spawn(async move {
+            let _ = decoy_ep_clone.accept().await;
+        });
+
+        let discovery_port = 24895;
+        let (capture_handle, _cap_tx, _cap_state) =
+            create_mock_capture(single_monitor_geom("RealSrv"));
+        let srv_rt = RuntimeState::new();
+        let (srv_cmd_tx, srv_cmd_rx) = mpsc::unbounded_channel();
+        let srv_cfg = ServerConfig {
+            name: "roamed-server".into(),
+            discovery: true,
+            discovery_port,
+            ..Default::default()
+        };
+        let srv_rt_c = srv_rt.clone();
+        let srv_task = tokio::spawn(async move {
+            run_server_with_backends(
+                srv_cfg,
+                real_ep,
+                capture_handle,
+                None,
+                "linux-x11",
+                Some(srv_rt_c),
+                Some(srv_cmd_rx),
+            )
+            .await
+        });
+
+        let (mut injector, _) = MockInjector::new(single_monitor_geom("Cli"));
+        let cli_rt = RuntimeState::new();
+        let (cli_cmd_tx, cli_cmd_rx) = mpsc::unbounded_channel();
+        let cli_cfg = ClientConfig {
+            name: "roaming-client".into(),
+            // Point explicitly at the stale address, but pin the real server's fingerprint!
+            server: Some(stale_addr.to_string()),
+            edge: Edge::Right,
+            discovery_port,
+            trusted_fingerprint: Some(real_fp),
+            clipboard: false,
+            ..Default::default()
+        };
+
+        let cli_rt_c = cli_rt.clone();
+        let cli_task = tokio::spawn(async move {
+            let mut no_clip = None;
+            run_client_with_backends(
+                cli_cfg,
+                &mut injector,
+                &mut no_clip,
+                Some(cli_rt_c),
+                Some(cli_cmd_rx),
+            )
+            .await
+        });
+
+        // Client should fail on stale_addr, discover real_ep by fingerprint, and connect!
+        let mut connected = false;
+        for _ in 0..80 {
+            if srv_rt.snapshot().peers.len() == 1
+                && cli_rt.snapshot().status.starts_with("Connected")
+            {
+                connected = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert!(
+            connected,
+            "client should follow pinned server via LAN discovery; status={}",
+            cli_rt.snapshot().status
+        );
+
+        cli_cmd_tx.send(RuntimeCommand::Shutdown).unwrap();
+        srv_cmd_tx.send(RuntimeCommand::Shutdown).unwrap();
+        let cli_res = tokio::time::timeout(Duration::from_millis(800), cli_task)
+            .await
+            .expect("client must exit cleanly on Shutdown")
+            .unwrap();
+        let srv_res = tokio::time::timeout(Duration::from_millis(800), srv_task)
+            .await
+            .expect("server must exit cleanly on Shutdown")
+            .unwrap();
+        assert!(cli_res.is_ok());
+        assert!(srv_res.is_ok());
+
+        decoy_ep.close();
+        decoy_task.abort();
+    }
+
+    #[tokio::test]
+    async fn client_supervisor_shutdown_interrupts_connect_and_backoff_immediately() {
+        use crate::client::run_client_with_backends;
+        use crate::runtime::RuntimeCommand;
+        use tokio::sync::mpsc;
+
+        // Bind a UDP socket that never answers QUIC handshakes so connect_client waits on CONNECT_TIMEOUT
+        let blackhole = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        let blackhole_addr = blackhole.local_addr().unwrap();
+
+        let (mut injector, _) = MockInjector::new(single_monitor_geom("Cli"));
+        let (cli_cmd_tx, cli_cmd_rx) = mpsc::unbounded_channel();
+        let cli_cfg = ClientConfig {
+            name: "shutdown-test".into(),
+            server: Some(blackhole_addr.to_string()),
+            insecure_skip_verify: true,
+            clipboard: false,
+            ..Default::default()
+        };
+
+        let cli_task = tokio::spawn(async move {
+            let mut no_clip = None;
+            run_client_with_backends(cli_cfg, &mut injector, &mut no_clip, None, Some(cli_cmd_rx))
+                .await
+        });
+
+        tokio::time::sleep(Duration::from_millis(120)).await;
+        let started = std::time::Instant::now();
+        cli_cmd_tx.send(RuntimeCommand::Shutdown).unwrap();
+
+        let res = tokio::time::timeout(Duration::from_millis(500), cli_task)
+            .await
+            .expect("Shutdown must interrupt in-flight connect without waiting 4s")
+            .unwrap();
+        assert!(res.is_ok());
+        assert!(started.elapsed() < Duration::from_millis(400));
+        drop(blackhole);
     }
 }
