@@ -79,11 +79,23 @@ jobs:
           RUSTFLAGS: "-C target-feature=+crt-static"
         run: cargo build --release --locked --bin glide
 
-      - name: Stage Windows artifact
+      - name: Build Windows MSI installer and stage artifacts
         shell: pwsh
         run: |
           New-Item -ItemType Directory -Force -Path release-artifacts | Out-Null
           Copy-Item target\release\glide.exe release-artifacts\glide-windows-x86_64.exe
+          $ver = (Select-String -Path Cargo.toml -Pattern '^version\s*=\s*"([^"]+)"' | Select-Object -First 1).Matches[0].Groups[1].Value
+          $wix = Join-Path $env:USERPROFILE ".dotnet\tools\wix.exe"
+          if (-not (Test-Path $wix)) {
+            dotnet tool install --global wix --version 5.0.2
+          }
+          & $wix build packaging\windows\glide.wxs `
+            -arch x64 `
+            -d "Version=$ver" `
+            -d "ExePath=target\release\glide.exe" `
+            -d "IconPath=packaging\windows\glide.ico" `
+            -o release-artifacts\glide-windows-x86_64.msi
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           Get-ChildItem release-artifacts
 
       - name: Upload Windows artifacts
@@ -112,7 +124,7 @@ jobs:
 
       - name: Generate SHA256SUMS.txt
         run: |
-          (cd release-assets && sha256sum glide-windows-x86_64.exe glide-linux-x86_64 glide_*_amd64.deb > SHA256SUMS.txt)
+          (cd release-assets && sha256sum glide-windows-x86_64.msi glide-windows-x86_64.exe glide-linux-x86_64 glide_*_amd64.deb > SHA256SUMS.txt)
           ls -lh release-assets/
           cat release-assets/SHA256SUMS.txt
 
@@ -138,7 +150,8 @@ jobs:
           ${RECENT_COMMITS}
 
           ### Downloads
-          - **Windows 11:** \`glide-windows-x86_64.exe\` *(standalone — no installer or extra DLLs needed)*
+          - **Windows 11 Installer (Recommended):** \`glide-windows-x86_64.msi\` *(per-user install to \`%LOCALAPPDATA%\Programs\Glide\`, Start Menu shortcut, Apps & Features uninstaller, no admin/UAC prompt required)*
+          - **Windows 11 Portable:** \`glide-windows-x86_64.exe\` *(standalone — no installer or extra DLLs needed)*
           - **Ubuntu / Debian Linux (X11 & Wayland):** \`${DEB_FILE}\`
           - **Linux standalone binary:** \`glide-linux-x86_64\`
           - **Checksums:** \`SHA256SUMS.txt\`

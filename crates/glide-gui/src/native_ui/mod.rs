@@ -2082,6 +2082,11 @@ const SCENES: &[(&str, SceneFn)] = &[
                 download_url: format!("{}nightly/glide-windows-x86_64.exe", updater::ASSET_URL_PREFIX),
                 size: 21_788_672,
             }),
+            msi_asset: Some(updater::UpdateAsset {
+                name: "glide-windows-x86_64.msi".into(),
+                download_url: format!("{}nightly/glide-windows-x86_64.msi", updater::ASSET_URL_PREFIX),
+                size: 11_000_000,
+            }),
             deb_asset: Some(updater::UpdateAsset {
                 name: "glide_0.3.0_amd64.deb".into(),
                 download_url: format!("{}nightly/glide_0.3.0_amd64.deb", updater::ASSET_URL_PREFIX),

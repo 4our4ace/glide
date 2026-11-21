@@ -36,6 +36,7 @@ pub const NIGHTLY_RELEASE_API_URL: &str =
 
 const CHECKSUMS_ASSET_NAME: &str = "SHA256SUMS.txt";
 const WINDOWS_BINARY_ASSET: &str = "glide-windows-x86_64.exe";
+const WINDOWS_MSI_ASSET: &str = "glide-windows-x86_64.msi";
 const LINUX_BINARY_ASSET: &str = "glide-linux-x86_64";
 const MAX_CHECKSUMS_BYTES: usize = 64 * 1024;
 const MAX_BINARY_BYTES: u64 = 128 * 1024 * 1024;
@@ -61,6 +62,8 @@ pub struct AvailableUpdate {
     pub is_channel_switch: bool,
     /// Standalone executable asset for the current OS (`glide-windows-x86_64.exe` / `glide-linux-x86_64`).
     pub binary_asset: Option<UpdateAsset>,
+    /// Windows `.msi` installer asset (`glide-windows-x86_64.msi`).
+    pub msi_asset: Option<UpdateAsset>,
     /// Debian/Ubuntu `.deb` package asset (Linux only, used when running from `/usr/bin/glide`).
     pub deb_asset: Option<UpdateAsset>,
     /// Verified download URL for `SHA256SUMS.txt` from this release (mandatory for self-update).
@@ -76,7 +79,7 @@ impl AvailableUpdate {
         }
         #[cfg(target_os = "windows")]
         {
-            self.binary_asset.is_some()
+            self.binary_asset.is_some() || self.msi_asset.is_some()
         }
         #[cfg(target_os = "linux")]
         {
@@ -257,11 +260,16 @@ fn extract_nightly_sha(release: &GithubRelease) -> Option<String> {
     None
 }
 
-fn select_assets_for_platform(
-    assets: &[GithubAsset],
-    want_windows: bool,
-) -> (Option<UpdateAsset>, Option<UpdateAsset>, Option<String>) {
+struct PlatformAssets {
+    binary_asset: Option<UpdateAsset>,
+    msi_asset: Option<UpdateAsset>,
+    deb_asset: Option<UpdateAsset>,
+    checksums_url: Option<String>,
+}
+
+fn select_assets_for_platform(assets: &[GithubAsset], want_windows: bool) -> PlatformAssets {
     let mut binary_asset = None;
+    let mut msi_asset = None;
     let mut deb_asset = None;
     let mut checksums_url = None;
 
@@ -276,6 +284,12 @@ fn select_assets_for_platform(
         if want_windows {
             if a.name == WINDOWS_BINARY_ASSET {
                 binary_asset = Some(UpdateAsset {
+                    name: a.name.clone(),
+                    download_url: a.browser_download_url.clone(),
+                    size: a.size,
+                });
+            } else if a.name == WINDOWS_MSI_ASSET {
+                msi_asset = Some(UpdateAsset {
                     name: a.name.clone(),
                     download_url: a.browser_download_url.clone(),
                     size: a.size,
@@ -298,7 +312,12 @@ fn select_assets_for_platform(
         }
     }
 
-    (binary_asset, deb_asset, checksums_url)
+    PlatformAssets {
+        binary_asset,
+        msi_asset,
+        deb_asset,
+        checksums_url,
+    }
 }
 
 fn evaluate_release(
@@ -310,8 +329,12 @@ fn evaluate_release(
     want_windows: bool,
 ) -> UpdateCheckState {
     let html_url = sanitize_release_url(release.html_url.as_deref());
-    let (binary_asset, deb_asset, checksums_url) =
-        select_assets_for_platform(&release.assets, want_windows);
+    let PlatformAssets {
+        binary_asset,
+        msi_asset,
+        deb_asset,
+        checksums_url,
+    } = select_assets_for_platform(&release.assets, want_windows);
     let is_channel_switch = selected_channel != current_channel;
 
     match selected_channel {
@@ -331,6 +354,7 @@ fn evaluate_release(
                     html_url,
                     is_channel_switch,
                     binary_asset,
+                    msi_asset,
                     deb_asset,
                     checksums_url,
                 }))
@@ -363,6 +387,7 @@ fn evaluate_release(
                     html_url,
                     is_channel_switch,
                     binary_asset,
+                    msi_asset,
                     deb_asset,
                     checksums_url,
                 }))
@@ -606,7 +631,7 @@ fn append_os_suffix(path: &Path, suffix: &str) -> PathBuf {
     PathBuf::from(s)
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "windows"))]
 fn is_dir_writable(dir: &Path) -> bool {
     let probe = dir.join(format!(".glide-update-probe-{}", std::process::id()));
     match OpenOptions::new().write(true).create_new(true).open(&probe) {
@@ -665,49 +690,108 @@ where
 
     #[cfg(target_os = "windows")]
     {
+        use std::os::windows::process::CommandExt;
+        use std::process::Stdio;
+
         let _ = allow_interactive_sudo;
-        let asset = update
-            .binary_asset
-            .as_ref()
-            .ok_or_else(|| "Release does not include a Windows binary".to_string())?;
-        let expected_sha =
-            fetch_expected_sha256(&agent, checksums_url, &asset.name, current_version)?;
-        let staged = append_os_suffix(&current_exe, &format!(".new.{}", std::process::id()));
-        download_verified_file(
-            &agent,
-            asset,
-            &expected_sha,
-            &staged,
-            current_version,
-            &mut on_progress,
-        )?;
+        let parent = current_exe
+            .parent()
+            .ok_or_else(|| "Current executable has no parent directory".to_string())?;
 
-        on_installing();
-        let backup = append_os_suffix(&current_exe, ".old");
-        let _ = fs::remove_file(&backup);
+        // Writable install directory (per-user MSI in %LOCALAPPDATA%\Programs\Glide\ or portable .exe):
+        // fast, zero-UAC atomic in-place swap followed by clean shutdown, relaunch, and .old cleanup.
+        if is_dir_writable(parent) {
+            if let Some(asset) = update.binary_asset.as_ref() {
+                let expected_sha =
+                    fetch_expected_sha256(&agent, checksums_url, &asset.name, current_version)?;
+                let staged = append_os_suffix(&current_exe, &format!(".new.{}", std::process::id()));
+                download_verified_file(
+                    &agent,
+                    asset,
+                    &expected_sha,
+                    &staged,
+                    current_version,
+                    &mut on_progress,
+                )?;
 
-        // Windows permits renaming a running .exe on the same volume, then moving the verified
-        // replacement directly into its original path so taskbar pins & autostart stay intact.
-        fs::rename(&current_exe, &backup).map_err(|e| {
-            let _ = fs::remove_file(&staged);
+                on_installing();
+                let backup = append_os_suffix(&current_exe, ".old");
+                let _ = fs::remove_file(&backup);
+
+                // Windows permits renaming a running .exe on the same volume, then moving the verified
+                // replacement directly into its original path so Start Menu shortcuts, taskbar pins,
+                // and autostart stay intact.
+                fs::rename(&current_exe, &backup).map_err(|e| {
+                    let _ = fs::remove_file(&staged);
+                    format!("Cannot replace {}: {e}", current_exe.display())
+                })?;
+
+                if let Err(e) = fs::rename(&staged, &current_exe) {
+                    let _ = fs::rename(&backup, &current_exe);
+                    let _ = fs::remove_file(&staged);
+                    return Err(format!("Failed moving verified update into place: {e}"));
+                }
+
+                info!(
+                    version = %update.version,
+                    exe = %current_exe.display(),
+                    "Installed verified Glide update on Windows"
+                );
+                return Ok(UpdateInstallOutcome::InstalledRelaunch(current_exe));
+            }
+        }
+
+        // Protected directory (e.g. C:\Program Files\Glide) or MSI-only release: download & verify
+        // the MSI package into a temp staging dir and launch Windows Installer (`msiexec /i ... /passive`).
+        let msi_asset = update.msi_asset.as_ref().ok_or_else(|| {
             format!(
-                "Cannot replace {} (move Glide out of Program Files or run as Administrator): {e}",
-                current_exe.display()
+                "Cannot write to {} and release has no Windows .msi installer",
+                parent.display()
             )
         })?;
+        let expected_sha =
+            fetch_expected_sha256(&agent, checksums_url, &msi_asset.name, current_version)?;
+        let stage_dir = std::env::temp_dir().join(format!("glide-update-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&stage_dir);
+        fs::create_dir_all(&stage_dir)
+            .map_err(|e| format!("Failed creating update staging directory: {e}"))?;
+        let msi_path = stage_dir.join(&msi_asset.name);
 
-        if let Err(e) = fs::rename(&staged, &current_exe) {
-            let _ = fs::rename(&backup, &current_exe);
-            let _ = fs::remove_file(&staged);
-            return Err(format!("Failed moving verified update into place: {e}"));
+        if let Err(e) = download_verified_file(
+            &agent,
+            msi_asset,
+            &expected_sha,
+            &msi_path,
+            current_version,
+            &mut on_progress,
+        ) {
+            let _ = fs::remove_dir_all(&stage_dir);
+            return Err(e);
         }
+
+        on_installing();
+        const DETACHED_PROCESS: u32 = 0x0000_0008;
+        const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
+        std::process::Command::new("msiexec.exe")
+            .arg("/i")
+            .arg(&msi_path)
+            .arg("/passive")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .creation_flags(DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP)
+            .spawn()
+            .map_err(|e| {
+                let _ = fs::remove_dir_all(&stage_dir);
+                format!("Failed launching msiexec.exe: {e}")
+            })?;
 
         info!(
             version = %update.version,
-            exe = %current_exe.display(),
-            "Installed verified Glide update on Windows"
+            msi = %msi_path.display(),
+            "Launched verified Windows MSI installer for Glide update"
         );
-        Ok(UpdateInstallOutcome::InstalledRelaunch(current_exe))
+        Ok(UpdateInstallOutcome::ExternalInstallerLaunched)
     }
 
     #[cfg(target_os = "linux")]
@@ -1251,6 +1335,13 @@ mod tests {
                 size: 20_000_000,
             },
             GithubAsset {
+                name: WINDOWS_MSI_ASSET.into(),
+                browser_download_url: format!(
+                    "https://github.com/4our4ace/glide/releases/download/{tag}/{WINDOWS_MSI_ASSET}"
+                ),
+                size: 11_000_000,
+            },
+            GithubAsset {
                 name: LINUX_BINARY_ASSET.into(),
                 browser_download_url: format!(
                     "https://github.com/4our4ace/glide/releases/download/{tag}/{LINUX_BINARY_ASSET}"
@@ -1396,6 +1487,7 @@ mod tests {
                 assert_eq!(avail.version, "nightly (7b68d47)");
                 assert!(!avail.is_channel_switch);
                 assert!(avail.binary_asset.is_some());
+                assert!(avail.msi_asset.is_some());
                 assert!(avail.checksums_url.is_some());
             }
             other => panic!("expected Available, got {other:?}"),
