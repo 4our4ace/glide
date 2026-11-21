@@ -244,9 +244,74 @@ pub async fn send_file_on(conn: &Connection, payload: &glide_proto::FilePayload)
     send_bulk_on(conn, &glide_proto::BulkTransfer::File(payload.clone())).await
 }
 
+/// Sends a cross-edge drag-and-drop file payload over a fresh unidirectional QUIC stream on `conn`.
+pub async fn send_drag_file_on(
+    conn: &Connection,
+    payload: &glide_proto::DragFilePayload,
+) -> Result<()> {
+    send_bulk_on(conn, &glide_proto::BulkTransfer::DragFile(payload.clone())).await
+}
+
+async fn write_file_payload(uni: &mut SendStream, file: &glide_proto::FilePayload) -> Result<()> {
+    use glide_proto::MAX_FILE_BYTES;
+
+    if file.data.len() > MAX_FILE_BYTES {
+        return Err(anyhow!(
+            "file payload too large ({} bytes > max {})",
+            file.data.len(),
+            MAX_FILE_BYTES
+        ));
+    }
+    let safe_name = glide_proto::sanitize_filename(&file.filename);
+    let name_bytes = safe_name.as_bytes();
+    let name_len = (name_bytes.len().min(u16::MAX as usize)) as u16;
+    uni.write_all(&name_len.to_be_bytes()).await?;
+    uni.write_all(&name_bytes[..name_len as usize]).await?;
+    uni.write_all(&file.sha256).await?;
+    uni.write_all(&(file.data.len() as u32).to_be_bytes())
+        .await?;
+    uni.write_all(&file.data).await?;
+    Ok(())
+}
+
+async fn read_file_payload(uni: &mut RecvStream) -> Result<glide_proto::FilePayload> {
+    use glide_proto::{sanitize_filename, FilePayload, MAX_FILE_BYTES};
+
+    let mut name_len_buf = [0u8; 2];
+    uni.read_exact(&mut name_len_buf).await?;
+    let name_len = u16::from_be_bytes(name_len_buf) as usize;
+    let mut name_raw = vec![0u8; name_len];
+    uni.read_exact(&mut name_raw).await?;
+    let filename = sanitize_filename(&String::from_utf8_lossy(&name_raw));
+
+    let mut sha256 = [0u8; 32];
+    uni.read_exact(&mut sha256).await?;
+    let mut len_buf = [0u8; 4];
+    uni.read_exact(&mut len_buf).await?;
+    let len = u32::from_be_bytes(len_buf) as usize;
+    if len > MAX_FILE_BYTES {
+        return Err(anyhow!(
+            "file exceeds maximum size ({len} > {MAX_FILE_BYTES})"
+        ));
+    }
+    let mut data = vec![0u8; len];
+    uni.read_exact(&mut data).await?;
+    let actual_hash: [u8; 32] = Sha256::digest(&data).into();
+    if actual_hash != sha256 {
+        return Err(anyhow!("file payload SHA-256 verification failed"));
+    }
+    Ok(FilePayload {
+        filename,
+        sha256,
+        data: Bytes::from(data),
+    })
+}
+
 /// Sends a clipboard or file payload over an independent unidirectional QUIC stream.
 pub async fn send_bulk_on(conn: &Connection, transfer: &glide_proto::BulkTransfer) -> Result<()> {
-    use glide_proto::{BulkTransfer, BULK_KIND_CLIPBOARD, BULK_KIND_FILE, MAX_FILE_BYTES};
+    use glide_proto::{
+        BulkTransfer, BULK_KIND_CLIPBOARD, BULK_KIND_DRAG_FILE, BULK_KIND_FILE,
+    };
 
     let mut uni = conn
         .open_uni()
@@ -268,23 +333,13 @@ pub async fn send_bulk_on(conn: &Connection, transfer: &glide_proto::BulkTransfe
             uni.write_all(&payload.data).await?;
         }
         BulkTransfer::File(file) => {
-            if file.data.len() > MAX_FILE_BYTES {
-                return Err(anyhow!(
-                    "file payload too large ({} bytes > max {})",
-                    file.data.len(),
-                    MAX_FILE_BYTES
-                ));
-            }
-            let safe_name = glide_proto::sanitize_filename(&file.filename);
-            let name_bytes = safe_name.as_bytes();
-            let name_len = (name_bytes.len().min(u16::MAX as usize)) as u16;
             uni.write_all(&[BULK_KIND_FILE]).await?;
-            uni.write_all(&name_len.to_be_bytes()).await?;
-            uni.write_all(&name_bytes[..name_len as usize]).await?;
-            uni.write_all(&file.sha256).await?;
-            uni.write_all(&(file.data.len() as u32).to_be_bytes())
-                .await?;
-            uni.write_all(&file.data).await?;
+            write_file_payload(&mut uni, file).await?;
+        }
+        BulkTransfer::DragFile(drag_file) => {
+            uni.write_all(&[BULK_KIND_DRAG_FILE]).await?;
+            uni.write_all(&drag_file.drag_id.to_be_bytes()).await?;
+            write_file_payload(&mut uni, &drag_file.file).await?;
         }
     }
 
@@ -295,8 +350,7 @@ pub async fn send_bulk_on(conn: &Connection, transfer: &glide_proto::BulkTransfe
 /// Accepts and validates the next unidirectional bulk stream (clipboard or file) on `conn`.
 pub async fn recv_bulk_on(conn: &Connection) -> Result<glide_proto::BulkTransfer> {
     use glide_proto::{
-        sanitize_filename, BulkTransfer, FilePayload, BULK_KIND_CLIPBOARD, BULK_KIND_FILE,
-        MAX_FILE_BYTES,
+        BulkTransfer, DragFilePayload, BULK_KIND_CLIPBOARD, BULK_KIND_DRAG_FILE, BULK_KIND_FILE,
     };
 
     let mut uni = conn.accept_uni().await.context("bulk uni stream closed")?;
@@ -327,35 +381,13 @@ pub async fn recv_bulk_on(conn: &Connection) -> Result<glide_proto::BulkTransfer
                 data: Bytes::from(data),
             }))
         }
-        BULK_KIND_FILE => {
-            let mut name_len_buf = [0u8; 2];
-            uni.read_exact(&mut name_len_buf).await?;
-            let name_len = u16::from_be_bytes(name_len_buf) as usize;
-            let mut name_raw = vec![0u8; name_len];
-            uni.read_exact(&mut name_raw).await?;
-            let filename = sanitize_filename(&String::from_utf8_lossy(&name_raw));
-
-            let mut sha256 = [0u8; 32];
-            uni.read_exact(&mut sha256).await?;
-            let mut len_buf = [0u8; 4];
-            uni.read_exact(&mut len_buf).await?;
-            let len = u32::from_be_bytes(len_buf) as usize;
-            if len > MAX_FILE_BYTES {
-                return Err(anyhow!(
-                    "file exceeds maximum size ({len} > {MAX_FILE_BYTES})"
-                ));
-            }
-            let mut data = vec![0u8; len];
-            uni.read_exact(&mut data).await?;
-            let actual_hash: [u8; 32] = Sha256::digest(&data).into();
-            if actual_hash != sha256 {
-                return Err(anyhow!("file payload SHA-256 verification failed"));
-            }
-            Ok(BulkTransfer::File(FilePayload {
-                filename,
-                sha256,
-                data: Bytes::from(data),
-            }))
+        BULK_KIND_FILE => Ok(BulkTransfer::File(read_file_payload(&mut uni).await?)),
+        BULK_KIND_DRAG_FILE => {
+            let mut id_buf = [0u8; 8];
+            uni.read_exact(&mut id_buf).await?;
+            let drag_id = u64::from_be_bytes(id_buf);
+            let file = read_file_payload(&mut uni).await?;
+            Ok(BulkTransfer::DragFile(DragFilePayload { drag_id, file }))
         }
         other => Err(anyhow!("unknown bulk transfer kind: 0x{other:02X}")),
     }
@@ -365,7 +397,9 @@ pub async fn recv_bulk_on(conn: &Connection) -> Result<glide_proto::BulkTransfer
 pub async fn recv_clipboard_on(conn: &Connection) -> Result<ClipboardPayload> {
     match recv_bulk_on(conn).await? {
         glide_proto::BulkTransfer::Clipboard(c) => Ok(c),
-        glide_proto::BulkTransfer::File(_) => Err(anyhow!("expected clipboard transfer, got file")),
+        glide_proto::BulkTransfer::File(_) | glide_proto::BulkTransfer::DragFile(_) => {
+            Err(anyhow!("expected clipboard transfer, got file"))
+        }
     }
 }
 
@@ -465,6 +499,17 @@ mod tests {
                 data: file_bytes,
             };
             send_file_on(&sess.conn, &file).await.unwrap();
+
+            let drag_bytes = Bytes::from_static(b"cross-edge dragged payload");
+            let drag_file = glide_proto::DragFilePayload {
+                drag_id: 99,
+                file: glide_proto::FilePayload {
+                    filename: "Büro report.pdf".into(),
+                    sha256: sha256_bytes(&drag_bytes),
+                    data: drag_bytes,
+                },
+            };
+            send_drag_file_on(&sess.conn, &drag_file).await.unwrap();
             tokio::time::sleep(Duration::from_millis(120)).await;
         });
 
@@ -501,7 +546,8 @@ mod tests {
 
         let mut got_clip = false;
         let mut got_file = false;
-        for _ in 0..2 {
+        let mut got_drag_file = false;
+        for _ in 0..3 {
             match client.recv_bulk().await.unwrap() {
                 glide_proto::BulkTransfer::Clipboard(clip) => {
                     assert_eq!(clip.format, ClipboardFormat::TextUtf8);
@@ -516,9 +562,15 @@ mod tests {
                     assert_eq!(f.data.as_ref(), b"hello file transfer");
                     got_file = true;
                 }
+                glide_proto::BulkTransfer::DragFile(df) => {
+                    assert_eq!(df.drag_id, 99);
+                    assert_eq!(df.file.filename, "Büro report.pdf");
+                    assert_eq!(df.file.data.as_ref(), b"cross-edge dragged payload");
+                    got_drag_file = true;
+                }
             }
         }
-        assert!(got_clip && got_file);
+        assert!(got_clip && got_file && got_drag_file);
 
         server_task.await.unwrap();
     }

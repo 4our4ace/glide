@@ -63,6 +63,10 @@ struct HookState {
     locked: AtomicBool,
     auto_lock_fullscreen: AtomicBool,
     sync_lock_keys: AtomicBool,
+    drag_drop_files: AtomicBool,
+    lmb_down: AtomicBool,
+    lmb_started_on_edge: AtomicBool,
+    drag_strip_armed: AtomicBool,
     edge_threshold_px: AtomicI32,
     dead_corner_px: AtomicI32,
     edge_dwell_ms: AtomicU64,
@@ -175,6 +179,13 @@ impl CaptureControl for WindowsCaptureControl {
 
     fn set_sync_lock_keys(&self, enabled: bool) {
         self.state.sync_lock_keys.store(enabled, Ordering::Relaxed);
+    }
+
+    fn set_drag_drop_files(&self, enabled: bool) {
+        self.state.drag_drop_files.store(enabled, Ordering::Relaxed);
+        if !enabled && self.state.drag_strip_armed.swap(false, Ordering::SeqCst) {
+            let _ = self.state.tx.send(CaptureEvent::DragStripArmed(false));
+        }
     }
 
     fn enter_remote(&self) -> Result<()> {
@@ -392,6 +403,33 @@ unsafe extern "system" fn mouse_ll_proc(code: i32, wparam: WPARAM, lparam: LPARA
             let suppress = with_hook_state(|state| {
                 let remote = state.remote_mode.load(Ordering::Acquire);
                 if !remote {
+                    match msg {
+                        WM_LBUTTONDOWN => {
+                            let edges = state.active_edges.lock().clone();
+                            let geom = state.geometry.lock().clone();
+                            let started_on_edge = edges
+                                .iter()
+                                .any(|&e| geom.distance_to_edge(e, ms.pt.x, ms.pt.y) <= 4);
+                            state
+                                .lmb_started_on_edge
+                                .store(started_on_edge, Ordering::Relaxed);
+                            state.lmb_down.store(true, Ordering::SeqCst);
+                            let _ = state
+                                .tx
+                                .send(CaptureEvent::LocalLeftButton { pressed: true });
+                        }
+                        WM_LBUTTONUP => {
+                            state.lmb_down.store(false, Ordering::SeqCst);
+                            state.lmb_started_on_edge.store(false, Ordering::Relaxed);
+                            if state.drag_strip_armed.swap(false, Ordering::SeqCst) {
+                                let _ = state.tx.send(CaptureEvent::DragStripArmed(false));
+                            }
+                            let _ = state
+                                .tx
+                                .send(CaptureEvent::LocalLeftButton { pressed: false });
+                        }
+                        _ => {}
+                    }
                     return false;
                 }
 
@@ -412,6 +450,7 @@ unsafe extern "system" fn mouse_ll_proc(code: i32, wparam: WPARAM, lparam: LPARA
                         true
                     }
                     WM_LBUTTONDOWN => {
+                        state.lmb_down.store(true, Ordering::SeqCst);
                         let _ = state.tx.send(CaptureEvent::MouseButton {
                             button: MouseButton::Left,
                             pressed: true,
@@ -419,6 +458,7 @@ unsafe extern "system" fn mouse_ll_proc(code: i32, wparam: WPARAM, lparam: LPARA
                         true
                     }
                     WM_LBUTTONUP => {
+                        state.lmb_down.store(false, Ordering::SeqCst);
                         let _ = state.tx.send(CaptureEvent::MouseButton {
                             button: MouseButton::Left,
                             pressed: false,
@@ -546,6 +586,9 @@ fn handle_raw_mouse_input(lparam: LPARAM) {
         state.maybe_refresh_geometry();
         let edges = state.active_edges.lock().clone();
         if edges.is_empty() {
+            if state.drag_strip_armed.swap(false, Ordering::SeqCst) {
+                let _ = state.tx.send(CaptureEvent::DragStripArmed(false));
+            }
             return;
         }
 
@@ -559,12 +602,44 @@ fn handle_raw_mouse_input(lparam: LPARAM) {
         // Step 4: Fullscreen app auto-lock
         if state.auto_lock_fullscreen.load(Ordering::Relaxed) && is_foreground_fullscreen(&geom) {
             *state.edge_push.lock() = (None, 0.0, None);
+            if state.drag_strip_armed.swap(false, Ordering::SeqCst) {
+                let _ = state.tx.send(CaptureEvent::DragStripArmed(false));
+            }
             return;
+        }
+
+        let lmb_down = state.lmb_down.load(Ordering::Acquire);
+        let dnd_enabled = state.drag_drop_files.load(Ordering::Relaxed);
+        let started_on_edge = state.lmb_started_on_edge.load(Ordering::Relaxed);
+
+        // Arm the invisible 1px edge-strip drop target ONLY while LMB is held (having started
+        // away from the edge so scrollbars/window resizing are never blocked) and the cursor
+        // approaches within 48px of an active outer edge.
+        if lmb_down && dnd_enabled && !started_on_edge {
+            let min_dist = edges
+                .iter()
+                .map(|&e| geom.distance_to_edge(e, pt.x, pt.y))
+                .min()
+                .unwrap_or(i32::MAX);
+            if min_dist <= 48 && !state.drag_strip_armed.swap(true, Ordering::SeqCst) {
+                let _ = state.tx.send(CaptureEvent::DragStripArmed(true));
+            } else if min_dist > 80 && state.drag_strip_armed.swap(false, Ordering::SeqCst) {
+                let _ = state.tx.send(CaptureEvent::DragStripArmed(false));
+            }
+        } else if state.drag_strip_armed.swap(false, Ordering::SeqCst) {
+            let _ = state.tx.send(CaptureEvent::DragStripArmed(false));
         }
 
         let threshold = state.edge_threshold_px.load(Ordering::Relaxed).max(1) as f32;
         let dead_corner = state.dead_corner_px.load(Ordering::Relaxed).max(0);
-        let dwell_ms = state.edge_dwell_ms.load(Ordering::Relaxed);
+        let base_dwell_ms = state.edge_dwell_ms.load(Ordering::Relaxed);
+        // While LMB is held and cross-edge DnD is enabled, allow 25ms for OLE DragEnter to hit
+        // the edge strip before parking the cursor. Zero added latency for normal cursor crossing!
+        let dwell_ms = if lmb_down && dnd_enabled && !started_on_edge {
+            base_dwell_ms.max(25)
+        } else {
+            base_dwell_ms
+        };
 
         let mut push = state.edge_push.lock();
         let mut crossed = None;
@@ -596,6 +671,7 @@ fn handle_raw_mouse_input(lparam: LPARAM) {
 
         if let Some((edge, normalized_pos)) = crossed {
             *push = (None, 0.0, None);
+            state.drag_strip_armed.store(false, Ordering::SeqCst);
             state.remote_mode.store(true, Ordering::SeqCst);
             // Step 2: Park cursor cleanly in the invisible bottom-right corner!
             state.park_cursor_invisibly();
@@ -669,6 +745,10 @@ pub fn start_windows_capture(config: CaptureConfig) -> Result<CaptureHandle> {
         edge_dwell_ms: AtomicU64::new(config.edge_dwell_ms),
         auto_lock_fullscreen: AtomicBool::new(config.auto_lock_fullscreen),
         sync_lock_keys: AtomicBool::new(config.sync_lock_keys),
+        drag_drop_files: AtomicBool::new(config.drag_drop_files),
+        lmb_down: AtomicBool::new(false),
+        lmb_started_on_edge: AtomicBool::new(false),
+        drag_strip_armed: AtomicBool::new(false),
         config,
         tx,
         active_edges: Mutex::new(Vec::new()),

@@ -36,6 +36,7 @@ struct SharedState {
     geometry: Mutex<DesktopGeometry>,
     remote_mode: AtomicBool,
     locked: AtomicBool,
+    drag_drop_files: AtomicBool,
     edge_threshold_px: AtomicI32,
     dead_corner_px: AtomicI32,
     edge_dwell_ms: AtomicU64,
@@ -91,6 +92,10 @@ impl CaptureControl for X11CaptureControl {
             .edge_dwell_ms
             .store(edge_dwell_ms, Ordering::Relaxed);
         self.shared.locked.store(locked, Ordering::Relaxed);
+    }
+
+    fn set_drag_drop_files(&self, enabled: bool) {
+        self.shared.drag_drop_files.store(enabled, Ordering::Relaxed);
     }
 
     fn enter_remote(&self) -> Result<()> {
@@ -237,6 +242,7 @@ pub fn start_x11_capture(config: CaptureConfig) -> Result<CaptureHandle> {
         geometry: Mutex::new(geometry),
         remote_mode: AtomicBool::new(false),
         locked: AtomicBool::new(false),
+        drag_drop_files: AtomicBool::new(config.drag_drop_files),
         edge_threshold_px: AtomicI32::new(config.edge_threshold_px.max(1)),
         dead_corner_px: AtomicI32::new(config.dead_corner_px.max(0)),
         edge_dwell_ms: AtomicU64::new(config.edge_dwell_ms),
@@ -298,6 +304,9 @@ fn run_capture_loop(
     let mut last_geom_refresh = Instant::now();
     let mut last_local_query = Instant::now();
     let mut mods = ModifierMask::EMPTY;
+    let mut lmb_down = false;
+    let mut lmb_started_on_edge = false;
+    let mut drag_strip_armed = false;
 
     let do_grab = |conn: &RustConnection,
                    shared: &SharedState,
@@ -309,16 +318,28 @@ fn run_capture_loop(
         let pointer_mask = CoreEventMask::BUTTON_PRESS
             | CoreEventMask::BUTTON_RELEASE
             | CoreEventMask::POINTER_MOTION;
-        let _ = conn.grab_pointer(
-            false,
-            ctrl_win,
-            pointer_mask,
-            GrabMode::ASYNC,
-            GrabMode::ASYNC,
-            x11rb::NONE,
-            blank_cursor,
-            x11rb::CURRENT_TIME,
-        );
+        // Retry briefly if an X11 XDND source (e.g. Nautilus) is still releasing its pointer grab
+        // after our synthetic Escape cancellation.
+        for attempt in 0..6 {
+            let status = conn
+                .grab_pointer(
+                    false,
+                    ctrl_win,
+                    pointer_mask,
+                    GrabMode::ASYNC,
+                    GrabMode::ASYNC,
+                    x11rb::NONE,
+                    blank_cursor,
+                    x11rb::CURRENT_TIME,
+                )
+                .ok()
+                .and_then(|c| c.reply().ok())
+                .map(|r| r.status);
+            if status == Some(x11rb::protocol::xproto::GrabStatus::SUCCESS) || attempt == 5 {
+                break;
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
         let _ = conn.grab_keyboard(
             false,
             ctrl_win,
@@ -404,6 +425,10 @@ fn run_capture_loop(
                     }
                     let edges = shared.active_edges.lock().clone();
                     if edges.is_empty() {
+                        if drag_strip_armed {
+                            drag_strip_armed = false;
+                            let _ = tx.send(CaptureEvent::DragStripArmed(false));
+                        }
                         continue;
                     }
                     if last_local_query.elapsed() < Duration::from_millis(2)
@@ -423,9 +448,33 @@ fn run_capture_loop(
                     *shared.last_local_norm.lock() =
                         geom.normalize_point(ptr.root_x as i32, ptr.root_y as i32);
 
+                    let dnd_enabled = shared.drag_drop_files.load(Ordering::Relaxed);
+                    if lmb_down && dnd_enabled && !lmb_started_on_edge {
+                        let min_dist = edges
+                            .iter()
+                            .map(|&e| geom.distance_to_edge(e, ptr.root_x as i32, ptr.root_y as i32))
+                            .min()
+                            .unwrap_or(i32::MAX);
+                        if min_dist <= 48 && !drag_strip_armed {
+                            drag_strip_armed = true;
+                            let _ = tx.send(CaptureEvent::DragStripArmed(true));
+                        } else if min_dist > 80 && drag_strip_armed {
+                            drag_strip_armed = false;
+                            let _ = tx.send(CaptureEvent::DragStripArmed(false));
+                        }
+                    } else if drag_strip_armed {
+                        drag_strip_armed = false;
+                        let _ = tx.send(CaptureEvent::DragStripArmed(false));
+                    }
+
                     let threshold = shared.edge_threshold_px.load(Ordering::Relaxed).max(1) as f32;
                     let dead_corner = shared.dead_corner_px.load(Ordering::Relaxed).max(0);
-                    let dwell_ms = shared.edge_dwell_ms.load(Ordering::Relaxed);
+                    let base_dwell_ms = shared.edge_dwell_ms.load(Ordering::Relaxed);
+                    let dwell_ms = if lmb_down && dnd_enabled && !lmb_started_on_edge {
+                        base_dwell_ms.max(25)
+                    } else {
+                        base_dwell_ms
+                    };
 
                     let mut crossed = None;
                     for &edge in &edges {
@@ -466,8 +515,13 @@ fn run_capture_loop(
                         edge_push_edge = None;
                         edge_push_accum = 0.0;
                         edge_dwell_start = None;
+                        drag_strip_armed = false;
                         shared.remote_mode.store(true, Ordering::SeqCst);
-                        do_grab(&conn, &shared, &mut grabbed, &mut cursor_hider);
+                        // Note: defer do_grab until CMD_ENTER_REMOTE when LMB is down so server.rs
+                        // can cancel an X11 XDND source grab cleanly before we grab the pointer!
+                        if !(lmb_down && dnd_enabled) {
+                            do_grab(&conn, &shared, &mut grabbed, &mut cursor_hider);
+                        }
                         let _ = tx.send(CaptureEvent::EdgeCrossed {
                             edge,
                             normalized_pos,
@@ -492,10 +546,29 @@ fn run_capture_loop(
                 }
             }
             Event::XinputRawButtonPress(rb) => {
+                let btn = rb.detail as u8;
                 if !shared.remote_mode.load(Ordering::Acquire) {
+                    if btn == 1 {
+                        lmb_down = true;
+                        let edges = shared.active_edges.lock().clone();
+                        let geom = shared.geometry.lock().clone();
+                        lmb_started_on_edge = conn
+                            .query_pointer(root)
+                            .ok()
+                            .and_then(|c| c.reply().ok())
+                            .is_some_and(|ptr| {
+                                edges.iter().any(|&e| {
+                                    geom.distance_to_edge(e, ptr.root_x as i32, ptr.root_y as i32)
+                                        <= 4
+                                })
+                            });
+                        let _ = tx.send(CaptureEvent::LocalLeftButton { pressed: true });
+                    }
                     continue;
                 }
-                let btn = rb.detail as u8;
+                if btn == 1 {
+                    lmb_down = true;
+                }
                 match btn {
                     4 => {
                         let _ = tx.send(CaptureEvent::MouseScroll {
@@ -532,10 +605,23 @@ fn run_capture_loop(
                 }
             }
             Event::XinputRawButtonRelease(rb) => {
+                let btn = rb.detail as u8;
                 if !shared.remote_mode.load(Ordering::Acquire) {
+                    if btn == 1 {
+                        lmb_down = false;
+                        lmb_started_on_edge = false;
+                        if drag_strip_armed {
+                            drag_strip_armed = false;
+                            let _ = tx.send(CaptureEvent::DragStripArmed(false));
+                        }
+                        let _ = tx.send(CaptureEvent::LocalLeftButton { pressed: false });
+                    }
                     continue;
                 }
-                if let Some(mb) = MouseButton::from_x11_button(rb.detail as u8) {
+                if btn == 1 {
+                    lmb_down = false;
+                }
+                if let Some(mb) = MouseButton::from_x11_button(btn) {
                     let _ = tx.send(CaptureEvent::MouseButton {
                         button: mb,
                         pressed: false,

@@ -294,3 +294,86 @@ pub fn create_mock_clipboard() -> (
         received,
     )
 }
+
+#[derive(Debug, Default)]
+pub struct MockDndState {
+    pub enabled: AtomicBool,
+    pub armed: AtomicBool,
+    pub active_edges: Mutex<Vec<Edge>>,
+    pub staged: Mutex<Option<(Edge, Vec<std::path::PathBuf>)>>,
+    pub cancelled_local_drags: std::sync::atomic::AtomicUsize,
+    pub incoming_cancels: std::sync::atomic::AtomicUsize,
+    pub delivered_drops: Mutex<Vec<Vec<std::path::PathBuf>>>,
+}
+
+impl MockDndState {
+    pub fn stage_files(&self, edge: Edge, paths: Vec<std::path::PathBuf>) {
+        *self.staged.lock() = Some((edge, paths));
+    }
+}
+
+pub struct MockDndBackend {
+    pub state: Arc<MockDndState>,
+}
+
+impl crate::dnd::DndBackend for MockDndBackend {
+    fn set_enabled(&self, enabled: bool) {
+        self.state.enabled.store(enabled, Ordering::SeqCst);
+        if !enabled {
+            self.state.armed.store(false, Ordering::SeqCst);
+            *self.state.staged.lock() = None;
+        }
+    }
+
+    fn set_active_edges(&self, edges: &[Edge], _dead_corner_px: i32) {
+        *self.state.active_edges.lock() = edges.to_vec();
+    }
+
+    fn set_drag_armed(&self, armed: bool) {
+        let effective = armed && self.state.enabled.load(Ordering::Acquire);
+        self.state.armed.store(effective, Ordering::SeqCst);
+    }
+
+    fn take_staged_files(&self, edge: Edge) -> Option<Vec<std::path::PathBuf>> {
+        if !self.state.enabled.load(Ordering::Acquire) {
+            return None;
+        }
+        let mut guard = self.state.staged.lock();
+        if guard.as_ref().is_some_and(|(e, _)| *e == edge) {
+            guard.take().map(|(_, p)| p)
+        } else {
+            None
+        }
+    }
+
+    fn cancel_local_drag(&self) {
+        self.state.armed.store(false, Ordering::SeqCst);
+        *self.state.staged.lock() = None;
+        self.state
+            .cancelled_local_drags
+            .fetch_add(1, Ordering::SeqCst);
+    }
+
+    fn on_incoming_drag_cancel(&self) {
+        self.state.incoming_cancels.fetch_add(1, Ordering::SeqCst);
+    }
+
+    fn deliver_drop(
+        &self,
+        paths: Vec<std::path::PathBuf>,
+    ) -> Result<crate::dnd::DropDeliveryOutcome> {
+        self.state.delivered_drops.lock().push(paths);
+        Ok(crate::dnd::DropDeliveryOutcome::DroppedIntoTarget)
+    }
+}
+
+pub fn create_mock_dnd() -> (Arc<dyn crate::dnd::DndBackend>, Arc<MockDndState>) {
+    let state = Arc::new(MockDndState {
+        enabled: AtomicBool::new(true),
+        ..Default::default()
+    });
+    let backend: Arc<dyn crate::dnd::DndBackend> = Arc::new(MockDndBackend {
+        state: Arc::clone(&state),
+    });
+    (backend, state)
+}

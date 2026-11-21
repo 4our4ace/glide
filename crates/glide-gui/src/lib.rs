@@ -184,7 +184,8 @@ impl AppController {
 
         let task = match role {
             "server" => {
-                let scfg = cfg.server;
+                let mut scfg = cfg.server;
+                scfg.drag_drop_files = cfg.drag_drop_files;
                 let rt_err = rt.clone();
                 tokio::spawn(async move {
                     if let Err(e) =
@@ -200,7 +201,8 @@ impl AppController {
                 })
             }
             "client" => {
-                let ccfg = cfg.client;
+                let mut ccfg = cfg.client;
+                ccfg.drag_drop_files = cfg.drag_drop_files;
                 let rt_err = rt.clone();
                 tokio::spawn(async move {
                     if let Err(e) =
@@ -240,6 +242,8 @@ impl AppController {
                 new_cfg.auto_start_on_launch = true;
             }
         }
+        new_cfg.server.drag_drop_files = new_cfg.drag_drop_files;
+        new_cfg.client.drag_drop_files = new_cfg.drag_drop_files;
         new_cfg.save(&self.config_path)?;
         self.runtime.set_record_history(new_cfg.clipboard_history);
         let s = new_cfg.server.clone();
@@ -255,6 +259,7 @@ impl AppController {
             locked,
             sync_lock_keys: s.sync_lock_keys,
             clipboard: s.clipboard,
+            drag_drop_files: s.drag_drop_files,
         });
         self.send_cmd(RuntimeCommand::UpdateClientTuning {
             sensitivity: c.sensitivity,
@@ -265,6 +270,7 @@ impl AppController {
             dead_corner_px: c.dead_corner_px,
             sync_lock_keys: c.sync_lock_keys,
             clipboard: c.clipboard,
+            drag_drop_files: c.drag_drop_files,
             key_remap: c.key_remap,
         });
         Ok(())

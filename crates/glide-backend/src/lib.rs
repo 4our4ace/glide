@@ -5,6 +5,7 @@
 //! so `glide-core` and `glide-gui` stay 100% platform-agnostic.
 
 pub mod dib_png;
+pub mod dnd;
 pub mod geometry;
 pub mod icon;
 pub mod mock;
@@ -36,6 +37,7 @@ use geometry::DesktopGeometry;
 use glide_hid::{HidUsage, MouseButton};
 use glide_proto::{ClipboardPayload, Edge, LockState, OsKind};
 use serde::{Deserialize, Serialize};
+use std::sync::Arc;
 use tokio::sync::mpsc;
 
 /// Client input injection backend selector (Linux supports XTest, Wayland Portal/EIS, and kernel `uinput`).
@@ -70,6 +72,8 @@ pub struct CaptureConfig {
     pub enable_hotkeys: bool,
     /// Keep the server's local CapsLock / NumLock state & keyboard LEDs in sync while controlling a client.
     pub sync_lock_keys: bool,
+    /// Enable cross-edge file drag-and-drop detection along active outer edges.
+    pub drag_drop_files: bool,
 }
 
 impl Default for CaptureConfig {
@@ -82,6 +86,7 @@ impl Default for CaptureConfig {
             auto_lock_fullscreen: true,
             enable_hotkeys: true,
             sync_lock_keys: true,
+            drag_drop_files: true,
         }
     }
 }
@@ -97,6 +102,13 @@ pub enum CaptureEvent {
     MouseScroll { dx_120: i16, dy_120: i16 },
     /// Physical mouse button transition while in remote mode.
     MouseButton { button: MouseButton, pressed: bool },
+    /// Physical left mouse button transition while in local mode (never suppresses local clicks;
+    /// used to arm edge drop targets and detect local drop releases).
+    LocalLeftButton { pressed: bool },
+    /// Hints that the local cursor with LMB held is approaching (`true`) or moved away from
+    /// (`false`) an active outer edge, so invisible 1px edge-strip drop targets are only shown
+    /// when a drag approaches the border.
+    DragStripArmed(bool),
     /// Physical USB HID key transition while in remote mode.
     Key { usage: HidUsage, pressed: bool },
     /// Local escape hotkey pressed — unconditionally return control to server.
@@ -123,6 +135,8 @@ pub trait CaptureControl: Send + Sync {
     );
     /// Updates whether CapsLock / NumLock keys should also toggle local OS state & LEDs in remote mode.
     fn set_sync_lock_keys(&self, _enabled: bool) {}
+    /// Updates whether cross-edge file drag-and-drop assistance is enabled.
+    fn set_drag_drop_files(&self, _enabled: bool) {}
     /// Enters remote mode: suppresses/grabs local input and parks/hides cursor cleanly.
     fn enter_remote(&self) -> Result<()>;
     /// Leaves remote mode: releases grab and warps cursor to `return_edge` at `normalized_pos`.
@@ -347,6 +361,41 @@ pub fn start_clipboard() -> Result<ClipboardHandle> {
     #[cfg(target_os = "macos")]
     {
         macos::start_macos_clipboard()
+    }
+}
+
+/// Starts the native OS cross-edge file drag-and-drop backend.
+///
+/// Falls back cleanly to [`dnd::NoopDndBackend`] if the platform display server does not
+/// support it, so KVM input capture/injection never fails to start.
+pub fn start_dnd() -> Arc<dyn dnd::DndBackend> {
+    #[cfg(target_os = "linux")]
+    {
+        if linux_wayland::is_wayland_session() {
+            linux_wayland::dnd::start_wayland_dnd()
+        } else {
+            match linux_x11::dnd::start_x11_dnd() {
+                Ok(b) => b,
+                Err(e) => {
+                    tracing::warn!(error = %e, "X11 DnD backend unavailable; falling back to no-op");
+                    Arc::new(dnd::NoopDndBackend)
+                }
+            }
+        }
+    }
+    #[cfg(target_os = "windows")]
+    {
+        match windows::dnd::start_windows_dnd() {
+            Ok(b) => b,
+            Err(e) => {
+                tracing::warn!(error = %e, "Windows OLE DnD backend unavailable; falling back to no-op");
+                Arc::new(dnd::NoopDndBackend)
+            }
+        }
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "windows")))]
+    {
+        Arc::new(dnd::NoopDndBackend)
     }
 }
 
