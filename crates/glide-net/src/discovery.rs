@@ -311,12 +311,8 @@ fn lan_priority(iface: &LocalIpv4Iface) -> (u8, String) {
     (tier, iface.ip.to_string())
 }
 
-/// Convenience helper returning active local IPv4 addresses ordered with physical LAN IPs first.
-pub fn local_ipv4_addresses() -> Vec<String> {
-    let mut ranked: Vec<(u8, String)> = active_ipv4_interfaces()
-        .into_iter()
-        .map(|i| lan_priority(&i))
-        .collect();
+fn ranked_ipv4_addresses(ifaces: &[LocalIpv4Iface]) -> Vec<String> {
+    let mut ranked: Vec<(u8, String)> = ifaces.iter().map(lan_priority).collect();
     ranked.sort();
     let mut ips: Vec<String> = Vec::with_capacity(ranked.len());
     for (_, ip) in ranked {
@@ -327,8 +323,16 @@ pub fn local_ipv4_addresses() -> Vec<String> {
     ips
 }
 
+/// Convenience helper returning active local IPv4 addresses ordered with physical LAN IPs first.
+pub fn local_ipv4_addresses() -> Vec<String> {
+    ranked_ipv4_addresses(&active_ipv4_interfaces())
+}
+
 /// Binds a listener UDP socket on `0.0.0.0:port` and joins multicast on EVERY active IPv4 NIC.
-fn bind_listener_socket(port: u16) -> Result<(UdpSocket, HashSet<Ipv4Addr>)> {
+fn bind_listener_socket_with_ifaces(
+    port: u16,
+    ifaces: &[LocalIpv4Iface],
+) -> Result<(UdpSocket, HashSet<Ipv4Addr>)> {
     let sock = Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::UDP))
         .context("failed to create discovery listener socket")?;
     sock.set_reuse_address(true)?;
@@ -345,7 +349,7 @@ fn bind_listener_socket(port: u16) -> Result<(UdpSocket, HashSet<Ipv4Addr>)> {
 
     let mut joined = HashSet::new();
     let _ = sock.set_multicast_loop_v4(true);
-    for iface in active_ipv4_interfaces() {
+    for iface in ifaces {
         if sock
             .join_multicast_v4(&DISCOVERY_MULTICAST_ADDR, &iface.ip)
             .is_ok()
@@ -361,38 +365,74 @@ fn bind_listener_socket(port: u16) -> Result<(UdpSocket, HashSet<Ipv4Addr>)> {
     Ok((tokio_sock, joined))
 }
 
-/// Sends a UDP packet out of EVERY active non-loopback IPv4 interface using an explicit
-/// interface-bound ephemeral socket (subnet broadcast + multicast + limited broadcast),
-/// plus loopback for single-machine testing. Works even with zero Wi-Fi / no default gateway!
-fn blast_on_all_interfaces(payload: &[u8], port: u16, include_loopback: bool) {
-    let ifaces = active_ipv4_interfaces();
-    let mcast_dest = SocketAddrV4::new(DISCOVERY_MULTICAST_ADDR, port);
-    let bcast_dest = SocketAddrV4::new(Ipv4Addr::BROADCAST, port);
+fn bind_interface_sender(ip: Ipv4Addr) -> Option<std::net::UdpSocket> {
+    let sock = Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::UDP)).ok()?;
+    let _ = sock.set_broadcast(true);
+    let _ = sock.set_multicast_if_v4(&ip);
+    let _ = sock.set_multicast_ttl_v4(2);
+    let _ = sock.set_multicast_loop_v4(true);
+    sock.bind(&SocketAddrV4::new(ip, 0).into()).ok()?;
+    Some(sock.into())
+}
 
-    for iface in &ifaces {
-        let Ok(sock) = Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::UDP)) else {
-            continue;
+/// Caches interface-bound ephemeral UDP sockets so periodic beacons and probe retries do not
+/// churn sockets (`socket`/`setsockopt`/`bind`/`close`) or re-enumerate NICs on every tick.
+struct BroadcastBlaster {
+    sockets: HashMap<Ipv4Addr, (Ipv4Addr, std::net::UdpSocket)>,
+    loopback: Option<std::net::UdpSocket>,
+}
+
+impl BroadcastBlaster {
+    fn new(ifaces: &[LocalIpv4Iface]) -> Self {
+        let mut me = Self {
+            sockets: HashMap::with_capacity(ifaces.len()),
+            loopback: std::net::UdpSocket::bind("127.0.0.1:0").ok(),
         };
-        let _ = sock.set_broadcast(true);
-        let _ = sock.set_multicast_if_v4(&iface.ip);
-        let _ = sock.set_multicast_ttl_v4(2);
-        let _ = sock.set_multicast_loop_v4(true);
-        if sock.bind(&SocketAddrV4::new(iface.ip, 0).into()).is_err() {
-            continue;
-        }
-        let std_sock: std::net::UdpSocket = sock.into();
-        // 1. Subnet-directed broadcast (most reliable across Windows Firewall & Fritz!Box / home routers & direct cables!)
-        let subnet_bcast = SocketAddrV4::new(iface.broadcast, port);
-        let _ = std_sock.send_to(payload, subnet_bcast);
-        // 2. Multicast explicitly routed out THIS NIC
-        let _ = std_sock.send_to(payload, mcast_dest);
-        // 3. Global broadcast explicitly routed out THIS NIC
-        let _ = std_sock.send_to(payload, bcast_dest);
+        me.refresh(ifaces);
+        me
     }
 
-    if include_loopback {
-        if let Ok(sock) = std::net::UdpSocket::bind("127.0.0.1:0") {
-            let _ = sock.send_to(payload, SocketAddrV4::new(Ipv4Addr::LOCALHOST, port));
+    fn refresh(&mut self, ifaces: &[LocalIpv4Iface]) {
+        self.sockets
+            .retain(|ip, _| ifaces.iter().any(|i| i.ip == *ip));
+        for iface in ifaces {
+            if let Some((bcast, _)) = self.sockets.get_mut(&iface.ip) {
+                *bcast = iface.broadcast;
+            } else if let Some(sock) = bind_interface_sender(iface.ip) {
+                self.sockets.insert(iface.ip, (iface.broadcast, sock));
+            }
+        }
+        if self.loopback.is_none() {
+            self.loopback = std::net::UdpSocket::bind("127.0.0.1:0").ok();
+        }
+    }
+
+    /// Sends `payload` out of every cached non-loopback IPv4 interface (subnet broadcast +
+    /// multicast + limited broadcast), plus loopback when requested.
+    fn blast(&mut self, payload: &[u8], port: u16, include_loopback: bool) {
+        let mcast_dest = SocketAddrV4::new(DISCOVERY_MULTICAST_ADDR, port);
+        let bcast_dest = SocketAddrV4::new(Ipv4Addr::BROADCAST, port);
+
+        // Drop any socket whose interface went down (e.g. after sleep/wake) so the next refresh rebinds it.
+        self.sockets.retain(|_, (iface_bcast, std_sock)| {
+            // 1. Subnet-directed broadcast (most reliable across Windows Firewall & home routers & direct cables)
+            let r1 = std_sock.send_to(payload, SocketAddrV4::new(*iface_bcast, port));
+            // 2. Multicast explicitly routed out THIS NIC
+            let r2 = std_sock.send_to(payload, mcast_dest);
+            // 3. Global broadcast explicitly routed out THIS NIC
+            let r3 = std_sock.send_to(payload, bcast_dest);
+            r1.is_ok() || r2.is_ok() || r3.is_ok()
+        });
+
+        if include_loopback {
+            if let Some(ref sock) = self.loopback {
+                if sock
+                    .send_to(payload, SocketAddrV4::new(Ipv4Addr::LOCALHOST, port))
+                    .is_err()
+                {
+                    self.loopback = None;
+                }
+            }
         }
     }
 }
@@ -409,27 +449,31 @@ pub fn spawn_server_beacon(
     fingerprint: String,
     os: String,
 ) -> Result<JoinHandle<()>> {
-    let (socket, mut joined_ifaces) = bind_listener_socket(discovery_port)?;
+    let initial_ifaces = active_ipv4_interfaces();
+    let (socket, mut joined_ifaces) =
+        bind_listener_socket_with_ifaces(discovery_port, &initial_ifaces)?;
 
     let handle = tokio::spawn(async move {
         let mut buf = [0u8; 1024];
         let mut beacon_tick = tokio::time::interval(Duration::from_millis(500));
         let mut last_iface_refresh = Instant::now();
         let mut rate_limiter = ProbeRateLimiter::new(Instant::now());
+        let mut blaster = BroadcastBlaster::new(&initial_ifaces);
 
-        let make_payload = |ips: Vec<String>| -> Vec<u8> {
+        let make_payload = |ips: &[String]| -> Vec<u8> {
             let beacon = ServerBeacon {
                 magic: MAGIC_BEACON.into(),
                 name: name.clone(),
                 quic_port,
                 fingerprint: fingerprint.clone(),
                 os: os.clone(),
-                ips,
+                ips: ips.to_vec(),
             };
             serde_json::to_vec(&beacon).unwrap_or_default()
         };
 
-        let mut cached_payload = make_payload(local_ipv4_addresses());
+        let mut cached_ips = ranked_ipv4_addresses(&initial_ifaces);
+        let mut cached_payload = make_payload(&cached_ips);
 
         loop {
             tokio::select! {
@@ -437,6 +481,7 @@ pub fn spawn_server_beacon(
                     if last_iface_refresh.elapsed() >= Duration::from_secs(3) {
                         last_iface_refresh = Instant::now();
                         let current = active_ipv4_interfaces();
+                        joined_ifaces.retain(|ip| current.iter().any(|i| i.ip == *ip));
                         for iface in &current {
                             if !joined_ifaces.contains(&iface.ip)
                                 && socket.join_multicast_v4(DISCOVERY_MULTICAST_ADDR, iface.ip).is_ok()
@@ -445,9 +490,14 @@ pub fn spawn_server_beacon(
                                 joined_ifaces.insert(iface.ip);
                             }
                         }
-                        cached_payload = make_payload(local_ipv4_addresses());
+                        blaster.refresh(&current);
+                        let new_ips = ranked_ipv4_addresses(&current);
+                        if new_ips != cached_ips {
+                            cached_ips = new_ips;
+                            cached_payload = make_payload(&cached_ips);
+                        }
                     }
-                    blast_on_all_interfaces(&cached_payload, discovery_port, true);
+                    blaster.blast(&cached_payload, discovery_port, true);
                 }
                 recv = socket.recv_from(&mut buf) => {
                     match recv {
@@ -459,7 +509,7 @@ pub fn spawn_server_beacon(
                                     trace!(%src, allow_bcast, "Received LAN discovery probe; replying");
                                     let _ = socket.send_to(&cached_payload, src).await;
                                     if allow_bcast {
-                                        blast_on_all_interfaces(&cached_payload, discovery_port, false);
+                                        blaster.blast(&cached_payload, discovery_port, false);
                                     }
                                 }
                             }
@@ -489,12 +539,18 @@ pub async fn discover_servers(
     let probe_sock = UdpSocket::bind("0.0.0.0:0").await?;
     let _ = probe_sock.set_broadcast(true);
 
+    // Enumerate NICs once per discovery scan and reuse bound sender sockets across retries.
+    let ifaces = active_ipv4_interfaces();
+    let mut blaster = BroadcastBlaster::new(&ifaces);
+
     // Passive listener on discovery_port (joins multicast on all NICs to catch periodic 500ms beacons!)
-    let beacon_sock = bind_listener_socket(discovery_port).ok().map(|(s, _)| s);
+    let beacon_sock = bind_listener_socket_with_ifaces(discovery_port, &ifaces)
+        .ok()
+        .map(|(s, _)| s);
 
     // Send probes out of EVERY interface AND from probe_sock so server unicast replies reach probe_sock
-    blast_on_all_interfaces(MAGIC_PROBE, discovery_port, true);
-    let _ = send_probe_from_socket(&probe_sock, discovery_port).await;
+    blaster.blast(MAGIC_PROBE, discovery_port, true);
+    let _ = send_probe_from_socket(&probe_sock, discovery_port, &ifaces).await;
 
     let mut found: HashMap<String, DiscoveredServer> = HashMap::new();
     let deadline = tokio::time::Instant::now() + timeout;
@@ -514,8 +570,8 @@ pub async fn discover_servers(
         let recv_event: Option<std::io::Result<(&[u8], SocketAddr)>> = tokio::select! {
             _ = tokio::time::sleep(remaining) => break,
             _ = probe_retry.tick() => {
-                blast_on_all_interfaces(MAGIC_PROBE, discovery_port, true);
-                let _ = send_probe_from_socket(&probe_sock, discovery_port).await;
+                blaster.blast(MAGIC_PROBE, discovery_port, true);
+                let _ = send_probe_from_socket(&probe_sock, discovery_port, &ifaces).await;
                 continue;
             }
             res = probe_sock.recv_from(&mut buf_a) => {
@@ -565,12 +621,16 @@ pub async fn discover_servers(
     Ok(list)
 }
 
-async fn send_probe_from_socket(sock: &UdpSocket, port: u16) -> Result<()> {
+async fn send_probe_from_socket(
+    sock: &UdpSocket,
+    port: u16,
+    ifaces: &[LocalIpv4Iface],
+) -> Result<()> {
     let mcast = SocketAddrV4::new(DISCOVERY_MULTICAST_ADDR, port);
     let bcast = SocketAddrV4::new(Ipv4Addr::BROADCAST, port);
     let _ = sock.send_to(MAGIC_PROBE, mcast).await;
     let _ = sock.send_to(MAGIC_PROBE, bcast).await;
-    for iface in active_ipv4_interfaces() {
+    for iface in ifaces {
         let _ = sock
             .send_to(MAGIC_PROBE, SocketAddrV4::new(iface.broadcast, port))
             .await;

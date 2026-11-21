@@ -16,8 +16,8 @@ use std::sync::Arc;
 use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
 use wl_clipboard_rs::copy::{
-    ClipboardType as CopyClipboardType, MimeSource, MimeType as CopyMimeType, Options,
-    Seat as CopySeat, Source,
+    ClipboardType as CopyClipboardType, MimeType as CopyMimeType, Options, Seat as CopySeat,
+    Source,
 };
 use wl_clipboard_rs::paste::{ClipboardType as PasteClipboardType, Seat as PasteSeat};
 use wl_clipboard_rs::watch::{CancelHandle, ClipboardEvent, ClipboardType as WatchClipboardType, Watcher};
@@ -39,8 +39,6 @@ impl Drop for WaylandClipboardBackend {
 
 impl ClipboardBackend for WaylandClipboardBackend {
     fn set(&self, payload: ClipboardPayload) -> Result<()> {
-        *self.shared.last_written_hash.lock() = Some(payload.sha256);
-
         let mut opts = Options::new();
         opts.clipboard(CopyClipboardType::Regular)
             .seat(CopySeat::All)
@@ -48,31 +46,23 @@ impl ClipboardBackend for WaylandClipboardBackend {
 
         let prepared = match payload.format {
             ClipboardFormat::TextUtf8 => {
-                // Normalize CRLF -> LF for clean Linux pasting
-                let normalized = match std::str::from_utf8(&payload.data) {
-                    Ok(s) if s.contains("\r\n") => s.replace("\r\n", "\n").into_bytes(),
-                    _ => payload.data.to_vec(),
+                // Normalize CRLF -> LF for clean Linux pasting; reuse the existing
+                // SHA-256 when no CRLF replacement was needed.
+                let (normalized, hash) = match std::str::from_utf8(&payload.data) {
+                    Ok(s) if s.contains("\r\n") => {
+                        let bytes = s.replace("\r\n", "\n").into_bytes();
+                        let h = sha256_bytes(&bytes);
+                        (bytes, h)
+                    }
+                    _ => (payload.data.to_vec(), payload.sha256),
                 };
-                // Also store normalized hash so our watcher skips the echo
-                *self.shared.last_written_hash.lock() = Some(sha256_bytes(&normalized));
-                let sources = vec![
-                    MimeSource {
-                        source: Source::Bytes(normalized.clone().into()),
-                        mime_type: CopyMimeType::Specific("text/plain;charset=utf-8".into()),
-                    },
-                    MimeSource {
-                        source: Source::Bytes(normalized.clone().into()),
-                        mime_type: CopyMimeType::Specific("UTF8_STRING".into()),
-                    },
-                    MimeSource {
-                        source: Source::Bytes(normalized.into()),
-                        mime_type: CopyMimeType::Specific("text/plain".into()),
-                    },
-                ];
-                opts.prepare_copy_multi(sources)
+                *self.shared.last_written_hash.lock() = Some(hash);
+                // CopyMimeType::Text registers all standard UTF-8/text MIME types sharing a single Arc<[u8]>.
+                opts.prepare_copy(Source::Bytes(normalized.into()), CopyMimeType::Text)
                     .map_err(|e| anyhow!("Wayland clipboard prepare_copy text failed: {e}"))?
             }
             ClipboardFormat::ImagePng => {
+                *self.shared.last_written_hash.lock() = Some(payload.sha256);
                 let data = payload.data.to_vec();
                 opts.prepare_copy(
                     Source::Bytes(data.into()),

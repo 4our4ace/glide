@@ -68,6 +68,7 @@ struct UinputSetup {
 }
 
 #[repr(C)]
+#[derive(Clone, Copy)]
 #[allow(deprecated)]
 struct InputEvent {
     tv_sec: libc::time_t,
@@ -110,6 +111,7 @@ pub struct UinputInjector {
     x11: Option<X11Helper>,
     wayland: bool,
     geometry: DesktopGeometry,
+    last_geom_refresh: Instant,
     parked_pos: (i32, i32),
     rem_x: f32,
     rem_y: f32,
@@ -206,6 +208,7 @@ impl UinputInjector {
             )
         };
         let (cx, cy) = geometry.primary_center();
+        let now = Instant::now();
 
         debug!(
             wayland,
@@ -217,6 +220,7 @@ impl UinputInjector {
             x11,
             wayland,
             geometry,
+            last_geom_refresh: now,
             parked_pos: (cx, cy),
             rem_x: 0.0,
             rem_y: 0.0,
@@ -224,7 +228,7 @@ impl UinputInjector {
             scroll_rem_y: 0,
             est_x: cx as f32,
             est_y: cy as f32,
-            last_pointer_sync: Instant::now(),
+            last_pointer_sync: now,
             edge_push_accum: 0.0,
             pressed_keys: HashSet::new(),
             pressed_buttons: HashSet::new(),
@@ -232,38 +236,41 @@ impl UinputInjector {
     }
 
     fn emit_events(&mut self, events: &[(u16, u16, i32)]) -> Result<()> {
-        let mut buf = Vec::with_capacity((events.len() + 1) * std::mem::size_of::<InputEvent>());
-        for &(type_, code, value) in events {
-            let ev = InputEvent {
-                tv_sec: 0,
-                tv_usec: 0,
-                type_,
-                code,
-                value,
-            };
-            let bytes = unsafe {
-                std::slice::from_raw_parts(
-                    &ev as *const InputEvent as *const u8,
-                    std::mem::size_of::<InputEvent>(),
-                )
-            };
-            buf.extend_from_slice(bytes);
-        }
-        let syn = InputEvent {
+        let total = events.len() + 1;
+        let to_ev = |type_: u16, code: u16, value: i32| InputEvent {
             tv_sec: 0,
             tv_usec: 0,
-            type_: EV_SYN,
-            code: SYN_REPORT,
-            value: 0,
+            type_,
+            code,
+            value,
         };
-        let syn_bytes = unsafe {
-            std::slice::from_raw_parts(
-                &syn as *const InputEvent as *const u8,
-                std::mem::size_of::<InputEvent>(),
-            )
-        };
-        buf.extend_from_slice(syn_bytes);
-        self.file.write_all(&buf).context("uinput write failed")?;
+        if total <= 8 {
+            let mut stack = [to_ev(0, 0, 0); 8];
+            for (dst, &(type_, code, value)) in stack.iter_mut().zip(events.iter()) {
+                *dst = to_ev(type_, code, value);
+            }
+            stack[events.len()] = to_ev(EV_SYN, SYN_REPORT, 0);
+            let bytes = unsafe {
+                std::slice::from_raw_parts(
+                    stack.as_ptr() as *const u8,
+                    total * std::mem::size_of::<InputEvent>(),
+                )
+            };
+            self.file.write_all(bytes).context("uinput write failed")?;
+        } else {
+            let mut vec = Vec::with_capacity(total);
+            for &(type_, code, value) in events {
+                vec.push(to_ev(type_, code, value));
+            }
+            vec.push(to_ev(EV_SYN, SYN_REPORT, 0));
+            let bytes = unsafe {
+                std::slice::from_raw_parts(
+                    vec.as_ptr() as *const u8,
+                    vec.len() * std::mem::size_of::<InputEvent>(),
+                )
+            };
+            self.file.write_all(bytes).context("uinput write failed")?;
+        }
         Ok(())
     }
 
@@ -273,7 +280,14 @@ impl UinputInjector {
         } else if let Ok(geom) = crate::linux_wayland::query_desktop_geometry() {
             self.geometry = geom;
         }
+        self.last_geom_refresh = Instant::now();
         Ok(())
+    }
+
+    fn maybe_refresh_geometry(&mut self) {
+        if self.last_geom_refresh.elapsed() >= Duration::from_secs(5) {
+            let _ = self.refresh_geometry();
+        }
     }
 
     fn warp_to(&mut self, x: i32, y: i32) -> Result<()> {
@@ -339,13 +353,13 @@ impl InputInjector for UinputInjector {
     }
 
     fn enter(&mut self, edge: Edge, normalized_pos: f32) -> Result<()> {
-        let _ = self.refresh_geometry();
+        self.maybe_refresh_geometry();
         let (x, y) = self.geometry.point_on_edge(edge, normalized_pos, 4);
         self.warp_to(x, y)
     }
 
     fn enter_at(&mut self, norm_x: f32, norm_y: f32) -> Result<()> {
-        let _ = self.refresh_geometry();
+        self.maybe_refresh_geometry();
         let (x, y) = self.geometry.denormalize_point(norm_x, norm_y);
         self.warp_to(x, y)
     }
@@ -392,14 +406,17 @@ impl InputInjector for UinputInjector {
         self.rem_y -= iy as f32;
 
         if ix != 0 || iy != 0 {
-            let mut evs = Vec::with_capacity(2);
+            let mut evs = [(0u16, 0u16, 0i32); 2];
+            let mut n = 0;
             if ix != 0 {
-                evs.push((EV_REL, REL_X, ix));
+                evs[n] = (EV_REL, REL_X, ix);
+                n += 1;
             }
             if iy != 0 {
-                evs.push((EV_REL, REL_Y, iy));
+                evs[n] = (EV_REL, REL_Y, iy);
+                n += 1;
             }
-            self.emit_events(&evs)?;
+            self.emit_events(&evs[..n])?;
         }
 
         let (min_x, min_y, max_x, max_y) = self.geometry.bounds();
@@ -425,7 +442,12 @@ impl InputInjector for UinputInjector {
             self.est_x.round() as i32,
             self.est_y.round() as i32,
         );
-        if dist > 96 && self.last_pointer_sync.elapsed() < Duration::from_millis(35) {
+        let elapsed = self.last_pointer_sync.elapsed();
+        let should_sync = dist <= 8
+            || self.edge_push_accum > 0.0
+            || (dist <= 96 && elapsed >= Duration::from_millis(4))
+            || elapsed >= Duration::from_millis(35);
+        if !should_sync {
             return Ok(None);
         }
 
@@ -446,27 +468,32 @@ impl InputInjector for UinputInjector {
     }
 
     fn scroll(&mut self, dx_120: i16, dy_120: i16) -> Result<()> {
-        let mut evs = Vec::with_capacity(4);
+        let mut evs = [(0u16, 0u16, 0i32); 4];
+        let mut n = 0;
         if dy_120 != 0 {
-            evs.push((EV_REL, REL_WHEEL_HI_RES, dy_120 as i32));
+            evs[n] = (EV_REL, REL_WHEEL_HI_RES, dy_120 as i32);
+            n += 1;
             self.scroll_rem_y += dy_120 as i32;
             let ticks = self.scroll_rem_y / 120;
             if ticks != 0 {
                 self.scroll_rem_y -= ticks * 120;
-                evs.push((EV_REL, REL_WHEEL, ticks));
+                evs[n] = (EV_REL, REL_WHEEL, ticks);
+                n += 1;
             }
         }
         if dx_120 != 0 {
-            evs.push((EV_REL, REL_HWHEEL_HI_RES, dx_120 as i32));
+            evs[n] = (EV_REL, REL_HWHEEL_HI_RES, dx_120 as i32);
+            n += 1;
             self.scroll_rem_x += dx_120 as i32;
             let ticks = self.scroll_rem_x / 120;
             if ticks != 0 {
                 self.scroll_rem_x -= ticks * 120;
-                evs.push((EV_REL, REL_HWHEEL, ticks));
+                evs[n] = (EV_REL, REL_HWHEEL, ticks);
+                n += 1;
             }
         }
-        if !evs.is_empty() {
-            self.emit_events(&evs)?;
+        if n > 0 {
+            self.emit_events(&evs[..n])?;
         }
         Ok(())
     }
@@ -541,12 +568,14 @@ impl InputInjector for UinputInjector {
         Ok(())
     }
 
-    fn reveal_if_moved_locally(&mut self) {
-        let hidden = self
-            .x11
+    fn is_cursor_hidden(&self) -> bool {
+        self.x11
             .as_ref()
-            .is_some_and(|x11| x11.cursor_hider.is_hidden());
-        if !hidden {
+            .is_some_and(|x11| x11.cursor_hider.is_hidden())
+    }
+
+    fn reveal_if_moved_locally(&mut self) {
+        if !self.is_cursor_hidden() {
             return;
         }
         if let Ok((x, y)) = self.sync_pointer() {

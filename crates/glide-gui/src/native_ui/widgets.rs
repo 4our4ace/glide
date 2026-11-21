@@ -20,14 +20,13 @@ pub enum BtnKind {
 pub fn button(
     p: Palette,
     key: impl Into<String>,
-    label: impl Into<String>,
+    label: &'static str,
     kind: BtnKind,
     height: f32,
     px: f32,
     disabled: bool,
     on_press: impl Fn(&mut Ui, &mut Tx) + 'static,
 ) -> El {
-    let label = label.into();
     let (fill, hover, border_w, border_c, fg) = match kind {
         BtnKind::Default => (p.surface, p.hover, 1.0, p.line_2, p.text),
         BtnKind::Primary => (
@@ -50,7 +49,7 @@ pub fn button(
     let mut b = row()
         .key(key)
         .role("button")
-        .label(label.clone())
+        .label_static(label)
         .h(height)
         .px(px)
         .center()
@@ -92,7 +91,7 @@ pub fn button(
 pub fn xs_button(
     p: Palette,
     key: impl Into<String>,
-    label: impl Into<String>,
+    label: &'static str,
     kind: BtnKind,
     disabled: bool,
     on_press: impl Fn(&mut Ui, &mut Tx) + 'static,
@@ -104,7 +103,7 @@ pub fn xs_button(
 pub fn toggle(
     p: Palette,
     key: impl Into<String>,
-    label: &str,
+    label: &'static str,
     on: bool,
     on_toggle: impl Fn(&mut Ui, &mut Tx) + 'static,
 ) -> El {
@@ -112,7 +111,7 @@ pub fn toggle(
     let inset = (h - k) * 0.5;
     el().key(key)
         .role("switch")
-        .label(label)
+        .label_static(label)
         .checked(on)
         .size(w, h)
         .radius(h * 0.5)
@@ -159,7 +158,7 @@ pub fn segmented<T: Copy + PartialEq + 'static>(
         let mut seg = row()
             .key(name)
             .role("segment")
-            .label(name)
+            .label_static(name)
             .checked(active)
             .h(h)
             .px(px)
@@ -200,9 +199,9 @@ pub fn slider_row(
     let to_norm = move |x: f32| ((x - k * 0.5) / travel).clamp(0.0, 1.0);
 
     let slider = el()
-        .key(format!("{key}-slider"))
+        .key("slider")
         .role("slider")
-        .label(label)
+        .label_static(label)
         .range_value(f64::from(norm), 0.0, 1.0)
         .a11y_value(value_text.clone())
         .size(w, h)
@@ -304,12 +303,16 @@ pub fn card(p: Palette, key: impl Into<String>) -> El {
 }
 
 /// Card containing rows separated by crisp 1px horizontal dividers.
-pub fn card_rows(p: Palette, key: impl Into<String>, rows: Vec<El>) -> El {
+pub fn card_rows(
+    p: Palette,
+    key: impl Into<String>,
+    rows: impl IntoIterator<Item = El>,
+) -> El {
     let mut c = card(p, key);
-    let len = rows.len();
-    for (i, r) in rows.into_iter().enumerate() {
+    let mut iter = rows.into_iter().peekable();
+    while let Some(r) = iter.next() {
         c = c.child(r);
-        if i + 1 < len {
+        if iter.peek().is_some() {
             c = c.child(rule(1.0, p.line).a11y_hidden());
         }
     }
@@ -418,7 +421,7 @@ pub fn text_field(
     let style = if mono { ty::MONO } else { ty::BODY };
     let mut input = text_input(edit, style)
         .key("input")
-        .label(placeholder)
+        .label_static(placeholder)
         .single_line()
         .grow(1.0)
         .shrink()

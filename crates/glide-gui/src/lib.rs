@@ -246,7 +246,7 @@ impl AppController {
         let c = new_cfg.client.clone();
         *self.config.lock() = new_cfg;
 
-        let locked = self.runtime.snapshot().locked;
+        let locked = self.runtime.read(|s| s.locked);
         self.send_cmd(RuntimeCommand::UpdateServerTuning {
             edge_threshold_px: s.edge_threshold_px,
             dead_corner_px: s.dead_corner_px,

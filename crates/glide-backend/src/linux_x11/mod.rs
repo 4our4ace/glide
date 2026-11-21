@@ -30,36 +30,47 @@ pub fn query_desktop_geometry(conn: &RustConnection, screen_num: usize) -> Resul
 
     let mut monitors = Vec::new();
     if let Ok(res_cookie) = conn.randr_get_screen_resources_current(root) {
+        let primary_cookie = conn.randr_get_output_primary(root).ok();
         if let Ok(res) = res_cookie.reply() {
-            let primary_output = conn
-                .randr_get_output_primary(root)
-                .ok()
+            let primary_output = primary_cookie
                 .and_then(|c| c.reply().ok())
                 .map(|r| r.output)
                 .unwrap_or(0);
 
-            for &output in &res.outputs {
-                let Ok(out_cookie) = conn.randr_get_output_info(output, res.config_timestamp)
-                else {
-                    continue;
-                };
-                let Ok(out_info) = out_cookie.reply() else {
-                    continue;
-                };
-                if out_info.crtc == 0 {
-                    continue;
-                }
-                let Ok(crtc_cookie) = conn.randr_get_crtc_info(out_info.crtc, res.config_timestamp)
-                else {
-                    continue;
-                };
+            // Pipeline all GetOutputInfo requests in a single roundtrip.
+            let out_cookies: Vec<_> = res
+                .outputs
+                .iter()
+                .filter_map(|&output| {
+                    conn.randr_get_output_info(output, res.config_timestamp)
+                        .ok()
+                        .map(|c| (output, c))
+                })
+                .collect();
+
+            // Pipeline all GetCrtcInfo requests for connected outputs in a single roundtrip.
+            let crtc_cookies: Vec<_> = out_cookies
+                .into_iter()
+                .filter_map(|(output, c)| {
+                    let out_info = c.reply().ok()?;
+                    if out_info.crtc == 0 {
+                        return None;
+                    }
+                    let crtc_cookie = conn
+                        .randr_get_crtc_info(out_info.crtc, res.config_timestamp)
+                        .ok()?;
+                    Some((output, out_info.name, crtc_cookie))
+                })
+                .collect();
+
+            for (output, raw_name, crtc_cookie) in crtc_cookies {
                 let Ok(crtc) = crtc_cookie.reply() else {
                     continue;
                 };
                 if crtc.width == 0 || crtc.height == 0 {
                     continue;
                 }
-                let name = String::from_utf8_lossy(&out_info.name).into_owned();
+                let name = String::from_utf8_lossy(&raw_name).into_owned();
                 monitors.push(MonitorRect {
                     name,
                     x: crtc.x as i32,

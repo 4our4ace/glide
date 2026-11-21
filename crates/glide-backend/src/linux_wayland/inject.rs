@@ -337,6 +337,7 @@ pub struct WaylandInjector {
     dbus_tx: std::sync::mpsc::Sender<DbusCmd>,
     transport: Transport,
     geometry: DesktopGeometry,
+    last_geom_refresh: Instant,
     est_x: f32,
     est_y: f32,
     scroll_rem_x: i32,
@@ -540,6 +541,7 @@ impl WaylandInjector {
             dbus_tx: cmd_tx,
             transport,
             geometry,
+            last_geom_refresh: Instant::now(),
             est_x: cx as f32,
             est_y: cy as f32,
             scroll_rem_x: 0,
@@ -548,6 +550,15 @@ impl WaylandInjector {
             pressed_keys: HashSet::new(),
             pressed_buttons: HashSet::new(),
         })
+    }
+
+    fn maybe_refresh_geometry(&mut self) {
+        if self.last_geom_refresh.elapsed() >= Duration::from_secs(5) {
+            if let Ok(g) = query_desktop_geometry() {
+                self.geometry = g;
+            }
+            self.last_geom_refresh = Instant::now();
+        }
     }
 
     fn warp_to(&mut self, tx: i32, ty: i32) -> Result<()> {
@@ -637,17 +648,18 @@ impl InputInjector for WaylandInjector {
         if let Ok(g) = query_desktop_geometry() {
             self.geometry = g;
         }
+        self.last_geom_refresh = Instant::now();
         Ok(self.geometry.clone())
     }
 
     fn enter(&mut self, edge: Edge, normalized_pos: f32) -> Result<()> {
-        let _ = self.desktop_geometry();
+        self.maybe_refresh_geometry();
         let (x, y) = self.geometry.point_on_edge(edge, normalized_pos, 4);
         self.warp_to(x, y)
     }
 
     fn enter_at(&mut self, norm_x: f32, norm_y: f32) -> Result<()> {
-        let _ = self.desktop_geometry();
+        self.maybe_refresh_geometry();
         let (x, y) = self.geometry.denormalize_point(norm_x, norm_y);
         self.warp_to(x, y)
     }
