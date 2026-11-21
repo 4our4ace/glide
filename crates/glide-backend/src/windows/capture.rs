@@ -118,7 +118,8 @@ impl HookState {
             *self.edge_push.lock() = (None, 0.0, None);
             self.edge_push_active.store(false, Ordering::Release);
             if self.remote_mode.load(Ordering::Acquire) {
-                self.park_cursor_invisibly();
+                let (px, py) = new_geom.primary_park_corner();
+                self.park_cursor_at(px, py);
             }
             debug!(
                 monitors = new_geom.monitors.len(),
@@ -554,11 +555,16 @@ unsafe extern "system" fn mouse_ll_proc(code: i32, wparam: WPARAM, lparam: LPARA
                 if !remote {
                     match msg {
                         WM_LBUTTONDOWN => {
-                            let edges = state.active_edges.lock().clone();
-                            let geom = state.geometry.lock().clone();
-                            let started_on_edge = edges
-                                .iter()
-                                .any(|&e| geom.distance_to_edge(e, ms.pt.x, ms.pt.y) <= 4);
+                            let edge_mask = state.active_edges.load();
+                            let started_on_edge = if edge_mask != 0 {
+                                let geom = state.geometry.read();
+                                ALL_EDGES.iter().any(|&e| {
+                                    (edge_mask & edge_bit(e)) != 0
+                                        && geom.distance_to_edge(e, ms.pt.x, ms.pt.y) <= 4
+                                })
+                            } else {
+                                false
+                            };
                             state
                                 .lmb_started_on_edge
                                 .store(started_on_edge, Ordering::Relaxed);

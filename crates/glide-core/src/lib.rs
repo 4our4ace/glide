@@ -1293,10 +1293,11 @@ mod tests {
             })
             .unwrap();
         tokio::time::sleep(Duration::from_millis(60)).await;
-        // Move inward, press LMB on a file on client
+        // Move inward (allow QUIC datagram Lane A to land before clicking on Lane B)
         cap_tx
             .send(CaptureEvent::MouseDelta { dx: 80.0, dy: 0.0 })
             .unwrap();
+        tokio::time::sleep(Duration::from_millis(25)).await;
         cap_tx
             .send(CaptureEvent::MouseButton {
                 button: MouseButton::Left,
