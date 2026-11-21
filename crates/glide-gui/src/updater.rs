@@ -5,6 +5,7 @@
 use serde::Deserialize;
 use std::time::Duration;
 
+pub const REPO_URL_PREFIX: &str = "https://github.com/4our4ace/glide/";
 pub const RELEASES_PAGE_URL: &str = "https://github.com/4our4ace/glide/releases";
 pub const LATEST_RELEASE_API_URL: &str =
     "https://api.github.com/repos/4our4ace/glide/releases/latest";
@@ -49,6 +50,27 @@ pub fn is_newer_version(current: &str, latest: &str) -> bool {
     }
 }
 
+/// Validates that a release URL points strictly inside the official Glide GitHub repository.
+pub fn validate_release_url(url: &str) -> Result<(), String> {
+    if !url.starts_with(REPO_URL_PREFIX) {
+        return Err("Refusing to open URL outside the Glide GitHub repository".into());
+    }
+    glide_backend::os_integration::validate_https_url(url).map_err(|e| e.to_string())?;
+    let path = &url[REPO_URL_PREFIX.len()..];
+    if path.split(['/', '?', '#']).any(|seg| seg == "..") {
+        return Err("Refusing to open URL containing path traversal".into());
+    }
+    Ok(())
+}
+
+/// Restricts release links returned by the GitHub API to the official Glide repository.
+pub fn sanitize_release_url(html_url: Option<&str>) -> String {
+    html_url
+        .filter(|u| validate_release_url(u).is_ok())
+        .map(str::to_owned)
+        .unwrap_or_else(|| RELEASES_PAGE_URL.to_owned())
+}
+
 /// Performs a single blocking HTTPS check against GitHub Releases (`latest`).
 pub fn check_latest_release(current_version: &str) -> UpdateCheckState {
     let agent = ureq::Agent::config_builder()
@@ -89,10 +111,7 @@ pub fn check_latest_release(current_version: &str) -> UpdateCheckState {
     };
 
     if is_newer_version(current_version, &latest_tag) {
-        let url = release
-            .html_url
-            .filter(|u| u.starts_with("https://"))
-            .unwrap_or_else(|| RELEASES_PAGE_URL.to_owned());
+        let url = sanitize_release_url(release.html_url.as_deref());
         UpdateCheckState::Available {
             version: display_tag,
             url,
@@ -104,47 +123,10 @@ pub fn check_latest_release(current_version: &str) -> UpdateCheckState {
     }
 }
 
-/// Opens an `https://` URL in the user's default browser.
+/// Opens a verified Glide GitHub release `https://` URL in the user's default browser.
 pub fn open_url(url: &str) -> Result<(), String> {
-    if !url.starts_with("https://") {
-        return Err("Refusing to open non-HTTPS URL".into());
-    }
-
-    #[cfg(target_os = "windows")]
-    {
-        use std::os::windows::process::CommandExt;
-        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-        std::process::Command::new("cmd")
-            .args(["/C", "start", "", url])
-            .creation_flags(CREATE_NO_WINDOW)
-            .spawn()
-            .map(|_| ())
-            .map_err(|e| e.to_string())
-    }
-
-    #[cfg(target_os = "linux")]
-    {
-        std::process::Command::new("xdg-open")
-            .arg(url)
-            .spawn()
-            .map(|_| ())
-            .map_err(|e| e.to_string())
-    }
-
-    #[cfg(target_os = "macos")]
-    {
-        std::process::Command::new("open")
-            .arg(url)
-            .spawn()
-            .map(|_| ())
-            .map_err(|e| e.to_string())
-    }
-
-    #[cfg(not(any(target_os = "windows", target_os = "linux", target_os = "macos")))]
-    {
-        let _ = url;
-        Err("Opening browser links is unsupported on this OS".into())
-    }
+    validate_release_url(url)?;
+    glide_backend::os_integration::open_url(url).map_err(|e| e.to_string())
 }
 
 #[cfg(test)]
@@ -161,5 +143,39 @@ mod tests {
         assert!(is_newer_version("0.3.0", "v1.0.0"));
         assert!(!is_newer_version("0.3.0", "v0.3.0"));
         assert!(!is_newer_version("0.3.0", "v0.2.9"));
+    }
+
+    #[test]
+    fn release_url_restricted_to_glide_repo() {
+        assert_eq!(
+            sanitize_release_url(Some(
+                "https://github.com/4our4ace/glide/releases/tag/v0.4.0"
+            )),
+            "https://github.com/4our4ace/glide/releases/tag/v0.4.0"
+        );
+        assert_eq!(
+            sanitize_release_url(Some("https://evil.example/glide")),
+            RELEASES_PAGE_URL
+        );
+        assert_eq!(
+            sanitize_release_url(Some("https://github.com/other/glide/releases")),
+            RELEASES_PAGE_URL
+        );
+        assert_eq!(
+            sanitize_release_url(Some("https://github.com/4our4ace/glide/\"&calc")),
+            RELEASES_PAGE_URL
+        );
+        assert_eq!(
+            sanitize_release_url(Some("https://github.com/4our4ace/glide/releases\r\n")),
+            RELEASES_PAGE_URL
+        );
+        assert_eq!(
+            sanitize_release_url(Some("https://github.com/4our4ace/glide/../other/repo")),
+            RELEASES_PAGE_URL
+        );
+        assert_eq!(sanitize_release_url(None), RELEASES_PAGE_URL);
+        assert!(open_url("https://evil.example/payload").is_err());
+        assert!(open_url("http://github.com/4our4ace/glide/releases").is_err());
+        assert!(open_url("https://github.com/4our4ace/glide/releases\0").is_err());
     }
 }

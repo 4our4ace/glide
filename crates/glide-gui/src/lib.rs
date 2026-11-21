@@ -593,11 +593,10 @@ pub(crate) fn launch_browser_window(url: &str) -> Option<std::process::Child> {
                 return Some(child);
             }
         }
-        Command::new("cmd")
-            .creation_flags(CREATE_NO_WINDOW)
-            .args(["/C", "start", "", url])
-            .spawn()
-            .ok()
+        if glide_backend::os_integration::open_loopback_url(url).is_err() {
+            let _ = glide_backend::os_integration::open_url(url);
+        }
+        None
     }
 
     #[cfg(target_os = "linux")]
@@ -635,12 +634,18 @@ pub(crate) fn launch_browser_window(url: &str) -> Option<std::process::Child> {
                 return Some(child);
             }
         }
-        Command::new("xdg-open").arg(url).spawn().ok()
+        if glide_backend::os_integration::open_loopback_url(url).is_err() {
+            let _ = glide_backend::os_integration::open_url(url);
+        }
+        None
     }
 
     #[cfg(target_os = "macos")]
     {
-        std::process::Command::new("open").arg(url).spawn().ok()
+        if glide_backend::os_integration::open_loopback_url(url).is_err() {
+            let _ = glide_backend::os_integration::open_url(url);
+        }
+        None
     }
 }
 
