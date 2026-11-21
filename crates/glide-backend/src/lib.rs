@@ -38,6 +38,76 @@ use glide_proto::{ClipboardPayload, Edge, LockState, OsKind};
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
 
+/// All four screen edges in deterministic iteration order.
+#[cfg(any(target_os = "linux", target_os = "windows"))]
+pub(crate) const ALL_EDGES: [Edge; 4] = [Edge::Left, Edge::Right, Edge::Top, Edge::Bottom];
+
+#[cfg(any(target_os = "linux", target_os = "windows"))]
+#[inline]
+pub(crate) const fn edge_bit(edge: Edge) -> u8 {
+    match edge {
+        Edge::Left => 1 << 0,
+        Edge::Right => 1 << 1,
+        Edge::Top => 1 << 2,
+        Edge::Bottom => 1 << 3,
+    }
+}
+
+/// Lock-free bitmask of active screen edges (replaces `Mutex<Vec<Edge>>` on 1000Hz hot paths).
+#[cfg(any(target_os = "linux", target_os = "windows"))]
+pub(crate) struct AtomicEdgeMask(std::sync::atomic::AtomicU8);
+
+#[cfg(any(target_os = "linux", target_os = "windows"))]
+impl AtomicEdgeMask {
+    pub(crate) const fn empty() -> Self {
+        Self(std::sync::atomic::AtomicU8::new(0))
+    }
+
+    pub(crate) fn set(&self, edges: &[Edge]) {
+        let mut mask = 0u8;
+        for &e in edges {
+            mask |= edge_bit(e);
+        }
+        self.0.store(mask, std::sync::atomic::Ordering::Release);
+    }
+
+    #[inline]
+    pub(crate) fn load(&self) -> u8 {
+        self.0.load(std::sync::atomic::Ordering::Acquire)
+    }
+}
+
+/// Lock-free packed normalized `(f32, f32)` cursor coordinates.
+#[cfg(any(target_os = "linux", target_os = "windows"))]
+pub(crate) struct AtomicNormPoint(std::sync::atomic::AtomicU64);
+
+#[cfg(any(target_os = "linux", target_os = "windows"))]
+impl AtomicNormPoint {
+    pub(crate) fn new(nx: f32, ny: f32) -> Self {
+        Self(std::sync::atomic::AtomicU64::new(Self::pack(nx, ny)))
+    }
+
+    #[inline]
+    fn pack(nx: f32, ny: f32) -> u64 {
+        ((nx.to_bits() as u64) << 32) | (ny.to_bits() as u64)
+    }
+
+    #[inline]
+    pub(crate) fn store(&self, nx: f32, ny: f32) {
+        self.0
+            .store(Self::pack(nx, ny), std::sync::atomic::Ordering::Relaxed);
+    }
+
+    #[inline]
+    pub(crate) fn load(&self) -> (f32, f32) {
+        let bits = self.0.load(std::sync::atomic::Ordering::Relaxed);
+        (
+            f32::from_bits((bits >> 32) as u32),
+            f32::from_bits(bits as u32),
+        )
+    }
+}
+
 /// Client input injection backend selector (Linux supports XTest, Wayland Portal/EIS, and kernel `uinput`).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]

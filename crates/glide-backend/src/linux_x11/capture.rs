@@ -3,11 +3,14 @@
 
 use crate::geometry::DesktopGeometry;
 use crate::linux_x11::{query_desktop_geometry, X11CursorHider};
-use crate::{CaptureConfig, CaptureControl, CaptureEvent, CaptureHandle};
+use crate::{
+    edge_bit, AtomicEdgeMask, AtomicNormPoint, CaptureConfig, CaptureControl, CaptureEvent,
+    CaptureHandle, ALL_EDGES,
+};
 use anyhow::{Context, Result};
 use glide_hid::{HidUsage, ModifierMask, MouseButton};
 use glide_proto::{Edge, LockState};
-use parking_lot::Mutex;
+use parking_lot::{Mutex, RwLock};
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::thread;
@@ -32,15 +35,15 @@ enum LeaveTarget {
 }
 
 struct SharedState {
-    active_edges: Mutex<Vec<Edge>>,
-    geometry: Mutex<DesktopGeometry>,
+    active_edges: AtomicEdgeMask,
+    geometry: RwLock<DesktopGeometry>,
     remote_mode: AtomicBool,
     locked: AtomicBool,
     edge_threshold_px: AtomicI32,
     dead_corner_px: AtomicI32,
     edge_dwell_ms: AtomicU64,
     pending_leave: Mutex<Option<LeaveTarget>>,
-    last_local_norm: Mutex<(f32, f32)>,
+    last_local_norm: AtomicNormPoint,
 }
 
 struct X11CaptureControl {
@@ -70,7 +73,7 @@ impl X11CaptureControl {
 
 impl CaptureControl for X11CaptureControl {
     fn set_active_edges(&self, edges: &[Edge]) {
-        *self.shared.active_edges.lock() = edges.to_vec();
+        self.shared.active_edges.set(edges);
     }
 
     fn update_tuning(
@@ -111,7 +114,7 @@ impl CaptureControl for X11CaptureControl {
     }
 
     fn desktop_geometry(&self) -> DesktopGeometry {
-        self.shared.geometry.lock().clone()
+        self.shared.geometry.read().clone()
     }
 
     fn lock_state(&self) -> LockState {
@@ -127,7 +130,7 @@ impl CaptureControl for X11CaptureControl {
     }
 
     fn last_local_cursor_norm(&self) -> (f32, f32) {
-        *self.shared.last_local_norm.lock()
+        self.shared.last_local_norm.load()
     }
 }
 
@@ -233,15 +236,15 @@ pub fn start_x11_capture(config: CaptureConfig) -> Result<CaptureHandle> {
     conn.flush()?;
 
     let shared = Arc::new(SharedState {
-        active_edges: Mutex::new(Vec::new()),
-        geometry: Mutex::new(geometry),
+        active_edges: AtomicEdgeMask::empty(),
+        geometry: RwLock::new(geometry),
         remote_mode: AtomicBool::new(false),
         locked: AtomicBool::new(false),
         edge_threshold_px: AtomicI32::new(config.edge_threshold_px.max(1)),
         dead_corner_px: AtomicI32::new(config.dead_corner_px.max(0)),
         edge_dwell_ms: AtomicU64::new(config.edge_dwell_ms),
         pending_leave: Mutex::new(None),
-        last_local_norm: Mutex::new((0.5, 0.5)),
+        last_local_norm: AtomicNormPoint::new(0.5, 0.5),
     });
 
     let (tx, rx) = mpsc::unbounded_channel();
@@ -292,15 +295,20 @@ fn run_capture_loop(
 ) {
     let mut grabbed = false;
     let mut cursor_hider = X11CursorHider::init(&conn);
+    // This thread is the sole writer of `shared.geometry`, so keeping a local copy
+    // avoids cloning DesktopGeometry on every mouse event.
+    let mut local_geom = shared.geometry.read().clone();
     let mut edge_push_edge: Option<Edge> = None;
     let mut edge_push_accum: f32 = 0.0;
     let mut edge_dwell_start: Option<Instant> = None;
     let mut last_geom_refresh = Instant::now();
     let mut last_local_query = Instant::now();
+    let mut last_ptr: Option<(i32, i32)> = None;
+    let mut raw_travel: f32 = 0.0;
     let mut mods = ModifierMask::EMPTY;
 
     let do_grab = |conn: &RustConnection,
-                   shared: &SharedState,
+                   geom: &DesktopGeometry,
                    grabbed: &mut bool,
                    cursor_hider: &mut X11CursorHider| {
         if *grabbed {
@@ -326,7 +334,7 @@ fn run_capture_loop(
             GrabMode::ASYNC,
             GrabMode::ASYNC,
         );
-        let (cx, cy) = shared.geometry.lock().primary_center();
+        let (cx, cy) = geom.primary_center();
         let _ = conn.warp_pointer(x11rb::NONE, root, 0, 0, 0, 0, cx as i16, cy as i16);
         cursor_hider.hide(conn, root);
         let _ = conn.flush();
@@ -335,7 +343,7 @@ fn run_capture_loop(
     };
 
     let do_ungrab = |conn: &RustConnection,
-                     shared: &SharedState,
+                     geom: &DesktopGeometry,
                      grabbed: &mut bool,
                      cursor_hider: &mut X11CursorHider,
                      target: Option<LeaveTarget>| {
@@ -345,7 +353,6 @@ fn run_capture_loop(
             *grabbed = false;
         }
         if let Some(t) = target {
-            let geom = shared.geometry.lock().clone();
             let (x, y) = match t {
                 LeaveTarget::Edge(edge, norm) => geom.point_on_edge(edge, norm, 6),
                 LeaveTarget::Point(nx, ny) => geom.denormalize_point(nx, ny),
@@ -366,9 +373,14 @@ fn run_capture_loop(
             }
         };
 
-        if last_geom_refresh.elapsed() >= Duration::from_secs(5) {
+        // Defer periodic XRandR roundtrips while actively forwarding remote input
+        // so 1000Hz remote mouse motion never stutters on a 5s RandR query.
+        if !shared.remote_mode.load(Ordering::Acquire)
+            && last_geom_refresh.elapsed() >= Duration::from_secs(5)
+        {
             if let Ok(geom) = query_desktop_geometry(&conn, screen_num) {
-                *shared.geometry.lock() = geom;
+                local_geom = geom.clone();
+                *shared.geometry.write() = geom;
             }
             last_geom_refresh = Instant::now();
         }
@@ -377,13 +389,19 @@ fn run_capture_loop(
             Event::ClientMessage(cm) if cm.type_ == wake_atom => {
                 let cmd = cm.data.as_data32()[0];
                 match cmd {
-                    CMD_ENTER_REMOTE => do_grab(&conn, &shared, &mut grabbed, &mut cursor_hider),
+                    CMD_ENTER_REMOTE => {
+                        last_ptr = None;
+                        raw_travel = 0.0;
+                        do_grab(&conn, &local_geom, &mut grabbed, &mut cursor_hider);
+                    }
                     CMD_LEAVE_REMOTE => {
                         let leave = shared.pending_leave.lock().take();
                         edge_push_edge = None;
                         edge_push_accum = 0.0;
                         edge_dwell_start = None;
-                        do_ungrab(&conn, &shared, &mut grabbed, &mut cursor_hider, leave);
+                        last_ptr = None;
+                        raw_travel = 0.0;
+                        do_ungrab(&conn, &local_geom, &mut grabbed, &mut cursor_hider, leave);
                     }
                     _ => {}
                 }
@@ -395,21 +413,37 @@ fn run_capture_loop(
                 }
                 if shared.remote_mode.load(Ordering::Acquire) {
                     if !grabbed {
-                        do_grab(&conn, &shared, &mut grabbed, &mut cursor_hider);
+                        do_grab(&conn, &local_geom, &mut grabbed, &mut cursor_hider);
                     }
                     let _ = tx.send(CaptureEvent::MouseDelta { dx, dy });
                 } else {
                     if shared.locked.load(Ordering::Relaxed) {
                         continue;
                     }
-                    let edges = shared.active_edges.lock().clone();
-                    if edges.is_empty() {
+                    let edge_mask = shared.active_edges.load();
+                    if edge_mask == 0 {
                         continue;
                     }
-                    if last_local_query.elapsed() < Duration::from_millis(2)
-                        && edge_push_edge.is_none()
-                    {
-                        continue;
+
+                    raw_travel += dx.abs().max(dy.abs());
+                    if edge_push_edge.is_none() {
+                        if let Some((px, py)) = last_ptr {
+                            let mut min_dist = i32::MAX;
+                            for edge in ALL_EDGES {
+                                if (edge_mask & edge_bit(edge)) != 0 {
+                                    min_dist = min_dist.min(local_geom.distance_to_edge(edge, px, py));
+                                }
+                            }
+                            let pace_ms = if min_dist > 160 && raw_travel < (min_dist as f32) * 0.25
+                            {
+                                16
+                            } else {
+                                2
+                            };
+                            if last_local_query.elapsed() < Duration::from_millis(pace_ms) {
+                                continue;
+                            }
+                        }
                     }
                     last_local_query = Instant::now();
 
@@ -419,16 +453,23 @@ fn run_capture_loop(
                     let Ok(ptr) = cookie.reply() else {
                         continue;
                     };
-                    let geom = shared.geometry.lock().clone();
-                    *shared.last_local_norm.lock() =
-                        geom.normalize_point(ptr.root_x as i32, ptr.root_y as i32);
+                    let px = ptr.root_x as i32;
+                    let py = ptr.root_y as i32;
+                    last_ptr = Some((px, py));
+                    raw_travel = 0.0;
+
+                    let (nx, ny) = local_geom.normalize_point(px, py);
+                    shared.last_local_norm.store(nx, ny);
 
                     let threshold = shared.edge_threshold_px.load(Ordering::Relaxed).max(1) as f32;
                     let dead_corner = shared.dead_corner_px.load(Ordering::Relaxed).max(0);
                     let dwell_ms = shared.edge_dwell_ms.load(Ordering::Relaxed);
 
                     let mut crossed = None;
-                    for &edge in &edges {
+                    for edge in ALL_EDGES {
+                        if (edge_mask & edge_bit(edge)) == 0 {
+                            continue;
+                        }
                         let outward = match edge {
                             Edge::Left => -dx,
                             Edge::Right => dx,
@@ -436,13 +477,9 @@ fn run_capture_loop(
                             Edge::Bottom => dy,
                         };
                         if outward > 0.0 {
-                            if let Some(norm) = geom.hit_outer_edge_guarded(
-                                edge,
-                                ptr.root_x as i32,
-                                ptr.root_y as i32,
-                                2,
-                                dead_corner,
-                            ) {
+                            if let Some(norm) =
+                                local_geom.hit_outer_edge_guarded(edge, px, py, 2, dead_corner)
+                            {
                                 if edge_push_edge == Some(edge) {
                                     edge_push_accum += outward;
                                 } else {
@@ -466,22 +503,19 @@ fn run_capture_loop(
                         edge_push_edge = None;
                         edge_push_accum = 0.0;
                         edge_dwell_start = None;
+                        last_ptr = None;
+                        raw_travel = 0.0;
                         shared.remote_mode.store(true, Ordering::SeqCst);
-                        do_grab(&conn, &shared, &mut grabbed, &mut cursor_hider);
+                        do_grab(&conn, &local_geom, &mut grabbed, &mut cursor_hider);
                         let _ = tx.send(CaptureEvent::EdgeCrossed {
                             edge,
                             normalized_pos,
                         });
                     } else if edge_push_edge.is_some() {
                         let still_touching = edge_push_edge.is_some_and(|e| {
-                            geom.hit_outer_edge_guarded(
-                                e,
-                                ptr.root_x as i32,
-                                ptr.root_y as i32,
-                                3,
-                                dead_corner,
-                            )
-                            .is_some()
+                            local_geom
+                                .hit_outer_edge_guarded(e, px, py, 3, dead_corner)
+                                .is_some()
                         });
                         if !still_touching {
                             edge_push_edge = None;
@@ -552,7 +586,9 @@ fn run_capture_loop(
 
                 if usage == config.escape_key && shared.remote_mode.load(Ordering::Acquire) {
                     shared.remote_mode.store(false, Ordering::SeqCst);
-                    do_ungrab(&conn, &shared, &mut grabbed, &mut cursor_hider, None);
+                    last_ptr = None;
+                    raw_travel = 0.0;
+                    do_ungrab(&conn, &local_geom, &mut grabbed, &mut cursor_hider, None);
                     let _ = tx.send(CaptureEvent::EscapeHotkey);
                     continue;
                 }
@@ -560,6 +596,15 @@ fn run_capture_loop(
                 // Direct keyboard screen-switch (Ctrl+Alt+Arrow) & Lock toggle (Ctrl+Alt+L)
                 if config.enable_hotkeys && mods.ctrl() && mods.contains(ModifierMask::ALT_LEFT) {
                     if let Some(dir) = arrow_to_edge(usage) {
+                        if !shared.remote_mode.load(Ordering::Acquire) {
+                            if let Ok(cookie) = conn.query_pointer(root) {
+                                if let Ok(ptr) = cookie.reply() {
+                                    let (nx, ny) = local_geom
+                                        .normalize_point(ptr.root_x as i32, ptr.root_y as i32);
+                                    shared.last_local_norm.store(nx, ny);
+                                }
+                            }
+                        }
                         let _ = tx.send(CaptureEvent::HotkeySwitch { direction: dir });
                         continue;
                     }

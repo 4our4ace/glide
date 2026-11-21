@@ -8,11 +8,14 @@
 
 use crate::geometry::DesktopGeometry;
 use crate::windows::{init_dpi_awareness, query_desktop_geometry, GLIDE_EXTRA_INFO};
-use crate::{CaptureConfig, CaptureControl, CaptureEvent, CaptureHandle};
+use crate::{
+    edge_bit, AtomicEdgeMask, AtomicNormPoint, CaptureConfig, CaptureControl, CaptureEvent,
+    CaptureHandle, ALL_EDGES,
+};
 use anyhow::{anyhow, Context, Result};
 use glide_hid::{is_windows_fake_altgr_lctrl, HidUsage, ModifierMask, MouseButton, WinScan};
 use glide_proto::{Edge, LockState};
-use parking_lot::Mutex;
+use parking_lot::{Mutex, RwLock};
 use std::mem::size_of;
 use std::ptr;
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicIsize, AtomicU64, AtomicU8, Ordering};
@@ -57,8 +60,8 @@ enum LeaveTarget {
 struct HookState {
     config: CaptureConfig,
     tx: mpsc::UnboundedSender<CaptureEvent>,
-    active_edges: Mutex<Vec<Edge>>,
-    geometry: Mutex<DesktopGeometry>,
+    active_edges: AtomicEdgeMask,
+    geometry: RwLock<DesktopGeometry>,
     remote_mode: AtomicBool,
     locked: AtomicBool,
     auto_lock_fullscreen: AtomicBool,
@@ -68,8 +71,9 @@ struct HookState {
     edge_dwell_ms: AtomicU64,
     anchor_x: AtomicI32,
     anchor_y: AtomicI32,
-    last_local_norm: Mutex<(f32, f32)>,
+    last_local_norm: AtomicNormPoint,
     pending_leave: Mutex<Option<LeaveTarget>>,
+    edge_push_active: AtomicBool,
     edge_push: Mutex<(Option<Edge>, f32, Option<Instant>)>,
     mods: AtomicU8,
     start_instant: Instant,
@@ -92,29 +96,34 @@ impl HookState {
                 .is_ok()
         {
             if let Ok(geom) = query_desktop_geometry() {
-                *self.geometry.lock() = geom;
+                *self.geometry.write() = geom;
             }
         }
     }
 
-    fn park_cursor_invisibly(&self) {
-        let (px, py) = self.geometry.lock().primary_park_corner();
+    fn park_cursor_at(&self, px: i32, py: i32) {
         self.anchor_x.store(px, Ordering::Relaxed);
         self.anchor_y.store(py, Ordering::Relaxed);
         unsafe {
             SetCursorPos(px, py);
         }
     }
+
+    fn clear_edge_push(&self) {
+        if self.edge_push_active.swap(false, Ordering::Relaxed) {
+            *self.edge_push.lock() = (None, 0.0, None);
+        }
+    }
 }
 
-static GLOBAL_HOOK_STATE: OnceLock<Mutex<Option<Arc<HookState>>>> = OnceLock::new();
+static GLOBAL_HOOK_STATE: OnceLock<RwLock<Option<Arc<HookState>>>> = OnceLock::new();
 
 fn with_hook_state<F, R>(f: F) -> Option<R>
 where
     F: FnOnce(&HookState) -> R,
 {
     let cell = GLOBAL_HOOK_STATE.get()?;
-    let guard = cell.lock();
+    let guard = cell.read();
     guard.as_deref().map(f)
 }
 
@@ -127,8 +136,8 @@ impl Drop for WindowsCaptureControl {
     fn drop(&mut self) {
         // Always restore cursor & stop hook loop cleanly on shutdown
         if self.state.remote_mode.swap(false, Ordering::SeqCst) {
-            let (nx, ny) = *self.state.last_local_norm.lock();
-            let (x, y) = self.state.geometry.lock().denormalize_point(nx, ny);
+            let (nx, ny) = self.state.last_local_norm.load();
+            let (x, y) = self.state.geometry.read().denormalize_point(nx, ny);
             unsafe {
                 SetCursorPos(x, y);
             }
@@ -140,14 +149,14 @@ impl Drop for WindowsCaptureControl {
             }
         }
         if let Some(cell) = GLOBAL_HOOK_STATE.get() {
-            *cell.lock() = None;
+            *cell.write() = None;
         }
     }
 }
 
 impl CaptureControl for WindowsCaptureControl {
     fn set_active_edges(&self, edges: &[Edge]) {
-        *self.state.active_edges.lock() = edges.to_vec();
+        self.state.active_edges.set(edges);
     }
 
     fn update_tuning(
@@ -213,7 +222,7 @@ impl CaptureControl for WindowsCaptureControl {
     }
 
     fn desktop_geometry(&self) -> DesktopGeometry {
-        self.state.geometry.lock().clone()
+        self.state.geometry.read().clone()
     }
 
     fn lock_state(&self) -> LockState {
@@ -224,7 +233,7 @@ impl CaptureControl for WindowsCaptureControl {
     }
 
     fn last_local_cursor_norm(&self) -> (f32, f32) {
-        *self.state.last_local_norm.lock()
+        self.state.last_local_norm.load()
     }
 }
 
@@ -264,6 +273,15 @@ fn translate_ll_key(vk_code: u32, scan_code: u32, flags: u32) -> Option<HidUsage
     HidUsage::from_win_scan(win_scan)
 }
 
+#[inline]
+fn eq_utf16_ascii(wide: &[u16], ascii: &str) -> bool {
+    wide.len() == ascii.len()
+        && wide
+            .iter()
+            .zip(ascii.bytes())
+            .all(|(&w, b)| w == u16::from(b))
+}
+
 /// Checks whether the active foreground window covers an entire monitor (e.g. fullscreen game/VM),
 /// excluding Windows desktop shell windows (`Progman`, `WorkerW`, `Shell_TrayWnd`).
 fn is_foreground_fullscreen(geom: &DesktopGeometry) -> bool {
@@ -274,11 +292,12 @@ fn is_foreground_fullscreen(geom: &DesktopGeometry) -> bool {
     let mut class_buf = [0u16; 64];
     let len = unsafe { GetClassNameW(hwnd, class_buf.as_mut_ptr(), class_buf.len() as i32) };
     if len > 0 {
-        let class_name = String::from_utf16_lossy(&class_buf[..len as usize]);
-        if matches!(
-            class_name.as_str(),
-            "Progman" | "WorkerW" | "Shell_TrayWnd" | "Shell_SecondaryTrayWnd"
-        ) {
+        let wide = &class_buf[..len as usize];
+        if eq_utf16_ascii(wide, "Progman")
+            || eq_utf16_ascii(wide, "WorkerW")
+            || eq_utf16_ascii(wide, "Shell_TrayWnd")
+            || eq_utf16_ascii(wide, "Shell_SecondaryTrayWnd")
+        {
             return false;
         }
     }
@@ -544,8 +563,8 @@ fn handle_raw_mouse_input(lparam: LPARAM) {
         }
 
         state.maybe_refresh_geometry();
-        let edges = state.active_edges.lock().clone();
-        if edges.is_empty() {
+        let edge_mask = state.active_edges.load();
+        if edge_mask == 0 {
             return;
         }
 
@@ -553,22 +572,17 @@ fn handle_raw_mouse_input(lparam: LPARAM) {
         if unsafe { GetCursorPos(&mut pt) } == 0 {
             return;
         }
-        let geom = state.geometry.lock().clone();
-        *state.last_local_norm.lock() = geom.normalize_point(pt.x, pt.y);
+        let geom = state.geometry.read();
+        let (nx, ny) = geom.normalize_point(pt.x, pt.y);
+        state.last_local_norm.store(nx, ny);
 
-        // Step 4: Fullscreen app auto-lock
-        if state.auto_lock_fullscreen.load(Ordering::Relaxed) && is_foreground_fullscreen(&geom) {
-            *state.edge_push.lock() = (None, 0.0, None);
-            return;
-        }
-
-        let threshold = state.edge_threshold_px.load(Ordering::Relaxed).max(1) as f32;
         let dead_corner = state.dead_corner_px.load(Ordering::Relaxed).max(0);
-        let dwell_ms = state.edge_dwell_ms.load(Ordering::Relaxed);
 
-        let mut push = state.edge_push.lock();
-        let mut crossed = None;
-        for &edge in &edges {
+        let mut hit: Option<(Edge, f32, f32)> = None;
+        for edge in ALL_EDGES {
+            if (edge_mask & edge_bit(edge)) == 0 {
+                continue;
+            }
             let outward = match edge {
                 Edge::Left => -dx,
                 Edge::Right => dx,
@@ -577,38 +591,61 @@ fn handle_raw_mouse_input(lparam: LPARAM) {
             };
             if outward > 0.0 {
                 if let Some(norm) = geom.hit_outer_edge_guarded(edge, pt.x, pt.y, 2, dead_corner) {
-                    if push.0 == Some(edge) {
-                        push.1 += outward;
-                    } else {
-                        *push = (Some(edge), outward, Some(Instant::now()));
-                    }
-                    let dwell_ok = dwell_ms == 0
-                        || push
-                            .2
-                            .is_some_and(|t| t.elapsed() >= Duration::from_millis(dwell_ms));
-                    if push.1 >= threshold && dwell_ok {
-                        crossed = Some((edge, norm));
-                    }
+                    hit = Some((edge, norm, outward));
                     break;
                 }
             }
         }
 
-        if let Some((edge, normalized_pos)) = crossed {
-            *push = (None, 0.0, None);
-            state.remote_mode.store(true, Ordering::SeqCst);
-            // Step 2: Park cursor cleanly in the invisible bottom-right corner!
-            state.park_cursor_invisibly();
-            let _ = state.tx.send(CaptureEvent::EdgeCrossed {
-                edge,
-                normalized_pos,
-            });
-        } else if let Some(prev_edge) = push.0 {
-            if geom
-                .hit_outer_edge_guarded(prev_edge, pt.x, pt.y, 4, dead_corner)
-                .is_none()
+        if let Some((edge, norm, outward)) = hit {
+            // Only query foreground fullscreen status when the cursor actually pushes an active edge,
+            // avoiding 1000Hz GetForegroundWindow/GetClassNameW/GetWindowRect syscalls mid-screen.
+            if state.auto_lock_fullscreen.load(Ordering::Relaxed) && is_foreground_fullscreen(&geom)
             {
+                state.clear_edge_push();
+                return;
+            }
+
+            let threshold = state.edge_threshold_px.load(Ordering::Relaxed).max(1) as f32;
+            let dwell_ms = state.edge_dwell_ms.load(Ordering::Relaxed);
+
+            let mut push = state.edge_push.lock();
+            if push.0 == Some(edge) {
+                push.1 += outward;
+            } else {
+                *push = (Some(edge), outward, Some(Instant::now()));
+                state.edge_push_active.store(true, Ordering::Relaxed);
+            }
+            let dwell_ok = dwell_ms == 0
+                || push
+                    .2
+                    .is_some_and(|t| t.elapsed() >= Duration::from_millis(dwell_ms));
+            if push.1 >= threshold && dwell_ok {
                 *push = (None, 0.0, None);
+                state.edge_push_active.store(false, Ordering::Relaxed);
+                drop(push);
+                let (px, py) = geom.primary_park_corner();
+                drop(geom);
+                state.remote_mode.store(true, Ordering::SeqCst);
+                // Step 2: Park cursor cleanly in the invisible bottom-right corner!
+                state.park_cursor_at(px, py);
+                let _ = state.tx.send(CaptureEvent::EdgeCrossed {
+                    edge,
+                    normalized_pos: norm,
+                });
+            }
+        } else if state.edge_push_active.load(Ordering::Relaxed) {
+            let mut push = state.edge_push.lock();
+            if let Some(prev_edge) = push.0 {
+                if geom
+                    .hit_outer_edge_guarded(prev_edge, pt.x, pt.y, 4, dead_corner)
+                    .is_none()
+                {
+                    *push = (None, 0.0, None);
+                    state.edge_push_active.store(false, Ordering::Relaxed);
+                }
+            } else {
+                state.edge_push_active.store(false, Ordering::Relaxed);
             }
         }
     });
@@ -629,27 +666,33 @@ unsafe extern "system" fn capture_wnd_proc(
             with_hook_state(|state| {
                 // Save current local cursor before hiding/parking (for hotkey return memory)
                 let mut pt = POINT { x: 0, y: 0 };
-                if unsafe { GetCursorPos(&mut pt) } != 0 {
-                    let norm = state.geometry.lock().normalize_point(pt.x, pt.y);
-                    *state.last_local_norm.lock() = norm;
-                }
-                state.park_cursor_invisibly();
+                let (px, py) = {
+                    let geom = state.geometry.read();
+                    if unsafe { GetCursorPos(&mut pt) } != 0 {
+                        let (nx, ny) = geom.normalize_point(pt.x, pt.y);
+                        state.last_local_norm.store(nx, ny);
+                    }
+                    geom.primary_park_corner()
+                };
+                state.park_cursor_at(px, py);
             });
             0
         }
         WM_APP_LEAVE_REMOTE => {
             with_hook_state(|state| {
                 if let Some(target) = state.pending_leave.lock().take() {
-                    let geom = state.geometry.lock().clone();
-                    let (x, y) = match target {
-                        LeaveTarget::Edge(edge, norm) => geom.point_on_edge(edge, norm, 6),
-                        LeaveTarget::Point(nx, ny) => geom.denormalize_point(nx, ny),
+                    let (x, y) = {
+                        let geom = state.geometry.read();
+                        match target {
+                            LeaveTarget::Edge(edge, norm) => geom.point_on_edge(edge, norm, 6),
+                            LeaveTarget::Point(nx, ny) => geom.denormalize_point(nx, ny),
+                        }
                     };
                     unsafe {
                         SetCursorPos(x, y);
                     }
                 }
-                *state.edge_push.lock() = (None, 0.0, None);
+                state.clear_edge_push();
             });
             0
         }
@@ -671,14 +714,15 @@ pub fn start_windows_capture(config: CaptureConfig) -> Result<CaptureHandle> {
         sync_lock_keys: AtomicBool::new(config.sync_lock_keys),
         config,
         tx,
-        active_edges: Mutex::new(Vec::new()),
-        geometry: Mutex::new(geometry),
+        active_edges: AtomicEdgeMask::empty(),
+        geometry: RwLock::new(geometry),
         remote_mode: AtomicBool::new(false),
         locked: AtomicBool::new(false),
         anchor_x: AtomicI32::new(0),
         anchor_y: AtomicI32::new(0),
-        last_local_norm: Mutex::new((0.5, 0.5)),
+        last_local_norm: AtomicNormPoint::new(0.5, 0.5),
         pending_leave: Mutex::new(None),
+        edge_push_active: AtomicBool::new(false),
         edge_push: Mutex::new((None, 0.0, None)),
         mods: AtomicU8::new(0),
         start_instant: Instant::now(),
@@ -686,8 +730,8 @@ pub fn start_windows_capture(config: CaptureConfig) -> Result<CaptureHandle> {
         last_geom_refresh_ms: AtomicU64::new(0),
     });
 
-    let cell = GLOBAL_HOOK_STATE.get_or_init(|| Mutex::new(None));
-    *cell.lock() = Some(Arc::clone(&state));
+    let cell = GLOBAL_HOOK_STATE.get_or_init(|| RwLock::new(None));
+    *cell.write() = Some(Arc::clone(&state));
 
     let (ready_tx, ready_rx) = std::sync::mpsc::channel::<Result<isize>>();
 
