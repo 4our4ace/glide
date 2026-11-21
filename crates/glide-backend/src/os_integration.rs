@@ -4,6 +4,9 @@
 use anyhow::{Context, Result};
 use std::path::PathBuf;
 
+/// Maximum URL length accepted by [`open_url`] and [`open_loopback_url`].
+pub const MAX_URL_LEN: usize = 2048;
+
 /// Returns (and creates if needed) the destination folder for received files:
 /// `~/Downloads/Glide` on Linux or `%USERPROFILE%\Downloads\Glide` on Windows.
 pub fn file_receive_dir() -> Result<PathBuf> {
@@ -38,6 +41,8 @@ pub fn is_autostart_enabled() -> bool {
 
 /// Enables or disables starting Glide automatically at user login.
 pub fn set_autostart(enabled: bool, args: &str) -> Result<()> {
+    validate_autostart_args(args)?;
+
     #[cfg(target_os = "linux")]
     {
         let path = linux_autostart_path().context("could not determine XDG autostart path")?;
@@ -51,18 +56,10 @@ pub fn set_autostart(enabled: bool, args: &str) -> Result<()> {
             std::fs::create_dir_all(parent)?;
         }
         let exe = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("/usr/bin/glide"));
-        let desktop = format!(
-            "[Desktop Entry]\n\
-             Type=Application\n\
-             Name=Glide KVM\n\
-             Comment=Ultra-low-latency software KVM\n\
-             Exec=\"{}\" {}\n\
-             Icon=glide\n\
-             Terminal=false\n\
-             X-GNOME-Autostart-enabled=true\n",
-            exe.display(),
-            args
-        );
+        let exe_str = exe
+            .to_str()
+            .context("current executable path is not valid UTF-8")?;
+        let desktop = build_linux_desktop_entry(exe_str, args)?;
         std::fs::write(&path, desktop)?;
         Ok(())
     }
@@ -187,7 +184,7 @@ pub fn configure_firewall() -> Result<String> {
     }
     #[cfg(target_os = "linux")]
     {
-        Ok("On Ubuntu, if UFW is enabled, run: sudo ufw allow 24800:24801/udp".into())
+        Ok("On Ubuntu, if UFW is enabled, allow Glide only from your LAN subnet (replace with your subnet), e.g.: sudo ufw allow from 192.168.1.0/24 to any port 24800:24801 proto udp".into())
     }
     #[cfg(not(any(target_os = "linux", target_os = "windows")))]
     {
@@ -228,6 +225,206 @@ pub fn configure_elevated_task() -> Result<String> {
     {
         Ok("Elevated Scheduled Task helper is Windows-only. On Ubuntu use: systemctl --user enable --now glide-client.service".into())
     }
+}
+
+/// Validates an external `https://` URL before passing it to the OS browser launcher.
+pub fn validate_https_url(url: &str) -> Result<()> {
+    validate_url_chars_and_len(url)?;
+    let rest = url
+        .strip_prefix("https://")
+        .ok_or_else(|| anyhow::anyhow!("Refusing to open non-HTTPS URL"))?;
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or("");
+    if authority.is_empty() || authority.contains('@') {
+        anyhow::bail!("Invalid HTTPS URL authority");
+    }
+    Ok(())
+}
+
+/// Validates a loopback `http://127.0.0.1:<port>`, `http://localhost:<port>`,
+/// or `http://[::1]:<port>` URL for the local browser fallback UI.
+pub fn validate_loopback_url(url: &str) -> Result<()> {
+    validate_url_chars_and_len(url)?;
+    let rest = url
+        .strip_prefix("http://127.0.0.1:")
+        .or_else(|| url.strip_prefix("http://localhost:"))
+        .or_else(|| url.strip_prefix("http://[::1]:"))
+        .ok_or_else(|| anyhow::anyhow!("Refusing to open non-loopback local URL"))?;
+    let port_str = rest.split(['/', '?', '#']).next().unwrap_or("");
+    let port: u16 = port_str
+        .parse()
+        .map_err(|_| anyhow::anyhow!("Invalid loopback URL port"))?;
+    if port == 0 {
+        anyhow::bail!("Invalid loopback URL port 0");
+    }
+    Ok(())
+}
+
+fn validate_url_chars_and_len(url: &str) -> Result<()> {
+    if url.is_empty() {
+        anyhow::bail!("URL must not be empty");
+    }
+    if url.len() > MAX_URL_LEN {
+        anyhow::bail!("URL exceeds maximum allowed length of {MAX_URL_LEN} bytes");
+    }
+    if url.chars().any(|c| {
+        c.is_control()
+            || c.is_whitespace()
+            || matches!(c, '"' | '\'' | '`' | '\\')
+    }) {
+        anyhow::bail!("URL contains forbidden characters");
+    }
+    Ok(())
+}
+
+/// Opens a validated `https://` URL in the user's default browser without invoking a shell.
+pub fn open_url(url: &str) -> Result<()> {
+    validate_https_url(url)?;
+    open_validated_url(url)
+}
+
+/// Opens a validated loopback URL in the user's default browser without invoking a shell.
+pub fn open_loopback_url(url: &str) -> Result<()> {
+    validate_loopback_url(url)?;
+    open_validated_url(url)
+}
+
+fn open_validated_url(url: &str) -> Result<()> {
+    #[cfg(target_os = "windows")]
+    {
+        use std::ptr;
+        use windows_sys::Win32::UI::Shell::ShellExecuteW;
+        use windows_sys::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
+
+        let operation: Vec<u16> = "open\0".encode_utf16().collect();
+        let target: Vec<u16> = url.encode_utf16().chain(std::iter::once(0)).collect();
+        let ret = unsafe {
+            ShellExecuteW(
+                ptr::null_mut(),
+                operation.as_ptr(),
+                target.as_ptr(),
+                ptr::null(),
+                ptr::null(),
+                SW_SHOWNORMAL,
+            )
+        } as isize;
+        if ret <= 32 {
+            anyhow::bail!("ShellExecuteW failed with code {ret}");
+        }
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        std::process::Command::new("xdg-open")
+            .arg(url)
+            .spawn()
+            .context("failed to launch xdg-open")?;
+        Ok(())
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        std::process::Command::new("open")
+            .arg(url)
+            .spawn()
+            .context("failed to launch open")?;
+        Ok(())
+    }
+
+    #[cfg(not(any(target_os = "windows", target_os = "linux", target_os = "macos")))]
+    {
+        let _ = url;
+        anyhow::bail!("Opening browser links is unsupported on this OS")
+    }
+}
+
+fn validate_autostart_args(args: &str) -> Result<()> {
+    if args
+        .chars()
+        .any(|c| c.is_control() || (c.is_whitespace() && c != ' '))
+    {
+        anyhow::bail!("autostart arguments contain forbidden control or newline characters");
+    }
+    Ok(())
+}
+
+/// Escapes a single argument token for a Freedesktop `.desktop` `Exec=` key.
+///
+/// Per the Desktop Entry Specification, `.desktop` string unescaping runs before
+/// `Exec=` argument unquoting, so quoted `\`, `"`, `$`, and `` ` `` are prefixed
+/// with `\\`, and literal `%` is doubled to `%%` to prevent field-code expansion.
+#[cfg(any(target_os = "linux", test))]
+fn escape_desktop_exec_arg(arg: &str) -> Result<String> {
+    if arg.chars().any(|c| c.is_control()) {
+        anyhow::bail!("desktop Exec argument contains forbidden control characters");
+    }
+    let needs_quoting = arg.is_empty()
+        || arg.chars().any(|c| {
+            matches!(
+                c,
+                ' ' | '\t'
+                    | '\n'
+                    | '"'
+                    | '\''
+                    | '\\'
+                    | '>'
+                    | '<'
+                    | '~'
+                    | '|'
+                    | '&'
+                    | ';'
+                    | '$'
+                    | '*'
+                    | '?'
+                    | '#'
+                    | '('
+                    | ')'
+                    | '`'
+            )
+        });
+
+    if !needs_quoting {
+        return Ok(arg.replace('%', "%%"));
+    }
+
+    let mut out = String::with_capacity(arg.len() + 8);
+    out.push('"');
+    for c in arg.chars() {
+        match c {
+            '\\' => out.push_str(r"\\\\"),
+            '"' => out.push_str(r#"\\""#),
+            '$' => out.push_str(r"\\$"),
+            '`' => out.push_str(r"\\`"),
+            '%' => out.push_str("%%"),
+            other => out.push(other),
+        }
+    }
+    out.push('"');
+    Ok(out)
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn build_linux_desktop_entry(exe: &str, args: &str) -> Result<String> {
+    if exe.is_empty() {
+        anyhow::bail!("executable path must not be empty");
+    }
+    validate_autostart_args(args)?;
+    let mut exec_parts = Vec::new();
+    exec_parts.push(escape_desktop_exec_arg(exe)?);
+    for tok in args.split(' ').filter(|s| !s.is_empty()) {
+        exec_parts.push(escape_desktop_exec_arg(tok)?);
+    }
+    let exec_line = exec_parts.join(" ");
+    Ok(format!(
+        "[Desktop Entry]\n\
+         Type=Application\n\
+         Name=Glide KVM\n\
+         Comment=Ultra-low-latency software KVM\n\
+         Exec={exec_line}\n\
+         Icon=glide\n\
+         Terminal=false\n\
+         X-GNOME-Autostart-enabled=true\n"
+    ))
 }
 
 #[cfg(target_os = "linux")]
@@ -409,5 +606,70 @@ mod tests {
         assert!(launcher.contains("exit $p.ExitCode"));
         // The launcher must not embed raw unencoded single-quoted payload from the inner script.
         assert!(!launcher.contains("Register-ScheduledTask"));
+    }
+}
+
+#[cfg(test)]
+mod hardening_tests {
+    use super::*;
+
+    #[test]
+    fn desktop_exec_escaping_handles_reserved_chars_and_rejects_newlines() {
+        assert_eq!(
+            escape_desktop_exec_arg("/usr/bin/glide").unwrap(),
+            "/usr/bin/glide"
+        );
+        assert_eq!(
+            escape_desktop_exec_arg("/home/user/My Apps/glide").unwrap(),
+            "\"/home/user/My Apps/glide\""
+        );
+        assert_eq!(
+            escape_desktop_exec_arg(r#"/opt/a"b$c\d`e%f/glide"#).unwrap(),
+            r#""/opt/a\\"b\\$c\\\\d\\`e%%f/glide""#
+        );
+        assert_eq!(escape_desktop_exec_arg("100%").unwrap(), "100%%");
+        assert!(escape_desktop_exec_arg("bad\nline").is_err());
+        assert!(escape_desktop_exec_arg("bad\rline").is_err());
+        assert!(escape_desktop_exec_arg("bad\0nul").is_err());
+
+        let entry = build_linux_desktop_entry(
+            "/home/user/My Apps/glide",
+            "gui --minimized --auto-start client",
+        )
+        .unwrap();
+        assert!(entry.contains(
+            "Exec=\"/home/user/My Apps/glide\" gui --minimized --auto-start client\n"
+        ));
+        assert!(build_linux_desktop_entry("", "gui").is_err());
+        assert!(build_linux_desktop_entry("/usr/bin/glide", "gui\nExec=evil").is_err());
+        assert!(build_linux_desktop_entry("/usr/bin/glide", "gui\rExec=evil").is_err());
+    }
+
+    #[test]
+    fn open_url_validation_rejects_unsafe_and_oversized_urls() {
+        assert!(validate_https_url("https://github.com/4our4ace/glide/releases").is_ok());
+        assert!(validate_https_url("http://github.com/4our4ace/glide/releases").is_err());
+        assert!(validate_https_url("http://127.0.0.1:24802").is_err());
+        assert!(validate_https_url("file:///etc/passwd").is_err());
+        assert!(validate_https_url("javascript:alert(1)").is_err());
+        assert!(validate_https_url("https://").is_err());
+        assert!(validate_https_url("https://github.com@evil.example/foo").is_err());
+        assert!(validate_https_url("https://example.com/a b").is_err());
+        assert!(validate_https_url("https://example.com/a\"b").is_err());
+        assert!(validate_https_url("https://example.com/a'b").is_err());
+        assert!(validate_https_url("https://example.com/a`b").is_err());
+        assert!(validate_https_url("https://example.com/a\nb").is_err());
+        assert!(validate_https_url("https://example.com/a\0b").is_err());
+
+        let too_long = format!("https://example.com/{}", "a".repeat(MAX_URL_LEN));
+        assert!(validate_https_url(&too_long).is_err());
+
+        assert!(validate_loopback_url("http://127.0.0.1:24802").is_ok());
+        assert!(validate_loopback_url("http://localhost:24802/").is_ok());
+        assert!(validate_loopback_url("http://[::1]:24802/").is_ok());
+        assert!(validate_loopback_url("http://127.0.0.1:0").is_err());
+        assert!(validate_loopback_url("http://127.0.0.1:24802@evil.example").is_err());
+        assert!(validate_loopback_url("http://evil.example:24802").is_err());
+        assert!(validate_loopback_url("http://127.0.0.1:24802/a\"&calc").is_err());
     }
 }

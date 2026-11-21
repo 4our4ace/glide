@@ -512,17 +512,28 @@ pub async fn run_client_session(
                         }
                     }
                     Some(BulkTransfer::File(file)) => {
-                        match file_receive_dir()
-                            .and_then(|dir| save_received_file(&dir, &file.filename, &file.data))
-                        {
-                            Ok(saved) => {
-                                info!(file = %file.filename, path = %saved.display(), bytes = file.data.len(), "Received file from server");
-                                if let Some(rt) = runtime {
-                                    rt.record_file("received", file.filename, file.data.len(), Some(saved));
+                        let filename = file.filename;
+                        let data = file.data;
+                        let byte_len = data.len();
+                        let rt_clone = runtime.cloned();
+                        tokio::spawn(async move {
+                            let fname_for_save = filename.clone();
+                            let saved = tokio::task::spawn_blocking(move || {
+                                file_receive_dir()
+                                    .and_then(|dir| save_received_file(&dir, &fname_for_save, &data))
+                            })
+                            .await;
+                            match saved {
+                                Ok(Ok(path)) => {
+                                    info!(file = %filename, path = %path.display(), bytes = byte_len, "Received file from server");
+                                    if let Some(rt) = rt_clone {
+                                        rt.record_file("received", filename, byte_len, Some(path));
+                                    }
                                 }
+                                Ok(Err(e)) => warn!(error = %e, "Failed saving received file"),
+                                Err(e) => warn!(error = %e, "Received file save task failed"),
                             }
-                            Err(e) => warn!(error = %e, "Failed saving received file"),
-                        }
+                        });
                     }
                     None => {
                         bulk_open = false;

@@ -1079,7 +1079,7 @@
             <div class="brand-mark" aria-hidden="true">
               <svg viewBox="11 8 45 45" fill="currentColor"><path d="M20 9V46.5L28 39.76V17Z" fill-opacity=".55"/><path d="M32 21V43.88L36 52.5L42.3 49.6L36 36H47Z"/></svg>
             </div>
-            <span><b style="color:var(--text-2); font-weight:600;">Glide <span id="versionLabel">v0.2.1</span></b> &middot; Direct PC-to-PC. No account, no cloud, no internet.</span>
+            <span><b style="color:var(--text-2); font-weight:600;">Glide <span id="versionLabel">v__GLIDE_VERSION__</span></b> &middot; Direct PC-to-PC. No account, no cloud, no internet.</span>
           </div>
         </div>
 
@@ -1685,7 +1685,7 @@ function renderStatus(st) {
             <div class="row-title">${escapeHtml(p.name)}</div>
             <div class="row-meta">${EDGE_ARROW[p.edge] || ''} ${escapeHtml(p.edge)} \u00b7 ${rtt}</div>
           </div>
-          <button class="xs ${isFocused ? '' : 'primary'}" onclick="${isFocused ? 'switchToEdge(null)' : `switchToEdge('${escapeHtml(p.edge)}')`}">
+          <button class="xs ${isFocused ? '' : 'primary'}" data-peer-action="${isFocused ? 'return' : 'jump'}" data-edge="${escapeHtml(p.edge)}">
             ${isFocused ? 'Return' : 'Jump'}
           </button>
         </div>`;
@@ -1727,7 +1727,7 @@ function renderStatus(st) {
             <div class="row-title">${escapeHtml(item.preview)}</div>
             <div class="row-meta">${dir} \u00b7 ${isImg ? 'Image' : 'Text'} \u00b7 ${formatBytes(byteCount)}</div>
           </div>
-          <button class="xs" onclick="resendClip(${Number(item.id)})" title="Send to the other PC again">Re-send</button>
+          <button class="xs" data-resend-id="${Number(item.id)}" title="Send to the other PC again">Re-send</button>
         </div>`;
       }).join('');
     }
@@ -1765,13 +1765,25 @@ $('errDismissBtn').onclick = () => {
   $('errBanner').classList.remove('show');
 };
 
-window.resendClip = async (id) => {
+async function resendClip(id) {
   const res = await jsonPost('/api/clipboard/resend', { id });
   if (res.error) toast('Failed: ' + res.error);
   else toast('Sent to the other PC');
-};
+}
 
-window.switchToEdge = switchToEdge;
+$('serverPeersList').addEventListener('click', (e) => {
+  const btn = e.target.closest('button[data-peer-action]');
+  if (!btn) return;
+  if (btn.dataset.peerAction === 'return') switchToEdge(null);
+  else if (btn.dataset.edge) switchToEdge(btn.dataset.edge);
+});
+
+$('clipHistory').addEventListener('click', (e) => {
+  const btn = e.target.closest('button[data-resend-id]');
+  if (!btn) return;
+  const id = Number(btn.dataset.resendId);
+  if (Number.isFinite(id)) resendClip(id);
+});
 
 function renderRemaps() {
   const list = $('remapList');
@@ -1783,17 +1795,24 @@ function renderRemaps() {
   list.innerHTML = rules.map((r, i) => `
     <div class="row-item" style="min-height:40px; padding:6px 8px 6px 12px;">
       <div class="grow"><span class="kbd">${escapeHtml(r.from)}</span> <span style="color:var(--faint); margin:0 4px;">&rarr;</span> <span class="kbd">${escapeHtml(r.to)}</span></div>
-      <button class="xs ghost" onclick="removeRemap(${i})" title="Remove">
+      <button class="xs ghost" data-remove-remap="${i}" title="Remove">
         <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round"><path d="M6 6l12 12M18 6 6 18"/></svg>
       </button>
     </div>`).join('');
 }
 
-window.removeRemap = async (idx) => {
+async function removeRemap(idx) {
   state.config.client.key_remap.splice(idx, 1);
   renderRemaps();
   await pushConfig();
-};
+}
+
+$('remapList').addEventListener('click', (e) => {
+  const btn = e.target.closest('button[data-remove-remap]');
+  if (!btn) return;
+  const idx = Number(btn.dataset.removeRemap);
+  if (Number.isInteger(idx) && idx >= 0) removeRemap(idx);
+});
 
 async function addRemapRule(from, to) {
   if (!state.config || !from || !to) return;
@@ -2010,7 +2029,7 @@ function renderDevices(devices) {
       <span>Start Glide as Server on your main PC</span></div>`;
     return;
   }
-  list.innerHTML = devices.map(d => {
+  list.innerHTML = devices.map((d, idx) => {
     const osInfo = formatOs(d.os);
     return `<div class="row-item">
       <span class="os-ico">${osIconSvg(osInfo.cls)}</span>
@@ -2018,7 +2037,7 @@ function renderDevices(devices) {
         <div class="row-title">${escapeHtml(d.name)}</div>
         <div class="row-meta" title="Fingerprint ${escapeHtml(d.fingerprint || '')}">${escapeHtml(d.addr)}</div>
       </div>
-      <button class="xs primary" onclick="connectDiscovered('${escapeHtml(d.addr)}','${escapeHtml(d.fingerprint)}')">Connect</button>
+      <button class="xs primary" data-device-idx="${idx}">Connect</button>
     </div>`;
   }).join('');
 }
@@ -2043,7 +2062,7 @@ async function scanLan(silent = false) {
 }
 $('scanBtn').onclick = () => scanLan(false);
 
-window.connectDiscovered = async (addr, fp) => {
+async function connectDiscovered(addr, fp) {
   if (state.running) await api('/api/stop', { method: 'POST' });
   setRole('client');
   state.config.client.server = addr;
@@ -2054,7 +2073,15 @@ window.connectDiscovered = async (addr, fp) => {
   const res = await jsonPost('/api/start', { role: 'client' });
   if (res.error) toast('Error: ' + res.error);
   else toast('Connecting to ' + addr);
-};
+}
+
+$('deviceList').addEventListener('click', (e) => {
+  const btn = e.target.closest('button[data-device-idx]');
+  if (!btn) return;
+  const idx = Number(btn.dataset.deviceIdx);
+  const dev = Array.isArray(state.devices) ? state.devices[idx] : null;
+  if (dev && dev.addr) connectDiscovered(dev.addr, dev.fingerprint || null);
+});
 
 // File send
 const dz = $('dropzone');
@@ -2139,6 +2166,10 @@ async function init() {
   state.os = data.os || 'unknown';
   state.hostname = data.hostname || 'This PC';
   state.trayActive = !!data.tray_active;
+
+  if (data.version) {
+    $('versionLabel').textContent = 'v' + String(data.version).replace(/^v/i, '');
+  }
 
   const osInfo = formatOs(state.os);
   $('osLabel').textContent = `${state.hostname} \u00b7 ${osInfo.label}`;

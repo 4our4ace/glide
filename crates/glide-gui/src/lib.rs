@@ -593,11 +593,10 @@ pub(crate) fn launch_browser_window(url: &str) -> Option<std::process::Child> {
                 return Some(child);
             }
         }
-        Command::new("cmd")
-            .creation_flags(CREATE_NO_WINDOW)
-            .args(["/C", "start", "", url])
-            .spawn()
-            .ok()
+        if glide_backend::os_integration::open_loopback_url(url).is_err() {
+            let _ = glide_backend::os_integration::open_url(url);
+        }
+        None
     }
 
     #[cfg(target_os = "linux")]
@@ -635,12 +634,18 @@ pub(crate) fn launch_browser_window(url: &str) -> Option<std::process::Child> {
                 return Some(child);
             }
         }
-        Command::new("xdg-open").arg(url).spawn().ok()
+        if glide_backend::os_integration::open_loopback_url(url).is_err() {
+            let _ = glide_backend::os_integration::open_url(url);
+        }
+        None
     }
 
     #[cfg(target_os = "macos")]
     {
-        std::process::Command::new("open").arg(url).spawn().ok()
+        if glide_backend::os_integration::open_loopback_url(url).is_err() {
+            let _ = glide_backend::os_integration::open_url(url);
+        }
+        None
     }
 }
 
@@ -664,6 +669,36 @@ fn percent_decode(input: &str) -> String {
     String::from_utf8_lossy(&out).into_owned()
 }
 
+const MAX_CONTROL_BODY_BYTES: usize = 1024 * 1024;
+const HTTP_IO_TIMEOUT: Duration = Duration::from_secs(15);
+
+fn is_allowed_host(host: &str, port: u16) -> bool {
+    let host = host.trim();
+    let Some((name, p)) = host.rsplit_once(':') else {
+        return false;
+    };
+    if p != port.to_string() {
+        return false;
+    }
+    name == "127.0.0.1" || name.eq_ignore_ascii_case("localhost") || name == "[::1]"
+}
+
+fn is_allowed_origin(origin: &str, port: u16) -> bool {
+    let origin = origin.trim();
+    let Some(rest) = origin
+        .strip_prefix("http://")
+        .or_else(|| origin.strip_prefix("HTTP://"))
+    else {
+        return false;
+    };
+    is_allowed_host(rest, port)
+}
+
+fn is_allowed_fetch_site(val: &str) -> bool {
+    let v = val.trim();
+    v.eq_ignore_ascii_case("same-origin") || v.eq_ignore_ascii_case("none")
+}
+
 async fn write_response(
     stream: &mut TcpStream,
     status: &str,
@@ -675,27 +710,48 @@ async fn write_response(
          Content-Type: {content_type}\r\n\
          Content-Length: {}\r\n\
          Cache-Control: no-store\r\n\
+         X-Content-Type-Options: nosniff\r\n\
+         X-Frame-Options: DENY\r\n\
+         Referrer-Policy: no-referrer\r\n\
          Connection: close\r\n\r\n",
         body.len()
     );
-    stream.write_all(hdr.as_bytes()).await?;
-    stream.write_all(body).await?;
+    tokio::time::timeout(HTTP_IO_TIMEOUT, async {
+        stream.write_all(hdr.as_bytes()).await?;
+        stream.write_all(body).await?;
+        Ok::<(), std::io::Error>(())
+    })
+    .await
+    .context("HTTP response write timed out")??;
     Ok(())
 }
 
 async fn handle_http_conn(mut stream: TcpStream, ctrl: Arc<AppController>) -> Result<()> {
+    let local_port = stream
+        .local_addr()
+        .context("failed to read local HTTP socket address")?
+        .port();
+
     let mut buf = Vec::with_capacity(4096);
     let mut chunk = [0u8; 4096];
-    let header_end = loop {
-        let n = stream.read(&mut chunk).await?;
-        if n == 0 {
-            return Ok(());
+    let header_end = match tokio::time::timeout(HTTP_IO_TIMEOUT, async {
+        loop {
+            let n = stream.read(&mut chunk).await?;
+            if n == 0 {
+                return Ok::<Option<usize>, std::io::Error>(None);
+            }
+            buf.extend_from_slice(&chunk[..n]);
+            if let Some(pos) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                return Ok(Some(pos));
+            }
+            if buf.len() > 64 * 1024 {
+                return Ok(Some(usize::MAX));
+            }
         }
-        buf.extend_from_slice(&chunk[..n]);
-        if let Some(pos) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
-            break pos;
-        }
-        if buf.len() > 64 * 1024 {
+    })
+    .await
+    {
+        Ok(Ok(Some(usize::MAX))) => {
             write_response(
                 &mut stream,
                 "431 Request Header Fields Too Large",
@@ -703,6 +759,19 @@ async fn handle_http_conn(mut stream: TcpStream, ctrl: Arc<AppController>) -> Re
                 b"headers too large",
             )
             .await?;
+            return Ok(());
+        }
+        Ok(Ok(Some(pos))) => pos,
+        Ok(Ok(None)) => return Ok(()),
+        Ok(Err(e)) => return Err(e.into()),
+        Err(_) => {
+            let _ = write_response(
+                &mut stream,
+                "408 Request Timeout",
+                "text/plain",
+                b"request timeout",
+            )
+            .await;
             return Ok(());
         }
     };
@@ -716,31 +785,85 @@ async fn handle_http_conn(mut stream: TcpStream, ctrl: Arc<AppController>) -> Re
     let path = raw_path.split('?').next().unwrap_or("/");
 
     let mut content_len: usize = 0;
+    let mut content_len_count: usize = 0;
+    let mut content_len_invalid = false;
+    let mut has_transfer_encoding = false;
     let mut x_filename: Option<String> = None;
-    let mut host_ok = true;
+    let mut host_ok = false;
+    let mut host_count: usize = 0;
+    let mut origin_ok = true;
+    let mut origin_count: usize = 0;
+    let mut fetch_site_ok = true;
+    let mut fetch_site_count: usize = 0;
 
     for line in lines {
         if let Some((k, v)) = line.split_once(':') {
             let key = k.trim().to_ascii_lowercase();
             let val = v.trim();
             match key.as_str() {
-                "content-length" => content_len = val.parse().unwrap_or(0),
+                "content-length" => {
+                    content_len_count += 1;
+                    match val.parse::<usize>() {
+                        Ok(n) => content_len = n,
+                        Err(_) => content_len_invalid = true,
+                    }
+                }
+                "transfer-encoding" => has_transfer_encoding = true,
                 "x-filename" => x_filename = Some(percent_decode(val)),
                 "host" => {
-                    let host_only = val.split(':').next().unwrap_or("");
-                    host_ok = host_only == "127.0.0.1" || host_only == "localhost";
+                    host_count += 1;
+                    host_ok = is_allowed_host(val, local_port);
+                }
+                "origin" => {
+                    origin_count += 1;
+                    origin_ok = origin_ok && is_allowed_origin(val, local_port);
+                }
+                "sec-fetch-site" => {
+                    fetch_site_count += 1;
+                    fetch_site_ok = fetch_site_ok && is_allowed_fetch_site(val);
                 }
                 _ => {}
             }
         }
     }
 
-    if !host_ok {
+    if host_count != 1 || !host_ok {
         write_response(&mut stream, "403 Forbidden", "text/plain", b"loopback only").await?;
         return Ok(());
     }
 
-    if content_len > MAX_FILE_BYTES {
+    if method != "GET"
+        && method != "HEAD"
+        && (origin_count > 1 || !origin_ok || fetch_site_count > 1 || !fetch_site_ok)
+    {
+        write_response(
+            &mut stream,
+            "403 Forbidden",
+            "text/plain",
+            b"cross-origin request blocked",
+        )
+        .await?;
+        return Ok(());
+    }
+
+    if has_transfer_encoding || content_len_count > 1 || content_len_invalid {
+        write_response(
+            &mut stream,
+            "400 Bad Request",
+            "text/plain",
+            b"invalid framing",
+        )
+        .await?;
+        return Ok(());
+    }
+
+    let max_body_bytes = if method == "POST" && path == "/api/send-file" {
+        MAX_FILE_BYTES
+    } else {
+        MAX_CONTROL_BODY_BYTES
+    };
+
+    if content_len > max_body_bytes {
         write_response(
             &mut stream,
             "413 Payload Too Large",
@@ -752,28 +875,60 @@ async fn handle_http_conn(mut stream: TcpStream, ctrl: Arc<AppController>) -> Re
     }
 
     let body_start = header_end + 4;
-    let mut body = Vec::with_capacity(content_len);
+    let mut body = Vec::with_capacity(content_len.min(64 * 1024));
     if buf.len() > body_start {
-        body.extend_from_slice(&buf[body_start..]);
+        let take = (buf.len() - body_start).min(content_len);
+        body.extend_from_slice(&buf[body_start..body_start + take]);
     }
-    while body.len() < content_len {
-        let to_read = (content_len - body.len()).min(65536);
-        let mut tmp = vec![0u8; to_read];
-        let n = stream.read(&mut tmp).await?;
-        if n == 0 {
-            break;
+    if body.len() < content_len {
+        let mut tmp = vec![0u8; 64 * 1024];
+        let read_res = tokio::time::timeout(HTTP_IO_TIMEOUT, async {
+            while body.len() < content_len {
+                let to_read = (content_len - body.len()).min(tmp.len());
+                let n = stream.read(&mut tmp[..to_read]).await?;
+                if n == 0 {
+                    break;
+                }
+                body.extend_from_slice(&tmp[..n]);
+            }
+            Ok::<(), std::io::Error>(())
+        })
+        .await;
+        match read_res {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => return Err(e.into()),
+            Err(_) => {
+                let _ = write_response(
+                    &mut stream,
+                    "408 Request Timeout",
+                    "text/plain",
+                    b"body read timeout",
+                )
+                .await;
+                return Ok(());
+            }
         }
-        body.extend_from_slice(&tmp[..n]);
+    }
+    if body.len() < content_len {
+        write_response(
+            &mut stream,
+            "400 Bad Request",
+            "text/plain",
+            b"truncated request body",
+        )
+        .await?;
+        return Ok(());
     }
     body.truncate(content_len);
 
     match (method, path) {
         ("GET", "/") | ("GET", "/index.html") => {
+            let html = UI_HTML.replace("__GLIDE_VERSION__", env!("CARGO_PKG_VERSION"));
             write_response(
                 &mut stream,
                 "200 OK",
                 "text/html; charset=utf-8",
-                UI_HTML.as_bytes(),
+                html.as_bytes(),
             )
             .await?;
         }
@@ -805,20 +960,33 @@ async fn handle_http_conn(mut stream: TcpStream, ctrl: Arc<AppController>) -> Re
             let hdr = "HTTP/1.1 200 OK\r\n\
                        Content-Type: text/event-stream\r\n\
                        Cache-Control: no-cache\r\n\
+                       X-Content-Type-Options: nosniff\r\n\
+                       X-Frame-Options: DENY\r\n\
+                       Referrer-Policy: no-referrer\r\n\
                        Connection: keep-alive\r\n\r\n";
-            stream.write_all(hdr.as_bytes()).await?;
+            tokio::time::timeout(HTTP_IO_TIMEOUT, stream.write_all(hdr.as_bytes()))
+                .await
+                .context("SSE header write timed out")??;
             let mut rx = ctrl.runtime.subscribe();
             let initial = serde_json::to_string(&ctrl.runtime.snapshot())?;
-            stream
-                .write_all(format!("data: {initial}\n\n").as_bytes())
-                .await?;
+            tokio::time::timeout(
+                HTTP_IO_TIMEOUT,
+                stream.write_all(format!("data: {initial}\n\n").as_bytes()),
+            )
+            .await
+            .context("SSE initial write timed out")??;
             loop {
                 tokio::select! {
                     res = rx.recv() => {
                         match res {
                             Ok(()) | Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
                                 let snap = serde_json::to_string(&ctrl.runtime.snapshot())?;
-                                if stream.write_all(format!("data: {snap}\n\n").as_bytes()).await.is_err() {
+                                let wrote = tokio::time::timeout(
+                                    HTTP_IO_TIMEOUT,
+                                    stream.write_all(format!("data: {snap}\n\n").as_bytes()),
+                                )
+                                .await;
+                                if !matches!(wrote, Ok(Ok(()))) {
                                     break;
                                 }
                             }
@@ -826,7 +994,12 @@ async fn handle_http_conn(mut stream: TcpStream, ctrl: Arc<AppController>) -> Re
                         }
                     }
                     _ = tokio::time::sleep(Duration::from_secs(15)) => {
-                        if stream.write_all(b": keepalive\n\n").await.is_err() {
+                        let wrote = tokio::time::timeout(
+                            HTTP_IO_TIMEOUT,
+                            stream.write_all(b": keepalive\n\n"),
+                        )
+                        .await;
+                        if !matches!(wrote, Ok(Ok(()))) {
                             break;
                         }
                     }
@@ -839,6 +1012,7 @@ async fn handle_http_conn(mut stream: TcpStream, ctrl: Arc<AppController>) -> Re
             let fp = ctrl.load_identity();
             let doctor = glide_backend::run_doctor().ok();
             let payload = json!({
+                "version": env!("CARGO_PKG_VERSION"),
                 "config": cfg,
                 "status": ctrl.runtime.snapshot(),
                 "fingerprint": fp,
@@ -882,22 +1056,30 @@ async fn handle_http_conn(mut stream: TcpStream, ctrl: Arc<AppController>) -> Re
         }
 
         ("POST", "/api/config") => match serde_json::from_slice::<GlideConfigFile>(&body) {
-            Ok(new_cfg) => match ctrl.apply_config(new_cfg) {
-                Ok(()) => {
-                    write_response(&mut stream, "200 OK", "application/json", br#"{"ok":true}"#)
-                        .await?
+            Ok(mut new_cfg) => {
+                // Never allow the HTTP control API to repoint TLS identity or TOFU store paths.
+                {
+                    let prev = ctrl.config.lock();
+                    new_cfg.server.identity_dir = prev.server.identity_dir.clone();
+                    new_cfg.client.tofu_store_path = prev.client.tofu_store_path.clone();
                 }
-                Err(e) => {
-                    let msg = json!({ "error": e.to_string() }).to_string();
-                    write_response(
-                        &mut stream,
-                        "500 Internal Server Error",
-                        "application/json",
-                        msg.as_bytes(),
-                    )
-                    .await?;
+                match ctrl.apply_config(new_cfg) {
+                    Ok(()) => {
+                        write_response(&mut stream, "200 OK", "application/json", br#"{"ok":true}"#)
+                            .await?
+                    }
+                    Err(e) => {
+                        let msg = json!({ "error": e.to_string() }).to_string();
+                        write_response(
+                            &mut stream,
+                            "500 Internal Server Error",
+                            "application/json",
+                            msg.as_bytes(),
+                        )
+                        .await?;
+                    }
                 }
-            },
+            }
             Err(e) => {
                 let msg = json!({ "error": e.to_string() }).to_string();
                 write_response(
@@ -997,7 +1179,8 @@ async fn handle_http_conn(mut stream: TcpStream, ctrl: Arc<AppController>) -> Re
         }
 
         ("POST", "/api/send-file") => {
-            let filename = x_filename.unwrap_or_else(|| "glide-transfer.bin".into());
+            let raw_name = x_filename.unwrap_or_else(|| "glide-transfer.bin".into());
+            let filename = glide_proto::sanitize_filename(&raw_name);
             if ctrl.send_cmd(RuntimeCommand::SendFile {
                 filename,
                 data: Bytes::from(body),
@@ -1016,9 +1199,38 @@ async fn handle_http_conn(mut stream: TcpStream, ctrl: Arc<AppController>) -> Re
         }
 
         ("POST", "/api/os/autostart") => {
-            let req: serde_json::Value = serde_json::from_slice(&body).unwrap_or_default();
+            let req: serde_json::Value = match serde_json::from_slice(&body) {
+                Ok(v) => v,
+                Err(e) => {
+                    let msg = json!({ "error": e.to_string() }).to_string();
+                    write_response(
+                        &mut stream,
+                        "400 Bad Request",
+                        "application/json",
+                        msg.as_bytes(),
+                    )
+                    .await?;
+                    return Ok(());
+                }
+            };
             let enabled = req["enabled"].as_bool().unwrap_or(false);
-            let role = req["role"].as_str().unwrap_or("client");
+            let role = match req.get("role") {
+                None => "client",
+                Some(v) => match v.as_str() {
+                    Some("server") => "server",
+                    Some("client") => "client",
+                    _ => {
+                        write_response(
+                            &mut stream,
+                            "400 Bad Request",
+                            "application/json",
+                            br#"{"error":"role must be 'server' or 'client'"}"#,
+                        )
+                        .await?;
+                        return Ok(());
+                    }
+                },
+            };
             let args = format!("gui --minimized --auto-start {role}");
             match set_autostart(enabled, &args) {
                 Ok(()) => {
@@ -1044,35 +1256,39 @@ async fn handle_http_conn(mut stream: TcpStream, ctrl: Arc<AppController>) -> Re
             }
         }
 
-        ("POST", "/api/os/firewall") => {
-            let res = configure_firewall();
-            let msg = match res {
-                Ok(m) => json!({ "ok": true, "message": m }),
-                Err(e) => json!({ "error": e.to_string(), "message": e.to_string() }),
-            };
-            write_response(
-                &mut stream,
-                "200 OK",
-                "application/json",
-                msg.to_string().as_bytes(),
-            )
-            .await?;
-        }
+        ("POST", "/api/os/firewall") => match configure_firewall() {
+            Ok(m) => {
+                let msg = json!({ "ok": true, "message": m }).to_string();
+                write_response(&mut stream, "200 OK", "application/json", msg.as_bytes()).await?;
+            }
+            Err(e) => {
+                let msg = json!({ "error": e.to_string(), "message": e.to_string() }).to_string();
+                write_response(
+                    &mut stream,
+                    "500 Internal Server Error",
+                    "application/json",
+                    msg.as_bytes(),
+                )
+                .await?;
+            }
+        },
 
-        ("POST", "/api/os/elevated") => {
-            let res = configure_elevated_task();
-            let msg = match res {
-                Ok(m) => json!({ "ok": true, "message": m }),
-                Err(e) => json!({ "error": e.to_string(), "message": e.to_string() }),
-            };
-            write_response(
-                &mut stream,
-                "200 OK",
-                "application/json",
-                msg.to_string().as_bytes(),
-            )
-            .await?;
-        }
+        ("POST", "/api/os/elevated") => match configure_elevated_task() {
+            Ok(m) => {
+                let msg = json!({ "ok": true, "message": m }).to_string();
+                write_response(&mut stream, "200 OK", "application/json", msg.as_bytes()).await?;
+            }
+            Err(e) => {
+                let msg = json!({ "error": e.to_string(), "message": e.to_string() }).to_string();
+                write_response(
+                    &mut stream,
+                    "500 Internal Server Error",
+                    "application/json",
+                    msg.as_bytes(),
+                )
+                .await?;
+            }
+        },
 
         ("POST", "/api/trust/reset") => {
             let tofu_path = ctrl.config.lock().client.resolved_tofu_path();
@@ -1110,60 +1326,168 @@ async fn handle_http_conn(mut stream: TcpStream, ctrl: Arc<AppController>) -> Re
 mod tests {
     use super::*;
 
+    async fn send_raw_http(addr: SocketAddr, req: &str) -> String {
+        let mut s = TcpStream::connect(addr).await.unwrap();
+        s.write_all(req.as_bytes()).await.unwrap();
+        let mut resp = String::new();
+        s.read_to_string(&mut resp).await.unwrap();
+        resp
+    }
+
+    #[test]
+    fn host_origin_and_fetch_site_validators() {
+        assert!(is_allowed_host("127.0.0.1:24802", 24802));
+        assert!(is_allowed_host("localhost:24802", 24802));
+        assert!(is_allowed_host("LOCALHOST:24802", 24802));
+        assert!(is_allowed_host("[::1]:24802", 24802));
+        assert!(!is_allowed_host("127.0.0.1", 24802));
+        assert!(!is_allowed_host("127.0.0.1:9999", 24802));
+        assert!(!is_allowed_host("evil.example:24802", 24802));
+        assert!(!is_allowed_host("127.0.0.1.evil.example:24802", 24802));
+
+        assert!(is_allowed_origin("http://127.0.0.1:24802", 24802));
+        assert!(is_allowed_origin("http://localhost:24802", 24802));
+        assert!(is_allowed_origin("http://[::1]:24802", 24802));
+        assert!(!is_allowed_origin("http://evil.example", 24802));
+        assert!(!is_allowed_origin("https://127.0.0.1:24802", 24802));
+        assert!(!is_allowed_origin("null", 24802));
+
+        assert!(is_allowed_fetch_site("same-origin"));
+        assert!(is_allowed_fetch_site("none"));
+        assert!(!is_allowed_fetch_site("cross-site"));
+        assert!(!is_allowed_fetch_site("same-site"));
+    }
+
     #[tokio::test]
     async fn gui_http_serves_ui_state_and_blocks_dns_rebinding() {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
-        let url = format!("http://127.0.0.1:{}", addr.port());
-        let tmp_cfg = std::env::temp_dir().join("glide-gui-test.toml");
+        let port = addr.port();
+        let url = format!("http://127.0.0.1:{port}");
+        let tmp_cfg = std::env::temp_dir().join(format!(
+            "glide-gui-test-{}-{port}.toml",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&tmp_cfg);
         let (quit_tx, _quit_rx) = mpsc::unbounded_channel();
-        let ctrl = Arc::new(AppController::new(tmp_cfg, url, quit_tx));
+        let ctrl = Arc::new(AppController::new(tmp_cfg.clone(), url, quit_tx));
+        {
+            let mut cfg = ctrl.config.lock();
+            cfg.server.identity_dir = Some(PathBuf::from("/original/identity"));
+            cfg.client.tofu_store_path = Some(PathBuf::from("/original/tofu"));
+        }
 
         let srv_ctrl = Arc::clone(&ctrl);
         let srv = tokio::spawn(async move {
-            for _ in 0..3 {
+            for _ in 0..10 {
                 let (stream, _) = listener.accept().await.unwrap();
                 let _ = handle_http_conn(stream, Arc::clone(&srv_ctrl)).await;
             }
         });
 
-        // 1. GET / returns HTML
-        let mut s1 = TcpStream::connect(addr).await.unwrap();
-        s1.write_all(
-            format!("GET / HTTP/1.1\r\nHost: 127.0.0.1:{}\r\n\r\n", addr.port()).as_bytes(),
-        )
-        .await
-        .unwrap();
-        let mut r1 = String::new();
-        s1.read_to_string(&mut r1).await.unwrap();
+        // 1. GET / returns HTML with security headers and injected version (not v0.2.1)
+        let r1 = send_raw_http(addr, &format!("GET / HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\n\r\n"))
+            .await;
         assert!(r1.starts_with("HTTP/1.1 200 OK"));
-        assert!(r1.contains("Glide"));
+        assert!(r1.contains("X-Content-Type-Options: nosniff"));
+        assert!(r1.contains("X-Frame-Options: DENY"));
+        assert!(r1.contains("Referrer-Policy: no-referrer"));
+        assert!(r1.contains(&format!("v{}", env!("CARGO_PKG_VERSION"))));
+        assert!(!r1.contains("v0.2.1"));
+        assert!(!r1.contains("onclick="));
 
-        // 2. GET /api/state returns valid JSON
-        let mut s2 = TcpStream::connect(addr).await.unwrap();
-        s2.write_all(
-            format!(
-                "GET /api/state HTTP/1.1\r\nHost: localhost:{}\r\n\r\n",
-                addr.port()
-            )
-            .as_bytes(),
+        // 2. GET /api/state returns valid JSON including version
+        let r2 = send_raw_http(
+            addr,
+            &format!("GET /api/state HTTP/1.1\r\nHost: localhost:{port}\r\n\r\n"),
         )
-        .await
-        .unwrap();
-        let mut r2 = String::new();
-        s2.read_to_string(&mut r2).await.unwrap();
+        .await;
         assert!(r2.starts_with("HTTP/1.1 200 OK"));
         assert!(r2.contains("\"status\""));
+        assert!(r2.contains(&format!("\"version\":\"{}\"", env!("CARGO_PKG_VERSION"))));
 
         // 3. Non-loopback Host header is blocked (DNS rebinding guard)
-        let mut s3 = TcpStream::connect(addr).await.unwrap();
-        s3.write_all(b"GET /api/state HTTP/1.1\r\nHost: evil.example\r\n\r\n")
-            .await
-            .unwrap();
-        let mut r3 = String::new();
-        s3.read_to_string(&mut r3).await.unwrap();
+        let r3 = send_raw_http(addr, "GET /api/state HTTP/1.1\r\nHost: evil.example\r\n\r\n").await;
         assert!(r3.starts_with("HTTP/1.1 403 Forbidden"));
 
+        // 4. Missing Host header is blocked
+        let r4 = send_raw_http(addr, "GET /api/state HTTP/1.1\r\n\r\n").await;
+        assert!(r4.starts_with("HTTP/1.1 403 Forbidden"));
+
+        // 5. Duplicate Host headers are blocked
+        let r5 = send_raw_http(
+            addr,
+            &format!("GET /api/state HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nHost: evil.example:{port}\r\n\r\n"),
+        )
+        .await;
+        assert!(r5.starts_with("HTTP/1.1 403 Forbidden"));
+
+        // 6. Cross-origin POST is blocked by Origin check
+        let r6 = send_raw_http(
+            addr,
+            &format!("POST /api/lock HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nOrigin: https://evil.example\r\nContent-Length: 0\r\n\r\n"),
+        )
+        .await;
+        assert!(r6.starts_with("HTTP/1.1 403 Forbidden"));
+
+        // 7. Cross-site POST is blocked by Sec-Fetch-Site check
+        let r7 = send_raw_http(
+            addr,
+            &format!("POST /api/lock HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nSec-Fetch-Site: cross-site\r\nContent-Length: 0\r\n\r\n"),
+        )
+        .await;
+        assert!(r7.starts_with("HTTP/1.1 403 Forbidden"));
+
+        // 8. JSON/control route rejects oversized payload (> 1 MiB)
+        let r8 = send_raw_http(
+            addr,
+            &format!(
+                "POST /api/config HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nOrigin: http://127.0.0.1:{port}\r\nSec-Fetch-Site: same-origin\r\nContent-Length: {}\r\n\r\n",
+                MAX_CONTROL_BODY_BYTES + 1
+            ),
+        )
+        .await;
+        assert!(r8.starts_with("HTTP/1.1 413 Payload Too Large"));
+
+        // 9. /api/os/autostart rejects invalid role
+        let bad_autostart = r#"{"enabled":true,"role":"client; rm -rf /"}"#;
+        let r9 = send_raw_http(
+            addr,
+            &format!(
+                "POST /api/os/autostart HTTP/1.1\r\nHost: [::1]:{port}\r\nOrigin: http://[::1]:{port}\r\nSec-Fetch-Site: same-origin\r\nContent-Length: {}\r\n\r\n{bad_autostart}",
+                bad_autostart.len()
+            ),
+        )
+        .await;
+        assert!(r9.starts_with("HTTP/1.1 400 Bad Request"));
+
+        // 10. POST /api/config preserves existing identity_dir and tofu_store_path
+        let mut tampered = ctrl.config.lock().clone();
+        tampered.server.identity_dir = Some(PathBuf::from("/tmp/attacker-identity"));
+        tampered.client.tofu_store_path = Some(PathBuf::from("/tmp/attacker-tofu"));
+        let cfg_json = serde_json::to_string(&tampered).unwrap();
+        let r10 = send_raw_http(
+            addr,
+            &format!(
+                "POST /api/config HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nOrigin: http://127.0.0.1:{port}\r\nSec-Fetch-Site: same-origin\r\nContent-Length: {}\r\n\r\n{cfg_json}",
+                cfg_json.len()
+            ),
+        )
+        .await;
+        assert!(r10.starts_with("HTTP/1.1 200 OK"));
+        {
+            let saved = ctrl.config.lock();
+            assert_eq!(
+                saved.server.identity_dir,
+                Some(PathBuf::from("/original/identity"))
+            );
+            assert_eq!(
+                saved.client.tofu_store_path,
+                Some(PathBuf::from("/original/tofu"))
+            );
+        }
+
         srv.await.unwrap();
+        let _ = std::fs::remove_file(&tmp_cfg);
     }
 }

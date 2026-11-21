@@ -304,6 +304,40 @@ pub async fn send_bulk_on(conn: &Connection, transfer: &glide_proto::BulkTransfe
     Ok(())
 }
 
+const BULK_INITIAL_ALLOC_CAP: usize = 64 * 1024;
+const BULK_READ_CHUNK_SIZE: usize = 64 * 1024;
+
+/// Reads exactly `declared_len` bytes incrementally without pre-allocating more than
+/// `min(declared_len, 64 KiB)` upfront, preventing single-header memory exhaustion.
+async fn read_exact_incremental<R: tokio::io::AsyncRead + Unpin>(
+    reader: &mut R,
+    declared_len: usize,
+) -> Result<Vec<u8>> {
+    use tokio::io::AsyncReadExt;
+
+    if declared_len == 0 {
+        return Ok(Vec::new());
+    }
+    let mut data = Vec::with_capacity(declared_len.min(BULK_INITIAL_ALLOC_CAP));
+    let mut chunk = vec![0u8; declared_len.min(BULK_READ_CHUNK_SIZE)];
+    while data.len() < declared_len {
+        let to_read = (declared_len - data.len()).min(chunk.len());
+        let n = reader
+            .read(&mut chunk[..to_read])
+            .await
+            .context("stream error while reading bulk payload")?;
+        if n == 0 {
+            return Err(anyhow!(
+                "bulk stream truncated: expected {declared_len} bytes, got {}",
+                data.len()
+            ));
+        }
+        data.extend_from_slice(&chunk[..n]);
+    }
+    debug_assert_eq!(data.len(), declared_len);
+    Ok(data)
+}
+
 /// Reads and validates a single unidirectional bulk stream (clipboard or file).
 pub async fn recv_bulk_stream(mut uni: RecvStream) -> Result<glide_proto::BulkTransfer> {
     use glide_proto::{
@@ -323,8 +357,7 @@ pub async fn recv_bulk_stream(mut uni: RecvStream) -> Result<glide_proto::BulkTr
                 .await
                 .context("failed reading clipboard header")?;
             let (format, sha256, len) = ClipboardPayload::decode_header(&hdr)?;
-            let mut data = vec![0u8; len];
-            uni.read_exact(&mut data)
+            let data = read_exact_incremental(&mut uni, len)
                 .await
                 .context("failed reading clipboard body")?;
             let actual_hash: [u8; 32] = Sha256::digest(&data).into();
@@ -341,8 +374,9 @@ pub async fn recv_bulk_stream(mut uni: RecvStream) -> Result<glide_proto::BulkTr
             let mut name_len_buf = [0u8; 2];
             uni.read_exact(&mut name_len_buf).await?;
             let name_len = u16::from_be_bytes(name_len_buf) as usize;
-            let mut name_raw = vec![0u8; name_len];
-            uni.read_exact(&mut name_raw).await?;
+            let name_raw = read_exact_incremental(&mut uni, name_len)
+                .await
+                .context("failed reading file transfer name")?;
             let filename = sanitize_filename(&String::from_utf8_lossy(&name_raw));
 
             let mut sha256 = [0u8; 32];
@@ -355,8 +389,9 @@ pub async fn recv_bulk_stream(mut uni: RecvStream) -> Result<glide_proto::BulkTr
                     "file exceeds maximum size ({len} > {MAX_FILE_BYTES})"
                 ));
             }
-            let mut data = vec![0u8; len];
-            uni.read_exact(&mut data).await?;
+            let data = read_exact_incremental(&mut uni, len)
+                .await
+                .context("failed reading file transfer body")?;
             let actual_hash: [u8; 32] = Sha256::digest(&data).into();
             if actual_hash != sha256 {
                 return Err(anyhow!("file payload SHA-256 verification failed"));
@@ -552,5 +587,27 @@ mod tests {
             .expect("re-binding same UDP addr after close() must succeed");
         assert_eq!(ep2.local_addr(), addr);
         ep2.close();
+    }
+
+    #[tokio::test]
+    async fn read_exact_incremental_reads_chunks_and_rejects_truncated_large_header() {
+        // Multi-chunk exact read (> 64 KiB)
+        let payload: Vec<u8> = (0..(150 * 1024)).map(|i| (i % 251) as u8).collect();
+        let mut cursor = std::io::Cursor::new(payload.clone());
+        let got = read_exact_incremental(&mut cursor, payload.len())
+            .await
+            .unwrap();
+        assert_eq!(got, payload);
+
+        // Zero-length read
+        let mut empty = std::io::Cursor::new(Vec::<u8>::new());
+        assert!(read_exact_incremental(&mut empty, 0).await.unwrap().is_empty());
+
+        // Malicious 256 MiB declared length with only 16 bytes on the wire fails fast without OOM
+        let mut tiny = std::io::Cursor::new(b"0123456789abcdef".as_slice());
+        let err = read_exact_incremental(&mut tiny, glide_proto::MAX_FILE_BYTES)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("truncated"));
     }
 }
