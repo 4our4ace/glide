@@ -176,6 +176,7 @@ pub struct Ui {
     pub saved_servers_expanded: bool,
     pub scanning: bool,
     pub show_advanced: bool,
+    pub show_nightly_warning: bool,
     pub update_state: UpdateCheckState,
 
     // Editable text fields + last committed snapshots
@@ -263,6 +264,7 @@ impl Ui {
             saved_servers_expanded: false,
             scanning: false,
             show_advanced: false,
+            show_nightly_warning: false,
             update_state: UpdateCheckState::Idle,
             port_edit: TextEdit::new(&port_str),
             server_edit: TextEdit::new(&server_str),
@@ -664,6 +666,7 @@ impl Ui {
 
     pub fn set_update_channel(&mut self, channel: UpdateChannel, tx: &mut Tx) {
         if self.config.update_channel == channel {
+            self.show_nightly_warning = false;
             return;
         }
         if matches!(
@@ -674,6 +677,36 @@ impl Ui {
         ) {
             return;
         }
+        if channel == UpdateChannel::Nightly && self.config.update_channel == UpdateChannel::Stable
+        {
+            self.show_nightly_warning = true;
+            return;
+        }
+        self.apply_update_channel_switch(channel, tx);
+    }
+
+    pub fn cancel_switch_to_nightly(&mut self) {
+        self.show_nightly_warning = false;
+    }
+
+    pub fn confirm_switch_to_nightly(&mut self, tx: &mut Tx) {
+        self.show_nightly_warning = false;
+        if self.config.update_channel == UpdateChannel::Nightly {
+            return;
+        }
+        if matches!(
+            self.update_state,
+            UpdateCheckState::Downloading { .. }
+                | UpdateCheckState::Installing { .. }
+                | UpdateCheckState::AwaitingSudoPassword { .. }
+        ) {
+            return;
+        }
+        self.apply_update_channel_switch(UpdateChannel::Nightly, tx);
+    }
+
+    fn apply_update_channel_switch(&mut self, channel: UpdateChannel, tx: &mut Tx) {
+        self.show_nightly_warning = false;
         self.config.update_channel = channel;
         self.push_config();
         self.update_state = UpdateCheckState::Idle;
@@ -692,39 +725,39 @@ impl Ui {
         }
         let channel = self.config.update_channel;
         self.update_state = UpdateCheckState::Checking;
-        let handle = self.handle.clone();
+        let _ = tx;
+        let Some(handle) = self.handle.clone() else {
+            return;
+        };
         let current = env!("CARGO_PKG_VERSION");
         self.rt.spawn(async move {
             let state =
                 tokio::task::spawn_blocking(move || updater::check_release(channel, current))
                     .await
                     .unwrap_or_else(|_| UpdateCheckState::Error("Update check failed".into()));
-            if let Some(h) = handle {
-                h.update(move |s, tx| {
-                    if s.config.update_channel != channel {
-                        return;
+            handle.update(move |s, tx| {
+                if s.config.update_channel != channel {
+                    return;
+                }
+                match &state {
+                    UpdateCheckState::UpToDate { latest } => {
+                        s.toast(format!("Glide {latest} is up to date"), tx);
                     }
-                    match &state {
-                        UpdateCheckState::UpToDate { latest } => {
-                            s.toast(format!("Glide {latest} is up to date"), tx);
+                    UpdateCheckState::Available(avail) => {
+                        if avail.is_channel_switch {
+                            s.toast(format!("Ready to switch to Glide {}", avail.version), tx);
+                        } else {
+                            s.toast(format!("Glide {} is available", avail.version), tx);
                         }
-                        UpdateCheckState::Available(avail) => {
-                            if avail.is_channel_switch {
-                                s.toast(format!("Ready to switch to Glide {}", avail.version), tx);
-                            } else {
-                                s.toast(format!("Glide {} is available", avail.version), tx);
-                            }
-                        }
-                        UpdateCheckState::Error(msg) => {
-                            s.toast(msg.clone(), tx);
-                        }
-                        _ => {}
                     }
-                    s.update_state = state;
-                });
-            }
+                    UpdateCheckState::Error(msg) => {
+                        s.toast(msg.clone(), tx);
+                    }
+                    _ => {}
+                }
+                s.update_state = state;
+            });
         });
-        let _ = tx;
     }
 
     pub fn install_update(&mut self, tx: &mut Tx) {
@@ -1385,6 +1418,7 @@ fn on_key(s: &mut Ui, ev: &KeyEvent, tx: &mut Tx) -> bool {
 }
 
 fn on_close(s: &mut Ui, tx: &mut Tx) {
+    s.show_nightly_warning = false;
     s.window_vis.set_visible(false);
     // If no system tray is available, closing the window quits Glide cleanly instead of
     // leaving an invisible background process. Read the atomic directly so an async tray
@@ -2135,6 +2169,15 @@ const SCENES: &[(&str, SceneFn)] = &[
             checksums_url: Some(format!("{}nightly/SHA256SUMS.txt", updater::ASSET_URL_PREFIX)),
         }));
     }),
+    ("settings-nightly-warn-light", |s| {
+        s.theme = ThemePref::Light;
+        s.tab = Tab::Settings;
+        s.is_windows = false;
+        s.os_label = "Linux";
+        s.show_advanced = false;
+        s.config.update_channel = UpdateChannel::Stable;
+        s.show_nightly_warning = true;
+    }),
 ];
 
 #[cfg(test)]
@@ -2442,6 +2485,7 @@ mod tests {
                 "settings-update-ready",
                 &["elevated-row", "update-channel-row", "updates-row"],
             ),
+            ("settings-nightly-warn-light", &["nightly-warning-modal"]),
             (
                 "clipboard-filled",
                 &[
@@ -2578,6 +2622,110 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[tokio::test]
+    async fn stable_to_nightly_switch_requires_warning_confirmation() {
+        struct CleanupDir(PathBuf);
+        impl Drop for CleanupDir {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+
+        let dir = std::env::temp_dir().join(format!(
+            "glide-ui-nightly-warn-test-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let _cleanup = CleanupDir(dir.clone());
+
+        let (quit_tx, _quit_rx) = tokio::sync::mpsc::unbounded_channel();
+        let ctrl = Arc::new(AppController::new(
+            dir.join("config.toml"),
+            "http://127.0.0.1:0".into(),
+            quit_tx,
+        ));
+        let vis = Arc::new(WindowVisibility::new(true));
+        let mut ui = Ui::new(ctrl, tokio::runtime::Handle::current(), vis);
+
+        assert_eq!(ui.config.update_channel, UpdateChannel::build_channel());
+        assert!(!ui.show_nightly_warning);
+        ui.config.update_channel = UpdateChannel::Stable;
+        ui.tab = Tab::Settings;
+        ui.theme = ThemePref::Light;
+
+        let text_sys = rune::text::TextSystem::new(FONTS, ("Inter", "JetBrains Mono"));
+        let mut rt = rune::Runtime::with_text(
+            ui,
+            view,
+            (GUI_WIDTH as f32, GUI_HEIGHT as f32),
+            rune::Env::new(false, 1.0),
+            text_sys,
+        );
+        rt.frame(0.0);
+        rt.settle_all();
+        rt.frame(0.0);
+
+        let click_key = |rt: &mut rune::Runtime<Ui>, key: &str| {
+            let (x, y) = rt
+                .find(key)
+                .unwrap_or_else(|| panic!("element `{key}` should exist"));
+            rt.pointer_down(x, y);
+            rt.pointer_up(x, y);
+            rt.frame(0.0);
+            rt.settle_all();
+            rt.frame(0.0);
+        };
+
+        assert!(rt.find("nightly-warning-modal").is_none());
+
+        // Clicking Nightly from Stable opens the confirmation modal without switching yet.
+        click_key(&mut rt, "Nightly");
+        assert!(rt.state.show_nightly_warning);
+        assert_eq!(rt.state.config.update_channel, UpdateChannel::Stable);
+
+        let modal = rt
+            .elements()
+            .into_iter()
+            .find(|e| e.key.as_deref() == Some("nightly-warning-modal"))
+            .expect("nightly-warning-modal should render inside 900x640");
+        assert!(
+            modal.rect[0] >= 0.0
+                && modal.rect[1] >= 0.0
+                && modal.rect[0] + modal.rect[2] <= GUI_WIDTH as f32 + 1.0
+                && modal.rect[1] + modal.rect[3] <= GUI_HEIGHT as f32 + 1.0
+                && modal.rect[2] >= 400.0
+                && modal.rect[3] >= 100.0,
+            "nightly-warning-modal bounds should fit cleanly within 900x640, got {:?}",
+            modal.rect
+        );
+        assert!(rt.find("nightly-warn-cancel").is_some());
+        assert!(rt.find("nightly-warn-confirm").is_some());
+
+        // Cancel dismisses the modal and stays on Stable.
+        click_key(&mut rt, "nightly-warn-cancel");
+        assert!(!rt.state.show_nightly_warning);
+        assert_eq!(rt.state.config.update_channel, UpdateChannel::Stable);
+        assert!(rt.find("nightly-warning-modal").is_none());
+
+        // Trigger Nightly again and confirm the switch.
+        click_key(&mut rt, "Nightly");
+        assert!(rt.state.show_nightly_warning);
+        assert_eq!(rt.state.config.update_channel, UpdateChannel::Stable);
+
+        click_key(&mut rt, "nightly-warn-confirm");
+        assert!(!rt.state.show_nightly_warning);
+        assert_eq!(rt.state.config.update_channel, UpdateChannel::Nightly);
+        assert!(rt.find("nightly-warning-modal").is_none());
+        assert!(matches!(rt.state.update_state, UpdateCheckState::Checking));
+
+        // Switching Nightly -> Stable happens immediately with no modal.
+        click_key(&mut rt, "Stable");
+        assert!(!rt.state.show_nightly_warning);
+        assert_eq!(rt.state.config.update_channel, UpdateChannel::Stable);
+        assert!(rt.find("nightly-warning-modal").is_none());
     }
 }
 
