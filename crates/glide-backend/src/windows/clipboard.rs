@@ -24,7 +24,7 @@ use tracing::{debug, trace, warn};
 use windows_sys::Win32::Foundation::{HANDLE, HWND, LPARAM, LRESULT, WPARAM};
 use windows_sys::Win32::System::DataExchange::{
     AddClipboardFormatListener, CloseClipboard, EmptyClipboard, GetClipboardData,
-    IsClipboardFormatAvailable, OpenClipboard, RegisterClipboardFormatW,
+    GetClipboardOwner, IsClipboardFormatAvailable, OpenClipboard, RegisterClipboardFormatW,
     RemoveClipboardFormatListener, SetClipboardData,
 };
 use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
@@ -125,12 +125,20 @@ fn read_raw_format(format: u32) -> Option<Vec<u8>> {
     Some(data)
 }
 
+enum RawClipboardRead {
+    UnicodeText(Vec<u16>),
+    Png(Vec<u8>),
+    Dib(Vec<u8>),
+}
+
 fn read_clipboard_payload(hwnd: HWND, png_format: u32) -> Option<(ClipboardFormat, Vec<u8>)> {
     if !open_clipboard_with_retry(hwnd) {
         return None;
     }
 
-    let result = if unsafe { IsClipboardFormatAvailable(CF_UNICODETEXT) } != 0 {
+    // Copy raw bytes while holding the OS clipboard lock, then release it immediately
+    // before running expensive UTF-16 normalization or DIB -> PNG compression.
+    let raw = if unsafe { IsClipboardFormatAvailable(CF_UNICODETEXT) } != 0 {
         let handle = unsafe { GetClipboardData(CF_UNICODETEXT) };
         if !handle.is_null() {
             let ptr = unsafe { GlobalLock(handle) } as *const u16;
@@ -139,16 +147,11 @@ fn read_clipboard_payload(hwnd: HWND, png_format: u32) -> Option<(ClipboardForma
                 let max_u16 = bytes / 2;
                 let slice = unsafe { std::slice::from_raw_parts(ptr, max_u16) };
                 let len = slice.iter().position(|&c| c == 0).unwrap_or(slice.len());
-                let text = String::from_utf16_lossy(&slice[..len]);
+                let wide = slice[..len].to_vec();
                 unsafe {
                     GlobalUnlock(handle);
                 }
-                let normalized = text.replace("\r\n", "\n");
-                if !normalized.is_empty() && normalized.len() <= MAX_CLIPBOARD_BYTES {
-                    Some((ClipboardFormat::TextUtf8, normalized.into_bytes()))
-                } else {
-                    None
-                }
+                Some(RawClipboardRead::UnicodeText(wide))
             } else {
                 None
             }
@@ -156,13 +159,39 @@ fn read_clipboard_payload(hwnd: HWND, png_format: u32) -> Option<(ClipboardForma
             None
         }
     } else if let Some(png_data) = read_raw_format(png_format) {
-        if png_data.len() <= MAX_CLIPBOARD_BYTES {
-            Some((ClipboardFormat::ImagePng, png_data))
-        } else {
-            None
+        Some(RawClipboardRead::Png(png_data))
+    } else {
+        read_raw_format(CF_DIBV5)
+            .or_else(|| read_raw_format(CF_DIB))
+            .map(RawClipboardRead::Dib)
+    };
+
+    unsafe {
+        CloseClipboard();
+    }
+
+    match raw? {
+        RawClipboardRead::UnicodeText(wide) => {
+            let text = String::from_utf16_lossy(&wide);
+            let normalized = if text.contains("\r\n") {
+                text.replace("\r\n", "\n")
+            } else {
+                text
+            };
+            if !normalized.is_empty() && normalized.len() <= MAX_CLIPBOARD_BYTES {
+                Some((ClipboardFormat::TextUtf8, normalized.into_bytes()))
+            } else {
+                None
+            }
         }
-    } else if let Some(dib_data) = read_raw_format(CF_DIBV5).or_else(|| read_raw_format(CF_DIB)) {
-        match dib_to_png(&dib_data) {
+        RawClipboardRead::Png(png_data) => {
+            if png_data.len() <= MAX_CLIPBOARD_BYTES {
+                Some((ClipboardFormat::ImagePng, png_data))
+            } else {
+                None
+            }
+        }
+        RawClipboardRead::Dib(dib_data) => match dib_to_png(&dib_data) {
             Ok(png_bytes) if png_bytes.len() <= MAX_CLIPBOARD_BYTES => {
                 debug!(
                     dib_len = dib_data.len(),
@@ -176,15 +205,8 @@ fn read_clipboard_payload(hwnd: HWND, png_format: u32) -> Option<(ClipboardForma
                 debug!(error = %e, "Could not convert CF_DIB to PNG");
                 None
             }
-        }
-    } else {
-        None
-    };
-
-    unsafe {
-        CloseClipboard();
+        },
     }
-    result
 }
 
 fn set_raw_clipboard_bytes(format: u32, bytes: &[u8]) {
@@ -204,7 +226,45 @@ fn set_raw_clipboard_bytes(format: u32, bytes: &[u8]) {
     }
 }
 
+enum PreparedWrite {
+    UnicodeText(Vec<u16>),
+    Image { dib: Option<Vec<u8>> },
+    None,
+}
+
 fn write_clipboard_payload(hwnd: HWND, png_format: u32, payload: &ClipboardPayload) {
+    // Perform UTF-16 encoding or PNG -> CF_DIB decoding BEFORE acquiring the global
+    // Windows clipboard lock so other apps are never blocked while we decode images.
+    let prepared = match payload.format {
+        ClipboardFormat::TextUtf8 => match std::str::from_utf8(&payload.data) {
+            Ok(s) => {
+                let mut wide = Vec::with_capacity(s.len() + 1);
+                let mut prev_cr = false;
+                for ch in s.chars() {
+                    if ch == '\n' && !prev_cr {
+                        wide.push(u16::from(b'\r'));
+                    }
+                    let mut enc = [0u16; 2];
+                    wide.extend_from_slice(ch.encode_utf16(&mut enc));
+                    prev_cr = ch == '\r';
+                }
+                wide.push(0);
+                PreparedWrite::UnicodeText(wide)
+            }
+            Err(_) => PreparedWrite::None,
+        },
+        ClipboardFormat::ImagePng => {
+            let dib = match png_to_dib(&payload.data) {
+                Ok(dib) => Some(dib),
+                Err(e) => {
+                    debug!(error = %e, "Could not synthesize CF_DIB companion for PNG");
+                    None
+                }
+            };
+            PreparedWrite::Image { dib }
+        }
+    };
+
     if !open_clipboard_with_retry(hwnd) {
         warn!("Failed to open Windows clipboard for writing");
         return;
@@ -214,26 +274,21 @@ fn write_clipboard_payload(hwnd: HWND, png_format: u32, payload: &ClipboardPaylo
         EmptyClipboard();
     }
 
-    match payload.format {
-        ClipboardFormat::TextUtf8 => {
-            if let Ok(s) = std::str::from_utf8(&payload.data) {
-                let crlf = s.replace("\r\n", "\n").replace('\n', "\r\n");
-                let mut wide: Vec<u16> = crlf.encode_utf16().collect();
-                wide.push(0);
-                let byte_slice = unsafe {
-                    std::slice::from_raw_parts(wide.as_ptr() as *const u8, wide.len() * 2)
-                };
-                set_raw_clipboard_bytes(CF_UNICODETEXT, byte_slice);
-            }
+    match prepared {
+        PreparedWrite::UnicodeText(wide) => {
+            let byte_slice = unsafe {
+                std::slice::from_raw_parts(wide.as_ptr() as *const u8, wide.len() * 2)
+            };
+            set_raw_clipboard_bytes(CF_UNICODETEXT, byte_slice);
         }
-        ClipboardFormat::ImagePng => {
+        PreparedWrite::Image { dib } => {
             // Write BOTH modern "PNG" AND legacy CF_DIB so every Windows app can paste!
             set_raw_clipboard_bytes(png_format, &payload.data);
-            match png_to_dib(&payload.data) {
-                Ok(dib) => set_raw_clipboard_bytes(CF_DIB, &dib),
-                Err(e) => debug!(error = %e, "Could not synthesize CF_DIB companion for PNG"),
+            if let Some(dib) = dib {
+                set_raw_clipboard_bytes(CF_DIB, &dib);
             }
         }
+        PreparedWrite::None => {}
     }
 
     unsafe {
@@ -249,6 +304,11 @@ unsafe extern "system" fn clip_wnd_proc(
 ) -> LRESULT {
     match msg {
         WM_CLIPBOARDUPDATE => {
+            // Skip reading/encoding/hashing our own clipboard writes.
+            if unsafe { GetClipboardOwner() } == hwnd {
+                trace!("Ignoring Windows clipboard update owned by Glide");
+                return 0;
+            }
             with_clip_state(|state| {
                 if let Some((format, data)) = read_clipboard_payload(hwnd, state.png_format) {
                     let hash = sha256_bytes(&data);

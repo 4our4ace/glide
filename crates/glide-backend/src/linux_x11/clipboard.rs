@@ -38,18 +38,24 @@ struct Atoms {
 
 impl Atoms {
     fn intern(conn: &RustConnection) -> Result<Self> {
-        let intern =
-            |name: &[u8]| -> Result<Atom> { Ok(conn.intern_atom(false, name)?.reply()?.atom) };
+        let clipboard = conn.intern_atom(false, b"CLIPBOARD")?;
+        let targets = conn.intern_atom(false, b"TARGETS")?;
+        let utf8_string = conn.intern_atom(false, b"UTF8_STRING")?;
+        let text_plain_utf8 = conn.intern_atom(false, b"text/plain;charset=utf-8")?;
+        let image_png = conn.intern_atom(false, b"image/png")?;
+        let incr = conn.intern_atom(false, b"INCR")?;
+        let prop = conn.intern_atom(false, b"GLIDE_CLIP_DATA")?;
+        let wake = conn.intern_atom(false, b"GLIDE_CLIP_WAKE")?;
         Ok(Self {
-            clipboard: intern(b"CLIPBOARD")?,
-            targets: intern(b"TARGETS")?,
-            utf8_string: intern(b"UTF8_STRING")?,
-            text_plain_utf8: intern(b"text/plain;charset=utf-8")?,
+            clipboard: clipboard.reply()?.atom,
+            targets: targets.reply()?.atom,
+            utf8_string: utf8_string.reply()?.atom,
+            text_plain_utf8: text_plain_utf8.reply()?.atom,
             string: AtomEnum::STRING.into(),
-            image_png: intern(b"image/png")?,
-            incr: intern(b"INCR")?,
-            prop: intern(b"GLIDE_CLIP_DATA")?,
-            wake: intern(b"GLIDE_CLIP_WAKE")?,
+            image_png: image_png.reply()?.atom,
+            incr: incr.reply()?.atom,
+            prop: prop.reply()?.atom,
+            wake: wake.reply()?.atom,
         })
     }
 }
@@ -251,15 +257,26 @@ fn run_clipboard_loop(
 
                 match state {
                     ReadState::AwaitingTargets => {
-                        let offered: Vec<Atom> = prop
-                            .value32()
-                            .map(|iter| iter.collect())
-                            .unwrap_or_default();
-                        let chosen = if offered.contains(&atoms.utf8_string) {
+                        let mut has_utf8 = false;
+                        let mut has_plain_utf8 = false;
+                        let mut has_png = false;
+                        if let Some(iter) = prop.value32() {
+                            for atom in iter {
+                                if atom == atoms.utf8_string {
+                                    has_utf8 = true;
+                                    break;
+                                } else if atom == atoms.text_plain_utf8 {
+                                    has_plain_utf8 = true;
+                                } else if atom == atoms.image_png {
+                                    has_png = true;
+                                }
+                            }
+                        }
+                        let chosen = if has_utf8 {
                             Some((atoms.utf8_string, ClipboardFormat::TextUtf8))
-                        } else if offered.contains(&atoms.text_plain_utf8) {
+                        } else if has_plain_utf8 {
                             Some((atoms.text_plain_utf8, ClipboardFormat::TextUtf8))
-                        } else if offered.contains(&atoms.image_png) {
+                        } else if has_png {
                             Some((atoms.image_png, ClipboardFormat::ImagePng))
                         } else {
                             None
@@ -340,14 +357,16 @@ fn run_clipboard_loop(
 
                 if let Some(payload) = owned {
                     if req.target == atoms.targets {
-                        let targets: Vec<Atom> = match payload.format {
-                            ClipboardFormat::TextUtf8 => vec![
-                                atoms.targets,
-                                atoms.utf8_string,
-                                atoms.text_plain_utf8,
-                                atoms.string,
-                            ],
-                            ClipboardFormat::ImagePng => vec![atoms.targets, atoms.image_png],
+                        let text_targets = [
+                            atoms.targets,
+                            atoms.utf8_string,
+                            atoms.text_plain_utf8,
+                            atoms.string,
+                        ];
+                        let png_targets = [atoms.targets, atoms.image_png];
+                        let targets: &[Atom] = match payload.format {
+                            ClipboardFormat::TextUtf8 => &text_targets,
+                            ClipboardFormat::ImagePng => &png_targets,
                         };
                         if conn
                             .change_property32(
@@ -355,7 +374,7 @@ fn run_clipboard_loop(
                                 req.requestor,
                                 property,
                                 AtomEnum::ATOM,
-                                &targets,
+                                targets,
                             )
                             .is_ok()
                         {
