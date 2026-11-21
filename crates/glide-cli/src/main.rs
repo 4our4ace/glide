@@ -841,7 +841,7 @@ async fn run_command(command: Command, config: Option<PathBuf>) -> Result<()> {
                         );
                     }
                     let mut last_printed = 0u8;
-                    let exe = glide_gui::updater::download_and_install_update(
+                    let outcome = glide_gui::updater::download_and_install_update(
                         &avail,
                         current_ver,
                         true,
@@ -854,11 +854,28 @@ async fn run_command(command: Command, config: Option<PathBuf>) -> Result<()> {
                         || println!("SHA-256 verified. Installing {}…", avail.version),
                     )
                     .map_err(|e| anyhow::anyhow!("{e}"))?;
-                    println!(
-                        "Successfully updated Glide to {} ({}).",
-                        avail.version,
-                        exe.display()
-                    );
+                    match outcome {
+                        glide_gui::updater::UpdateInstallOutcome::InstalledRelaunch(exe) => {
+                            println!(
+                                "Successfully updated Glide to {} ({}).",
+                                avail.version,
+                                exe.display()
+                            );
+                        }
+                        glide_gui::updater::UpdateInstallOutcome::ExternalInstallerLaunched => {
+                            println!(
+                                "Launched installer for Glide {}; follow the installer to finish.",
+                                avail.version
+                            );
+                        }
+                        glide_gui::updater::UpdateInstallOutcome::NeedsSudoPassword {
+                            stage_dir,
+                            ..
+                        } => {
+                            glide_gui::updater::cleanup_staged_dir(&stage_dir);
+                            anyhow::bail!("Interactive sudo prompt unavailable; run `sudo dpkg -i` manually.");
+                        }
+                    }
                 }
                 glide_gui::updater::UpdateCheckState::Error(msg) => {
                     anyhow::bail!("{msg}");

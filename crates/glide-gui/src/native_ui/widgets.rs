@@ -461,6 +461,54 @@ pub fn text_field(
     box_el
 }
 
+/// Single-line masked password input (uses Rune's `.secure()` so text is masked and omitted
+/// from the OS accessibility tree).
+pub fn password_field(
+    p: Palette,
+    key: &'static str,
+    edit: &TextEdit,
+    placeholder: &'static str,
+    access: impl for<'a> Fn(&'a mut Ui) -> &'a mut TextEdit + 'static,
+    on_submit: Option<fn(&mut Ui, &mut Tx)>,
+) -> El {
+    let mut input = text_input(edit, ty::BODY)
+        .key("input")
+        .label_static(placeholder)
+        .single_line()
+        .secure()
+        .grow(1.0)
+        .shrink()
+        .min_w(0.0)
+        .color(p.text)
+        .placeholder(placeholder, p.faint)
+        .caret(p.accent, p.accent.alpha(0.22))
+        .on_edit(access);
+    if let Some(sub) = on_submit {
+        input = input.on_submit(sub);
+    }
+
+    let inner = row()
+        .key("clip")
+        .grow(1.0)
+        .shrink()
+        .min_w(0.0)
+        .center_y()
+        .clip_rounded(0.0)
+        .child(input);
+
+    row()
+        .key(key)
+        .w_full()
+        .h(32.0)
+        .px(10.0)
+        .center_y()
+        .radius(6.0)
+        .fill(p.surface)
+        .border(1.0, if edit.focused { p.accent } else { p.line_2 })
+        .cursor(Cursor::Text)
+        .child(inner)
+}
+
 /// Centered empty state inside a list card.
 pub fn empty_box(
     p: Palette,

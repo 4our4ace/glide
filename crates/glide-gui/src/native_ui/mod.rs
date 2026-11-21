@@ -184,6 +184,8 @@ pub struct Ui {
     pub receive_dir_edit: TextEdit,
     pub remap_from: TextEdit,
     pub remap_to: TextEdit,
+    pub sudo_password: TextEdit,
+    pub sudo_submitting: bool,
     last_committed_port: String,
     last_committed_server: String,
     last_committed_max_file_mb: String,
@@ -266,6 +268,8 @@ impl Ui {
             receive_dir_edit: TextEdit::new(&receive_dir_str),
             remap_from: TextEdit::default(),
             remap_to: TextEdit::default(),
+            sudo_password: TextEdit::default(),
+            sudo_submitting: false,
             last_committed_port: port_str,
             last_committed_server: server_str,
             last_committed_max_file_mb: max_file_mb_str,
@@ -659,7 +663,9 @@ impl Ui {
         }
         if matches!(
             self.update_state,
-            UpdateCheckState::Downloading { .. } | UpdateCheckState::Installing { .. }
+            UpdateCheckState::Downloading { .. }
+                | UpdateCheckState::Installing { .. }
+                | UpdateCheckState::AwaitingSudoPassword { .. }
         ) {
             return;
         }
@@ -675,6 +681,7 @@ impl Ui {
             UpdateCheckState::Checking
                 | UpdateCheckState::Downloading { .. }
                 | UpdateCheckState::Installing { .. }
+                | UpdateCheckState::AwaitingSudoPassword { .. }
         ) {
             return;
         }
@@ -782,12 +789,42 @@ impl Ui {
             .unwrap_or_else(|_| Err("Update task panicked".into()));
 
             match res {
-                Ok(relaunch_exe) => {
+                Ok(updater::UpdateInstallOutcome::InstalledRelaunch(relaunch_exe)) => {
                     *ctrl.relaunch_after_exit.lock() = Some(relaunch_exe);
                     if let Some(h) = handle {
                         h.update(move |s, tx| {
                             s.quit_app(tx);
                         });
+                    }
+                }
+                Ok(updater::UpdateInstallOutcome::ExternalInstallerLaunched) => {
+                    if let Some(h) = handle {
+                        h.update(move |s, tx| {
+                            s.quit_app(tx);
+                        });
+                    }
+                }
+                Ok(updater::UpdateInstallOutcome::NeedsSudoPassword {
+                    deb_path,
+                    stage_dir,
+                    username,
+                }) => {
+                    if let Some(h) = handle {
+                        let ver = version.clone();
+                        h.update(move |s, _| {
+                            updater::zeroize_string(&mut s.sudo_password.text);
+                            s.sudo_password.clear();
+                            s.sudo_submitting = false;
+                            s.update_state = UpdateCheckState::AwaitingSudoPassword {
+                                version: ver,
+                                deb_path,
+                                stage_dir,
+                                username,
+                                error: None,
+                            };
+                        });
+                    } else {
+                        updater::cleanup_staged_dir(&stage_dir);
                     }
                 }
                 Err(msg) => {
@@ -800,6 +837,119 @@ impl Ui {
                 }
             }
         });
+    }
+
+    pub fn submit_sudo_update(&mut self, tx: &mut Tx) {
+        if self.sudo_submitting {
+            return;
+        }
+        let (version, deb_path, stage_dir, username) = match &self.update_state {
+            UpdateCheckState::AwaitingSudoPassword {
+                version,
+                deb_path,
+                stage_dir,
+                username,
+                ..
+            } => (
+                version.clone(),
+                deb_path.clone(),
+                stage_dir.clone(),
+                username.clone(),
+            ),
+            _ => return,
+        };
+
+        let mut password = std::mem::take(&mut self.sudo_password.text);
+        self.sudo_password.clear();
+        if password.is_empty() {
+            self.update_state = UpdateCheckState::AwaitingSudoPassword {
+                version,
+                deb_path,
+                stage_dir,
+                username,
+                error: Some("Please enter your sudo password.".into()),
+            };
+            return;
+        }
+
+        self.sudo_submitting = true;
+        self.update_state = UpdateCheckState::AwaitingSudoPassword {
+            version: version.clone(),
+            deb_path: deb_path.clone(),
+            stage_dir: stage_dir.clone(),
+            username: username.clone(),
+            error: None,
+        };
+        self.toast(format!("Installing Glide {version}…"), tx);
+
+        let handle = self.handle.clone();
+        let ctrl = Arc::clone(&self.ctrl);
+        self.rt.spawn(async move {
+            let dp = deb_path.clone();
+            let sd = stage_dir.clone();
+            let res = tokio::task::spawn_blocking(move || {
+                updater::install_staged_deb_with_sudo(&dp, &sd, &mut password)
+            })
+            .await
+            .unwrap_or_else(|_| {
+                updater::cleanup_staged_dir(&stage_dir);
+                Err(updater::SudoInstallError::Fatal(
+                    "Sudo update task panicked".into(),
+                ))
+            });
+
+            match res {
+                Ok(relaunch_exe) => {
+                    *ctrl.relaunch_after_exit.lock() = Some(relaunch_exe);
+                    if let Some(h) = handle {
+                        h.update(move |s, tx| {
+                            s.sudo_submitting = false;
+                            s.update_state = UpdateCheckState::Installing { version };
+                            s.quit_app(tx);
+                        });
+                    }
+                }
+                Err(updater::SudoInstallError::WrongPassword(msg)) => {
+                    if let Some(h) = handle {
+                        h.update(move |s, _| {
+                            s.sudo_submitting = false;
+                            s.update_state = UpdateCheckState::AwaitingSudoPassword {
+                                version,
+                                deb_path,
+                                stage_dir,
+                                username,
+                                error: Some(msg),
+                            };
+                        });
+                    } else {
+                        updater::cleanup_staged_dir(&stage_dir);
+                    }
+                }
+                Err(updater::SudoInstallError::Fatal(msg)) => {
+                    if let Some(h) = handle {
+                        h.update(move |s, tx| {
+                            s.sudo_submitting = false;
+                            s.toast(msg.clone(), tx);
+                            s.update_state = UpdateCheckState::Error(msg);
+                        });
+                    }
+                }
+            }
+        });
+    }
+
+    pub fn cancel_sudo_update(&mut self, tx: &mut Tx) {
+        if self.sudo_submitting {
+            return;
+        }
+        updater::zeroize_string(&mut self.sudo_password.text);
+        self.sudo_password.clear();
+        if let UpdateCheckState::AwaitingSudoPassword { stage_dir, .. } =
+            std::mem::replace(&mut self.update_state, UpdateCheckState::Idle)
+        {
+            updater::cleanup_staged_dir(&stage_dir);
+            self.toast("Update cancelled", tx);
+        }
     }
 
     pub fn open_update_download(&mut self, tx: &mut Tx) {
@@ -1180,6 +1330,11 @@ impl Ui {
     }
 
     pub fn quit_app(&mut self, tx: &mut Tx) {
+        updater::zeroize_string(&mut self.sudo_password.text);
+        self.sudo_password.clear();
+        if let UpdateCheckState::AwaitingSudoPassword { stage_dir, .. } = &self.update_state {
+            updater::cleanup_staged_dir(stage_dir);
+        }
         let _ = self.ctrl.quit_tx.send(());
         tx.quit();
     }

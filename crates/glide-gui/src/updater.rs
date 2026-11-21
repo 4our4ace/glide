@@ -89,6 +89,30 @@ impl AvailableUpdate {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum UpdateInstallOutcome {
+    /// Update was installed in place; relaunch this executable cleanly after shutdown.
+    InstalledRelaunch(PathBuf),
+    /// An external OS installer (e.g. Windows `msiexec`) was launched out-of-process;
+    /// quit Glide cleanly so the installer can finish without relaunching directly.
+    ExternalInstallerLaunched,
+    /// Linux `.deb` was downloaded and SHA-256 verified inside a private `0700` staging
+    /// directory and is waiting for the current user's `sudo` password in the GUI modal.
+    NeedsSudoPassword {
+        deb_path: PathBuf,
+        stage_dir: PathBuf,
+        username: String,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SudoInstallError {
+    /// `sudo` rejected the password; the verified `.deb` remains staged for immediate retry.
+    WrongPassword(String),
+    /// Non-password error (`not in sudoers`, `dpkg` error, etc.); staging directory cleaned up.
+    Fatal(String),
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub enum UpdateCheckState {
     #[default]
@@ -104,6 +128,13 @@ pub enum UpdateCheckState {
     },
     Installing {
         version: String,
+    },
+    AwaitingSudoPassword {
+        version: String,
+        deb_path: PathBuf,
+        stage_dir: PathBuf,
+        username: String,
+        error: Option<String>,
     },
     Error(String),
 }
@@ -600,18 +631,18 @@ fn command_exists(name: &str) -> bool {
         .unwrap_or(false)
 }
 
-/// Downloads, SHA-256 verifies, and atomically installs `update`, returning the executable path to
-/// relaunch once the current process has released its ports and tray icon.
+/// Downloads, SHA-256 verifies, and installs `update` (or stages a verified `.deb` awaiting the
+/// current user's `sudo` password in GUI mode).
 ///
 /// `on_progress` receives download percentage (`0..=100`). `on_installing` fires right after the
 /// checksum passes and before the OS install/swap runs.
 pub fn download_and_install_update<Fp, Fi>(
     update: &AvailableUpdate,
     current_version: &str,
-    allow_sudo_fallback: bool,
+    allow_interactive_sudo: bool,
     mut on_progress: Fp,
     mut on_installing: Fi,
-) -> Result<PathBuf, String>
+) -> Result<UpdateInstallOutcome, String>
 where
     Fp: FnMut(u8),
     Fi: FnMut(),
@@ -634,7 +665,7 @@ where
 
     #[cfg(target_os = "windows")]
     {
-        let _ = allow_sudo_fallback;
+        let _ = allow_interactive_sudo;
         let asset = update
             .binary_asset
             .as_ref()
@@ -676,12 +707,13 @@ where
             exe = %current_exe.display(),
             "Installed verified Glide update on Windows"
         );
-        Ok(current_exe)
+        Ok(UpdateInstallOutcome::InstalledRelaunch(current_exe))
     }
 
     #[cfg(target_os = "linux")]
     {
         use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
+        use std::process::Stdio;
 
         let parent = current_exe
             .parent()
@@ -719,11 +751,13 @@ where
                 exe = %current_exe.display(),
                 "Installed verified Glide standalone update on Linux"
             );
-            return Ok(current_exe);
+            return Ok(UpdateInstallOutcome::InstalledRelaunch(current_exe));
         }
 
         // System-wide install (e.g. /usr/bin/glide from .deb): download + verify the .deb into a
-        // private 0700 temp directory and install via pkexec (GUI polkit) or sudo (CLI).
+        // private 0700 temp directory and install via `sudo` (authenticating as the current user,
+        // NOT root via Polkit/pkexec which fails on Debian and corporate laptops without a root
+        // password or local polkit admin group membership).
         let deb_asset = update.deb_asset.as_ref().ok_or_else(|| {
             format!(
                 "{} is root-owned and release has no .deb package for automatic install",
@@ -753,32 +787,102 @@ where
             return Err(e);
         }
 
-        on_installing();
-        let elevator = if !allow_sudo_fallback && command_exists("pkexec") {
-            Some("pkexec")
-        } else if allow_sudo_fallback && command_exists("sudo") {
-            Some("sudo")
-        } else if command_exists("pkexec") {
-            Some("pkexec")
-        } else {
-            None
-        };
+        if command_exists("sudo") {
+            // 1. If passwordless or cached `sudo` is already active, install silently right away.
+            let cached_ok = std::process::Command::new("sudo")
+                .arg("-n")
+                .arg("true")
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status()
+                .is_ok_and(|s| s.success());
 
-        let Some(elevator) = elevator else {
+            if cached_ok {
+                on_installing();
+                let status = std::process::Command::new("sudo")
+                    .arg("-n")
+                    .arg("--")
+                    .arg("dpkg")
+                    .arg("-i")
+                    .arg(&deb_path)
+                    .stdin(Stdio::null())
+                    .status()
+                    .map_err(|e| {
+                        let _ = fs::remove_dir_all(&stage_dir);
+                        format!("Failed launching sudo dpkg -i: {e}")
+                    })?;
+                let _ = fs::remove_dir_all(&stage_dir);
+                if !status.success() {
+                    return Err(format!(
+                        "Package install failed (exit {})",
+                        status.code().unwrap_or(-1)
+                    ));
+                }
+                let relaunch = linux_deb_relaunch_path(&current_exe);
+                info!(
+                    version = %update.version,
+                    exe = %relaunch.display(),
+                    "Installed verified Glide .deb update via cached sudo"
+                );
+                return Ok(UpdateInstallOutcome::InstalledRelaunch(relaunch));
+            }
+
+            // 2. CLI mode (attached terminal): prompt directly via interactive `sudo`.
+            if allow_interactive_sudo {
+                on_installing();
+                let status = std::process::Command::new("sudo")
+                    .arg("--")
+                    .arg("dpkg")
+                    .arg("-i")
+                    .arg(&deb_path)
+                    .status()
+                    .map_err(|e| {
+                        let _ = fs::remove_dir_all(&stage_dir);
+                        format!("Failed launching sudo dpkg -i: {e}")
+                    })?;
+                let _ = fs::remove_dir_all(&stage_dir);
+                if !status.success() {
+                    return Err(format!(
+                        "Package install cancelled or failed (exit {})",
+                        status.code().unwrap_or(-1)
+                    ));
+                }
+                let relaunch = linux_deb_relaunch_path(&current_exe);
+                info!(
+                    version = %update.version,
+                    exe = %relaunch.display(),
+                    "Installed verified Glide .deb update via interactive sudo"
+                );
+                return Ok(UpdateInstallOutcome::InstalledRelaunch(relaunch));
+            }
+
+            // 3. GUI mode: prompt for the current user's `sudo` password inside Glide's secure modal.
+            return Ok(UpdateInstallOutcome::NeedsSudoPassword {
+                deb_path,
+                stage_dir,
+                username: current_unix_username(),
+            });
+        }
+
+        // Only fall back to pkexec when `sudo` is not installed on the system at all.
+        if !command_exists("pkexec") {
             let _ = fs::remove_dir_all(&stage_dir);
             return Err(
-                "Administrator elevation (pkexec) unavailable; download the .deb manually".into(),
+                "Neither sudo nor pkexec is available; download and install the .deb manually"
+                    .into(),
             );
-        };
+        }
 
-        let status = std::process::Command::new(elevator)
+        on_installing();
+        let status = std::process::Command::new("pkexec")
             .arg("dpkg")
             .arg("-i")
             .arg(&deb_path)
             .status()
             .map_err(|e| {
                 let _ = fs::remove_dir_all(&stage_dir);
-                format!("Failed launching {elevator} dpkg -i: {e}")
+                format!("Failed launching pkexec dpkg -i: {e}")
             })?;
 
         let _ = fs::remove_dir_all(&stage_dir);
@@ -789,17 +893,13 @@ where
             ));
         }
 
-        let relaunch = if Path::new("/usr/bin/glide").exists() {
-            PathBuf::from("/usr/bin/glide")
-        } else {
-            current_exe
-        };
+        let relaunch = linux_deb_relaunch_path(&current_exe);
         info!(
             version = %update.version,
             exe = %relaunch.display(),
             "Installed verified Glide .deb update on Linux"
         );
-        Ok(relaunch)
+        Ok(UpdateInstallOutcome::InstalledRelaunch(relaunch))
     }
 
     #[cfg(not(any(target_os = "windows", target_os = "linux")))]
@@ -808,11 +908,191 @@ where
             checksums_url,
             current_exe,
             agent,
-            allow_sudo_fallback,
+            allow_interactive_sudo,
             &mut on_progress,
             &mut on_installing,
         );
         Err("Self-update is only supported on Windows and Linux".into())
+    }
+}
+
+/// Overwrites a secret string's buffer with zeroes and clears its length.
+pub fn zeroize_string(secret: &mut String) {
+    // SAFETY: Writing zero bytes over the UTF-8 buffer and then calling `clear()` leaves `secret`
+    // as a valid empty UTF-8 string while preventing the password from lingering in heap memory.
+    unsafe {
+        let bytes = secret.as_bytes_mut();
+        for b in bytes.iter_mut() {
+            std::ptr::write_volatile(b, 0);
+        }
+    }
+    std::sync::atomic::compiler_fence(std::sync::atomic::Ordering::SeqCst);
+    secret.clear();
+}
+
+/// Safely removes a Glide update staging directory created under the system temp directory.
+pub fn cleanup_staged_dir(stage_dir: &Path) {
+    let temp = std::env::temp_dir();
+    let is_glide_stage = stage_dir.parent() == Some(temp.as_path())
+        && stage_dir
+            .file_name()
+            .and_then(|n| n.to_str())
+            .is_some_and(|name| name.starts_with("glide-update-"));
+    if is_glide_stage {
+        let _ = fs::remove_dir_all(stage_dir);
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn linux_deb_relaunch_path(fallback: &Path) -> PathBuf {
+    if Path::new("/usr/bin/glide").exists() {
+        PathBuf::from("/usr/bin/glide")
+    } else {
+        fallback.to_path_buf()
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn current_unix_username() -> String {
+    if let Ok(user) = std::env::var("USER") {
+        let trimmed = user.trim();
+        if !trimmed.is_empty() {
+            return trimmed.to_owned();
+        }
+    }
+    if let Ok(out) = std::process::Command::new("id").arg("-un").output() {
+        if out.status.success() {
+            let name = String::from_utf8_lossy(&out.stdout).trim().to_owned();
+            if !name.is_empty() {
+                return name;
+            }
+        }
+    }
+    "your user".to_owned()
+}
+
+#[cfg_attr(not(any(target_os = "linux", test)), allow(dead_code))]
+fn classify_sudo_failure(stderr: &str, exit_code: i32) -> SudoInstallError {
+    let lower = stderr.to_ascii_lowercase();
+    if lower.contains("incorrect password")
+        || lower.contains("sorry, try again")
+        || lower.contains("authentication failure")
+        || lower.contains("no password was provided")
+    {
+        return SudoInstallError::WrongPassword(
+            "Incorrect password — please try again.".to_owned(),
+        );
+    }
+    if lower.contains("not in the sudoers") || lower.contains("may not run sudo") {
+        return SudoInstallError::Fatal(
+            "Your user does not have sudo permission to install packages.".to_owned(),
+        );
+    }
+    let detail = stderr
+        .lines()
+        .map(str::trim)
+        .find(|line| !line.is_empty())
+        .unwrap_or("");
+    if detail.is_empty() {
+        SudoInstallError::Fatal(format!("Package install failed (exit {exit_code})"))
+    } else {
+        let truncated: String = detail.chars().take(180).collect();
+        SudoInstallError::Fatal(format!("Package install failed: {truncated}"))
+    }
+}
+
+/// Installs an already downloaded & SHA-256 verified `.deb` package using the current user's
+/// `sudo` password (piped once via `sudo -S -k -p ""`, never passed on argv/env or saved to disk).
+///
+/// Always wipes `password` in memory before returning. On `SudoInstallError::WrongPassword`,
+/// keeps `stage_dir` intact so the user can retry without re-downloading.
+pub fn install_staged_deb_with_sudo(
+    deb_path: &Path,
+    stage_dir: &Path,
+    password: &mut String,
+) -> Result<PathBuf, SudoInstallError> {
+    #[cfg(target_os = "linux")]
+    {
+        use std::process::Stdio;
+
+        if !deb_path.is_file() || deb_path.parent() != Some(stage_dir) {
+            zeroize_string(password);
+            cleanup_staged_dir(stage_dir);
+            return Err(SudoInstallError::Fatal(
+                "Staged .deb update file is missing; please retry the update.".into(),
+            ));
+        }
+
+        let mut child = match std::process::Command::new("sudo")
+            .arg("-S")
+            .arg("-k")
+            .arg("-p")
+            .arg("")
+            .arg("--")
+            .arg("dpkg")
+            .arg("-i")
+            .arg(deb_path)
+            .env("LC_ALL", "C")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+        {
+            Ok(c) => c,
+            Err(e) => {
+                zeroize_string(password);
+                cleanup_staged_dir(stage_dir);
+                return Err(SudoInstallError::Fatal(format!(
+                    "Failed launching sudo dpkg -i: {e}"
+                )));
+            }
+        };
+
+        if let Some(mut stdin) = child.stdin.take() {
+            let _ = stdin.write_all(password.as_bytes());
+            let _ = stdin.write_all(b"\n");
+            let _ = stdin.flush();
+            // Explicitly drop stdin so sudo sees immediate EOF if authentication fails.
+            drop(stdin);
+        }
+        zeroize_string(password);
+
+        let output = match child.wait_with_output() {
+            Ok(out) => out,
+            Err(e) => {
+                cleanup_staged_dir(stage_dir);
+                return Err(SudoInstallError::Fatal(format!(
+                    "Failed waiting for sudo dpkg -i: {e}"
+                )));
+            }
+        };
+
+        if output.status.success() {
+            cleanup_staged_dir(stage_dir);
+            let current_exe = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("/usr/bin/glide"));
+            let relaunch = linux_deb_relaunch_path(&current_exe);
+            info!(
+                exe = %relaunch.display(),
+                "Installed verified Glide .deb update via user sudo"
+            );
+            return Ok(relaunch);
+        }
+
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let err = classify_sudo_failure(&stderr, output.status.code().unwrap_or(-1));
+        if matches!(err, SudoInstallError::Fatal(_)) {
+            cleanup_staged_dir(stage_dir);
+        }
+        Err(err)
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = (deb_path, stage_dir);
+        zeroize_string(password);
+        Err(SudoInstallError::Fatal(
+            "sudo .deb installation is only supported on Linux".into(),
+        ))
     }
 }
 
@@ -1179,5 +1459,48 @@ mod tests {
             strip_windows_verbatim_prefix(Path::new("/usr/bin/glide")),
             PathBuf::from("/usr/bin/glide")
         );
+    }
+
+    #[test]
+    fn classifies_sudo_errors_for_retry_vs_fatal() {
+        assert!(matches!(
+            classify_sudo_failure("Sorry, try again.\nsudo: 1 incorrect password attempt\n", 1),
+            SudoInstallError::WrongPassword(_)
+        ));
+        assert!(matches!(
+            classify_sudo_failure("sudo: no password was provided\n", 1),
+            SudoInstallError::WrongPassword(_)
+        ));
+        assert!(matches!(
+            classify_sudo_failure("alice is not in the sudoers file.\n", 1),
+            SudoInstallError::Fatal(msg) if msg.contains("sudo permission")
+        ));
+        assert!(matches!(
+            classify_sudo_failure("dpkg: error processing archive glide.deb\n", 2),
+            SudoInstallError::Fatal(msg) if msg.contains("dpkg: error")
+        ));
+    }
+
+    #[test]
+    fn zeroize_string_clears_buffer_and_length() {
+        let mut s = String::from("super-secret-password");
+        zeroize_string(&mut s);
+        assert!(s.is_empty());
+    }
+
+    #[test]
+    fn cleanup_staged_dir_only_removes_glide_temp_dirs() {
+        let temp = std::env::temp_dir();
+        let ok_dir = temp.join(format!("glide-update-test-{}", std::process::id()));
+        let other_dir = temp.join(format!("not-glide-test-{}", std::process::id()));
+        let _ = fs::create_dir_all(&ok_dir);
+        let _ = fs::create_dir_all(&other_dir);
+
+        cleanup_staged_dir(&ok_dir);
+        cleanup_staged_dir(&other_dir);
+
+        assert!(!ok_dir.exists());
+        assert!(other_dir.exists());
+        let _ = fs::remove_dir_all(&other_dir);
     }
 }

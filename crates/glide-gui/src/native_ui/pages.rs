@@ -3,8 +3,8 @@
 use super::icons;
 use super::theme::{ty, Palette, ThemePref};
 use super::widgets::{
-    badge, button, card, card_rows, empty_box, kbd, section_head, segmented, setting_row,
-    slider_row, text_field, toggle, xs_button, BtnKind,
+    badge, button, card, card_rows, empty_box, kbd, password_field, section_head, segmented,
+    setting_row, slider_row, text_field, toggle, xs_button, BtnKind,
 };
 use super::{DeskDrag, DragKind, Role, Tab, Ui};
 use crate::updater::UpdateCheckState;
@@ -52,6 +52,22 @@ pub fn root_view(s: &Ui, p: Palette) -> El {
         .child(sidebar(s, p))
         .child(main_col);
 
+    if let UpdateCheckState::AwaitingSudoPassword {
+        version,
+        username,
+        error,
+        ..
+    } = &s.update_state
+    {
+        root = root.child(sudo_password_modal(
+            s,
+            p,
+            version,
+            username,
+            error.as_deref(),
+        ));
+    }
+
     if let Some(msg) = s.active_toast() {
         root = root.child(
             row()
@@ -67,6 +83,100 @@ pub fn root_view(s: &Ui, p: Palette) -> El {
     }
 
     root
+}
+
+fn sudo_password_modal(
+    s: &Ui,
+    p: Palette,
+    version: &str,
+    username: &str,
+    error: Option<&str>,
+) -> El {
+    let mut dialog = col()
+        .key("sudo-modal-card")
+        .w(400.0)
+        .px(20.0)
+        .py(18.0)
+        .gap(12.0)
+        .radius(12.0)
+        .fill(p.surface)
+        .border(1.0, p.line_2)
+        .shadow(10.0, 28.0, Color::BLACK.alpha(0.32))
+        .modal_tx::<Ui>(!s.sudo_submitting, |ui, tx| ui.cancel_sudo_update(tx))
+        .child(
+            text(format!("Install Glide {version}"))
+                .font(ty::BRAND_TITLE)
+                .color(p.text),
+        )
+        .child(
+            text(format!(
+                "Enter the sudo password for {username} to upgrade the .deb package."
+            ))
+            .font(ty::SUB)
+            .color(p.text_2),
+        );
+
+    if let Some(err_msg) = error {
+        dialog = dialog.child(
+            row()
+                .key("sudo-modal-error")
+                .w_full()
+                .px(10.0)
+                .py(7.0)
+                .radius(6.0)
+                .fill(p.red_soft)
+                .border(1.0, p.red_line)
+                .child(text(err_msg).font(ty::SUB_MED).color(p.red)),
+        );
+    }
+
+    dialog = dialog
+        .child(password_field(
+            p,
+            "sudo-password-field",
+            &s.sudo_password,
+            "User password for sudo",
+            |ui| &mut ui.sudo_password,
+            Some(Ui::submit_sudo_update),
+        ))
+        .child(
+            row()
+                .key("sudo-modal-actions")
+                .w_full()
+                .gap(8.0)
+                .child(spacer())
+                .child(button(
+                    p,
+                    "sudo-cancel-btn",
+                    "Cancel",
+                    BtnKind::Default,
+                    30.0,
+                    14.0,
+                    s.sudo_submitting,
+                    |ui, tx| ui.cancel_sudo_update(tx),
+                ))
+                .child(button(
+                    p,
+                    "sudo-submit-btn",
+                    if s.sudo_submitting {
+                        "Installing…"
+                    } else {
+                        "Install & Restart"
+                    },
+                    BtnKind::Primary,
+                    30.0,
+                    14.0,
+                    s.sudo_submitting,
+                    |ui, tx| ui.submit_sudo_update(tx),
+                )),
+        );
+
+    row()
+        .key("sudo-modal-backdrop")
+        .pin(Some(0.0), Some(0.0), Some(0.0), Some(0.0))
+        .center()
+        .fill(Color::BLACK.alpha(0.42))
+        .child(dialog)
 }
 
 fn error_banner(p: Palette, msg: &str) -> El {
@@ -2745,6 +2855,17 @@ fn settings_page(s: &Ui, p: Palette) -> El {
                 p,
                 "update-install-progress-btn",
                 "Installing…",
+                BtnKind::Default,
+                true,
+                |_, _| {},
+            ),
+        ),
+        UpdateCheckState::AwaitingSudoPassword { version, .. } => (
+            Cow::Owned(format!("Enter sudo password to install {version}…")),
+            xs_button(
+                p,
+                "update-sudo-wait-btn",
+                "Authenticate…",
                 BtnKind::Default,
                 true,
                 |_, _| {},
