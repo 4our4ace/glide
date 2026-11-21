@@ -17,14 +17,23 @@ use tracing::{debug, trace, warn};
 use x11rb::connection::Connection;
 use x11rb::protocol::xinput::{self, ConnectionExt as XInputExt, EventMask, Fp3232, XIEventMask};
 use x11rb::protocol::xproto::{
-    ClientMessageData, ClientMessageEvent, ConnectionExt as XProtoExt, CreateWindowAux, Cursor,
-    EventMask as CoreEventMask, GrabMode, Window, WindowClass, CLIENT_MESSAGE_EVENT,
+    AtomEnum, ClientMessageData, ClientMessageEvent, ConnectionExt as XProtoExt, CreateWindowAux,
+    Cursor, EventMask as CoreEventMask, GrabMode, Window, WindowClass, CLIENT_MESSAGE_EVENT,
 };
 use x11rb::protocol::Event;
 use x11rb::rust_connection::RustConnection;
 
 const CMD_ENTER_REMOTE: u32 = 1;
 const CMD_LEAVE_REMOTE: u32 = 2;
+
+#[derive(Debug, Clone, Copy, Default)]
+struct EwmhFullscreenAtoms {
+    net_active_window: u32,
+    net_wm_state: u32,
+    net_wm_state_fullscreen: u32,
+    net_wm_window_type: u32,
+    net_wm_window_type_desktop: u32,
+}
 
 enum LeaveTarget {
     Edge(Edge, f32),
@@ -36,6 +45,7 @@ struct SharedState {
     geometry: Mutex<DesktopGeometry>,
     remote_mode: AtomicBool,
     locked: AtomicBool,
+    auto_lock_fullscreen: AtomicBool,
     pin_media_keys_local: AtomicBool,
     edge_threshold_px: AtomicI32,
     dead_corner_px: AtomicI32,
@@ -79,7 +89,7 @@ impl CaptureControl for X11CaptureControl {
         edge_threshold_px: i32,
         dead_corner_px: i32,
         edge_dwell_ms: u64,
-        _auto_lock_fullscreen: bool,
+        auto_lock_fullscreen: bool,
         locked: bool,
     ) {
         self.shared
@@ -91,6 +101,9 @@ impl CaptureControl for X11CaptureControl {
         self.shared
             .edge_dwell_ms
             .store(edge_dwell_ms, Ordering::Relaxed);
+        self.shared
+            .auto_lock_fullscreen
+            .store(auto_lock_fullscreen, Ordering::Relaxed);
         self.shared.locked.store(locked, Ordering::Relaxed);
     }
 
@@ -183,6 +196,115 @@ fn arrow_to_edge(usage: HidUsage) -> Option<Edge> {
     }
 }
 
+fn intern_ewmh_fullscreen_atoms(conn: &RustConnection) -> EwmhFullscreenAtoms {
+    let intern = |name: &[u8]| -> u32 {
+        conn.intern_atom(false, name)
+            .ok()
+            .and_then(|c| c.reply().ok())
+            .map_or(0, |r| r.atom)
+    };
+    EwmhFullscreenAtoms {
+        net_active_window: intern(b"_NET_ACTIVE_WINDOW"),
+        net_wm_state: intern(b"_NET_WM_STATE"),
+        net_wm_state_fullscreen: intern(b"_NET_WM_STATE_FULLSCREEN"),
+        net_wm_window_type: intern(b"_NET_WM_WINDOW_TYPE"),
+        net_wm_window_type_desktop: intern(b"_NET_WM_WINDOW_TYPE_DESKTOP"),
+    }
+}
+
+/// Extracts a 32-bit window ID from an X11 `WINDOW` property reply, ignoring `None` (`0`) and `root`.
+fn parse_window_id_from_property(format: u8, raw: &[u8], root: Window) -> Option<Window> {
+    if format != 32 || raw.len() < 4 {
+        return None;
+    }
+    let win = u32::from_ne_bytes([raw[0], raw[1], raw[2], raw[3]]);
+    if win == x11rb::NONE || win == root {
+        None
+    } else {
+        Some(win)
+    }
+}
+
+/// Parses a 32-bit X11 `ATOM[]` property buffer into a list of atom IDs.
+fn parse_atoms_from_property(format: u8, raw: &[u8]) -> Vec<u32> {
+    if format != 32 {
+        return Vec::new();
+    }
+    raw.chunks_exact(4)
+        .map(|chunk| u32::from_ne_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
+        .collect()
+}
+
+/// Returns `true` if a `_NET_WM_STATE` atom slice advertises `_NET_WM_STATE_FULLSCREEN`.
+fn wm_state_has_fullscreen(atoms: &[u32], fullscreen_atom: u32) -> bool {
+    fullscreen_atom != x11rb::NONE && atoms.contains(&fullscreen_atom)
+}
+
+/// Returns `true` if a `_NET_WM_WINDOW_TYPE` atom slice marks the window as a desktop shell window.
+fn wm_window_type_is_desktop(types: &[u32], desktop_atom: u32) -> bool {
+    desktop_atom != x11rb::NONE && types.contains(&desktop_atom)
+}
+
+/// Checks whether the currently active X11 window advertises `_NET_WM_STATE_FULLSCREEN`.
+///
+/// Gracefully returns `false` on window managers that do not support EWMH or when the active
+/// window is the root/desktop window.
+fn is_active_window_fullscreen(
+    conn: &RustConnection,
+    root: Window,
+    atoms: EwmhFullscreenAtoms,
+) -> bool {
+    if atoms.net_active_window == x11rb::NONE
+        || atoms.net_wm_state == x11rb::NONE
+        || atoms.net_wm_state_fullscreen == x11rb::NONE
+    {
+        return false;
+    }
+
+    let Ok(active_cookie) =
+        conn.get_property(false, root, atoms.net_active_window, AtomEnum::WINDOW, 0, 1)
+    else {
+        return false;
+    };
+    let Ok(active_reply) = active_cookie.reply() else {
+        return false;
+    };
+    let Some(active_win) =
+        parse_window_id_from_property(active_reply.format, &active_reply.value, root)
+    else {
+        return false;
+    };
+
+    if atoms.net_wm_window_type != x11rb::NONE && atoms.net_wm_window_type_desktop != x11rb::NONE {
+        if let Ok(type_cookie) = conn.get_property(
+            false,
+            active_win,
+            atoms.net_wm_window_type,
+            AtomEnum::ATOM,
+            0,
+            16,
+        ) {
+            if let Ok(type_reply) = type_cookie.reply() {
+                let win_types = parse_atoms_from_property(type_reply.format, &type_reply.value);
+                if wm_window_type_is_desktop(&win_types, atoms.net_wm_window_type_desktop) {
+                    return false;
+                }
+            }
+        }
+    }
+
+    let Ok(state_cookie) =
+        conn.get_property(false, active_win, atoms.net_wm_state, AtomEnum::ATOM, 0, 32)
+    else {
+        return false;
+    };
+    let Ok(state_reply) = state_cookie.reply() else {
+        return false;
+    };
+    let state_atoms = parse_atoms_from_property(state_reply.format, &state_reply.value);
+    wm_state_has_fullscreen(&state_atoms, atoms.net_wm_state_fullscreen)
+}
+
 /// Starts the X11 server input capture loop on a dedicated OS thread.
 pub fn start_x11_capture(config: CaptureConfig) -> Result<CaptureHandle> {
     let (conn, screen_num) =
@@ -223,6 +345,7 @@ pub fn start_x11_capture(config: CaptureConfig) -> Result<CaptureHandle> {
         .intern_atom(false, b"GLIDE_CAPTURE_WAKE")?
         .reply()?
         .atom;
+    let ewmh_atoms = intern_ewmh_fullscreen_atoms(&conn);
     let blank_cursor = create_blank_cursor(&conn, root)?;
 
     let raw_mask = XIEventMask::RAW_MOTION
@@ -244,6 +367,7 @@ pub fn start_x11_capture(config: CaptureConfig) -> Result<CaptureHandle> {
         geometry: Mutex::new(geometry),
         remote_mode: AtomicBool::new(false),
         locked: AtomicBool::new(false),
+        auto_lock_fullscreen: AtomicBool::new(config.auto_lock_fullscreen),
         pin_media_keys_local: AtomicBool::new(config.pin_media_keys_local),
         edge_threshold_px: AtomicI32::new(config.edge_threshold_px.max(1)),
         dead_corner_px: AtomicI32::new(config.dead_corner_px.max(0)),
@@ -266,6 +390,7 @@ pub fn start_x11_capture(config: CaptureConfig) -> Result<CaptureHandle> {
                 ctrl_win,
                 blank_cursor,
                 wake_atom,
+                ewmh_atoms,
                 config,
                 thread_shared,
                 tx,
@@ -294,6 +419,7 @@ fn run_capture_loop(
     ctrl_win: Window,
     blank_cursor: Cursor,
     wake_atom: u32,
+    ewmh_atoms: EwmhFullscreenAtoms,
     config: CaptureConfig,
     shared: Arc<SharedState>,
     tx: mpsc::UnboundedSender<CaptureEvent>,
@@ -451,6 +577,16 @@ fn run_capture_loop(
                                 2,
                                 dead_corner,
                             ) {
+                                // Only query EWMH _NET_WM_STATE_FULLSCREEN when the cursor actually
+                                // touches an active outer edge (zero 1000Hz mid-screen overhead).
+                                if shared.auto_lock_fullscreen.load(Ordering::Relaxed)
+                                    && is_active_window_fullscreen(&conn, root, ewmh_atoms)
+                                {
+                                    edge_push_edge = None;
+                                    edge_push_accum = 0.0;
+                                    edge_dwell_start = None;
+                                    break;
+                                }
                                 if edge_push_edge == Some(edge) {
                                     edge_push_accum += outward;
                                 } else {
@@ -624,4 +760,78 @@ fn run_capture_loop(
     cursor_hider.show(&conn, root);
     let _ = conn.flush();
     let _ = xinput::xi_select_events(&*conn, root, &[]);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn encode_u32s(vals: &[u32]) -> Vec<u8> {
+        let mut out = Vec::with_capacity(vals.len() * 4);
+        for v in vals {
+            out.extend_from_slice(&v.to_ne_bytes());
+        }
+        out
+    }
+
+    #[test]
+    fn parses_net_wm_state_atoms_and_detects_fullscreen() {
+        const ATOM_ABOVE: u32 = 301;
+        const ATOM_FULLSCREEN: u32 = 302;
+        const ATOM_FOCUSED: u32 = 303;
+
+        let raw_fs = encode_u32s(&[ATOM_ABOVE, ATOM_FULLSCREEN, ATOM_FOCUSED]);
+        let atoms_fs = parse_atoms_from_property(32, &raw_fs);
+        assert_eq!(atoms_fs, vec![ATOM_ABOVE, ATOM_FULLSCREEN, ATOM_FOCUSED]);
+        assert!(wm_state_has_fullscreen(&atoms_fs, ATOM_FULLSCREEN));
+
+        let raw_windowed = encode_u32s(&[ATOM_ABOVE, ATOM_FOCUSED]);
+        let atoms_win = parse_atoms_from_property(32, &raw_windowed);
+        assert!(!wm_state_has_fullscreen(&atoms_win, ATOM_FULLSCREEN));
+
+        // Non-32-bit format or empty/missing EWMH atom gracefully returns false
+        assert!(parse_atoms_from_property(8, &raw_fs).is_empty());
+        assert!(parse_atoms_from_property(0, &[]).is_empty());
+        assert!(!wm_state_has_fullscreen(&atoms_fs, x11rb::NONE));
+    }
+
+    #[test]
+    fn active_window_parser_ignores_none_root_and_invalid_properties() {
+        const ROOT: Window = 0x100;
+        const APP_WIN: Window = 0x0240_0007;
+
+        assert_eq!(
+            parse_window_id_from_property(32, &encode_u32s(&[APP_WIN]), ROOT),
+            Some(APP_WIN)
+        );
+        // Ignore None (0) and root window
+        assert_eq!(
+            parse_window_id_from_property(32, &encode_u32s(&[x11rb::NONE]), ROOT),
+            None
+        );
+        assert_eq!(
+            parse_window_id_from_property(32, &encode_u32s(&[ROOT]), ROOT),
+            None
+        );
+        // Ignore malformed / missing properties
+        assert_eq!(parse_window_id_from_property(0, &[], ROOT), None);
+        assert_eq!(parse_window_id_from_property(32, &[1, 2], ROOT), None);
+        assert_eq!(
+            parse_window_id_from_property(16, &encode_u32s(&[APP_WIN]), ROOT),
+            None
+        );
+    }
+
+    #[test]
+    fn desktop_window_type_is_detected_and_excluded() {
+        const ATOM_NORMAL: u32 = 401;
+        const ATOM_DESKTOP: u32 = 402;
+
+        assert!(wm_window_type_is_desktop(
+            &[ATOM_NORMAL, ATOM_DESKTOP],
+            ATOM_DESKTOP
+        ));
+        assert!(!wm_window_type_is_desktop(&[ATOM_NORMAL], ATOM_DESKTOP));
+        assert!(!wm_window_type_is_desktop(&[ATOM_DESKTOP], x11rb::NONE));
+    }
 }
