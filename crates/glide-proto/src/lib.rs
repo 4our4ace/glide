@@ -675,19 +675,99 @@ pub enum BulkTransfer {
 pub const BULK_KIND_CLIPBOARD: u8 = 0x01;
 pub const BULK_KIND_FILE: u8 = 0x02;
 
-/// Strips directory components and unsafe characters so received filenames can never traverse paths.
+/// Maximum UTF-8 byte length allowed for sanitized received filenames.
+pub const MAX_FILENAME_BYTES: usize = 200;
+
+fn truncate_utf8_bytes(s: &str, max_bytes: usize) -> &str {
+    if s.len() <= max_bytes {
+        return s;
+    }
+    let mut end = max_bytes;
+    while end > 0 && !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    &s[..end]
+}
+
+fn is_windows_reserved_device_name(name: &str) -> bool {
+    let stem = name.split('.').next().unwrap_or("").trim_end_matches(' ');
+    if stem.eq_ignore_ascii_case("CON")
+        || stem.eq_ignore_ascii_case("PRN")
+        || stem.eq_ignore_ascii_case("AUX")
+        || stem.eq_ignore_ascii_case("NUL")
+    {
+        return true;
+    }
+    let bytes = stem.as_bytes();
+    if bytes.len() == 4 && matches!(bytes[3], b'1'..=b'9') {
+        let prefix = &stem[..3];
+        if prefix.eq_ignore_ascii_case("COM") || prefix.eq_ignore_ascii_case("LPT") {
+            return true;
+        }
+    }
+    false
+}
+
+/// Strips directory components, unsafe characters, trailing dots/spaces, and Windows
+/// reserved device names, and caps UTF-8 byte length so received filenames are safe
+/// across Linux, macOS, and Windows filesystems.
 pub fn sanitize_filename(name: &str) -> String {
-    let base = name.rsplit(['/', '\\']).next().unwrap_or("file.bin").trim();
+    let base = name.rsplit(['/', '\\']).next().unwrap_or("");
     let cleaned: String = base
         .chars()
         .filter(|&c| {
             !c.is_control() && !matches!(c, '<' | '>' | ':' | '"' | '/' | '\\' | '|' | '?' | '*')
         })
         .collect();
-    if cleaned.is_empty() || cleaned == "." || cleaned == ".." {
-        "glide-file.bin".to_string()
+    let trimmed = cleaned
+        .trim_start()
+        .trim_end_matches(|c: char| c == '.' || c.is_whitespace());
+
+    if trimmed.is_empty() || trimmed == "." || trimmed == ".." {
+        return "glide-file.bin".to_string();
+    }
+
+    let mut result = if is_windows_reserved_device_name(trimmed) {
+        format!("_{trimmed}")
     } else {
-        cleaned
+        trimmed.to_string()
+    };
+
+    if result.len() > MAX_FILENAME_BYTES {
+        result = match result.rfind('.') {
+            Some(dot_idx)
+                if dot_idx > 0
+                    && result.len() - dot_idx <= 32
+                    && result.len() - dot_idx < MAX_FILENAME_BYTES =>
+            {
+                let ext = &result[dot_idx..];
+                let stem_budget = MAX_FILENAME_BYTES - ext.len();
+                let stem = truncate_utf8_bytes(&result[..dot_idx], stem_budget)
+                    .trim_end_matches(|c: char| c == '.' || c.is_whitespace());
+                if stem.is_empty() {
+                    format!("file{ext}")
+                } else {
+                    format!("{stem}{ext}")
+                }
+            }
+            _ => truncate_utf8_bytes(&result, MAX_FILENAME_BYTES)
+                .trim_end_matches(|c: char| c == '.' || c.is_whitespace())
+                .to_string(),
+        };
+    }
+
+    let final_trimmed = result
+        .trim_start()
+        .trim_end_matches(|c: char| c == '.' || c.is_whitespace());
+    if final_trimmed.is_empty() || final_trimmed == "." || final_trimmed == ".." {
+        "glide-file.bin".to_string()
+    } else if is_windows_reserved_device_name(final_trimmed) {
+        let prefixed = format!("_{final_trimmed}");
+        truncate_utf8_bytes(&prefixed, MAX_FILENAME_BYTES).to_string()
+    } else if final_trimmed.len() != result.len() {
+        final_trimmed.to_string()
+    } else {
+        result
     }
 }
 
@@ -820,5 +900,52 @@ mod tests {
         assert_eq!(sanitize_filename("../../etc/passwd"), "passwd");
         assert_eq!(sanitize_filename(r"C:\Users\me\photo.png"), "photo.png");
         assert_eq!(sanitize_filename(".."), "glide-file.bin");
+    }
+
+    #[test]
+    fn filename_sanitization_neutralizes_windows_reserved_names() {
+        for reserved in [
+            "CON", "con", "PRN", "AUX", "NUL", "COM1", "com9", "LPT1", "lpt9",
+        ] {
+            let safe = sanitize_filename(reserved);
+            assert_eq!(safe, format!("_{reserved}"));
+        }
+        assert_eq!(sanitize_filename("CON.txt"), "_CON.txt");
+        assert_eq!(sanitize_filename("nul.tar.gz"), "_nul.tar.gz");
+        assert_eq!(sanitize_filename("Lpt3.log"), "_Lpt3.log");
+        assert_eq!(sanitize_filename("CON   .txt"), "_CON   .txt");
+        assert_eq!(sanitize_filename("aux..."), "_aux");
+        // Non-reserved neighbors remain intact.
+        assert_eq!(sanitize_filename("COM0.txt"), "COM0.txt");
+        assert_eq!(sanitize_filename("COM10.txt"), "COM10.txt");
+        assert_eq!(sanitize_filename("CONSOLE.txt"), "CONSOLE.txt");
+    }
+
+    #[test]
+    fn filename_sanitization_strips_trailing_dots_and_spaces() {
+        assert_eq!(sanitize_filename("report.pdf   "), "report.pdf");
+        assert_eq!(sanitize_filename("report.pdf..."), "report.pdf");
+        assert_eq!(sanitize_filename("  notes.txt . . "), "notes.txt");
+        assert_eq!(sanitize_filename("...   "), "glide-file.bin");
+        assert_eq!(sanitize_filename(". ."), "glide-file.bin");
+    }
+
+    #[test]
+    fn filename_sanitization_caps_long_utf8_names_safely() {
+        let long_ascii = format!("{}.png", "a".repeat(250));
+        let safe_ascii = sanitize_filename(&long_ascii);
+        assert!(safe_ascii.len() <= MAX_FILENAME_BYTES);
+        assert!(safe_ascii.ends_with(".png"));
+
+        let long_emoji = format!("{}.txt", "🚀".repeat(60));
+        let safe_emoji = sanitize_filename(&long_emoji);
+        assert!(safe_emoji.len() <= MAX_FILENAME_BYTES);
+        assert!(safe_emoji.ends_with(".txt"));
+        assert!(safe_emoji.starts_with("🚀"));
+
+        let long_no_ext = format!("a{}", "🔥".repeat(60));
+        let safe_no_ext = sanitize_filename(&long_no_ext);
+        assert!(safe_no_ext.len() <= MAX_FILENAME_BYTES);
+        assert!(safe_no_ext.len() == 1 + 49 * 4);
     }
 }

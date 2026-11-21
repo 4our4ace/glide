@@ -261,33 +261,178 @@ impl RuntimeState {
     }
 }
 
-/// Safely saves a received file into `dir` without overwriting existing files.
+/// Maximum collision suffix attempts (`file (1).ext` .. `file (1000).ext`) before failing.
+const MAX_SAVE_COLLISIONS: u32 = 1000;
+
+/// Safely saves a received file into `dir` without following symlinks or overwriting existing files.
 pub fn save_received_file(
     dir: &std::path::Path,
     safe_filename: &str,
     data: &[u8],
 ) -> anyhow::Result<PathBuf> {
-    std::fs::create_dir_all(dir)?;
-    let mut candidate = dir.join(safe_filename);
-    if candidate.exists() {
-        let stem = candidate
-            .file_stem()
-            .and_then(|s| s.to_str())
-            .unwrap_or("file")
-            .to_string();
-        let ext = candidate
-            .extension()
-            .and_then(|e| e.to_str())
-            .map(|e| format!(".{e}"))
-            .unwrap_or_default();
-        for idx in 1..=999 {
-            let next = dir.join(format!("{stem} ({idx}){ext}"));
-            if !next.exists() {
-                candidate = next;
-                break;
+    use std::fs::OpenOptions;
+    use std::io::{ErrorKind, Write};
+
+    // Defense-in-depth: re-sanitize even if caller passed an already sanitized filename.
+    let safe_name = glide_proto::sanitize_filename(safe_filename);
+
+    match std::fs::symlink_metadata(dir) {
+        Ok(meta) => {
+            if meta.file_type().is_symlink() {
+                anyhow::bail!("refusing to save file into symlink directory {}", dir.display());
+            }
+            if !meta.is_dir() {
+                anyhow::bail!("receive path {} is not a directory", dir.display());
             }
         }
+        Err(e) if e.kind() == ErrorKind::NotFound => {
+            std::fs::create_dir_all(dir)?;
+            let meta = std::fs::symlink_metadata(dir)?;
+            if meta.file_type().is_symlink() || !meta.is_dir() {
+                anyhow::bail!(
+                    "receive path {} is a symlink or not a directory",
+                    dir.display()
+                );
+            }
+        }
+        Err(e) => return Err(e.into()),
     }
-    std::fs::write(&candidate, data)?;
-    Ok(candidate)
+
+    let base_path = dir.join(&safe_name);
+    let stem = base_path
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("file")
+        .to_string();
+    let ext = base_path
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(|e| format!(".{e}"))
+        .unwrap_or_default();
+
+    for idx in 0..=MAX_SAVE_COLLISIONS {
+        let candidate = if idx == 0 {
+            base_path.clone()
+        } else {
+            dir.join(format!("{stem} ({idx}){ext}"))
+        };
+
+        if let Ok(meta) = std::fs::symlink_metadata(&candidate) {
+            if meta.file_type().is_symlink() {
+                anyhow::bail!(
+                    "refusing to write through symlink target {}",
+                    candidate.display()
+                );
+            }
+        }
+
+        match OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&candidate)
+        {
+            Ok(mut file) => {
+                if let Err(e) = file.write_all(data) {
+                    let _ = std::fs::remove_file(&candidate);
+                    return Err(e.into());
+                }
+                return Ok(candidate);
+            }
+            Err(e) if e.kind() == ErrorKind::AlreadyExists => {
+                if let Ok(meta) = std::fs::symlink_metadata(&candidate) {
+                    if meta.file_type().is_symlink() {
+                        anyhow::bail!(
+                            "refusing to write through symlink target {}",
+                            candidate.display()
+                        );
+                    }
+                }
+                continue;
+            }
+            Err(e) => return Err(e.into()),
+        }
+    }
+
+    anyhow::bail!(
+        "failed to allocate a unique filename for '{}' after {} attempts",
+        safe_name,
+        MAX_SAVE_COLLISIONS
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    fn unique_temp_dir(label: &str) -> PathBuf {
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+        let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!(
+            "glide-save-test-{label}-{}-{n}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn save_received_file_creates_unique_names_without_overwriting() {
+        let dir = unique_temp_dir("collisions");
+        let p0 = save_received_file(&dir, "notes.txt", b"first").unwrap();
+        let p1 = save_received_file(&dir, "notes.txt", b"second").unwrap();
+        let p2 = save_received_file(&dir, "notes.txt", b"third").unwrap();
+
+        assert_eq!(p0.file_name().unwrap(), "notes.txt");
+        assert_eq!(p1.file_name().unwrap(), "notes (1).txt");
+        assert_eq!(p2.file_name().unwrap(), "notes (2).txt");
+        assert_eq!(std::fs::read(&p0).unwrap(), b"first");
+        assert_eq!(std::fs::read(&p1).unwrap(), b"second");
+        assert_eq!(std::fs::read(&p2).unwrap(), b"third");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn save_received_file_errors_when_collision_budget_exhausted() {
+        let dir = unique_temp_dir("exhausted");
+        std::fs::write(dir.join("dup.txt"), b"0").unwrap();
+        for idx in 1..=MAX_SAVE_COLLISIONS {
+            std::fs::write(dir.join(format!("dup ({idx}).txt")), b"x").unwrap();
+        }
+        let err = save_received_file(&dir, "dup.txt", b"new").unwrap_err();
+        assert!(err.to_string().contains("unique filename"));
+        assert_eq!(std::fs::read(dir.join("dup.txt")).unwrap(), b"0");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn save_received_file_rejects_symlink_dir_and_symlink_file() {
+        use std::os::unix::fs::symlink;
+
+        let root = unique_temp_dir("symlinks");
+        let real_dir = root.join("real");
+        std::fs::create_dir_all(&real_dir).unwrap();
+        let link_dir = root.join("link_dir");
+        symlink(&real_dir, &link_dir).unwrap();
+
+        // Target directory itself is a symlink -> must fail.
+        assert!(save_received_file(&link_dir, "ok.txt", b"data").is_err());
+
+        // Target file inside real_dir is a symlink (even dangling) -> must fail.
+        let victim = root.join("victim.txt");
+        std::fs::write(&victim, b"untouched").unwrap();
+        symlink(&victim, real_dir.join("payload.txt")).unwrap();
+        assert!(save_received_file(&real_dir, "payload.txt", b"evil").is_err());
+        assert_eq!(std::fs::read(&victim).unwrap(), b"untouched");
+
+        symlink(root.join("missing.txt"), real_dir.join("dangling.txt")).unwrap();
+        assert!(save_received_file(&real_dir, "dangling.txt", b"evil").is_err());
+        assert!(!root.join("missing.txt").exists());
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
 }
