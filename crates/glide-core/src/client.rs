@@ -12,7 +12,6 @@
 use crate::config::{compile_key_remaps, ClientConfig, DEFAULT_QUIC_PORT};
 use crate::runtime::{save_received_file, RuntimeCommand, RuntimeState};
 use anyhow::{anyhow, Context, Result};
-use glide_backend::os_integration::file_receive_dir;
 use glide_backend::{ClipboardHandle, InputInjector};
 use glide_net::discovery::discover_servers;
 use glide_net::tls::TrustMode;
@@ -246,6 +245,9 @@ pub async fn run_client_session(
                         RuntimeCommand::UpdateMaxFileBytes(limit) => {
                             config.max_file_bytes = Some(limit);
                         }
+                        RuntimeCommand::UpdateReceiveDir(dir) => {
+                            config.receive_dir = dir;
+                        }
                         RuntimeCommand::ResendClipboard(id) => {
                             if let Some(rt) = runtime {
                                 if let Some(payload) = rt.find_clipboard_payload(id) {
@@ -473,7 +475,8 @@ pub async fn run_client_session(
                         }
                     }
                     Ok(BulkTransfer::File(file)) => {
-                        match file_receive_dir()
+                        match config
+                            .resolved_receive_dir()
                             .and_then(|dir| save_received_file(&dir, &file.filename, &file.data))
                         {
                             Ok(saved) => {

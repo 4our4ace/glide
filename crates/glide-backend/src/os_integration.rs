@@ -1,23 +1,197 @@
 //! Step 10: Zero-friction OS integration helpers (Autostart, Windows Firewall,
 //! Windows Elevated Task helper, and safe file-drop destination folder).
 
-use anyhow::{Context, Result};
-use std::path::PathBuf;
+use anyhow::{anyhow, Context, Result};
+use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
 
-/// Returns (and creates if needed) the destination folder for received files:
-/// `~/Downloads/Glide` on Linux or `%USERPROFILE%\Downloads\Glide` on Windows.
-pub fn file_receive_dir() -> Result<PathBuf> {
-    let base = if let Ok(home) = std::env::var("HOME") {
-        PathBuf::from(home).join("Downloads")
-    } else if let Ok(profile) = std::env::var("USERPROFILE") {
-        PathBuf::from(profile).join("Downloads")
-    } else {
-        PathBuf::from(".")
+fn user_home_dir() -> Option<PathBuf> {
+    #[cfg(target_os = "windows")]
+    {
+        std::env::var_os("USERPROFILE")
+            .filter(|v| !v.is_empty())
+            .or_else(|| std::env::var_os("HOME").filter(|v| !v.is_empty()))
+            .map(PathBuf::from)
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        std::env::var_os("HOME")
+            .filter(|v| !v.is_empty())
+            .or_else(|| std::env::var_os("USERPROFILE").filter(|v| !v.is_empty()))
+            .map(PathBuf::from)
+    }
+}
+
+fn default_receive_dir_path() -> PathBuf {
+    match user_home_dir() {
+        Some(home) => home.join("Downloads").join("Glide"),
+        None => PathBuf::from(".").join("Glide"),
+    }
+}
+
+/// Resolves a custom or default file-receive directory without modifying the filesystem.
+///
+/// - `None` resolves to `~/Downloads/Glide` (or `%USERPROFILE%\Downloads\Glide` on Windows).
+/// - `Some(raw)` validates that the path is non-empty and free of NUL bytes, and safely expands
+///   a leading `~`, `~/`, or `~\` against the user's home directory.
+pub fn resolve_receive_dir(custom: Option<&str>) -> Result<PathBuf> {
+    let Some(raw) = custom else {
+        return Ok(default_receive_dir_path());
     };
-    let dir = base.join("Glide");
+
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Err(anyhow!("receive directory path cannot be empty"));
+    }
+    if trimmed.contains('\0') {
+        return Err(anyhow!("receive directory path contains a NUL byte"));
+    }
+
+    if trimmed == "~" {
+        return user_home_dir()
+            .ok_or_else(|| anyhow!("cannot expand '~': user home directory is unavailable"));
+    }
+
+    if let Some(rest) = trimmed
+        .strip_prefix("~/")
+        .or_else(|| trimmed.strip_prefix("~\\"))
+    {
+        let home = user_home_dir()
+            .ok_or_else(|| anyhow!("cannot expand '~/': user home directory is unavailable"))?;
+        if rest.is_empty() {
+            return Ok(home);
+        }
+        return Ok(home.join(rest));
+    }
+
+    Ok(PathBuf::from(trimmed))
+}
+
+/// Resolves and creates (if needed) the destination folder for received files.
+pub fn ensure_receive_dir(custom: Option<&str>) -> Result<PathBuf> {
+    let dir = resolve_receive_dir(custom)?;
     std::fs::create_dir_all(&dir)
         .with_context(|| format!("failed to create receive directory {}", dir.display()))?;
     Ok(dir)
+}
+
+/// Returns (and creates if needed) the default destination folder for received files:
+/// `~/Downloads/Glide` on Linux or `%USERPROFILE%\Downloads\Glide` on Windows.
+pub fn file_receive_dir() -> Result<PathBuf> {
+    ensure_receive_dir(None)
+}
+
+/// Opens a file or folder in the user's OS default handler / file manager without invoking a shell.
+pub fn open_path_in_os(path: &Path) -> Result<()> {
+    if !path.exists() {
+        anyhow::bail!("path does not exist: {}", path.display());
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        Command::new("xdg-open")
+            .arg(path)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .with_context(|| format!("failed to open {} with xdg-open", path.display()))?;
+        Ok(())
+    }
+
+    #[cfg(target_os = "windows")]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        Command::new("explorer.exe")
+            .arg(path)
+            .creation_flags(CREATE_NO_WINDOW)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .with_context(|| format!("failed to open {} with explorer.exe", path.display()))?;
+        Ok(())
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        Command::new("open")
+            .arg(path)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .with_context(|| format!("failed to open {} with open", path.display()))?;
+        Ok(())
+    }
+
+    #[cfg(not(any(target_os = "linux", target_os = "windows", target_os = "macos")))]
+    {
+        let _ = path;
+        anyhow::bail!("opening local paths is unsupported on this OS")
+    }
+}
+
+/// Reveals a file in the OS file manager (or opens the folder directly if `path` is a directory).
+pub fn reveal_in_file_manager(path: &Path) -> Result<()> {
+    if !path.exists() {
+        anyhow::bail!("path does not exist: {}", path.display());
+    }
+    if path.is_dir() {
+        return open_path_in_os(path);
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        let target = path
+            .parent()
+            .filter(|p| !p.as_os_str().is_empty())
+            .unwrap_or(path);
+        Command::new("xdg-open")
+            .arg(target)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .with_context(|| format!("failed to reveal {} with xdg-open", target.display()))?;
+        Ok(())
+    }
+
+    #[cfg(target_os = "windows")]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        Command::new("explorer.exe")
+            .arg("/select,")
+            .arg(path)
+            .creation_flags(CREATE_NO_WINDOW)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .with_context(|| format!("failed to reveal {} with explorer.exe", path.display()))?;
+        Ok(())
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        Command::new("open")
+            .arg("-R")
+            .arg(path)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .with_context(|| format!("failed to reveal {} with open", path.display()))?;
+        Ok(())
+    }
+
+    #[cfg(not(any(target_os = "linux", target_os = "windows", target_os = "macos")))]
+    {
+        let _ = path;
+        anyhow::bail!("revealing local files is unsupported on this OS")
+    }
 }
 
 /// Checks whether Glide is currently configured to start automatically on login.
@@ -253,4 +427,51 @@ fn windows_set_autostart(enabled: bool, args: &str) -> Result<()> {
         anyhow::bail!("Registry autostart update failed with error {res}");
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn resolve_receive_dir_handles_default_custom_tilde_and_invalid() {
+        // Default points to Downloads/Glide
+        let default_dir = resolve_receive_dir(None).expect("default receive dir");
+        assert!(
+            default_dir.ends_with(Path::new("Downloads").join("Glide"))
+                || default_dir.ends_with("Glide"),
+            "unexpected default dir: {}",
+            default_dir.display()
+        );
+
+        // Explicit custom path is trimmed and preserved
+        let custom = resolve_receive_dir(Some("  /tmp/glide-inbox  ")).expect("custom dir");
+        assert_eq!(custom, PathBuf::from("/tmp/glide-inbox"));
+
+        // Tilde expansion against user home
+        if let Some(home) = user_home_dir() {
+            assert_eq!(resolve_receive_dir(Some("~")).unwrap(), home);
+            assert_eq!(
+                resolve_receive_dir(Some("~/Transfers/Glide")).unwrap(),
+                home.join("Transfers/Glide")
+            );
+            assert_eq!(resolve_receive_dir(Some("~/")).unwrap(), home);
+        }
+
+        // Empty, whitespace-only, and NUL-containing paths are rejected
+        assert!(resolve_receive_dir(Some("")).is_err());
+        assert!(resolve_receive_dir(Some("   \t  ")).is_err());
+        assert!(resolve_receive_dir(Some("/tmp/bad\0path")).is_err());
+    }
+
+    #[test]
+    fn open_and_reveal_reject_missing_paths() {
+        let missing = std::env::temp_dir().join(format!(
+            "glide-nonexistent-path-{}-{}",
+            std::process::id(),
+            999_999
+        ));
+        assert!(open_path_in_os(&missing).is_err());
+        assert!(reveal_in_file_manager(&missing).is_err());
+    }
 }

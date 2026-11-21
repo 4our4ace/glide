@@ -2092,16 +2092,16 @@ fn clipboard_page(s: &Ui, p: Palette) -> El {
                 ),
         );
 
-    // Right: Send files dropzone + Recent transfers
+    // Right: Send files dropzone + Save folder + Recent transfers
     let dropzone = col()
         .key("dropzone")
         .role("button")
         .label("Drop files here or browse")
         .w_full()
-        .h(132.0)
-        .gap(10.0)
+        .h(94.0)
+        .gap(8.0)
         .center()
-        .radius(10.0)
+        .radius(8.0)
         .fill(if s.drop_hover {
             p.accent_soft
         } else {
@@ -2140,8 +2140,8 @@ fn clipboard_page(s: &Ui, p: Palette) -> El {
             );
         })
         .child(
-            el().size(34.0, 34.0)
-                .radius(8.0)
+            el().size(30.0, 30.0)
+                .radius(7.0)
                 .fill(p.surface)
                 .border(1.0, p.line)
                 .center()
@@ -2159,6 +2159,58 @@ fn clipboard_page(s: &Ui, p: Palette) -> El {
                 .child(text("browse").font(ty::LABEL).color(p.accent_text)),
         );
 
+    let has_custom_receive_dir = s.config.receive_dir.is_some();
+    let mut folder_btns = row().gap(5.0).center_y();
+    if has_custom_receive_dir {
+        folder_btns = folder_btns.child(xs_button(
+            p,
+            "receive-dir-reset-btn",
+            "Reset",
+            BtnKind::Ghost,
+            false,
+            |s, tx| s.reset_receive_dir(tx),
+        ));
+    }
+    folder_btns = folder_btns.child(xs_button(
+        p,
+        "receive-dir-open-btn",
+        "Open folder",
+        BtnKind::Default,
+        false,
+        |s, tx| s.open_receive_folder(tx),
+    ));
+
+    let save_folder_row = col()
+        .key("save-folder-row")
+        .w_full()
+        .px(10.0)
+        .py(8.0)
+        .gap(6.0)
+        .child(
+            row()
+                .w_full()
+                .center_y()
+                .justify_between()
+                .gap(8.0)
+                .child(text("Save folder").font(ty::SUB_MED).color(p.text_2))
+                .child(folder_btns),
+        )
+        .child(text_field(
+            p,
+            "receive-dir-input",
+            &s.receive_dir_edit,
+            None,
+            "Downloads/Glide (default)",
+            true,
+            |s| &mut s.receive_dir_edit,
+            Some(|s, _| s.commit_text_fields_and_push()),
+        ));
+
+    let transfer_card = card(p, "send-files-card")
+        .child(el().w_full().padding(8.0).child(dropzone))
+        .child(rule(1.0, p.line).a11y_hidden())
+        .child(save_folder_row);
+
     let files_body = if s.status.recent_files.is_empty() {
         empty_box(
             p,
@@ -2172,13 +2224,13 @@ fn clipboard_page(s: &Ui, p: Palette) -> El {
         let mut items = col().key("files-items").w_full();
         for (i, f) in s.status.recent_files.iter().take(show).enumerate() {
             let sent = f.direction == "sent";
-            let row_el = row()
+            let mut row_el = row()
                 .key(format!("file-{i}"))
                 .w_full()
                 .min_h(46.0)
                 .px(12.0)
                 .py(8.0)
-                .gap(10.0)
+                .gap(8.0)
                 .center_y()
                 .child(
                     el().size(28.0, 28.0)
@@ -2210,6 +2262,35 @@ fn clipboard_page(s: &Ui, p: Palette) -> El {
                             .truncate(),
                         ),
                 );
+            if let Some(saved_path) = f.saved_path.clone() {
+                let open_path = saved_path.clone();
+                let folder_path = saved_path;
+                row_el = row_el.child(
+                    row()
+                        .gap(4.0)
+                        .center_y()
+                        .child(button(
+                            p,
+                            format!("file-open-{i}"),
+                            "Open",
+                            BtnKind::Default,
+                            24.0,
+                            7.0,
+                            false,
+                            move |s, tx| s.open_received_file(open_path.clone(), tx),
+                        ))
+                        .child(button(
+                            p,
+                            format!("file-folder-{i}"),
+                            "Folder",
+                            BtnKind::Default,
+                            24.0,
+                            7.0,
+                            false,
+                            move |s, tx| s.reveal_received_file(folder_path.clone(), tx),
+                        )),
+                );
+            }
             items = items.child(row_el);
             if i + 1 < show {
                 items = items.child(rule(1.0, p.line).a11y_hidden());
@@ -2238,17 +2319,8 @@ fn clipboard_page(s: &Ui, p: Palette) -> El {
             col()
                 .w_full()
                 .gap(7.0)
-                .child(section_head(
-                    p,
-                    "send-head",
-                    "Send files",
-                    Some(
-                        text("Saved to Downloads/Glide")
-                            .font(ty::SUB)
-                            .color(p.faint),
-                    ),
-                ))
-                .child(dropzone),
+                .child(section_head(p, "send-head", "File transfer", None))
+                .child(transfer_card),
         )
         .child(
             col()

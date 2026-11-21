@@ -241,15 +241,19 @@ impl AppController {
             }
         }
         new_cfg.max_file_mb = new_cfg.max_file_mb_clamped();
+        new_cfg.receive_dir =
+            GlideConfigFile::normalized_receive_dir(new_cfg.receive_dir.as_deref());
         new_cfg.save(&self.config_path)?;
         self.runtime.set_record_history(new_cfg.clipboard_history);
         let max_file_bytes = new_cfg.max_file_bytes();
+        let receive_dir = new_cfg.receive_dir.clone();
         let s = new_cfg.server.clone();
         let c = new_cfg.client.clone();
         *self.config.lock() = new_cfg;
 
         let locked = self.runtime.snapshot().locked;
         self.send_cmd(RuntimeCommand::UpdateMaxFileBytes(max_file_bytes));
+        self.send_cmd(RuntimeCommand::UpdateReceiveDir(receive_dir));
         self.send_cmd(RuntimeCommand::UpdateServerTuning {
             edge_threshold_px: s.edge_threshold_px,
             dead_corner_px: s.dead_corner_px,

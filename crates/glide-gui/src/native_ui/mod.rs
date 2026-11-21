@@ -9,7 +9,8 @@ use crate::updater::{self, UpdateCheckState};
 use crate::{launch_browser_window, AppController, GUI_HEIGHT, GUI_WIDTH};
 use bytes::Bytes;
 use glide_backend::os_integration::{
-    configure_elevated_task, configure_firewall, is_autostart_enabled, set_autostart,
+    configure_elevated_task, configure_firewall, ensure_receive_dir, is_autostart_enabled,
+    open_path_in_os, resolve_receive_dir, reveal_in_file_manager, set_autostart,
 };
 use glide_core::config::{GlideConfigFile, KeyRemapRule};
 use glide_core::runtime::{
@@ -119,11 +120,13 @@ pub struct Ui {
     pub port_edit: TextEdit,
     pub server_edit: TextEdit,
     pub max_file_mb_edit: TextEdit,
+    pub receive_dir_edit: TextEdit,
     pub remap_from: TextEdit,
     pub remap_to: TextEdit,
     last_committed_port: String,
     last_committed_server: String,
     last_committed_max_file_mb: String,
+    last_committed_receive_dir: String,
 
     // Transient UI state
     toast: Option<(String, Option<Instant>)>,
@@ -152,6 +155,7 @@ impl Ui {
         let port_str = cfg.server.bind.port().to_string();
         let server_str = cfg.client.server.clone().unwrap_or_default();
         let max_file_mb_str = cfg.max_file_mb_clamped().to_string();
+        let receive_dir_str = cfg.receive_dir.clone().unwrap_or_default();
         let role = if status.mode == "client" {
             Role::Client
         } else if status.mode == "server" {
@@ -189,11 +193,13 @@ impl Ui {
             port_edit: TextEdit::new(&port_str),
             server_edit: TextEdit::new(&server_str),
             max_file_mb_edit: TextEdit::new(&max_file_mb_str),
+            receive_dir_edit: TextEdit::new(&receive_dir_str),
             remap_from: TextEdit::default(),
             remap_to: TextEdit::default(),
             last_committed_port: port_str,
             last_committed_server: server_str,
             last_committed_max_file_mb: max_file_mb_str,
+            last_committed_receive_dir: receive_dir_str,
             toast: None,
             dismissed_error: None,
             desk_drag: None,
@@ -356,6 +362,9 @@ impl Ui {
         if !self.max_file_mb_edit.focused {
             changed |= self.commit_max_file_mb();
         }
+        if !self.receive_dir_edit.focused {
+            changed |= self.commit_receive_dir();
+        }
         changed
     }
 
@@ -376,6 +385,33 @@ impl Ui {
         } else {
             let prev = self.last_committed_max_file_mb.clone();
             self.max_file_mb_edit = TextEdit::new(&prev);
+            false
+        }
+    }
+
+    pub fn commit_receive_dir(&mut self) -> bool {
+        let raw = self.receive_dir_edit.text.trim().to_owned();
+        if raw == self.last_committed_receive_dir {
+            return false;
+        }
+        if raw.is_empty() {
+            self.config.receive_dir = None;
+            if !self.receive_dir_edit.text.is_empty() {
+                self.receive_dir_edit = TextEdit::new("");
+            }
+            self.last_committed_receive_dir.clear();
+            return true;
+        }
+        if resolve_receive_dir(Some(&raw)).is_ok() {
+            self.config.receive_dir = Some(raw.clone());
+            if self.receive_dir_edit.text != raw {
+                self.receive_dir_edit = TextEdit::new(&raw);
+            }
+            self.last_committed_receive_dir = raw;
+            true
+        } else {
+            let prev = self.last_committed_receive_dir.clone();
+            self.receive_dir_edit = TextEdit::new(&prev);
             false
         }
     }
@@ -408,6 +444,9 @@ impl Ui {
         }
         if self.max_file_mb_edit.focused {
             changed |= self.commit_max_file_mb();
+        }
+        if self.receive_dir_edit.focused {
+            changed |= self.commit_receive_dir();
         }
         if changed {
             self.push_config();
@@ -789,6 +828,57 @@ impl Ui {
             }
         });
         let _ = tx;
+    }
+
+    pub fn reset_receive_dir(&mut self, tx: &mut Tx) {
+        self.config.receive_dir = None;
+        self.receive_dir_edit = TextEdit::new("");
+        self.last_committed_receive_dir.clear();
+        self.push_config();
+        self.toast("Save folder reset to Downloads/Glide", tx);
+    }
+
+    pub fn open_receive_folder(&mut self, tx: &mut Tx) {
+        self.commit_text_fields_and_push();
+        let custom = self.config.receive_dir.clone();
+        let handle = self.handle.clone();
+        let _ = tx;
+        self.rt.spawn_blocking(move || {
+            let res =
+                ensure_receive_dir(custom.as_deref()).and_then(|dir| open_path_in_os(&dir));
+            if let Err(e) = res {
+                if let Some(h) = handle {
+                    let msg = format!("Could not open folder: {e}");
+                    h.update(move |s, tx| s.toast(msg, tx));
+                }
+            }
+        });
+    }
+
+    pub fn open_received_file(&mut self, path: String, tx: &mut Tx) {
+        let handle = self.handle.clone();
+        let _ = tx;
+        self.rt.spawn_blocking(move || {
+            if let Err(e) = open_path_in_os(std::path::Path::new(&path)) {
+                if let Some(h) = handle {
+                    let msg = format!("Could not open file: {e}");
+                    h.update(move |s, tx| s.toast(msg, tx));
+                }
+            }
+        });
+    }
+
+    pub fn reveal_received_file(&mut self, path: String, tx: &mut Tx) {
+        let handle = self.handle.clone();
+        let _ = tx;
+        self.rt.spawn_blocking(move || {
+            if let Err(e) = reveal_in_file_manager(std::path::Path::new(&path)) {
+                if let Some(h) = handle {
+                    let msg = format!("Could not open folder: {e}");
+                    h.update(move |s, tx| s.toast(msg, tx));
+                }
+            }
+        });
     }
 
     pub fn toggle_autostart(&mut self, tx: &mut Tx) {
@@ -1265,7 +1355,7 @@ fn scene_clipboard_filled(s: &mut Ui) {
             filename: "notes.md".into(),
             bytes: 4_820,
             direction: "received".into(),
-            saved_path: None,
+            saved_path: Some("~/Downloads/Glide/notes.md".into()),
         },
     ];
 }

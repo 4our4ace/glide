@@ -78,6 +78,9 @@ pub struct GlideConfigFile {
     /// Maximum single file transfer size in megabytes (default `256`, safely clamped to `1..=4096`).
     #[serde(default = "default_max_file_mb")]
     pub max_file_mb: u32,
+    /// Optional custom folder for received files (defaults to `Downloads/Glide` when `None`).
+    #[serde(default)]
+    pub receive_dir: Option<String>,
     #[serde(default)]
     pub server: ServerConfig,
     #[serde(default)]
@@ -92,6 +95,7 @@ impl Default for GlideConfigFile {
             clipboard_history: true,
             hide_clipboard_history: false,
             max_file_mb: DEFAULT_MAX_FILE_MB,
+            receive_dir: None,
             server: ServerConfig::default(),
             client: ClientConfig::default(),
         }
@@ -120,17 +124,32 @@ impl GlideConfigFile {
         Self::max_file_bytes_for_mb(self.max_file_mb)
     }
 
-    /// Returns a `ServerConfig` populated with top-level shared settings (such as `max_file_mb`).
+    /// Normalizes a configured custom receive directory (`Some("  ")` -> `None`).
+    pub fn normalized_receive_dir(raw: Option<&str>) -> Option<String> {
+        raw.map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_owned)
+    }
+
+    /// Resolves the effective receive folder (expanding leading `~/` or falling back to `Downloads/Glide`).
+    pub fn resolved_receive_dir(&self) -> Result<PathBuf> {
+        let norm = Self::normalized_receive_dir(self.receive_dir.as_deref());
+        glide_backend::os_integration::resolve_receive_dir(norm.as_deref())
+    }
+
+    /// Returns a `ServerConfig` populated with top-level shared settings (`max_file_mb`, `receive_dir`).
     pub fn effective_server_config(&self) -> ServerConfig {
         let mut cfg = self.server.clone();
         cfg.max_file_bytes = Some(self.max_file_bytes());
+        cfg.receive_dir = Self::normalized_receive_dir(self.receive_dir.as_deref());
         cfg
     }
 
-    /// Returns a `ClientConfig` populated with top-level shared settings (such as `max_file_mb`).
+    /// Returns a `ClientConfig` populated with top-level shared settings (`max_file_mb`, `receive_dir`).
     pub fn effective_client_config(&self) -> ClientConfig {
         let mut cfg = self.client.clone();
         cfg.max_file_bytes = Some(self.max_file_bytes());
+        cfg.receive_dir = Self::normalized_receive_dir(self.receive_dir.as_deref());
         cfg
     }
 
@@ -140,6 +159,7 @@ impl GlideConfigFile {
         let mut cfg: Self = toml::from_str(&raw)
             .with_context(|| format!("failed to parse TOML config {}", path.display()))?;
         cfg.max_file_mb = cfg.max_file_mb_clamped();
+        cfg.receive_dir = Self::normalized_receive_dir(cfg.receive_dir.as_deref());
         Ok(cfg)
     }
 
@@ -149,6 +169,7 @@ impl GlideConfigFile {
         }
         let mut normalized = self.clone();
         normalized.max_file_mb = normalized.max_file_mb_clamped();
+        normalized.receive_dir = Self::normalized_receive_dir(normalized.receive_dir.as_deref());
         let body = toml::to_string_pretty(&normalized)?;
         fs::write(path, body)
             .with_context(|| format!("failed to write config file {}", path.display()))?;
@@ -193,6 +214,9 @@ pub struct ServerConfig {
     /// Effective maximum file transfer size in bytes (populated from top-level `max_file_mb`).
     #[serde(skip)]
     pub max_file_bytes: Option<usize>,
+    /// Effective custom receive folder (populated from top-level `receive_dir`).
+    #[serde(skip)]
+    pub receive_dir: Option<String>,
 }
 
 impl Default for ServerConfig {
@@ -214,6 +238,7 @@ impl Default for ServerConfig {
             motion_coalesce_us: 1000,
             identity_dir: None,
             max_file_bytes: None,
+            receive_dir: None,
         }
     }
 }
@@ -233,6 +258,11 @@ impl ServerConfig {
         self.max_file_bytes
             .unwrap_or(glide_proto::DEFAULT_MAX_FILE_BYTES)
             .min(u32::MAX as usize)
+    }
+
+    pub fn resolved_receive_dir(&self) -> Result<PathBuf> {
+        let norm = GlideConfigFile::normalized_receive_dir(self.receive_dir.as_deref());
+        glide_backend::os_integration::resolve_receive_dir(norm.as_deref())
     }
 }
 
@@ -278,6 +308,9 @@ pub struct ClientConfig {
     /// Effective maximum file transfer size in bytes (populated from top-level `max_file_mb`).
     #[serde(skip)]
     pub max_file_bytes: Option<usize>,
+    /// Effective custom receive folder (populated from top-level `receive_dir`).
+    #[serde(skip)]
+    pub receive_dir: Option<String>,
 }
 
 impl Default for ClientConfig {
@@ -302,6 +335,7 @@ impl Default for ClientConfig {
             clipboard: true,
             tofu_store_path: None,
             max_file_bytes: None,
+            receive_dir: None,
         }
     }
 }
@@ -317,6 +351,11 @@ impl ClientConfig {
         self.max_file_bytes
             .unwrap_or(glide_proto::DEFAULT_MAX_FILE_BYTES)
             .min(u32::MAX as usize)
+    }
+
+    pub fn resolved_receive_dir(&self) -> Result<PathBuf> {
+        let norm = GlideConfigFile::normalized_receive_dir(self.receive_dir.as_deref());
+        glide_backend::os_integration::resolve_receive_dir(norm.as_deref())
     }
 }
 
@@ -416,5 +455,44 @@ mod tests {
         let raw = toml::to_string_pretty(&cfg).unwrap();
         let parsed: GlideConfigFile = toml::from_str(&raw).unwrap();
         assert!(!parsed.server.pin_media_keys_local);
+    }
+
+    #[test]
+    fn receive_dir_defaults_none_normalizes_and_roundtrips() {
+        let legacy: GlideConfigFile = toml::from_str("").unwrap();
+        assert_eq!(legacy.receive_dir, None);
+        assert_eq!(legacy.effective_server_config().receive_dir, None);
+        assert_eq!(legacy.effective_client_config().receive_dir, None);
+
+        // Blank receive_dir normalizes to None on load/save
+        let tmp = std::env::temp_dir().join(format!(
+            "glide-cfg-receive-dir-{}.toml",
+            std::process::id()
+        ));
+        let cfg_blank = GlideConfigFile {
+            receive_dir: Some("   ".into()),
+            ..GlideConfigFile::default()
+        };
+        cfg_blank.save(&tmp).unwrap();
+        let reloaded_blank = GlideConfigFile::load(&tmp).unwrap();
+        assert_eq!(reloaded_blank.receive_dir, None);
+
+        // Non-empty custom receive_dir persists and propagates to effective server/client configs
+        let cfg_custom = GlideConfigFile {
+            receive_dir: Some("  ~/Inbox/GlideFiles  ".into()),
+            ..GlideConfigFile::default()
+        };
+        cfg_custom.save(&tmp).unwrap();
+        let reloaded = GlideConfigFile::load(&tmp).unwrap();
+        assert_eq!(reloaded.receive_dir.as_deref(), Some("~/Inbox/GlideFiles"));
+        assert_eq!(
+            reloaded.effective_server_config().receive_dir.as_deref(),
+            Some("~/Inbox/GlideFiles")
+        );
+        assert_eq!(
+            reloaded.effective_client_config().receive_dir.as_deref(),
+            Some("~/Inbox/GlideFiles")
+        );
+        let _ = std::fs::remove_file(&tmp);
     }
 }

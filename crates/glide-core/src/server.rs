@@ -13,7 +13,6 @@
 use crate::config::ServerConfig;
 use crate::runtime::{save_received_file, PeerSummary, RuntimeCommand, RuntimeState};
 use anyhow::Result;
-use glide_backend::os_integration::file_receive_dir;
 use glide_backend::{CaptureEvent, CaptureHandle, ClipboardHandle};
 use glide_hid::ModifierMask;
 use glide_net::discovery::spawn_server_beacon;
@@ -393,6 +392,9 @@ pub async fn run_server_with_backends(
                         let effective = limit.min(u32::MAX as usize);
                         config.max_file_bytes = Some(effective);
                         max_file_bytes.store(effective, Ordering::Relaxed);
+                    }
+                    RuntimeCommand::UpdateReceiveDir(dir) => {
+                        config.receive_dir = dir;
                     }
                     RuntimeCommand::ResendClipboard(id) => {
                         if let Some(ref rt) = runtime {
@@ -794,7 +796,8 @@ pub async fn run_server_with_backends(
                                 }
                             }
                             BulkTransfer::File(file) => {
-                                match file_receive_dir()
+                                match config
+                                    .resolved_receive_dir()
                                     .and_then(|dir| save_received_file(&dir, &file.filename, &file.data))
                                 {
                                     Ok(saved) => {
