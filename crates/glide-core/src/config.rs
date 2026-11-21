@@ -311,6 +311,9 @@ pub struct ClientConfig {
     /// Effective custom receive folder (populated from top-level `receive_dir`).
     #[serde(skip)]
     pub receive_dir: Option<String>,
+    /// Optional path to `known_servers.toml` for auto-recording connected server profiles.
+    #[serde(skip)]
+    pub known_servers_path: Option<PathBuf>,
 }
 
 impl Default for ClientConfig {
@@ -336,6 +339,7 @@ impl Default for ClientConfig {
             tofu_store_path: None,
             max_file_bytes: None,
             receive_dir: None,
+            known_servers_path: None,
         }
     }
 }
@@ -357,6 +361,210 @@ impl ClientConfig {
         let norm = GlideConfigFile::normalized_receive_dir(self.receive_dir.as_deref());
         glide_backend::os_integration::resolve_receive_dir(norm.as_deref())
     }
+}
+
+/// Maximum number of saved servers retained in `known_servers.toml`.
+pub const MAX_KNOWN_SERVERS: usize = 12;
+
+/// Default path for the saved server profiles store (`<config_dir>/known_servers.toml`).
+pub fn default_known_servers_path() -> PathBuf {
+    default_config_dir().join("known_servers.toml")
+}
+
+/// Resolves `known_servers.toml` adjacent to a specific config file, falling back to default config dir.
+pub fn known_servers_path_for_config(config_path: &Path) -> PathBuf {
+    config_path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .map(|p| p.join("known_servers.toml"))
+        .unwrap_or_else(default_known_servers_path)
+}
+
+fn default_right_edge() -> Edge {
+    Edge::Right
+}
+
+/// Current Unix timestamp in seconds.
+pub fn current_unix_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs())
+}
+
+/// A previously connected Glide server saved for one-click profile switching.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct KnownServer {
+    pub name: String,
+    pub address: String,
+    #[serde(default)]
+    pub fingerprint: Option<String>,
+    #[serde(default = "default_right_edge")]
+    pub edge: Edge,
+    #[serde(default)]
+    pub last_connected_unix: u64,
+}
+
+/// TOML-persisted list of recently connected Glide servers (`known_servers.toml`).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct KnownServersStore {
+    #[serde(default)]
+    pub servers: Vec<KnownServer>,
+}
+
+impl KnownServersStore {
+    /// Loads `known_servers.toml`, returning an empty store if the file does not exist yet.
+    pub fn load(path: &Path) -> Result<Self> {
+        if !path.exists() {
+            return Ok(Self::default());
+        }
+        let raw = fs::read_to_string(path)
+            .with_context(|| format!("failed to read known servers store {}", path.display()))?;
+        let mut store: Self = toml::from_str(&raw)
+            .with_context(|| format!("failed to parse known servers store {}", path.display()))?;
+        store.normalize();
+        Ok(store)
+    }
+
+    /// Saves `known_servers.toml` sorted by most recently connected and capped at `MAX_KNOWN_SERVERS`.
+    pub fn save(&self, path: &Path) -> Result<()> {
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        let mut normalized = self.clone();
+        normalized.normalize();
+        let body = toml::to_string_pretty(&normalized)?;
+        fs::write(path, body)
+            .with_context(|| format!("failed to write known servers store {}", path.display()))?;
+        Ok(())
+    }
+
+    fn normalize(&mut self) {
+        let existing = std::mem::take(&mut self.servers);
+        for entry in existing {
+            self.upsert_inner(entry);
+        }
+        self.sort_and_cap();
+    }
+
+    fn sort_and_cap(&mut self) {
+        self.servers.sort_by(|a, b| {
+            b.last_connected_unix
+                .cmp(&a.last_connected_unix)
+                .then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase()))
+                .then_with(|| a.address.cmp(&b.address))
+        });
+        self.servers.truncate(MAX_KNOWN_SERVERS);
+    }
+
+    fn upsert_inner(&mut self, mut entry: KnownServer) {
+        entry.name = entry.name.trim().to_owned();
+        entry.address = entry.address.trim().to_owned();
+        if entry.address.is_empty() {
+            return;
+        }
+        if entry.name.is_empty() {
+            entry.name = entry.address.clone();
+        }
+        entry.fingerprint = entry
+            .fingerprint
+            .map(|fp| fp.trim().to_owned())
+            .filter(|fp| !fp.is_empty());
+
+        let mut preserved_fp: Option<String> = None;
+        self.servers.retain(|existing| {
+            let fp_match = match (&entry.fingerprint, &existing.fingerprint) {
+                (Some(a), Some(b)) => a.eq_ignore_ascii_case(b),
+                _ => false,
+            };
+            let addr_match = existing.address.eq_ignore_ascii_case(&entry.address);
+            if fp_match || addr_match {
+                if entry.fingerprint.is_none() && preserved_fp.is_none() {
+                    preserved_fp = existing.fingerprint.clone();
+                }
+                false
+            } else {
+                true
+            }
+        });
+        if entry.fingerprint.is_none() {
+            entry.fingerprint = preserved_fp;
+        }
+        self.servers.push(entry);
+    }
+
+    /// Inserts or updates a server entry (deduplicating by fingerprint or address),
+    /// sorted by most recently connected and capped at `MAX_KNOWN_SERVERS`.
+    pub fn upsert(&mut self, mut entry: KnownServer) {
+        if entry.last_connected_unix == 0 {
+            entry.last_connected_unix = current_unix_secs();
+        }
+        self.upsert_inner(entry);
+        self.sort_and_cap();
+    }
+
+    /// Returns all saved servers sorted by most recently connected (capped at `MAX_KNOWN_SERVERS`).
+    pub fn list(&self) -> Vec<KnownServer> {
+        let mut out = self.clone();
+        out.sort_and_cap();
+        out.servers
+    }
+
+    /// Finds a saved server by exact case-insensitive name first, then address.
+    pub fn find(&self, query: &str) -> Option<&KnownServer> {
+        let q = query.trim();
+        if q.is_empty() {
+            return None;
+        }
+        self.servers
+            .iter()
+            .find(|s| s.name.eq_ignore_ascii_case(q))
+            .or_else(|| {
+                self.servers
+                    .iter()
+                    .find(|s| s.address.eq_ignore_ascii_case(q))
+            })
+    }
+
+    /// Removes any saved server matching `address_or_name` (case-insensitive on address, name, or fingerprint).
+    pub fn remove(&mut self, address_or_name: &str) -> bool {
+        let q = address_or_name.trim();
+        if q.is_empty() {
+            return false;
+        }
+        let before = self.servers.len();
+        self.servers.retain(|s| {
+            !s.address.eq_ignore_ascii_case(q)
+                && !s.name.eq_ignore_ascii_case(q)
+                && !s
+                    .fingerprint
+                    .as_deref()
+                    .is_some_and(|fp| fp.eq_ignore_ascii_case(q))
+        });
+        self.servers.len() != before
+    }
+}
+
+/// Upserts a server profile into `known_servers.toml` at `path` and persists it.
+pub fn record_known_server(path: &Path, entry: KnownServer) -> Result<KnownServersStore> {
+    let mut store = KnownServersStore::load(path).unwrap_or_default();
+    store.upsert(entry);
+    store.save(path)?;
+    Ok(store)
+}
+
+/// Lists saved servers from `known_servers.toml` at `path`, sorted by most recently connected.
+pub fn list_known_servers(path: &Path) -> Result<Vec<KnownServer>> {
+    Ok(KnownServersStore::load(path)?.list())
+}
+
+/// Forgets a saved server from `known_servers.toml` at `path` by address, name, or fingerprint.
+pub fn remove_known_server(path: &Path, address_or_name: &str) -> Result<bool> {
+    let mut store = KnownServersStore::load(path)?;
+    let removed = store.remove(address_or_name);
+    if removed {
+        store.save(path)?;
+    }
+    Ok(removed)
 }
 
 #[cfg(test)]
@@ -493,6 +701,110 @@ mod tests {
             reloaded.effective_client_config().receive_dir.as_deref(),
             Some("~/Inbox/GlideFiles")
         );
+        let _ = std::fs::remove_file(&tmp);
+    }
+
+    #[test]
+    fn known_servers_store_load_save_upsert_dedup_remove_and_cap() {
+        let tmp = std::env::temp_dir().join(format!(
+            "glide-known-servers-test-{}.toml",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&tmp);
+
+        // Missing file loads cleanly as empty
+        let empty = KnownServersStore::load(&tmp).unwrap();
+        assert!(empty.servers.is_empty());
+
+        // Record two servers and verify descending recency sort
+        record_known_server(
+            &tmp,
+            KnownServer {
+                name: "office-pc".into(),
+                address: "192.168.1.10:24800".into(),
+                fingerprint: Some("aa:bb:cc".into()),
+                edge: Edge::Left,
+                last_connected_unix: 1000,
+            },
+        )
+        .unwrap();
+        record_known_server(
+            &tmp,
+            KnownServer {
+                name: "studio-win".into(),
+                address: "192.168.1.20:24800".into(),
+                fingerprint: Some("dd:ee:ff".into()),
+                edge: Edge::Right,
+                last_connected_unix: 2000,
+            },
+        )
+        .unwrap();
+
+        let listed = list_known_servers(&tmp).unwrap();
+        assert_eq!(listed.len(), 2);
+        assert_eq!(listed[0].name, "studio-win");
+        assert_eq!(listed[1].name, "office-pc");
+
+        // Upsert by same fingerprint updates IP/edge/timestamp without duplicating
+        record_known_server(
+            &tmp,
+            KnownServer {
+                name: "office-pc".into(),
+                address: "192.168.1.99:24800".into(),
+                fingerprint: Some("AA:BB:CC".into()),
+                edge: Edge::Top,
+                last_connected_unix: 3000,
+            },
+        )
+        .unwrap();
+        let after_fp_dedup = list_known_servers(&tmp).unwrap();
+        assert_eq!(after_fp_dedup.len(), 2);
+        assert_eq!(after_fp_dedup[0].name, "office-pc");
+        assert_eq!(after_fp_dedup[0].address, "192.168.1.99:24800");
+        assert_eq!(after_fp_dedup[0].edge, Edge::Top);
+
+        // Upsert by same address without fingerprint preserves existing fingerprint
+        record_known_server(
+            &tmp,
+            KnownServer {
+                name: "studio-renamed".into(),
+                address: "192.168.1.20:24800".into(),
+                fingerprint: None,
+                edge: Edge::Bottom,
+                last_connected_unix: 4000,
+            },
+        )
+        .unwrap();
+        let store = KnownServersStore::load(&tmp).unwrap();
+        assert_eq!(store.servers.len(), 2);
+        let studio = store.find("studio-renamed").unwrap();
+        assert_eq!(studio.fingerprint.as_deref(), Some("dd:ee:ff"));
+        assert_eq!(studio.edge, Edge::Bottom);
+        assert!(store.find("192.168.1.99:24800").is_some());
+
+        // Cap at MAX_KNOWN_SERVERS keeping the most recent entries
+        for i in 0..(MAX_KNOWN_SERVERS + 4) {
+            record_known_server(
+                &tmp,
+                KnownServer {
+                    name: format!("srv-{i}"),
+                    address: format!("10.0.0.{}:24800", i + 1),
+                    fingerprint: Some(format!("fp-{i:02}")),
+                    edge: Edge::Right,
+                    last_connected_unix: 5000 + i as u64,
+                },
+            )
+            .unwrap();
+        }
+        let capped = list_known_servers(&tmp).unwrap();
+        assert_eq!(capped.len(), MAX_KNOWN_SERVERS);
+        assert_eq!(capped[0].name, format!("srv-{}", MAX_KNOWN_SERVERS + 3));
+
+        // Remove by name and by address
+        assert!(remove_known_server(&tmp, &format!("srv-{}", MAX_KNOWN_SERVERS + 3)).unwrap());
+        assert!(!remove_known_server(&tmp, "does-not-exist").unwrap());
+        assert_eq!(list_known_servers(&tmp).unwrap().len(), MAX_KNOWN_SERVERS - 1);
+
         let _ = std::fs::remove_file(&tmp);
     }
 }

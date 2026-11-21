@@ -9,7 +9,10 @@
 //! - Optional Linux `/dev/uinput` hardware-native HID backend
 //! - Guaranteed `release_all()` on leave or disconnect
 
-use crate::config::{compile_key_remaps, ClientConfig, DEFAULT_QUIC_PORT};
+use crate::config::{
+    compile_key_remaps, current_unix_secs, default_known_servers_path, record_known_server,
+    ClientConfig, KnownServer, DEFAULT_QUIC_PORT,
+};
 use crate::runtime::{save_received_file, RuntimeCommand, RuntimeState};
 use anyhow::{anyhow, Context, Result};
 use glide_backend::{ClipboardHandle, InputInjector};
@@ -146,6 +149,22 @@ pub async fn run_client_session(
             return Err(anyhow!("unexpected handshake response: {other:?}"));
         }
     };
+
+    if let Some(ref store_path) = config.known_servers_path {
+        let peer_fp = session
+            .peer_fingerprint()
+            .or_else(|| config.trusted_fingerprint.clone());
+        let entry = KnownServer {
+            name: server_name.clone(),
+            address: server_addr.to_string(),
+            fingerprint: peer_fp,
+            edge: config.edge,
+            last_connected_unix: current_unix_secs(),
+        };
+        if let Err(e) = record_known_server(store_path, entry) {
+            warn!(error = %e, "Failed saving known server profile");
+        }
+    }
 
     if let Some(rt) = runtime {
         rt.update(|s| {
@@ -543,6 +562,9 @@ pub async fn run_native_client_with_runtime(
     mut cmd_rx: Option<mpsc::UnboundedReceiver<RuntimeCommand>>,
 ) -> Result<()> {
     glide_backend::init_platform();
+    if config.known_servers_path.is_none() {
+        config.known_servers_path = Some(default_known_servers_path());
+    }
     let mut injector = glide_backend::create_injector_with_kind(config.input_backend)?;
     let geom = injector.desktop_geometry().unwrap_or_default();
 

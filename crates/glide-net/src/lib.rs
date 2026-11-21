@@ -205,6 +205,17 @@ impl GlideSession {
         self.conn.remote_address()
     }
 
+    /// Returns the SHA-256 fingerprint of the peer's TLS leaf certificate, if available.
+    pub fn peer_fingerprint(&self) -> Option<String> {
+        let certs = self
+            .conn
+            .peer_identity()?
+            .downcast::<Vec<rustls::pki_types::CertificateDer<'static>>>()
+            .ok()?;
+        let leaf = certs.first()?;
+        Some(tls::sha256_fingerprint(leaf.as_ref()))
+    }
+
     /// Sends a mouse delta or high-res scroll immediately as an unreliable QUIC datagram.
     #[inline]
     pub fn send_datagram(&self, msg: DatagramMessage) -> Result<()> {

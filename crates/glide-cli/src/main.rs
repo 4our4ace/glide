@@ -10,7 +10,10 @@ use clap::{Parser, Subcommand, ValueEnum};
 use glide_backend::os_integration::{configure_elevated_task, configure_firewall, set_autostart};
 use glide_backend::InputBackendKind;
 use glide_core::client::run_native_client;
-use glide_core::config::{default_config_dir, ClientConfig, GlideConfigFile, ServerConfig};
+use glide_core::config::{
+    default_config_dir, default_known_servers_path, known_servers_path_for_config,
+    remove_known_server, ClientConfig, GlideConfigFile, KnownServersStore, ServerConfig,
+};
 use glide_core::server::run_native_server;
 use glide_gui::{run_gui_blocking, GuiOptions, DEFAULT_GUI_PORT};
 use glide_hid::HidUsage;
@@ -160,6 +163,10 @@ enum Command {
 
     /// Run as a secondary machine (receives mouse, keyboard, and clipboard from a Glide server)
     Client {
+        /// Connect to a saved server profile by name or address (from `known_servers.toml`)
+        #[arg(short, long)]
+        profile: Option<String>,
+
         /// Explicit server address (host:port). Omit to auto-discover on LAN!
         #[arg(short, long)]
         server: Option<String>,
@@ -217,6 +224,12 @@ enum Command {
         no_clipboard: bool,
     },
 
+    /// List or manage saved server profiles (`known_servers.toml`)
+    Servers {
+        #[command(subcommand)]
+        action: Option<ServersAction>,
+    },
+
     /// Scan the local network for running Glide servers
     Discover {
         /// Scan duration in seconds (default: 3)
@@ -243,6 +256,24 @@ enum Command {
 
     /// Inspect monitors, DPI scaling, OS extensions, and German ISO HID key mappings
     Doctor,
+}
+
+#[derive(Subcommand, Debug)]
+enum ServersAction {
+    /// List saved servers sorted by most recently connected (default)
+    List,
+    /// Forget a saved server by name, address, or fingerprint
+    Forget {
+        /// Server name, host:port address, or fingerprint to remove
+        target: String,
+    },
+}
+
+fn resolve_known_servers_path(config_path: Option<&PathBuf>) -> PathBuf {
+    match config_path {
+        Some(p) => known_servers_path_for_config(p),
+        None => default_known_servers_path(),
+    }
 }
 
 fn load_config(path: Option<&PathBuf>) -> Result<GlideConfigFile> {
@@ -376,6 +407,7 @@ async fn run_command(command: Command, config: Option<PathBuf>) -> Result<()> {
         }
 
         Command::Client {
+            profile,
             server,
             server_name,
             edge,
@@ -392,6 +424,22 @@ async fn run_command(command: Command, config: Option<PathBuf>) -> Result<()> {
             no_clipboard,
         } => {
             let mut cfg: ClientConfig = load_config(cli_config.as_ref())?.effective_client_config();
+            let known_path = resolve_known_servers_path(cli_config.as_ref());
+            cfg.known_servers_path = Some(known_path.clone());
+            if let Some(ref query) = profile {
+                let store = KnownServersStore::load(&known_path)?;
+                let saved = store.find(query).ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "no saved server matching '{query}' in {} (run `glide servers` to list)",
+                        known_path.display()
+                    )
+                })?;
+                cfg.server = Some(saved.address.clone());
+                cfg.edge = saved.edge;
+                if saved.fingerprint.is_some() {
+                    cfg.trusted_fingerprint = saved.fingerprint.clone();
+                }
+            }
             if let Some(s) = server {
                 cfg.server = Some(s);
             }
@@ -439,6 +487,37 @@ async fn run_command(command: Command, config: Option<PathBuf>) -> Result<()> {
                 res = run_native_client(cfg) => res?,
                 _ = tokio::signal::ctrl_c() => {
                     tracing::info!("Shutting down Glide client (Ctrl+C)");
+                }
+            }
+        }
+
+        Command::Servers { action } => {
+            let known_path = resolve_known_servers_path(cli_config.as_ref());
+            match action.unwrap_or(ServersAction::List) {
+                ServersAction::List => {
+                    let servers = KnownServersStore::load(&known_path)?.list();
+                    if servers.is_empty() {
+                        println!("No saved servers yet ({}).", known_path.display());
+                        println!("Servers are saved automatically after your first client connection.");
+                    } else {
+                        println!(
+                            "{:<22} {:<24} {:<8} FINGERPRINT",
+                            "NAME", "ADDRESS", "EDGE"
+                        );
+                        println!("{}", "-".repeat(86));
+                        for s in servers {
+                            let edge_str = format!("{:?}", s.edge).to_lowercase();
+                            let fp = s.fingerprint.as_deref().unwrap_or("-");
+                            println!("{:<22} {:<24} {:<8} {}", s.name, s.address, edge_str, fp);
+                        }
+                    }
+                }
+                ServersAction::Forget { target } => {
+                    if remove_known_server(&known_path, &target)? {
+                        println!("Removed saved server '{target}'.");
+                    } else {
+                        println!("No saved server matched '{target}'.");
+                    }
                 }
             }
         }

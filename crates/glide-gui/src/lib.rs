@@ -200,7 +200,8 @@ impl AppController {
                 })
             }
             "client" => {
-                let ccfg = cfg.effective_client_config();
+                let mut ccfg = cfg.effective_client_config();
+                ccfg.known_servers_path = Some(self.known_servers_path());
                 let rt_err = rt.clone();
                 tokio::spawn(async move {
                     if let Err(e) =
@@ -220,6 +221,10 @@ impl AppController {
 
         *self.engine.lock() = Some(ActiveEngine { task, cmd_tx });
         Ok(())
+    }
+
+    fn known_servers_path(&self) -> PathBuf {
+        glide_core::config::known_servers_path_for_config(&self.config_path)
     }
 
     fn send_cmd(&self, cmd: RuntimeCommand) -> bool {

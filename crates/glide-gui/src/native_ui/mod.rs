@@ -12,7 +12,9 @@ use glide_backend::os_integration::{
     configure_elevated_task, configure_firewall, ensure_receive_dir, is_autostart_enabled,
     open_path_in_os, resolve_receive_dir, reveal_in_file_manager, set_autostart,
 };
-use glide_core::config::{GlideConfigFile, KeyRemapRule};
+use glide_core::config::{
+    list_known_servers, remove_known_server, GlideConfigFile, KeyRemapRule, KnownServer,
+};
 use glide_core::runtime::{
     ClipboardHistoryEntry, FileTransferEntry, PeerSummary, RuntimeCommand, StatusSnapshot,
 };
@@ -112,6 +114,7 @@ pub struct Ui {
     pub theme: ThemePref,
     pub selected_peer_name: Option<String>,
     pub discovered: Vec<DiscoveredPeer>,
+    pub known_servers: Vec<KnownServer>,
     pub scanning: bool,
     pub show_advanced: bool,
     pub update_state: UpdateCheckState,
@@ -147,6 +150,7 @@ impl Ui {
         let tray_active = ctrl.tray_active.load(Ordering::SeqCst);
         let autostart = is_autostart_enabled();
         let local_ips = local_ipv4_addresses();
+        let known_servers = list_known_servers(&ctrl.known_servers_path()).unwrap_or_default();
 
         let doctor_display = "Detecting display…".to_owned();
         let doctor_text =
@@ -187,6 +191,7 @@ impl Ui {
             theme: ThemePref::load(),
             selected_peer_name: None,
             discovered: Vec::new(),
+            known_servers,
             scanning: false,
             show_advanced: false,
             update_state: UpdateCheckState::Idle,
@@ -304,6 +309,9 @@ impl Ui {
     }
 
     fn apply_status(&mut self, snap: StatusSnapshot) {
+        let newly_connected_client = snap.mode == "client"
+            && snap.status.starts_with("Connected")
+            && (self.status.status != snap.status || self.status.local_addr != snap.local_addr);
         if snap.mode == "server" {
             self.role = Role::Server;
         } else if snap.mode == "client" {
@@ -313,6 +321,13 @@ impl Ui {
             self.dismissed_error = None;
         }
         self.status = snap;
+        if newly_connected_client {
+            self.refresh_known_servers();
+        }
+    }
+
+    pub fn refresh_known_servers(&mut self) {
+        self.known_servers = list_known_servers(&self.ctrl.known_servers_path()).unwrap_or_default();
     }
 
     // -----------------------------------------------------------------------
@@ -681,6 +696,46 @@ impl Ui {
                 }
             }
         });
+    }
+
+    pub fn connect_known_server(&mut self, srv: KnownServer, tx: &mut Tx) {
+        self.role = Role::Client;
+        self.config.last_role = Some("client".into());
+        self.config.auto_start_on_launch = true;
+        self.config.client.server = Some(srv.address.clone());
+        self.config.client.trusted_fingerprint = srv.fingerprint.clone();
+        self.config.client.edge = srv.edge;
+        self.server_edit = TextEdit::new(&srv.address);
+        self.last_committed_server = srv.address.clone();
+        self.push_config();
+        self.toast(format!("Connecting to {}…", srv.name), tx);
+
+        let ctrl = Arc::clone(&self.ctrl);
+        let handle = self.handle.clone();
+        self.rt.spawn(async move {
+            if let Err(e) = ctrl.start_engine("client").await {
+                let msg = format!("Error: {e}");
+                if let Some(h) = handle {
+                    h.update(move |s, tx| s.toast(msg, tx));
+                }
+            }
+        });
+    }
+
+    pub fn forget_known_server(&mut self, addr: String, tx: &mut Tx) {
+        let path = self.ctrl.known_servers_path();
+        match remove_known_server(&path, &addr) {
+            Ok(true) => {
+                self.refresh_known_servers();
+                self.toast("Removed saved server", tx);
+            }
+            Ok(false) => {
+                self.refresh_known_servers();
+            }
+            Err(e) => {
+                self.toast(format!("Could not remove server: {e}"), tx);
+            }
+        }
     }
 
     pub fn add_remap_rule(&mut self, from: &str, to: &str, tx: &mut Tx) {
@@ -1394,6 +1449,27 @@ const SCENES: &[(&str, SceneFn)] = &[
     ("client-connected", |s| {
         s.theme = ThemePref::Light;
         scene_client_connected(s);
+    }),
+    ("client-profiles", |s| {
+        s.theme = ThemePref::Light;
+        scene_client_connected(s);
+        s.status.local_addr = Some("192.168.1.42:24800".into());
+        s.known_servers = vec![
+            KnownServer {
+                name: "workstation".into(),
+                address: "192.168.1.42:24800".into(),
+                fingerprint: Some("ab:cd:ef".into()),
+                edge: Edge::Right,
+                last_connected_unix: 2000,
+            },
+            KnownServer {
+                name: "studio-pc".into(),
+                address: "192.168.1.88:24800".into(),
+                fingerprint: Some("12:34:56".into()),
+                edge: Edge::Left,
+                last_connected_unix: 1000,
+            },
+        ];
     }),
     ("input-server-light", |s| {
         s.theme = ThemePref::Light;

@@ -69,11 +69,17 @@ mod tests {
             motion_coalesce_us: 0,
             ..Default::default()
         };
+        let known_path = std::env::temp_dir().join(format!(
+            "glide-e2e-known-servers-{}.toml",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&known_path);
+
         let mut cli_cfg = ClientConfig {
             name: "ubuntu-test".into(),
             server: Some(addr.to_string()),
             edge: Edge::Right,
-            trusted_fingerprint: Some(fp),
+            trusted_fingerprint: Some(fp.clone()),
             sensitivity: 1.0,
             edge_threshold_px: 4,
             dead_corner_px: 24,
@@ -81,6 +87,7 @@ mod tests {
                 from: "CapsLock".into(),
                 to: "ControlLeft".into(),
             }],
+            known_servers_path: Some(known_path.clone()),
             ..Default::default()
         };
 
@@ -114,6 +121,13 @@ mod tests {
 
         tokio::time::sleep(Duration::from_millis(120)).await;
         assert_eq!(*cap_state.active_edges.lock(), vec![Edge::Right]);
+        let known = crate::config::list_known_servers(&known_path).unwrap();
+        assert_eq!(known.len(), 1);
+        assert_eq!(known[0].name, "win11-test");
+        assert_eq!(known[0].address, addr.to_string());
+        assert_eq!(known[0].fingerprint.as_deref(), Some(fp.as_str()));
+        assert_eq!(known[0].edge, Edge::Right);
+        let _ = std::fs::remove_file(&known_path);
 
         // 1. Lazy large clipboard (> 256 KiB): offered while client is unfocused — NOT transferred yet!
         let big_img = Bytes::from(vec![0x42u8; 300 * 1024]);

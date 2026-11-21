@@ -1100,14 +1100,122 @@ fn client_connection_col(s: &Ui, p: Palette) -> El {
         ),
     );
 
-    col()
+    let mut col_el = col()
         .key("client-conn-col")
         .grow(1.0)
         .shrink()
         .min_w(0.0)
-        .gap(8.0)
-        .child(section_head(p, "client-conn-head", "Connection", None))
-        .child(card_rows(p, "client-conn-card", vec![server_row, pos_row]))
+        .h_full()
+        .min_h(0.0)
+        .gap(10.0)
+        .child(
+            col()
+                .w_full()
+                .gap(7.0)
+                .child(section_head(p, "client-conn-head", "Connection", None))
+                .child(card_rows(p, "client-conn-card", vec![server_row, pos_row])),
+        );
+
+    if !s.known_servers.is_empty() {
+        let connected = s.client_connected();
+        let active_addr = s.status.local_addr.as_deref();
+        let count = s.known_servers.len();
+        let mut list = col().key("known-servers-list").w_full();
+        for (i, srv) in s.known_servers.iter().enumerate() {
+            let is_active = connected && active_addr == Some(srv.address.as_str());
+            let srv_connect = srv.clone();
+            let rm_addr = srv.address.clone();
+            let action = if is_active {
+                badge(p, format!("known-active-{i}"), "Active", true, false)
+            } else {
+                button(
+                    p,
+                    format!("known-conn-{i}"),
+                    if connected { "Switch" } else { "Connect" },
+                    BtnKind::Primary,
+                    22.0,
+                    8.0,
+                    false,
+                    move |s, tx| s.connect_known_server(srv_connect.clone(), tx),
+                )
+            };
+            let rm_btn = row()
+                .key(format!("known-rm-{i}"))
+                .role("button")
+                .label(format!("Forget {}", srv.name))
+                .size(22.0, 22.0)
+                .center()
+                .radius(5.0)
+                .hover(p.hover)
+                .press(p.press)
+                .cursor(Cursor::Pointer)
+                .focusable(true)
+                .on_press_tx(move |s: &mut Ui, tx| s.forget_known_server(rm_addr.clone(), tx))
+                .child(icons::close_icon(10.5, p.muted));
+
+            let item = row()
+                .key(format!("known-row-{i}"))
+                .w_full()
+                .min_h(36.0)
+                .px(10.0)
+                .py(5.0)
+                .gap(8.0)
+                .center_y()
+                .child(
+                    col()
+                        .grow(1.0)
+                        .shrink()
+                        .min_w(0.0)
+                        .gap(0.5)
+                        .child(
+                            text(srv.name.clone())
+                                .font(ty::SUB_MED)
+                                .color(p.text)
+                                .truncate(),
+                        )
+                        .child(
+                            text(srv.address.clone())
+                                .font(ty::SUB)
+                                .color(p.muted)
+                                .truncate(),
+                        ),
+                )
+                .child(row().gap(4.0).center_y().child(action).child(rm_btn));
+
+            list = list.child(item);
+            if i + 1 < count {
+                list = list.child(rule(1.0, p.line).a11y_hidden());
+            }
+        }
+
+        let scroll = col()
+            .key("known-servers-scroll")
+            .w_full()
+            .grow(1.0)
+            .min_h(0.0)
+            .scroll(ScrollSpec {
+                stick_bottom: false,
+            })
+            .child(list);
+
+        col_el = col_el.child(
+            col()
+                .key("known-servers-sec")
+                .w_full()
+                .grow(1.0)
+                .min_h(0.0)
+                .gap(6.0)
+                .child(section_head(p, "known-servers-head", "Saved servers", None))
+                .child(
+                    card(p, "known-servers-card")
+                        .grow(1.0)
+                        .min_h(0.0)
+                        .child(scroll),
+                ),
+        );
+    }
+
+    col_el
 }
 
 fn client_servers_col(s: &Ui, p: Palette) -> El {
