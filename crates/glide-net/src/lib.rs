@@ -26,26 +26,99 @@ use tls::{ensure_crypto_provider, FingerprintVerifier, ServerIdentity, TrustMode
 /// Builds a QUIC `TransportConfig` tuned for interactive sub-millisecond LAN/Wi-Fi input.
 ///
 /// - `initial_rtt(5ms)` avoids Quinn's default 333ms WAN RTT assumption.
-/// - `keep_alive_interval(120ms)` prevents laptop Wi-Fi NICs from entering 802.11 Power Save
-///   Mode (DTIM sleep), which otherwise causes 150-200ms wakeup spikes!
+/// - `keep_alive_interval(45ms)` beats the 102.4ms 802.11 DTIM beacon and 50–100ms laptop
+///   Wi-Fi PSM sleep timers that otherwise cause 150–200ms wakeup spikes.
+/// - `enable_segmentation_offload(false)` eliminates the `quinn-udp` Windows 11 Wi-Fi
+///   GSO/USO silent batch-drop bug.
+/// - `AckFrequencyConfig` (`ack_eliciting_threshold = 0`, `max_ack_delay = 2ms`,
+///   `reordering_threshold = 1`) eliminates 35–240ms PTO stalls on single-packet Wi-Fi loss.
 /// - `mtu_discovery_config(None)` avoids transient probe stalls on LANs.
+/// - Tight datagram buffers (`2 KiB` send / `4 KiB` recv) prevent seconds of stale mouse
+///   rubber-banding backlog during transient RF interference.
+/// - Bounded bulk windows (`512 KiB` send / `256 KiB` per-stream recv) stop Lane C clipboard
+///   and file streams from bloating the Wi-Fi AP buffer ahead of interactive input.
 fn build_transport_config() -> TransportConfig {
     let mut transport = TransportConfig::default();
     transport.initial_rtt(Duration::from_millis(5));
-    transport.keep_alive_interval(Some(Duration::from_millis(120)));
+    transport.keep_alive_interval(Some(Duration::from_millis(45)));
     transport.mtu_discovery_config(None);
+    transport.enable_segmentation_offload(false);
+
+    let mut ack_cfg = quinn::AckFrequencyConfig::default();
+    ack_cfg
+        .ack_eliciting_threshold(0u32.into())
+        .max_ack_delay(Some(Duration::from_millis(2)))
+        .reordering_threshold(1u32.into());
+    transport.ack_frequency_config(Some(ack_cfg));
+
     if let Ok(timeout) = IdleTimeout::try_from(Duration::from_secs(4)) {
         transport.max_idle_timeout(Some(timeout));
     }
-    transport.datagram_receive_buffer_size(Some(128 * 1024));
-    transport.datagram_send_buffer_size(128 * 1024);
+    transport.datagram_send_buffer_size(2048);
+    transport.datagram_receive_buffer_size(Some(4096));
+    transport.send_window(512 * 1024);
+    transport.stream_receive_window((256u32 * 1024).into());
     transport.max_concurrent_bidi_streams(4u32.into());
     transport.max_concurrent_uni_streams(32u32.into());
     transport
 }
 
-/// Binds a UDP socket configured with DSCP EF (`0xB8` -> Wi-Fi WMM `AC_VO` low-latency queue)
-/// and generous kernel buffers so input datagrams bypass router/Wi-Fi background queues.
+#[cfg(target_os = "linux")]
+fn set_linux_so_priority(sock: &socket2::Socket, prio: i32) {
+    use std::ffi::{c_int, c_void};
+    use std::os::fd::AsRawFd;
+
+    #[cfg(any(
+        target_arch = "mips",
+        target_arch = "mips64",
+        target_arch = "sparc",
+        target_arch = "sparc64"
+    ))]
+    const SOL_SOCKET: c_int = 0xffff;
+    #[cfg(not(any(
+        target_arch = "mips",
+        target_arch = "mips64",
+        target_arch = "sparc",
+        target_arch = "sparc64"
+    )))]
+    const SOL_SOCKET: c_int = 1;
+    const SO_PRIORITY: c_int = 12;
+
+    extern "C" {
+        fn setsockopt(
+            socket: c_int,
+            level: c_int,
+            name: c_int,
+            value: *const c_void,
+            option_len: u32,
+        ) -> c_int;
+    }
+
+    let val: c_int = prio;
+    // SAFETY: `sock.as_raw_fd()` is an open socket descriptor and `&val` points to a
+    // valid `c_int` of length `size_of::<c_int>()` for the duration of the syscall.
+    let _ = unsafe {
+        setsockopt(
+            sock.as_raw_fd(),
+            SOL_SOCKET,
+            SO_PRIORITY,
+            (&val as *const c_int).cast::<c_void>(),
+            std::mem::size_of::<c_int>() as u32,
+        )
+    };
+}
+
+/// Binds a UDP socket configured with DSCP EF (`0xB8` -> Wi-Fi WMM `AC_VO` low-latency queue),
+/// Linux `SO_PRIORITY = 6` (`TC_PRIO_INTERACTIVE`), and generous kernel buffers so input
+/// datagrams bypass OS/router/Wi-Fi background queues.
+///
+/// Note on `quinn-udp` DSCP preservation: on Linux, `quinn-udp` attaches a per-packet
+/// `IP_TOS` / `IPV6_TCLASS` cmsg carrying only the 2-bit ECN codepoint, which overrides
+/// socket-level DSCP without replacing `quinn-udp`'s raw `sendmsg` path. Setting
+/// `SO_PRIORITY = 6` on Linux sets kernel `sk_priority` (unprivileged up to 6), which is
+/// unaffected by ECN cmsgs and maps directly to Linux qdisc band 0 and `mac80211` Wi-Fi
+/// WMM `AC_VO` (UP 6). On Windows, `quinn-udp` uses `IP_ECN` / `IPV6_ECN` cmsgs, so
+/// socket-level `IP_TOS` is preserved.
 fn bind_low_latency_udp(bind_addr: SocketAddr) -> Result<std::net::UdpSocket> {
     use socket2::{Domain, Protocol, Socket, Type};
     let domain = if bind_addr.is_ipv6() {
@@ -60,6 +133,22 @@ fn bind_low_latency_udp(bind_addr: SocketAddr) -> Result<std::net::UdpSocket> {
     if bind_addr.is_ipv4() {
         // DSCP 46 (Expedited Forwarding) = TOS 0xB8 -> Wi-Fi WMM AC_VO low-latency priority
         let _ = sock.set_tos(0xB8);
+    } else {
+        #[cfg(any(
+            target_os = "linux",
+            target_os = "android",
+            target_os = "macos",
+            target_os = "freebsd",
+            target_os = "netbsd",
+            target_os = "openbsd",
+            target_os = "dragonfly",
+        ))]
+        let _ = sock.set_tclass_v6(0xB8);
+    }
+    #[cfg(target_os = "linux")]
+    {
+        // TC_PRIO_INTERACTIVE (6) -> Linux qdisc interactive band & mac80211 WMM AC_VO.
+        set_linux_so_priority(&sock, 6);
     }
     sock.set_nonblocking(true)?;
     sock.bind(&bind_addr.into())
@@ -266,6 +355,29 @@ impl GlideSession {
     }
 }
 
+const CONTROL_STREAM_PRIORITY: i32 = 100;
+const BULK_STREAM_PRIORITY: i32 = -100;
+const BULK_WRITE_CHUNK_THRESHOLD: usize = 64 * 1024;
+const BULK_WRITE_CHUNK_SIZE: usize = 32 * 1024;
+
+/// Writes a bulk payload to a unidirectional stream, chunking payloads larger than 64 KiB
+/// into 32 KiB writes with `tokio::task::yield_now()` between chunks so large clipboard or
+/// file transfers never monopolize a single Tokio worker turn.
+async fn write_bulk_payload(uni: &mut SendStream, data: &[u8]) -> Result<()> {
+    if data.len() <= BULK_WRITE_CHUNK_THRESHOLD {
+        uni.write_all(data).await?;
+        return Ok(());
+    }
+    let mut chunks = data.chunks(BULK_WRITE_CHUNK_SIZE).peekable();
+    while let Some(chunk) = chunks.next() {
+        uni.write_all(chunk).await?;
+        if chunks.peek().is_some() {
+            tokio::task::yield_now().await;
+        }
+    }
+    Ok(())
+}
+
 /// Sends a clipboard payload over a fresh unidirectional QUIC stream on `conn`.
 pub async fn send_clipboard_on(conn: &Connection, payload: &ClipboardPayload) -> Result<()> {
     use glide_proto::BULK_KIND_CLIPBOARD;
@@ -282,12 +394,13 @@ pub async fn send_clipboard_on(conn: &Connection, payload: &ClipboardPayload) ->
         .open_uni()
         .await
         .context("failed to open bulk uni stream")?;
+    let _ = uni.set_priority(BULK_STREAM_PRIORITY);
 
     let mut hdr = [0u8; 1 + ClipboardPayload::HEADER_LEN];
     hdr[0] = BULK_KIND_CLIPBOARD;
     hdr[1..].copy_from_slice(&payload.encode_header());
     uni.write_all(&hdr).await?;
-    uni.write_all(&payload.data).await?;
+    write_bulk_payload(&mut uni, &payload.data).await?;
     uni.finish().context("failed finishing bulk stream")?;
     Ok(())
 }
@@ -318,6 +431,7 @@ pub async fn send_file_on_with_limit(
         .open_uni()
         .await
         .context("failed to open bulk uni stream")?;
+    let _ = uni.set_priority(BULK_STREAM_PRIORITY);
 
     let safe_name = glide_proto::sanitize_filename(&file.filename);
     let name_bytes = safe_name.as_bytes();
@@ -330,7 +444,7 @@ pub async fn send_file_on_with_limit(
     hdr.extend_from_slice(&file.sha256);
     hdr.extend_from_slice(&(file.data.len() as u32).to_be_bytes());
     uni.write_all(&hdr).await?;
-    uni.write_all(&file.data).await?;
+    write_bulk_payload(&mut uni, &file.data).await?;
     uni.finish().context("failed finishing bulk stream")?;
     Ok(())
 }
@@ -365,6 +479,7 @@ pub async fn send_drag_file_on_with_limit(
         .open_uni()
         .await
         .context("failed to open bulk uni stream")?;
+    let _ = uni.set_priority(BULK_STREAM_PRIORITY);
 
     let safe_name = glide_proto::sanitize_filename(&file.filename);
     let name_bytes = safe_name.as_bytes();
@@ -378,7 +493,7 @@ pub async fn send_drag_file_on_with_limit(
     hdr.extend_from_slice(&file.sha256);
     hdr.extend_from_slice(&(file.data.len() as u32).to_be_bytes());
     uni.write_all(&hdr).await?;
-    uni.write_all(&file.data).await?;
+    write_bulk_payload(&mut uni, &file.data).await?;
     uni.finish().context("failed finishing bulk stream")?;
     Ok(())
 }
@@ -464,17 +579,19 @@ async fn read_file_payload(
             "file exceeds maximum size ({len} > {effective_limit})"
         ));
     }
-    let data = read_exact_incremental(uni, len)
-        .await
-        .context("failed reading file transfer body")?;
-    let actual_hash: [u8; 32] = Sha256::digest(&data).into();
+    let data = Bytes::from(
+        read_exact_incremental(uni, len)
+            .await
+            .context("failed reading file transfer body")?,
+    );
+    let actual_hash = sha256_bytes_async(data.clone()).await;
     if actual_hash != sha256 {
         return Err(anyhow!("file payload SHA-256 verification failed"));
     }
     Ok(FilePayload {
         filename,
         sha256,
-        data: Bytes::from(data),
+        data,
     })
 }
 
@@ -516,17 +633,19 @@ pub async fn recv_bulk_stream_with_atomic_limit(
                 .await
                 .context("failed reading clipboard header")?;
             let (format, sha256, len) = ClipboardPayload::decode_header(&hdr)?;
-            let data = read_exact_incremental(&mut uni, len)
-                .await
-                .context("failed reading clipboard body")?;
-            let actual_hash: [u8; 32] = Sha256::digest(&data).into();
+            let data = Bytes::from(
+                read_exact_incremental(&mut uni, len)
+                    .await
+                    .context("failed reading clipboard body")?,
+            );
+            let actual_hash = sha256_bytes_async(data.clone()).await;
             if actual_hash != sha256 {
                 return Err(anyhow!("clipboard payload SHA-256 verification failed"));
             }
             Ok(BulkTransfer::Clipboard(ClipboardPayload {
                 format,
                 sha256,
-                data: Bytes::from(data),
+                data,
             }))
         }
         BULK_KIND_FILE => {
@@ -591,6 +710,7 @@ impl ControlSender {
     const MAX_RETAINED_CAP: usize = 4096;
 
     fn new(stream: SendStream) -> Self {
+        let _ = stream.set_priority(CONTROL_STREAM_PRIORITY);
         Self {
             stream,
             buf: BytesMut::with_capacity(Self::INITIAL_CAP),
@@ -655,9 +775,25 @@ impl ControlReceiver {
     }
 }
 
+const SHA256_OFFLOAD_THRESHOLD: usize = 64 * 1024;
+
 /// Computes SHA-256 of arbitrary bytes (helper for clipboard hashing).
 pub fn sha256_bytes(data: &[u8]) -> [u8; 32] {
     Sha256::digest(data).into()
+}
+
+/// Computes SHA-256 of `data`, running inline for payloads up to 64 KiB and offloading
+/// larger payloads onto Tokio's blocking thread pool so verifying multi-megabyte clipboard
+/// images or files never stalls async worker threads.
+pub async fn sha256_bytes_async(data: Bytes) -> [u8; 32] {
+    if data.len() <= SHA256_OFFLOAD_THRESHOLD {
+        return sha256_bytes(&data);
+    }
+    let fallback = data.clone();
+    match tokio::task::spawn_blocking(move || sha256_bytes(&data)).await {
+        Ok(hash) => hash,
+        Err(_) => sha256_bytes(&fallback),
+    }
 }
 
 #[cfg(test)]
@@ -962,6 +1098,107 @@ mod tests {
             other => panic!("expected multi-chunk file, got {other:?}"),
         }
 
+        assert_eq!(
+            client.ctrl_send.stream.priority().unwrap(),
+            CONTROL_STREAM_PRIORITY
+        );
         server_task.await.unwrap();
+    }
+
+    #[test]
+    fn build_transport_config_smoke_checks_low_latency_wifi_tuning() {
+        let cfg = build_transport_config();
+        let dbg = format!("{cfg:?}");
+        assert!(dbg.contains("initial_rtt: 5ms"), "debug: {dbg}");
+        assert!(dbg.contains("keep_alive_interval: Some(45ms)"), "debug: {dbg}");
+        assert!(dbg.contains("mtu_discovery_config: None"), "debug: {dbg}");
+        assert!(
+            dbg.contains("enable_segmentation_offload: false"),
+            "debug: {dbg}"
+        );
+        assert!(
+            dbg.contains("ack_eliciting_threshold: 0")
+                && dbg.contains("max_ack_delay: Some(2ms)")
+                && dbg.contains("reordering_threshold: 1"),
+            "debug: {dbg}"
+        );
+        assert!(dbg.contains("datagram_send_buffer_size: 2048"), "debug: {dbg}");
+        assert!(
+            dbg.contains("datagram_receive_buffer_size: Some(4096)"),
+            "debug: {dbg}"
+        );
+        assert!(dbg.contains("send_window: 524288"), "debug: {dbg}");
+        assert!(dbg.contains("stream_receive_window: 262144"), "debug: {dbg}");
+    }
+
+    #[tokio::test]
+    async fn sha256_bytes_async_matches_sync_for_small_and_large_payloads() {
+        // Empty payload (inline path)
+        let empty = Bytes::new();
+        assert_eq!(sha256_bytes_async(empty.clone()).await, sha256_bytes(&empty));
+
+        // Small payload (<= 64 KiB, inline path)
+        let small = Bytes::from_static(b"glide low-latency sha256 check");
+        assert_eq!(sha256_bytes_async(small.clone()).await, sha256_bytes(&small));
+
+        // Exact threshold boundary (64 KiB, inline path)
+        let boundary = Bytes::from(vec![0x5Au8; SHA256_OFFLOAD_THRESHOLD]);
+        assert_eq!(
+            sha256_bytes_async(boundary.clone()).await,
+            sha256_bytes(&boundary)
+        );
+
+        // Large payload (> 64 KiB, spawn_blocking offload path)
+        let large_vec: Vec<u8> = (0..(256 * 1024 + 137)).map(|i| (i % 251) as u8).collect();
+        let large = Bytes::from(large_vec);
+        assert_eq!(sha256_bytes_async(large.clone()).await, sha256_bytes(&large));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_low_latency_udp_sets_so_priority_interactive() {
+        use std::ffi::{c_int, c_void};
+        use std::os::fd::AsRawFd;
+
+        #[cfg(any(
+            target_arch = "mips",
+            target_arch = "mips64",
+            target_arch = "sparc",
+            target_arch = "sparc64"
+        ))]
+        const SOL_SOCKET: c_int = 0xffff;
+        #[cfg(not(any(
+            target_arch = "mips",
+            target_arch = "mips64",
+            target_arch = "sparc",
+            target_arch = "sparc64"
+        )))]
+        const SOL_SOCKET: c_int = 1;
+        const SO_PRIORITY: c_int = 12;
+
+        extern "C" {
+            fn getsockopt(
+                socket: c_int,
+                level: c_int,
+                name: c_int,
+                value: *mut c_void,
+                option_len: *mut u32,
+            ) -> c_int;
+        }
+
+        let sock = bind_low_latency_udp("127.0.0.1:0".parse().unwrap()).unwrap();
+        let mut prio: c_int = 0;
+        let mut len: u32 = std::mem::size_of::<c_int>() as u32;
+        let rc = unsafe {
+            getsockopt(
+                sock.as_raw_fd(),
+                SOL_SOCKET,
+                SO_PRIORITY,
+                (&mut prio as *mut c_int).cast::<c_void>(),
+                &mut len,
+            )
+        };
+        assert_eq!(rc, 0, "getsockopt(SO_PRIORITY) failed");
+        assert_eq!(prio, 6, "expected TC_PRIO_INTERACTIVE (6)");
     }
 }

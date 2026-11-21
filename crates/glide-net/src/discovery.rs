@@ -323,9 +323,26 @@ fn ranked_ipv4_addresses(ifaces: &[LocalIpv4Iface]) -> Vec<String> {
     ips
 }
 
+/// Async version of [`active_ipv4_interfaces`] that offloads OS NIC enumeration
+/// (`getifaddrs` / Windows `GetAdaptersAddresses`) onto Tokio's blocking thread pool
+/// so async worker threads handling input/QUIC traffic are never stalled.
+pub async fn active_ipv4_interfaces_async() -> Vec<LocalIpv4Iface> {
+    tokio::task::spawn_blocking(active_ipv4_interfaces)
+        .await
+        .unwrap_or_default()
+}
+
 /// Convenience helper returning active local IPv4 addresses ordered with physical LAN IPs first.
 pub fn local_ipv4_addresses() -> Vec<String> {
     ranked_ipv4_addresses(&active_ipv4_interfaces())
+}
+
+/// Async version of [`local_ipv4_addresses`] that offloads OS NIC enumeration onto
+/// Tokio's blocking thread pool so callers in `tokio::select!` loops never block async workers.
+pub async fn local_ipv4_addresses_async() -> Vec<String> {
+    tokio::task::spawn_blocking(local_ipv4_addresses)
+        .await
+        .unwrap_or_default()
 }
 
 /// Binds a listener UDP socket on `0.0.0.0:port` and joins multicast on EVERY active IPv4 NIC.
@@ -371,8 +388,26 @@ fn bind_interface_sender(ip: Ipv4Addr) -> Option<std::net::UdpSocket> {
     let _ = sock.set_multicast_if_v4(&ip);
     let _ = sock.set_multicast_ttl_v4(2);
     let _ = sock.set_multicast_loop_v4(true);
+    sock.set_nonblocking(true).ok()?;
     sock.bind(&SocketAddrV4::new(ip, 0).into()).ok()?;
     Some(sock.into())
+}
+
+fn bind_loopback_sender() -> Option<std::net::UdpSocket> {
+    let sock = std::net::UdpSocket::bind("127.0.0.1:0").ok()?;
+    sock.set_nonblocking(true).ok()?;
+    Some(sock)
+}
+
+#[inline]
+fn send_alive(res: std::io::Result<usize>) -> bool {
+    match res {
+        Ok(_) => true,
+        // Ignore transient backpressure on congested/virtual NICs without dropping the socket
+        // or blocking a Tokio worker thread.
+        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => true,
+        Err(_) => false,
+    }
 }
 
 /// Caches interface-bound ephemeral UDP sockets so periodic beacons and probe retries do not
@@ -386,7 +421,7 @@ impl BroadcastBlaster {
     fn new(ifaces: &[LocalIpv4Iface]) -> Self {
         let mut me = Self {
             sockets: HashMap::with_capacity(ifaces.len()),
-            loopback: std::net::UdpSocket::bind("127.0.0.1:0").ok(),
+            loopback: bind_loopback_sender(),
         };
         me.refresh(ifaces);
         me
@@ -403,7 +438,7 @@ impl BroadcastBlaster {
             }
         }
         if self.loopback.is_none() {
-            self.loopback = std::net::UdpSocket::bind("127.0.0.1:0").ok();
+            self.loopback = bind_loopback_sender();
         }
     }
 
@@ -421,15 +456,12 @@ impl BroadcastBlaster {
             let r2 = std_sock.send_to(payload, mcast_dest);
             // 3. Global broadcast explicitly routed out THIS NIC
             let r3 = std_sock.send_to(payload, bcast_dest);
-            r1.is_ok() || r2.is_ok() || r3.is_ok()
+            send_alive(r1) || send_alive(r2) || send_alive(r3)
         });
 
         if include_loopback {
             if let Some(ref sock) = self.loopback {
-                if sock
-                    .send_to(payload, SocketAddrV4::new(Ipv4Addr::LOCALHOST, port))
-                    .is_err()
-                {
+                if !send_alive(sock.send_to(payload, SocketAddrV4::new(Ipv4Addr::LOCALHOST, port))) {
                     self.loopback = None;
                 }
             }
@@ -463,17 +495,15 @@ pub fn spawn_server_beacon_with_refresh(
     os: String,
     refresh_notify: Option<std::sync::Arc<tokio::sync::Notify>>,
 ) -> Result<JoinHandle<()>> {
-    let initial_ifaces = active_ipv4_interfaces();
-    let (socket, mut joined_ifaces) =
-        bind_listener_socket_with_ifaces(discovery_port, &initial_ifaces)?;
+    // Bind immediately so port errors surface synchronously, without running synchronous
+    // OS NIC enumeration (`getifaddrs` / `GetAdaptersAddresses`) on a Tokio worker thread.
+    let (socket, mut joined_ifaces) = bind_listener_socket_with_ifaces(discovery_port, &[])?;
 
     let handle = tokio::spawn(async move {
         let mut buf = [0u8; 1024];
         let mut beacon_tick = tokio::time::interval(Duration::from_millis(500));
         beacon_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-        let mut last_iface_refresh = Instant::now();
         let mut rate_limiter = ProbeRateLimiter::new(Instant::now());
-        let mut blaster = BroadcastBlaster::new(&initial_ifaces);
 
         let make_payload = |ips: &[String]| -> Vec<u8> {
             let beacon = ServerBeacon {
@@ -487,17 +517,37 @@ pub fn spawn_server_beacon_with_refresh(
             serde_json::to_vec(&beacon).unwrap_or_default()
         };
 
+        let initial_ifaces = active_ipv4_interfaces_async().await;
+        let mut last_iface_refresh = Instant::now();
+        let mut blaster = BroadcastBlaster::new(&initial_ifaces);
         let mut cached_ips = ranked_ipv4_addresses(&initial_ifaces);
         let mut cached_payload = make_payload(&cached_ips);
 
-        let refresh_interfaces =
+        for iface in &initial_ifaces {
+            match socket.join_multicast_v4(DISCOVERY_MULTICAST_ADDR, iface.ip) {
+                Ok(()) => {
+                    debug!(
+                        ip = %iface.ip,
+                        iface = %iface.name,
+                        "Joined discovery multicast on interface"
+                    );
+                    joined_ifaces.insert(iface.ip);
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::AddrInUse => {
+                    joined_ifaces.insert(iface.ip);
+                }
+                Err(_) => {}
+            }
+        }
+
+        let apply_interface_refresh =
             |socket: &UdpSocket,
              joined_ifaces: &mut HashSet<Ipv4Addr>,
              blaster: &mut BroadcastBlaster,
              cached_ips: &mut Vec<String>,
              cached_payload: &mut Vec<u8>,
+             current: &[LocalIpv4Iface],
              force_rejoin: bool| {
-                let current = active_ipv4_interfaces();
                 if force_rejoin {
                     // After sleep/wake or link bounce the OS/NIC may drop IGMP membership even
                     // if it reacquires the same IP address — leave first (avoiding EADDRINUSE
@@ -518,7 +568,7 @@ pub fn spawn_server_beacon_with_refresh(
                         }
                     });
                 }
-                for iface in &current {
+                for iface in current {
                     if !joined_ifaces.contains(&iface.ip) {
                         if force_rejoin {
                             let _ = socket.leave_multicast_v4(DISCOVERY_MULTICAST_ADDR, iface.ip);
@@ -544,8 +594,8 @@ pub fn spawn_server_beacon_with_refresh(
                     let _ =
                         socket.join_multicast_v4(DISCOVERY_MULTICAST_ADDR, Ipv4Addr::UNSPECIFIED);
                 }
-                blaster.refresh(&current);
-                let new_ips = ranked_ipv4_addresses(&current);
+                blaster.refresh(current);
+                let new_ips = ranked_ipv4_addresses(current);
                 if force_rejoin || new_ips != *cached_ips {
                     *cached_ips = new_ips;
                     *cached_payload = make_payload(cached_ips);
@@ -561,26 +611,30 @@ pub fn spawn_server_beacon_with_refresh(
                     }
                 } => {
                     debug!("LAN discovery beacon forcing immediate interface & multicast refresh");
+                    let current = active_ipv4_interfaces_async().await;
                     last_iface_refresh = Instant::now();
-                    refresh_interfaces(
+                    apply_interface_refresh(
                         &socket,
                         &mut joined_ifaces,
                         &mut blaster,
                         &mut cached_ips,
                         &mut cached_payload,
+                        &current,
                         true,
                     );
                     blaster.blast(&cached_payload, discovery_port, true);
                 }
                 _ = beacon_tick.tick() => {
                     if last_iface_refresh.elapsed() >= Duration::from_secs(3) {
+                        let current = active_ipv4_interfaces_async().await;
                         last_iface_refresh = Instant::now();
-                        refresh_interfaces(
+                        apply_interface_refresh(
                             &socket,
                             &mut joined_ifaces,
                             &mut blaster,
                             &mut cached_ips,
                             &mut cached_payload,
+                            &current,
                             false,
                         );
                     }
@@ -626,8 +680,9 @@ pub async fn discover_servers(
     let probe_sock = UdpSocket::bind("0.0.0.0:0").await?;
     let _ = probe_sock.set_broadcast(true);
 
-    // Enumerate NICs once per discovery scan and reuse bound sender sockets across retries.
-    let ifaces = active_ipv4_interfaces();
+    // Enumerate NICs off the async worker pool once per discovery scan and reuse bound
+    // non-blocking sender sockets across retries.
+    let ifaces = active_ipv4_interfaces_async().await;
     let mut blaster = BroadcastBlaster::new(&ifaces);
 
     // Passive listener on discovery_port (joins multicast on all NICs to catch periodic 500ms beacons!)
@@ -931,5 +986,48 @@ mod tests {
         assert_eq!(servers[0].name, "roaming-host");
         assert_eq!(servers[0].addr.port(), 24810);
         assert_eq!(servers[0].fingerprint, fp);
+    }
+
+    #[tokio::test]
+    async fn local_ipv4_addresses_async_matches_sync_and_returns_valid_non_loopback_ips() {
+        let sync_ips = local_ipv4_addresses();
+        let async_ips = local_ipv4_addresses_async().await;
+        assert_eq!(async_ips, sync_ips);
+        for ip_str in &async_ips {
+            let parsed: Ipv4Addr = ip_str
+                .parse()
+                .expect("local_ipv4_addresses_async must return valid IPv4 strings");
+            assert!(!parsed.is_loopback() && !parsed.is_unspecified());
+        }
+
+        let async_ifaces = active_ipv4_interfaces_async().await;
+        assert_eq!(ranked_ipv4_addresses(&async_ifaces), async_ips);
+    }
+
+    #[test]
+    fn nonblocking_sender_and_wouldblock_handling() {
+        assert!(send_alive(Ok(16)));
+        assert!(send_alive(Err(std::io::Error::from(
+            std::io::ErrorKind::WouldBlock
+        ))));
+        assert!(!send_alive(Err(std::io::Error::from(
+            std::io::ErrorKind::NetworkUnreachable
+        ))));
+
+        // Loopback sender socket must be non-blocking (recv_from returns WouldBlock immediately).
+        let sock = bind_loopback_sender().expect("bind_loopback_sender should succeed");
+        let mut buf = [0u8; 8];
+        let err = sock
+            .recv_from(&mut buf)
+            .expect_err("non-blocking socket with no data must not block");
+        assert_eq!(err.kind(), std::io::ErrorKind::WouldBlock);
+
+        // Interface sender bound to loopback must also be non-blocking.
+        let iface_sock =
+            bind_interface_sender(Ipv4Addr::LOCALHOST).expect("bind_interface_sender should bind");
+        let err = iface_sock
+            .recv_from(&mut buf)
+            .expect_err("non-blocking interface sender must not block");
+        assert_eq!(err.kind(), std::io::ErrorKind::WouldBlock);
     }
 }
