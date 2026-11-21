@@ -18,12 +18,14 @@ use glide_proto::{Edge, LockState};
 use parking_lot::{Mutex, RwLock};
 use std::mem::size_of;
 use std::ptr;
-use std::sync::atomic::{AtomicBool, AtomicI32, AtomicIsize, AtomicU64, AtomicU8, Ordering};
+use std::sync::atomic::{
+    AtomicBool, AtomicI32, AtomicIsize, AtomicU32, AtomicU64, AtomicU8, Ordering,
+};
 use std::sync::{Arc, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
-use tracing::{debug, trace, warn};
+use tracing::{debug, info, trace, warn};
 use windows_sys::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
 use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows_sys::Win32::System::RemoteDesktop::{
@@ -32,10 +34,13 @@ use windows_sys::Win32::System::RemoteDesktop::{
 use windows_sys::Win32::System::Threading::{
     GetCurrentThread, SetThreadPriority, THREAD_PRIORITY_HIGHEST,
 };
-use windows_sys::Win32::UI::Input::KeyboardAndMouse::{GetKeyState, VK_CAPITAL};
+use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
+    GetAsyncKeyState, GetKeyState, VK_CAPITAL, VK_LBUTTON,
+};
 use windows_sys::Win32::UI::Input::{
-    GetRawInputData, RegisterRawInputDevices, HRAWINPUT, MOUSE_MOVE_ABSOLUTE, RAWINPUT,
-    RAWINPUTDEVICE, RAWINPUTHEADER, RIDEV_INPUTSINK, RID_INPUT, RIM_TYPEMOUSE,
+    GetRawInputData, GetRegisteredRawInputDevices, RegisterRawInputDevices, HRAWINPUT,
+    MOUSE_MOVE_ABSOLUTE, RAWINPUT, RAWINPUTDEVICE, RAWINPUTHEADER, RIDEV_INPUTSINK, RID_INPUT,
+    RIM_TYPEMOUSE,
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     CallNextHookEx, CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW,
@@ -52,6 +57,7 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
 
 const WM_APP_ENTER_REMOTE: u32 = WM_APP + 1;
 const WM_APP_LEAVE_REMOTE: u32 = WM_APP + 2;
+const WM_APP_ENSURE_RAW_INPUT: u32 = WM_APP + 3;
 
 const VK_PAUSE_CODE: u32 = 0x13;
 const VK_SNAPSHOT_CODE: u32 = 0x2C;
@@ -66,6 +72,7 @@ enum LeaveTarget {
 struct HookState {
     config: CaptureConfig,
     tx: mpsc::UnboundedSender<CaptureEvent>,
+    capture_hwnd: AtomicIsize,
     active_edges: AtomicEdgeMask,
     geometry: RwLock<DesktopGeometry>,
     remote_mode: AtomicBool,
@@ -90,6 +97,8 @@ struct HookState {
     mods: AtomicU8,
     start_instant: Instant,
     last_raw_mouse_ms: AtomicU64,
+    last_raw_reclaim_ms: AtomicU64,
+    ll_moves_without_raw: AtomicU32,
     last_geom_refresh_ms: AtomicU64,
     last_resume_emit: Mutex<Option<Instant>>,
 }
@@ -159,6 +168,7 @@ impl HookState {
     fn release_to_local_on_suspend(&self, reason: &str) {
         let was_remote = self.remote_mode.swap(false, Ordering::SeqCst);
         self.mods.store(0, Ordering::Relaxed);
+        self.ll_moves_without_raw.store(0, Ordering::Relaxed);
         *self.edge_push.lock() = (None, 0.0, None);
         self.edge_push_active.store(false, Ordering::Release);
         *self.pending_leave.lock() = None;
@@ -179,6 +189,7 @@ impl HookState {
             self.restore_cursor_visibly();
         }
         self.mods.store(0, Ordering::Relaxed);
+        self.ll_moves_without_raw.store(0, Ordering::Relaxed);
         *self.edge_push.lock() = (None, 0.0, None);
         self.edge_push_active.store(false, Ordering::Release);
         *self.pending_leave.lock() = None;
@@ -255,6 +266,14 @@ impl Drop for WindowsCaptureControl {
 impl CaptureControl for WindowsCaptureControl {
     fn set_active_edges(&self, edges: &[Edge]) {
         self.state.active_edges.set(edges);
+        if !edges.is_empty() {
+            let hwnd = self.hwnd.load(Ordering::Acquire) as HWND;
+            if !hwnd.is_null() {
+                unsafe {
+                    PostMessageW(hwnd, WM_APP_ENSURE_RAW_INPUT, 0, 0);
+                }
+            }
+        }
     }
 
     fn update_tuning(
@@ -298,11 +317,15 @@ impl CaptureControl for WindowsCaptureControl {
     }
 
     fn enter_remote(&self) -> Result<()> {
-        self.state.remote_mode.store(true, Ordering::SeqCst);
-        let hwnd = self.hwnd.load(Ordering::Acquire) as HWND;
-        if !hwnd.is_null() {
-            unsafe {
-                PostMessageW(hwnd, WM_APP_ENTER_REMOTE, 0, 0);
+        // Only post WM_APP_ENTER_REMOTE when transitioning local -> remote (e.g. hotkey or UI
+        // jump). When edge crossing already entered remote mode and parked the cursor in the
+        // corner, posting WM_APP_ENTER_REMOTE would overwrite last_local_norm with (1.0, 1.0).
+        if !self.state.remote_mode.swap(true, Ordering::SeqCst) {
+            let hwnd = self.hwnd.load(Ordering::Acquire) as HWND;
+            if !hwnd.is_null() {
+                unsafe {
+                    PostMessageW(hwnd, WM_APP_ENTER_REMOTE, 0, 0);
+                }
             }
         }
         Ok(())
@@ -545,6 +568,23 @@ unsafe extern "system" fn keyboard_ll_proc(code: i32, wparam: WPARAM, lparam: LP
     unsafe { CallNextHookEx(ptr::null_mut(), code, wparam, lparam) }
 }
 
+fn maybe_request_raw_input_reclaim(state: &HookState, now: u64) {
+    let prev = state.last_raw_reclaim_ms.load(Ordering::Relaxed);
+    if (prev == 0 || now.saturating_sub(prev) >= 1000)
+        && state
+            .last_raw_reclaim_ms
+            .compare_exchange(prev, now.max(1), Ordering::Relaxed, Ordering::Relaxed)
+            .is_ok()
+    {
+        let hwnd = state.capture_hwnd.load(Ordering::Acquire) as HWND;
+        if !hwnd.is_null() {
+            unsafe {
+                PostMessageW(hwnd, WM_APP_ENSURE_RAW_INPUT, 0, 0);
+            }
+        }
+    }
+}
+
 unsafe extern "system" fn mouse_ll_proc(code: i32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
     if code >= 0 && lparam != 0 {
         let ms = unsafe { &*(lparam as *const MSLLHOOKSTRUCT) };
@@ -554,6 +594,35 @@ unsafe extern "system" fn mouse_ll_proc(code: i32, wparam: WPARAM, lparam: LPARA
                 let remote = state.remote_mode.load(Ordering::Acquire);
                 if !remote {
                     match msg {
+                        WM_MOUSEMOVE => {
+                            let now = state.elapsed_ms();
+                            let last_raw = state.last_raw_mouse_ms.load(Ordering::Relaxed);
+                            let missed = state
+                                .ll_moves_without_raw
+                                .fetch_add(1, Ordering::Relaxed)
+                                .saturating_add(1);
+                            // Self-heal if another window in this process (such as winit's
+                            // EventLoop::new or a native file dialog) overwrote our process-wide
+                            // Raw Input registration, and fall back to WH_MOUSE_LL deltas for
+                            // precision touchpads / RDP sessions that do not emit relative WM_INPUT.
+                            // Requiring >= 3 consecutive LL moves without Raw Input avoids spurious
+                            // triggers after normal idle pauses when Raw Input is healthy.
+                            if missed >= 3 && (last_raw == 0 || now.saturating_sub(last_raw) > 150) {
+                                maybe_request_raw_input_reclaim(state, now);
+                                if !state.locked.load(Ordering::Relaxed)
+                                    && state.active_edges.load() != 0
+                                {
+                                    let mut cur_pt = POINT { x: 0, y: 0 };
+                                    if unsafe { GetCursorPos(&mut cur_pt) } != 0 {
+                                        let dx = (ms.pt.x - cur_pt.x) as f32;
+                                        let dy = (ms.pt.y - cur_pt.y) as f32;
+                                        if dx != 0.0 || dy != 0.0 {
+                                            return process_local_edge_motion(state, dx, dy, ms.pt);
+                                        }
+                                    }
+                                }
+                            }
+                        }
                         WM_LBUTTONDOWN => {
                             let edge_mask = state.active_edges.load();
                             let started_on_edge = if edge_mask != 0 {
@@ -590,10 +659,18 @@ unsafe extern "system" fn mouse_ll_proc(code: i32, wparam: WPARAM, lparam: LPARA
 
                 match msg {
                     WM_MOUSEMOVE => {
-                        // Primary motion path is Raw Input (WM_INPUT). Fallback for touchpads:
+                        // Primary motion path is Raw Input (WM_INPUT). Fallback for touchpads /
+                        // re-claim if another window temporarily stole Raw Input:
                         let now = state.elapsed_ms();
                         let last_raw = state.last_raw_mouse_ms.load(Ordering::Relaxed);
-                        if now.saturating_sub(last_raw) > 100 {
+                        let missed = state
+                            .ll_moves_without_raw
+                            .fetch_add(1, Ordering::Relaxed)
+                            .saturating_add(1);
+                        if missed >= 3 && (last_raw == 0 || now.saturating_sub(last_raw) > 100) {
+                            if last_raw == 0 || now.saturating_sub(last_raw) > 250 {
+                                maybe_request_raw_input_reclaim(state, now);
+                            }
                             let ax = state.anchor_x.load(Ordering::Relaxed);
                             let ay = state.anchor_y.load(Ordering::Relaxed);
                             let dx = (ms.pt.x - ax) as f32;
@@ -697,6 +774,142 @@ unsafe extern "system" fn mouse_ll_proc(code: i32, wparam: WPARAM, lparam: LPARA
     unsafe { CallNextHookEx(ptr::null_mut(), code, wparam, lparam) }
 }
 
+/// Evaluates local cursor motion `(dx, dy)` at desktop point `pt` for cross-edge switching and
+/// drag-and-drop edge strip arming. Returns `true` if focus crossed into remote mode.
+fn process_local_edge_motion(state: &HookState, dx: f32, dy: f32, pt: POINT) -> bool {
+    if state.locked.load(Ordering::Relaxed) {
+        return false;
+    }
+
+    state.maybe_refresh_geometry();
+    let edge_mask = state.active_edges.load();
+    if edge_mask == 0 {
+        if state.drag_strip_armed.swap(false, Ordering::SeqCst) {
+            let _ = state.tx.send(CaptureEvent::DragStripArmed(false));
+        }
+        return false;
+    }
+
+    let geom = state.geometry.read();
+    let (nx, ny) = geom.normalize_point(pt.x, pt.y);
+    state.last_local_norm.store(nx, ny);
+
+    // Guard against stale `lmb_down` if an elevated (UIPI) window swallowed WM_LBUTTONUP.
+    let mut lmb_down = state.lmb_down.load(Ordering::Acquire);
+    if lmb_down && (unsafe { GetAsyncKeyState(VK_LBUTTON as i32) } as u16 & 0x8000) == 0 {
+        state.lmb_down.store(false, Ordering::SeqCst);
+        state.lmb_started_on_edge.store(false, Ordering::Relaxed);
+        lmb_down = false;
+    }
+    let dnd_enabled = state.drag_drop_files.load(Ordering::Relaxed);
+    let started_on_edge = state.lmb_started_on_edge.load(Ordering::Relaxed);
+
+    // Arm the invisible 1px edge-strip drop target ONLY while LMB is held (having started
+    // away from the edge so scrollbars/window resizing are never blocked) and the cursor
+    // approaches within 48px of an active outer edge.
+    if lmb_down && dnd_enabled && !started_on_edge {
+        let mut min_dist = i32::MAX;
+        for edge in ALL_EDGES {
+            if (edge_mask & edge_bit(edge)) != 0 {
+                min_dist = min_dist.min(geom.distance_to_edge(edge, pt.x, pt.y));
+            }
+        }
+        if min_dist <= 48 && !state.drag_strip_armed.swap(true, Ordering::SeqCst) {
+            let _ = state.tx.send(CaptureEvent::DragStripArmed(true));
+        } else if min_dist > 80 && state.drag_strip_armed.swap(false, Ordering::SeqCst) {
+            let _ = state.tx.send(CaptureEvent::DragStripArmed(false));
+        }
+    } else if state.drag_strip_armed.swap(false, Ordering::SeqCst) {
+        let _ = state.tx.send(CaptureEvent::DragStripArmed(false));
+    }
+
+    let dead_corner = state.dead_corner_px.load(Ordering::Relaxed).max(0);
+
+    let mut hit: Option<(Edge, f32, f32)> = None;
+    for edge in ALL_EDGES {
+        if (edge_mask & edge_bit(edge)) == 0 {
+            continue;
+        }
+        let outward = match edge {
+            Edge::Left => -dx,
+            Edge::Right => dx,
+            Edge::Top => -dy,
+            Edge::Bottom => dy,
+        };
+        if outward > 0.0 {
+            if let Some(norm) = geom.hit_outer_edge_guarded(edge, pt.x, pt.y, 2, dead_corner) {
+                hit = Some((edge, norm, outward));
+                break;
+            }
+        }
+    }
+
+    if let Some((edge, norm, outward)) = hit {
+        // Only query foreground fullscreen status when the cursor actually pushes an active edge,
+        // avoiding 1000Hz GetForegroundWindow/GetClassNameW/GetWindowRect syscalls mid-screen.
+        if state.auto_lock_fullscreen.load(Ordering::Relaxed) && is_foreground_fullscreen(&geom) {
+            state.clear_edge_push();
+            if state.drag_strip_armed.swap(false, Ordering::SeqCst) {
+                let _ = state.tx.send(CaptureEvent::DragStripArmed(false));
+            }
+            return false;
+        }
+
+        let threshold = state.edge_threshold_px.load(Ordering::Relaxed).max(1) as f32;
+        let base_dwell_ms = state.edge_dwell_ms.load(Ordering::Relaxed);
+        // While LMB is held and cross-edge DnD is enabled, allow 25ms for OLE DragEnter to hit
+        // the edge strip before parking the cursor. Zero added latency for normal cursor crossing!
+        let dwell_ms = if lmb_down && dnd_enabled && !started_on_edge {
+            base_dwell_ms.max(25)
+        } else {
+            base_dwell_ms
+        };
+
+        let mut push = state.edge_push.lock();
+        if push.0 == Some(edge) {
+            push.1 += outward;
+        } else {
+            *push = (Some(edge), outward, Some(Instant::now()));
+            state.edge_push_active.store(true, Ordering::Relaxed);
+        }
+        let dwell_ok = dwell_ms == 0
+            || push
+                .2
+                .is_some_and(|t| t.elapsed() >= Duration::from_millis(dwell_ms));
+        if push.1 >= threshold && dwell_ok {
+            *push = (None, 0.0, None);
+            state.edge_push_active.store(false, Ordering::Relaxed);
+            drop(push);
+            let (px, py) = geom.primary_park_corner();
+            drop(geom);
+            state.drag_strip_armed.store(false, Ordering::SeqCst);
+            state.remote_mode.store(true, Ordering::SeqCst);
+            // Park cursor cleanly in the invisible bottom-right corner!
+            state.park_cursor_at(px, py);
+            let _ = state.tx.send(CaptureEvent::EdgeCrossed {
+                edge,
+                normalized_pos: norm,
+            });
+            return true;
+        }
+    } else if state.edge_push_active.load(Ordering::Relaxed) {
+        let mut push = state.edge_push.lock();
+        if let Some(prev_edge) = push.0 {
+            if geom
+                .hit_outer_edge_guarded(prev_edge, pt.x, pt.y, 4, dead_corner)
+                .is_none()
+            {
+                *push = (None, 0.0, None);
+                state.edge_push_active.store(false, Ordering::Relaxed);
+            }
+        } else {
+            state.edge_push_active.store(false, Ordering::Relaxed);
+        }
+    }
+
+    false
+}
+
 fn handle_raw_mouse_input(lparam: LPARAM) {
     let mut size: u32 = size_of::<RAWINPUT>() as u32;
     let mut raw: RAWINPUT = unsafe { std::mem::zeroed() };
@@ -727,7 +940,8 @@ fn handle_raw_mouse_input(lparam: LPARAM) {
     with_hook_state(|state| {
         state
             .last_raw_mouse_ms
-            .store(state.elapsed_ms(), Ordering::Relaxed);
+            .store(state.elapsed_ms().max(1), Ordering::Relaxed);
+        state.ll_moves_without_raw.store(0, Ordering::Relaxed);
 
         if state.remote_mode.load(Ordering::Acquire) {
             let _ = state.tx.send(CaptureEvent::MouseDelta { dx, dy });
@@ -738,130 +952,71 @@ fn handle_raw_mouse_input(lparam: LPARAM) {
             return;
         }
 
-        state.maybe_refresh_geometry();
-        let edge_mask = state.active_edges.load();
-        if edge_mask == 0 {
-            if state.drag_strip_armed.swap(false, Ordering::SeqCst) {
-                let _ = state.tx.send(CaptureEvent::DragStripArmed(false));
-            }
-            return;
-        }
-
         let mut pt = POINT { x: 0, y: 0 };
         if unsafe { GetCursorPos(&mut pt) } == 0 {
             return;
         }
-        let geom = state.geometry.read();
-        let (nx, ny) = geom.normalize_point(pt.x, pt.y);
-        state.last_local_norm.store(nx, ny);
-
-        let lmb_down = state.lmb_down.load(Ordering::Acquire);
-        let dnd_enabled = state.drag_drop_files.load(Ordering::Relaxed);
-        let started_on_edge = state.lmb_started_on_edge.load(Ordering::Relaxed);
-
-        // Arm the invisible 1px edge-strip drop target ONLY while LMB is held (having started
-        // away from the edge so scrollbars/window resizing are never blocked) and the cursor
-        // approaches within 48px of an active outer edge.
-        if lmb_down && dnd_enabled && !started_on_edge {
-            let mut min_dist = i32::MAX;
-            for edge in ALL_EDGES {
-                if (edge_mask & edge_bit(edge)) != 0 {
-                    min_dist = min_dist.min(geom.distance_to_edge(edge, pt.x, pt.y));
-                }
-            }
-            if min_dist <= 48 && !state.drag_strip_armed.swap(true, Ordering::SeqCst) {
-                let _ = state.tx.send(CaptureEvent::DragStripArmed(true));
-            } else if min_dist > 80 && state.drag_strip_armed.swap(false, Ordering::SeqCst) {
-                let _ = state.tx.send(CaptureEvent::DragStripArmed(false));
-            }
-        } else if state.drag_strip_armed.swap(false, Ordering::SeqCst) {
-            let _ = state.tx.send(CaptureEvent::DragStripArmed(false));
-        }
-
-        let dead_corner = state.dead_corner_px.load(Ordering::Relaxed).max(0);
-
-        let mut hit: Option<(Edge, f32, f32)> = None;
-        for edge in ALL_EDGES {
-            if (edge_mask & edge_bit(edge)) == 0 {
-                continue;
-            }
-            let outward = match edge {
-                Edge::Left => -dx,
-                Edge::Right => dx,
-                Edge::Top => -dy,
-                Edge::Bottom => dy,
-            };
-            if outward > 0.0 {
-                if let Some(norm) = geom.hit_outer_edge_guarded(edge, pt.x, pt.y, 2, dead_corner) {
-                    hit = Some((edge, norm, outward));
-                    break;
-                }
-            }
-        }
-
-        if let Some((edge, norm, outward)) = hit {
-            // Only query foreground fullscreen status when the cursor actually pushes an active edge,
-            // avoiding 1000Hz GetForegroundWindow/GetClassNameW/GetWindowRect syscalls mid-screen.
-            if state.auto_lock_fullscreen.load(Ordering::Relaxed) && is_foreground_fullscreen(&geom)
-            {
-                state.clear_edge_push();
-                if state.drag_strip_armed.swap(false, Ordering::SeqCst) {
-                    let _ = state.tx.send(CaptureEvent::DragStripArmed(false));
-                }
-                return;
-            }
-
-            let threshold = state.edge_threshold_px.load(Ordering::Relaxed).max(1) as f32;
-            let base_dwell_ms = state.edge_dwell_ms.load(Ordering::Relaxed);
-            // While LMB is held and cross-edge DnD is enabled, allow 25ms for OLE DragEnter to hit
-            // the edge strip before parking the cursor. Zero added latency for normal cursor crossing!
-            let dwell_ms = if lmb_down && dnd_enabled && !started_on_edge {
-                base_dwell_ms.max(25)
-            } else {
-                base_dwell_ms
-            };
-
-            let mut push = state.edge_push.lock();
-            if push.0 == Some(edge) {
-                push.1 += outward;
-            } else {
-                *push = (Some(edge), outward, Some(Instant::now()));
-                state.edge_push_active.store(true, Ordering::Relaxed);
-            }
-            let dwell_ok = dwell_ms == 0
-                || push
-                    .2
-                    .is_some_and(|t| t.elapsed() >= Duration::from_millis(dwell_ms));
-            if push.1 >= threshold && dwell_ok {
-                *push = (None, 0.0, None);
-                state.edge_push_active.store(false, Ordering::Relaxed);
-                drop(push);
-                let (px, py) = geom.primary_park_corner();
-                drop(geom);
-                state.drag_strip_armed.store(false, Ordering::SeqCst);
-                state.remote_mode.store(true, Ordering::SeqCst);
-                // Step 2: Park cursor cleanly in the invisible bottom-right corner!
-                state.park_cursor_at(px, py);
-                let _ = state.tx.send(CaptureEvent::EdgeCrossed {
-                    edge,
-                    normalized_pos: norm,
-                });
-            }
-        } else if state.edge_push_active.load(Ordering::Relaxed) {
-            let mut push = state.edge_push.lock();
-            if let Some(prev_edge) = push.0 {
-                if geom
-                    .hit_outer_edge_guarded(prev_edge, pt.x, pt.y, 4, dead_corner)
-                    .is_none()
-                {
-                    *push = (None, 0.0, None);
-                    state.edge_push_active.store(false, Ordering::Relaxed);
-                }
-            } else {
-                state.edge_push_active.store(false, Ordering::Relaxed);
-            }
-        }
+        let _ = process_local_edge_motion(state, dx, dy, pt);
     });
+}
+
+fn register_mouse_raw_input(hwnd: HWND) -> bool {
+    let rid = RAWINPUTDEVICE {
+        usUsagePage: 0x01,
+        usUsage: 0x02,
+        dwFlags: RIDEV_INPUTSINK,
+        hwndTarget: hwnd,
+    };
+    unsafe { RegisterRawInputDevices(&rid, 1, size_of::<RAWINPUTDEVICE>() as u32) != 0 }
+}
+
+/// Returns `true` if this process's mouse Raw Input `(0x01, 0x02)` sink is currently registered
+/// to `hwnd` with `RIDEV_INPUTSINK`.
+fn is_mouse_raw_input_owned_by(hwnd: HWND) -> bool {
+    let mut count: u32 = 0;
+    let cb_size = size_of::<RAWINPUTDEVICE>() as u32;
+    unsafe {
+        GetRegisteredRawInputDevices(ptr::null_mut(), &mut count, cb_size);
+    }
+    if count == 0 || count > 256 {
+        return false;
+    }
+    let mut devices = vec![
+        RAWINPUTDEVICE {
+            usUsagePage: 0,
+            usUsage: 0,
+            dwFlags: 0,
+            hwndTarget: ptr::null_mut(),
+        };
+        count as usize
+    ];
+    let got = unsafe { GetRegisteredRawInputDevices(devices.as_mut_ptr(), &mut count, cb_size) };
+    if got == u32::MAX {
+        return false;
+    }
+    devices.iter().take(got as usize).any(|d| {
+        d.usUsagePage == 0x01
+            && d.usUsage == 0x02
+            && d.hwndTarget == hwnd
+            && (d.dwFlags & RIDEV_INPUTSINK) != 0
+    })
+}
+
+/// Re-registers our `RIDEV_INPUTSINK` mouse handler if another in-process window (such as winit's
+/// `EventLoop::new` or a native file picker) replaced the process-wide Raw Input registration.
+fn ensure_mouse_raw_input_registered(hwnd: HWND) {
+    if hwnd.is_null() {
+        return;
+    }
+    if !is_mouse_raw_input_owned_by(hwnd) {
+        if register_mouse_raw_input(hwnd) {
+            info!(
+                "Re-claimed Windows Raw Input mouse sink after another window overwrote registration"
+            );
+        } else {
+            warn!("Failed re-claiming Windows Raw Input mouse sink");
+        }
+    }
 }
 
 unsafe extern "system" fn capture_wnd_proc(
@@ -873,6 +1028,10 @@ unsafe extern "system" fn capture_wnd_proc(
     match msg {
         WM_INPUT => {
             handle_raw_mouse_input(lparam);
+            0
+        }
+        WM_APP_ENSURE_RAW_INPUT => {
+            ensure_mouse_raw_input_registered(hwnd);
             0
         }
         WM_APP_ENTER_REMOTE => {
@@ -923,6 +1082,7 @@ unsafe extern "system" fn capture_wnd_proc(
                 1 // TRUE per Win32 WM_POWERBROADCAST specification
             }
             PBT_APMRESUMEAUTOMATIC | PBT_APMRESUMESUSPEND | PBT_APMRESUMECRITICAL => {
+                ensure_mouse_raw_input_registered(hwnd);
                 with_hook_state(|state| {
                     state.handle_resume_or_unlock("WM_POWERBROADCAST_RESUME");
                 });
@@ -938,6 +1098,7 @@ unsafe extern "system" fn capture_wnd_proc(
                 0
             }
             WTS_SESSION_UNLOCK => {
+                ensure_mouse_raw_input_registered(hwnd);
                 with_hook_state(|state| {
                     state.handle_resume_or_unlock("WTS_SESSION_UNLOCK");
                 });
@@ -956,6 +1117,7 @@ pub fn start_windows_capture(config: CaptureConfig) -> Result<CaptureHandle> {
     let (tx, rx) = mpsc::unbounded_channel();
 
     let state = Arc::new(HookState {
+        capture_hwnd: AtomicIsize::new(0),
         edge_threshold_px: AtomicI32::new(config.edge_threshold_px.max(1)),
         dead_corner_px: AtomicI32::new(config.dead_corner_px.max(0)),
         edge_dwell_ms: AtomicU64::new(config.edge_dwell_ms),
@@ -982,6 +1144,8 @@ pub fn start_windows_capture(config: CaptureConfig) -> Result<CaptureHandle> {
         mods: AtomicU8::new(0),
         start_instant: Instant::now(),
         last_raw_mouse_ms: AtomicU64::new(0),
+        last_raw_reclaim_ms: AtomicU64::new(0),
+        ll_moves_without_raw: AtomicU32::new(0),
         last_geom_refresh_ms: AtomicU64::new(0),
         last_resume_emit: Mutex::new(None),
     });
@@ -990,6 +1154,7 @@ pub fn start_windows_capture(config: CaptureConfig) -> Result<CaptureHandle> {
     *cell.write() = Some(Arc::clone(&state));
 
     let (ready_tx, ready_rx) = std::sync::mpsc::channel::<Result<isize>>();
+    let thread_state = Arc::clone(&state);
 
     thread::Builder::new()
         .name("glide-win-capture".into())
@@ -999,6 +1164,9 @@ pub fn start_windows_capture(config: CaptureConfig) -> Result<CaptureHandle> {
             }
             match init_capture_window_and_hooks() {
                 Ok((hwnd, kb_hook, ms_hook, wts_registered)) => {
+                    thread_state
+                        .capture_hwnd
+                        .store(hwnd as isize, Ordering::Release);
                     let _ = ready_tx.send(Ok(hwnd as isize));
                     debug!(wts_registered, "Windows Raw Input + LL hooks active");
 
@@ -1010,6 +1178,7 @@ pub fn start_windows_capture(config: CaptureConfig) -> Result<CaptureHandle> {
                         }
                     }
 
+                    thread_state.capture_hwnd.store(0, Ordering::Release);
                     unsafe {
                         if !kb_hook.is_null() {
                             UnhookWindowsHookEx(kb_hook);
@@ -1091,13 +1260,7 @@ fn init_capture_window_and_hooks() -> Result<(HWND, HHOOK, HHOOK, bool)> {
         return Err(anyhow!("CreateWindowExW failed for Glide raw input window"));
     }
 
-    let rid = RAWINPUTDEVICE {
-        usUsagePage: 0x01,
-        usUsage: 0x02,
-        dwFlags: RIDEV_INPUTSINK,
-        hwndTarget: hwnd,
-    };
-    if unsafe { RegisterRawInputDevices(&rid, 1, size_of::<RAWINPUTDEVICE>() as u32) } == 0 {
+    if !register_mouse_raw_input(hwnd) {
         unsafe {
             DestroyWindow(hwnd);
         }

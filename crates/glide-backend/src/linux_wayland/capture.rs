@@ -7,8 +7,10 @@
 
 use crate::geometry::{DesktopGeometry, MonitorRect};
 use crate::linux_wayland::{
-    call_portal_request, close_portal_session, evdev_to_mouse_button, extract_object_path,
-    next_portal_token, opt_str, INPUT_CAPTURE_IFACE, PORTAL_DEST, PORTAL_PATH,
+    call_portal_request, clear_input_capture_restore_token, close_portal_session,
+    evdev_to_mouse_button, extract_object_path, load_input_capture_restore_token,
+    next_portal_token, opt_str, save_input_capture_restore_token, INPUT_CAPTURE_IFACE, PORTAL_DEST,
+    PORTAL_PATH,
 };
 use crate::{CaptureConfig, CaptureControl, CaptureEvent, CaptureHandle, RemoteMediaKeyTracker};
 use anyhow::{anyhow, Context, Result};
@@ -33,6 +35,7 @@ use zbus::MatchRule;
 
 const CAP_KEYBOARD: u32 = 1;
 const CAP_POINTER: u32 = 2;
+const PERSIST_MODE_REVOKED: u32 = 2;
 
 #[derive(Debug, Clone)]
 pub(crate) struct BarrierSpec {
@@ -45,6 +48,10 @@ pub(crate) struct BarrierSpec {
 }
 
 /// Computes InputCapture pointer barriers along each active outer edge, respecting `dead_corner_px`.
+///
+/// Per `org.freedesktop.portal.InputCapture::SetPointerBarriers`, barriers are inclusive of their
+/// endpoint pixels and must lie fully within a single zone (`0..height-1` for vertical barriers,
+/// `0..width-1` for horizontal barriers, with right/bottom edges placed at `right`/`bottom`).
 pub(crate) fn build_edge_barriers(
     geometry: &DesktopGeometry,
     active_edges: &[Edge],
@@ -70,22 +77,22 @@ pub(crate) fn build_edge_barriers(
             let (x1, y1, x2, y2) = match edge {
                 Edge::Left => {
                     let d = dead.min(m.height / 4);
-                    (m.left(), m.top() + d, m.left(), m.bottom() - d)
+                    (m.left(), m.top() + d, m.left(), m.bottom() - 1 - d)
                 }
                 Edge::Right => {
                     let d = dead.min(m.height / 4);
-                    (m.right(), m.top() + d, m.right(), m.bottom() - d)
+                    (m.right(), m.top() + d, m.right(), m.bottom() - 1 - d)
                 }
                 Edge::Top => {
                     let d = dead.min(m.width / 4);
-                    (m.left() + d, m.top(), m.right() - d, m.top())
+                    (m.left() + d, m.top(), m.right() - 1 - d, m.top())
                 }
                 Edge::Bottom => {
                     let d = dead.min(m.width / 4);
-                    (m.left() + d, m.bottom(), m.right() - d, m.bottom())
+                    (m.left() + d, m.bottom(), m.right() - 1 - d, m.bottom())
                 }
             };
-            if (x2 - x1).abs() >= 2 || (y2 - y1).abs() >= 2 {
+            if x2 > x1 || y2 > y1 {
                 barriers.push(BarrierSpec {
                     id: next_id,
                     edge,
@@ -119,6 +126,36 @@ pub(crate) fn normalize_barrier_hit(
             ((x - min_x as f64) / span).clamp(0.0, 1.0) as f32
         }
     }
+}
+
+/// Fallback edge inference when the compositor emits `Activated` with `barrier_id == 0`.
+pub(crate) fn infer_barrier_edge(
+    geometry: &DesktopGeometry,
+    active_edges: &[Edge],
+    x: f64,
+    y: f64,
+) -> Option<Edge> {
+    if active_edges.is_empty() {
+        return None;
+    }
+    let (min_x, min_y, max_x, max_y) = geometry.bounds();
+    active_edges.iter().copied().min_by(|&a, &b| {
+        let dist = |edge: Edge| -> f64 {
+            match edge {
+                Edge::Left => (x - min_x as f64).max(0.0),
+                Edge::Right => (max_x as f64 - x).max(0.0),
+                Edge::Top => (y - min_y as f64).max(0.0),
+                Edge::Bottom => (max_y as f64 - y).max(0.0),
+            }
+        };
+        dist(a).total_cmp(&dist(b))
+    })
+}
+
+pub(crate) fn parse_cursor_position(opts: &HashMap<String, OwnedValue>) -> (f64, f64) {
+    opts.get("cursor_position")
+        .and_then(|v| v.clone().try_into().ok())
+        .unwrap_or((0.0f64, 0.0f64))
 }
 
 fn parse_zones(results: &HashMap<String, OwnedValue>) -> (DesktopGeometry, u32) {
@@ -303,9 +340,25 @@ fn apply_barriers(
         )?;
         Ok(p)
     });
-    if let Err(e) = res {
-        warn!(error = %e, "Wayland InputCapture SetPointerBarriers failed");
-        return;
+    match res {
+        Ok(results) => {
+            if let Some(failed_val) = results.get("failed_barriers") {
+                if let Ok(failed) = Vec::<u32>::try_from(failed_val.clone()) {
+                    if !failed.is_empty() {
+                        warn!(
+                            ?failed,
+                            ?specs,
+                            zone_set,
+                            "Wayland InputCapture rejected some pointer barriers"
+                        );
+                    }
+                }
+            }
+        }
+        Err(e) => {
+            warn!(error = %e, "Wayland InputCapture SetPointerBarriers failed");
+            return;
+        }
     }
 
     let empty_opts: HashMap<&str, Value<'_>> = HashMap::new();
@@ -314,6 +367,89 @@ fn apply_barriers(
     } else if let Err(e) = proxy.call_noreply("Enable", &(session_path.as_ref(), empty_opts)) {
         warn!(error = %e, "Wayland InputCapture Enable failed");
     }
+}
+
+fn create_and_start_session(conn: &DbusConnection, proxy: &Proxy<'_>) -> Result<OwnedObjectPath> {
+    let portal_version: u32 = proxy.get_property("version").unwrap_or(1);
+
+    // Prefer InputCapture v2 (`CreateSession2` + `Start` with persistent restore token) when available.
+    if portal_version >= 2 {
+        let sess_tok = next_portal_token("ic_sess");
+        let mut create_opts: HashMap<&str, Value<'_>> = HashMap::new();
+        opt_str(&mut create_opts, "session_handle_token", &sess_tok);
+
+        match proxy.call::<_, _, HashMap<String, OwnedValue>>("CreateSession2", &(create_opts,)) {
+            Ok(create_res) => {
+                let session_path = create_res
+                    .get("session_handle")
+                    .and_then(extract_object_path)
+                    .ok_or_else(|| {
+                        anyhow!("InputCapture CreateSession2 returned no session_handle")
+                    })?;
+
+                let saved_token = load_input_capture_restore_token();
+                let start_tok = next_portal_token("ic_start");
+                let start_res =
+                    call_portal_request(conn, &start_tok, Duration::from_secs(120), || {
+                        let mut opts: HashMap<&str, Value<'_>> = HashMap::new();
+                        opt_str(&mut opts, "handle_token", &start_tok);
+                        opts.insert("capabilities", Value::from(CAP_KEYBOARD | CAP_POINTER));
+                        opts.insert("persist_mode", Value::from(PERSIST_MODE_REVOKED));
+                        if let Some(ref rt) = saved_token {
+                            opt_str(&mut opts, "restore_token", rt);
+                        }
+                        let p: OwnedObjectPath =
+                            proxy.call("Start", &(session_path.as_ref(), "", opts))?;
+                        Ok(p)
+                    });
+                match start_res {
+                    Ok(res) => {
+                        if let Some(Ok(new_tok)) = res
+                            .get("restore_token")
+                            .map(|v| v.downcast_ref::<String>())
+                        {
+                            save_input_capture_restore_token(&new_tok);
+                        }
+                        return Ok(session_path);
+                    }
+                    Err(e) => {
+                        if saved_token.is_some() {
+                            clear_input_capture_restore_token();
+                        }
+                        close_portal_session(conn, &session_path.as_ref());
+                        return Err(e).context("Wayland InputCapture Start failed");
+                    }
+                }
+            }
+            Err(e) => {
+                debug!(
+                    error = %e,
+                    portal_version,
+                    "InputCapture CreateSession2 unavailable; falling back to v1 CreateSession"
+                );
+            }
+        }
+    }
+
+    // InputCapture v1 fallback (`CreateSession` creates and immediately starts the session).
+    let create_tok = next_portal_token("ic_create");
+    let sess_tok = next_portal_token("ic_sess");
+    let create_res = call_portal_request(conn, &create_tok, Duration::from_secs(120), || {
+        let mut opts: HashMap<&str, Value<'_>> = HashMap::new();
+        opt_str(&mut opts, "handle_token", &create_tok);
+        opt_str(&mut opts, "session_handle_token", &sess_tok);
+        opts.insert("capabilities", Value::from(CAP_KEYBOARD | CAP_POINTER));
+        let p: OwnedObjectPath = proxy.call("CreateSession", &("", opts))?;
+        Ok(p)
+    })
+    .context(
+        "Wayland InputCapture CreateSession failed (requires GNOME 46+, KDE Plasma 6.1+, or Hyprland with xdg-desktop-portal >= 1.18)",
+    )?;
+
+    create_res
+        .get("session_handle")
+        .and_then(extract_object_path)
+        .ok_or_else(|| anyhow!("InputCapture CreateSession returned no session_handle"))
 }
 
 /// Starts the native Wayland server capture backend (`org.freedesktop.portal.InputCapture` + EIS).
@@ -327,25 +463,8 @@ fn start_wayland_capture_blocking(config: CaptureConfig) -> Result<CaptureHandle
     let proxy = Proxy::new(&conn, PORTAL_DEST, PORTAL_PATH, INPUT_CAPTURE_IFACE)
         .context("failed to create InputCapture portal proxy")?;
 
-    // 1. CreateSession
-    let create_tok = next_portal_token("ic_create");
-    let sess_tok = next_portal_token("ic_sess");
-    let create_res = call_portal_request(&conn, &create_tok, Duration::from_secs(120), || {
-        let mut opts: HashMap<&str, Value<'_>> = HashMap::new();
-        opt_str(&mut opts, "handle_token", &create_tok);
-        opt_str(&mut opts, "session_handle_token", &sess_tok);
-        opts.insert("capabilities", Value::from(CAP_KEYBOARD | CAP_POINTER));
-        let p: OwnedObjectPath = proxy.call("CreateSession", &("", opts))?;
-        Ok(p)
-    })
-    .context(
-        "Wayland InputCapture CreateSession failed (requires GNOME 46+, KDE Plasma 6.1+, or Hyprland with xdg-desktop-portal >= 1.18)",
-    )?;
-
-    let session_path = create_res
-        .get("session_handle")
-        .and_then(extract_object_path)
-        .ok_or_else(|| anyhow!("InputCapture CreateSession returned no session_handle"))?;
+    // 1. CreateSession2 + Start (v2) or CreateSession (v1)
+    let session_path = create_and_start_session(&conn, &proxy)?;
 
     // 2. GetZones
     let zones_tok = next_portal_token("ic_zones");
@@ -406,9 +525,11 @@ fn start_wayland_capture_blocking(config: CaptureConfig) -> Result<CaptureHandle
     std::thread::Builder::new()
         .name("glide-wl-ic-dbus".into())
         .spawn(move || {
-            let Ok(sig_conn) = DbusConnection::session() else {
-                return;
-            };
+            // CRITICAL: Reuse `conn.clone()` (the SAME D-Bus session connection & unique bus name
+            // that created the portal session). XDG Desktop Portal emits Activated/Deactivated/
+            // Disabled/ZonesChanged unicast to the session owner; opening a second session
+            // connection would silently miss every single barrier activation!
+            let sig_conn = conn.clone();
             let rule = match MatchRule::builder()
                 .msg_type(zbus::message::Type::Signal)
                 .sender(PORTAL_DEST)
@@ -455,10 +576,7 @@ fn start_wayland_capture_blocking(config: CaptureConfig) -> Result<CaptureHandle
                                     .get("barrier_id")
                                     .and_then(|v| v.downcast_ref::<u32>().ok())
                                     .unwrap_or(0);
-                                let (cx, cy) = opts
-                                    .get("cursor_position")
-                                    .and_then(|v| v.clone().try_into().ok())
-                                    .unwrap_or((0.0f64, 0.0f64));
+                                let (cx, cy) = parse_cursor_position(&opts);
 
                                 *shared_sig.activation_id.lock() = act_id;
                                 let geom = shared_sig.geometry.lock().clone();
@@ -470,7 +588,11 @@ fn start_wayland_capture_blocking(config: CaptureConfig) -> Result<CaptureHandle
                                     .lock()
                                     .iter()
                                     .find(|b| b.id == barrier_id)
-                                    .map(|b| b.edge);
+                                    .map(|b| b.edge)
+                                    .or_else(|| {
+                                        let active = shared_sig.active_edges.lock().clone();
+                                        infer_barrier_edge(&geom, &active, cx, cy)
+                                    });
 
                                 if let Some(edge) = edge_opt {
                                     let norm = normalize_barrier_hit(&geom, edge, cx, cy);
@@ -480,7 +602,7 @@ fn start_wayland_capture_blocking(config: CaptureConfig) -> Result<CaptureHandle
                                         normalized_pos: norm,
                                     });
                                 } else {
-                                    debug!(barrier_id, "InputCapture Activated with unknown barrier_id");
+                                    debug!(barrier_id, cx, cy, "InputCapture Activated with no matching edge");
                                 }
                             }
                             "Deactivated" | "Disabled" => {
@@ -805,7 +927,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn barriers_respect_dead_corners_on_all_edges() {
+    fn barriers_match_portal_spec_inclusive_endpoints_and_dead_corners() {
         let geom = DesktopGeometry::new(vec![MonitorRect {
             name: "DP-1".into(),
             x: 0,
@@ -815,6 +937,25 @@ mod tests {
             scale: 1.0,
             primary: true,
         }]);
+
+        // With dead_corner_px = 0, endpoints must stay strictly inside [0..height-1] / [0..width-1]
+        // matching org.freedesktop.portal.InputCapture::SetPointerBarriers examples.
+        let full = build_edge_barriers(
+            &geom,
+            &[Edge::Left, Edge::Right, Edge::Top, Edge::Bottom],
+            0,
+        );
+        assert_eq!(full.len(), 4);
+        assert_eq!((full[0].x1, full[0].y1, full[0].x2, full[0].y2), (0, 0, 0, 1079));
+        assert_eq!(
+            (full[1].x1, full[1].y1, full[1].x2, full[1].y2),
+            (1920, 0, 1920, 1079)
+        );
+        assert_eq!((full[2].x1, full[2].y1, full[2].x2, full[2].y2), (0, 0, 1919, 0));
+        assert_eq!(
+            (full[3].x1, full[3].y1, full[3].x2, full[3].y2),
+            (0, 1080, 1919, 1080)
+        );
 
         let barriers = build_edge_barriers(
             &geom,
@@ -826,30 +967,30 @@ mod tests {
         assert_eq!(barriers[0].edge, Edge::Left);
         assert_eq!(
             (barriers[0].x1, barriers[0].y1, barriers[0].x2, barriers[0].y2),
-            (0, 24, 0, 1056)
+            (0, 24, 0, 1055)
         );
 
         assert_eq!(barriers[1].edge, Edge::Right);
         assert_eq!(
             (barriers[1].x1, barriers[1].y1, barriers[1].x2, barriers[1].y2),
-            (1920, 24, 1920, 1056)
+            (1920, 24, 1920, 1055)
         );
 
         assert_eq!(barriers[2].edge, Edge::Top);
         assert_eq!(
             (barriers[2].x1, barriers[2].y1, barriers[2].x2, barriers[2].y2),
-            (24, 0, 1896, 0)
+            (24, 0, 1895, 0)
         );
 
         assert_eq!(barriers[3].edge, Edge::Bottom);
         assert_eq!(
             (barriers[3].x1, barriers[3].y1, barriers[3].x2, barriers[3].y2),
-            (24, 1080, 1896, 1080)
+            (24, 1080, 1895, 1080)
         );
     }
 
     #[test]
-    fn barrier_hit_normalization_maps_edges_cleanly() {
+    fn barrier_hit_normalization_and_fallback_edge_inference() {
         let geom = DesktopGeometry::new(vec![MonitorRect {
             name: "DP-1".into(),
             x: 0,
@@ -863,5 +1004,37 @@ mod tests {
         assert!((normalize_barrier_hit(&geom, Edge::Top, 1000.0, 0.0) - 0.5).abs() < 1e-4);
         assert!((normalize_barrier_hit(&geom, Edge::Left, 0.0, 0.0) - 0.0).abs() < 1e-4);
         assert!((normalize_barrier_hit(&geom, Edge::Bottom, 2000.0, 1000.0) - 1.0).abs() < 1e-4);
+
+        let all = [Edge::Left, Edge::Right, Edge::Top, Edge::Bottom];
+        assert_eq!(infer_barrier_edge(&geom, &all, -12.0, 500.0), Some(Edge::Left));
+        assert_eq!(infer_barrier_edge(&geom, &all, 2015.0, 500.0), Some(Edge::Right));
+        assert_eq!(infer_barrier_edge(&geom, &all, 900.0, -5.0), Some(Edge::Top));
+        assert_eq!(infer_barrier_edge(&geom, &all, 900.0, 1010.0), Some(Edge::Bottom));
+        assert_eq!(infer_barrier_edge(&geom, &[], 0.0, 500.0), None);
+    }
+
+    #[test]
+    fn zvariant_zones_and_cursor_position_deserialize_cleanly() {
+        let zones_val: OwnedValue = Value::from(vec![
+            (1920u32, 1080u32, 0i32, 0i32),
+            (2560u32, 1440u32, 1920i32, 0i32),
+        ])
+        .try_into()
+        .unwrap();
+        let mut results = HashMap::new();
+        results.insert("zone_set".to_owned(), OwnedValue::from(7u32));
+        results.insert("zones".to_owned(), zones_val);
+
+        let (geom, zone_set) = parse_zones(&results);
+        assert_eq!(zone_set, 7);
+        assert_eq!(geom.monitors.len(), 2);
+        assert_eq!(geom.bounds(), (0, 0, 4480, 1440));
+
+        let pos_val: OwnedValue = Value::from((-14.5f64, 540.25f64)).try_into().unwrap();
+        let mut opts = HashMap::new();
+        opts.insert("cursor_position".to_owned(), pos_val);
+        let (cx, cy) = parse_cursor_position(&opts);
+        assert!((cx - (-14.5)).abs() < 1e-6);
+        assert!((cy - 540.25).abs() < 1e-6);
     }
 }

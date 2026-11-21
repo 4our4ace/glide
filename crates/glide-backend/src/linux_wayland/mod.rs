@@ -198,13 +198,13 @@ pub fn extract_object_path(val: &OwnedValue) -> Option<OwnedObjectPath> {
     None
 }
 
-fn restore_token_path() -> Option<PathBuf> {
+fn restore_token_path_for(filename: &str) -> Option<PathBuf> {
     let dirs = directories::ProjectDirs::from("io", "glide", "glide")?;
-    Some(dirs.config_dir().join("wayland_remote_desktop.token"))
+    Some(dirs.config_dir().join(filename))
 }
 
-pub fn load_restore_token() -> Option<String> {
-    let path = restore_token_path()?;
+fn load_named_restore_token(filename: &str) -> Option<String> {
+    let path = restore_token_path_for(filename)?;
     let raw = std::fs::read_to_string(path).ok()?;
     let trimmed = raw.trim();
     if trimmed.is_empty() {
@@ -212,6 +212,14 @@ pub fn load_restore_token() -> Option<String> {
     } else {
         Some(trimmed.to_owned())
     }
+}
+
+pub fn load_restore_token() -> Option<String> {
+    load_named_restore_token("wayland_remote_desktop.token")
+}
+
+pub fn load_input_capture_restore_token() -> Option<String> {
+    load_named_restore_token("wayland_input_capture.token")
 }
 
 fn write_restore_token_file(path: &std::path::Path, token: &str) -> std::io::Result<()> {
@@ -232,20 +240,34 @@ fn write_restore_token_file(path: &std::path::Path, token: &str) -> std::io::Res
     Ok(())
 }
 
-pub fn save_restore_token(token: &str) {
+fn save_named_restore_token(filename: &str, token: &str) {
     let trimmed = token.trim();
     if trimmed.is_empty() {
         return;
     }
-    if let Some(path) = restore_token_path() {
+    if let Some(path) = restore_token_path_for(filename) {
         if let Err(e) = write_restore_token_file(&path, trimmed) {
             tracing::debug!(error = %e, path = %path.display(), "failed to persist Wayland restore token");
         }
     }
 }
 
+pub fn save_restore_token(token: &str) {
+    save_named_restore_token("wayland_remote_desktop.token", token);
+}
+
+pub fn save_input_capture_restore_token(token: &str) {
+    save_named_restore_token("wayland_input_capture.token", token);
+}
+
 pub fn clear_restore_token() {
-    if let Some(path) = restore_token_path() {
+    if let Some(path) = restore_token_path_for("wayland_remote_desktop.token") {
+        let _ = std::fs::remove_file(path);
+    }
+}
+
+pub fn clear_input_capture_restore_token() {
+    if let Some(path) = restore_token_path_for("wayland_input_capture.token") {
         let _ = std::fs::remove_file(path);
     }
 }

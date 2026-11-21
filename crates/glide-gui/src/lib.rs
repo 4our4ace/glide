@@ -508,14 +508,10 @@ pub fn run_gui_blocking(opts: GuiOptions) -> Result<()> {
         }
     };
 
-    if let Some(role) = effective_auto_start {
-        let ctrl_auto = Arc::clone(&ctrl);
-        rt.spawn(async move {
-            if let Err(e) = ctrl_auto.start_engine(&role).await {
-                warn!(error = %e, "Failed auto-starting Glide engine");
-            }
-        });
-    }
+    // Defer auto-starting the engine until `native_ui::run` initializes after `winit::EventLoop::build()`.
+    // On Windows, winit's EventLoop::new registers process-wide Raw Input for mice (`DeviceEvents::WhenFocused`),
+    // which would overwrite Glide's `RIDEV_INPUTSINK` mouse hook if the server started before EventLoop creation.
+    let pending_auto_start = Arc::new(Mutex::new(effective_auto_start));
 
     // Native OS System Tray integration runs asynchronously so D-Bus / icon setup never
     // blocks the window from appearing.
@@ -572,9 +568,18 @@ pub fn run_gui_blocking(opts: GuiOptions) -> Result<()> {
         rt.handle().clone(),
         opts.minimized,
         launch_t0,
+        Arc::clone(&pending_auto_start),
     ) {
         // No display or no usable GPU: keep Glide usable through the browser fallback.
         warn!(error = %e, "Native window unavailable; using the browser fallback");
+        if let Some(role) = pending_auto_start.lock().take() {
+            let ctrl_auto = Arc::clone(&ctrl);
+            rt.spawn(async move {
+                if let Err(err) = ctrl_auto.start_engine(&role).await {
+                    warn!(error = %err, "Failed auto-starting Glide engine");
+                }
+            });
+        }
         *ctrl.ui_show.lock() = None;
         *ctrl.ui_quit.lock() = None;
         *ctrl.ui_tray.lock() = None;

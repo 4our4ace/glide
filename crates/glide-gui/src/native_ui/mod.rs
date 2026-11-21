@@ -1249,6 +1249,7 @@ pub(crate) fn run(
     rt: tokio::runtime::Handle,
     minimized: bool,
     launch_t0: Instant,
+    pending_auto_start: Arc<parking_lot::Mutex<Option<String>>>,
 ) -> Result<(), String> {
     #[cfg(target_os = "linux")]
     rune::set_app_id("Glide");
@@ -1384,6 +1385,16 @@ pub(crate) fn run(
     let init_handle = handle.clone();
     let init_vis = Arc::clone(&window_vis);
     app = app.init(move || {
+        // Trigger auto-start here (after winit::EventLoop::build has completed its one-time
+        // Raw Input registration on Windows) so Glide's capture sink is never overwritten.
+        if let Some(role) = pending_auto_start.lock().take() {
+            let ctrl_auto = Arc::clone(&init_ctrl);
+            init_rt.spawn(async move {
+                if let Err(e) = ctrl_auto.start_engine(&role).await {
+                    warn!(error = %e, "Failed auto-starting Glide engine");
+                }
+            });
+        }
         let mut ui = Ui::new(init_ctrl, init_rt, init_vis);
         ui.handle = Some(init_handle);
         ui
