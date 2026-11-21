@@ -15,7 +15,7 @@ Share your clipboard, paste screenshots, and drop files across your desk — dir
 
 <p>
   <a href="https://github.com/4our4ace/glide/releases"><img alt="Version 0.3.0" src="https://img.shields.io/badge/version-v0.3.0-2563eb?style=for-the-badge"></a>
-  <img alt="Platforms: Windows 11 & Linux" src="https://img.shields.io/badge/platforms-Windows%2011%20%7C%20Linux%20X11-0f172a?style=for-the-badge">
+  <img alt="Platforms: Windows 11 & Linux (X11 + Wayland)" src="https://img.shields.io/badge/platforms-Windows%2011%20%7C%20Linux%20(X11%20%26%20Wayland)-0f172a?style=for-the-badge">
   <img alt="License: MIT or Apache-2.0" src="https://img.shields.io/badge/license-MIT%20%2F%20Apache--2.0-16a34a?style=for-the-badge">
 </p>
 
@@ -83,7 +83,7 @@ Download and double-click **`glide-windows-x86_64.exe`**.
 1. Click **Start Server** on the PC with your mouse and keyboard.
 2. If Windows Firewall pops up, allow access on **Private networks**.
 
-### Ubuntu / Debian Linux (X11)
+### Ubuntu / Debian Linux (X11 & Wayland)
 
 Install the `.deb` package:
 
@@ -96,7 +96,7 @@ sudo apt install ./glide_0.3.0_amd64.deb
 3. Drag **This PC** to the side it sits on and click **Connect**.
 
 > [!TIP]
-> After your first connection, Glide remembers each PC's role and connects automatically whenever you open it.
+> On **Wayland** (Ubuntu 24.04 GNOME, KDE Plasma 6, Hyprland, Sway), Glide automatically uses the standard desktop portals and remembers your permission after the first prompt. After your first connection, Glide remembers each PC's role and connects automatically whenever you open it.
 
 ---
 
@@ -113,7 +113,7 @@ sudo apt install ./glide_0.3.0_amd64.deb
 ## FAQ
 
 ### Does Glide need an account or internet connection?
-No. Glide talks directly between your PCs over your local network (Wi-Fi or Ethernet) with end-to-end encryption enabled automatically.
+No. Glide talks directly between your PCs over your local network (Wi-Fi or Ethernet) with end-to-end encryption enabled automatically. (You can optionally click **Check** in *Settings → Updates* whenever you want to check GitHub for a newer release.)
 
 ### Does copying screenshots work between Windows and Linux?
 Yes. Screenshots from Windows `Win+Shift+S`, Snipping Tool, Paint, browsers, and Linux tools like Flameshot convert and paste cleanly in both directions.
@@ -125,7 +125,7 @@ No. Glide automatically detects fullscreen windows and locks your cursor to the 
 Not at all. It only reads the connection's built-in timing locally and never sends extra ping traffic.
 
 ### Which operating systems are supported?
-Currently **Windows 11** and **Linux (X11)** (tested on Ubuntu 22.04+).
+**Windows 11** and **Linux (X11 & Wayland)** — auto-detected at launch.
 
 ---
 
@@ -144,10 +144,11 @@ Glide also runs cleanly from the terminal or as a background service:
 ```
 
 ```bash
-# Linux client (auto-discovers the server on your LAN)
+# Linux client (auto-discovers server & auto-detects Wayland vs X11)
 glide client --edge right
 
-# Optional Linux /dev/uinput backend for native libinput acceleration & hi-res scroll
+# Force a specific Linux input backend (portal on Wayland, xtest on X11, or /dev/uinput)
+glide client --edge right --backend portal
 glide client --edge right --backend uinput
 
 # LAN discovery & system check
@@ -162,7 +163,7 @@ glide doctor
 
 <br>
 
-Requires Rust (stable, 1.80+).
+Requires Rust (stable, 1.85+).
 
 - **Linux:** `./scripts/build-linux.sh` (or `./scripts/build-deb.sh` to build the `.deb` package)
 - **Windows:** `.\scripts\build-windows.ps1`

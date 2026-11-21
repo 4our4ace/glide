@@ -33,6 +33,7 @@ use tokio::task::JoinHandle;
 use tracing::{debug, info, warn};
 
 mod native_ui;
+pub(crate) mod updater;
 
 const UI_HTML: &str = include_str!("ui.html");
 const FONT_INTER: &[u8] = include_bytes!("../assets/fonts/inter.woff2");
@@ -549,7 +550,9 @@ pub fn run_gui_blocking(opts: GuiOptions) -> Result<()> {
 /// Launches the UI in a Chromium-family browser `--app` window with an isolated profile.
 pub(crate) fn launch_browser_window(url: &str) -> Option<std::process::Child> {
     #[cfg(target_os = "linux")]
-    if glide_backend::linux_x11::window_brand::focus_existing_glide_window() {
+    if !glide_backend::linux_wayland::is_wayland_session()
+        && glide_backend::linux_x11::window_brand::focus_existing_glide_window()
+    {
         return None;
     }
 
@@ -624,9 +627,11 @@ pub(crate) fn launch_browser_window(url: &str) -> Option<std::process::Child> {
                 ])
                 .spawn()
             {
-                glide_backend::linux_x11::window_brand::spawn_x11_window_brander(
-                    GUI_WIDTH, GUI_HEIGHT,
-                );
+                if !glide_backend::linux_wayland::is_wayland_session() {
+                    glide_backend::linux_x11::window_brand::spawn_x11_window_brander(
+                        GUI_WIDTH, GUI_HEIGHT,
+                    );
+                }
                 return Some(child);
             }
         }

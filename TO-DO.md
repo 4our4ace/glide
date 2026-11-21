@@ -73,9 +73,14 @@ Long-horizon engineering plan to make **Glide** a genuinely native, zero-lag, ze
 ## Deferred / Later Horizons (Explicitly Skipped For Now)
 
 ### Linux Wayland Backend (`crates/glide-backend/src/linux_wayland/`)
-- [ ] `xdg-desktop-portal` (`InputCapture` + `RemoteDesktop`) + `libei` / `reis` support for GNOME 46+, KDE Plasma 6.1+, and Hyprland/wlroots portals
-- [ ] Wayland clipboard bridge (`wlr-data-control` / `ext-data-control`)
-- [ ] Auto-detect X11 vs Wayland at runtime inside `glide-backend`
+- [x] `xdg-desktop-portal` (`InputCapture` + `RemoteDesktop`) + pure-Rust `libei` (`reis`) support for GNOME 46+, KDE Plasma 6.1+, and Hyprland/wlroots portals (with automatic portal D-Bus fallback on older compositors and persistent restore tokens)
+- [x] Native Wayland clipboard bridge (`ext-data-control` / `wlr-data-control` via `wl-clipboard-rs`, with automatic XWayland fallback on GNOME < 49)
+- [x] Auto-detect X11 vs Wayland at runtime inside `glide-backend` + Wayland-compatible `/dev/uinput` backend
+
+### Upcoming Features
+- [ ] Cross-edge file drag-and-drop (drag a file off a screen edge straight onto another PC)
+- [ ] Windows installer (`Setup.exe` / `.msi` + optional `winget` package)
+- [ ] One-click / automatic in-app updates (after manual "Check for updates" in Settings)
 
 ### macOS Backend (`crates/glide-backend/src/macos.rs`)
 - [ ] Capture: `CGEventTap` (`kCGHIDEventTap`) + `CGAssociateMouseAndMouseCursorPosition(false)` for raw unaccelerated deltas + `IOHIDManager` for extra keys/buttons

@@ -113,7 +113,7 @@ jobs:
 
           ### Downloads
           - **Windows 11:** Download and double-click \`glide-windows-x86_64.exe\` *(standalone — no installer or extra DLLs needed)*.
-          - **Ubuntu / Debian Linux (X11):** Download \`${DEB_FILE}\` and run:
+          - **Ubuntu / Debian Linux (X11 & Wayland):** Download \`${DEB_FILE}\` and run:
             \`\`\`bash
             sudo apt install ./${DEB_FILE}
             \`\`\`

@@ -98,13 +98,18 @@ fn mouse_btn_to_evdev(btn: MouseButton) -> u16 {
     }
 }
 
-pub struct UinputInjector {
-    file: File,
+struct X11Helper {
     conn: RustConnection,
     screen_num: usize,
     root: Window,
-    geometry: DesktopGeometry,
     cursor_hider: X11CursorHider,
+}
+
+pub struct UinputInjector {
+    file: File,
+    x11: Option<X11Helper>,
+    wayland: bool,
+    geometry: DesktopGeometry,
     parked_pos: (i32, i32),
     rem_x: f32,
     rem_y: f32,
@@ -179,22 +184,39 @@ impl UinputInjector {
             ));
         }
 
-        let (conn, screen_num) =
-            RustConnection::connect(None).context("failed to connect to X11 for geometry/warp")?;
-        let root = conn.setup().roots[screen_num].root;
-        let cursor_hider = X11CursorHider::init(&conn);
-        let geometry = query_desktop_geometry(&conn, screen_num)?;
+        let wayland = crate::linux_wayland::is_wayland_session();
+        let (x11, geometry) = if wayland {
+            let geom = crate::linux_wayland::query_desktop_geometry()
+                .unwrap_or_else(|_| DesktopGeometry::fallback());
+            (None, geom)
+        } else {
+            let (conn, screen_num) = RustConnection::connect(None)
+                .context("failed to connect to X11 for geometry/warp")?;
+            let root = conn.setup().roots[screen_num].root;
+            let cursor_hider = X11CursorHider::init(&conn);
+            let geometry = query_desktop_geometry(&conn, screen_num)?;
+            (
+                Some(X11Helper {
+                    conn,
+                    screen_num,
+                    root,
+                    cursor_hider,
+                }),
+                geometry,
+            )
+        };
         let (cx, cy) = geometry.primary_center();
 
-        debug!("Initialized Linux /dev/uinput virtual HID device (hardware-native acceleration & hi-res scroll)");
+        debug!(
+            wayland,
+            "Initialized Linux /dev/uinput virtual HID device (hardware-native acceleration & hi-res scroll)"
+        );
 
         Ok(Self {
             file,
-            conn,
-            screen_num,
-            root,
+            x11,
+            wayland,
             geometry,
-            cursor_hider,
             parked_pos: (cx, cy),
             rem_x: 0.0,
             rem_y: 0.0,
@@ -245,71 +267,87 @@ impl UinputInjector {
         Ok(())
     }
 
-    fn sync_pointer(&mut self) -> Result<(i32, i32)> {
-        let reply = self.conn.query_pointer(self.root)?.reply()?;
-        self.est_x = reply.root_x as f32;
-        self.est_y = reply.root_y as f32;
-        self.last_pointer_sync = Instant::now();
-        Ok((reply.root_x as i32, reply.root_y as i32))
+    fn refresh_geometry(&mut self) -> Result<()> {
+        if let Some(ref x11) = self.x11 {
+            self.geometry = query_desktop_geometry(&x11.conn, x11.screen_num)?;
+        } else if let Ok(geom) = crate::linux_wayland::query_desktop_geometry() {
+            self.geometry = geom;
+        }
+        Ok(())
     }
 
-    fn query_x11_lock_state(&self) -> LockState {
-        if let Ok(cookie) = self.conn.get_keyboard_control() {
-            if let Ok(reply) = cookie.reply() {
-                return LockState {
-                    caps_lock: (reply.led_mask & 1) != 0,
-                    num_lock: (reply.led_mask & 2) != 0,
-                };
+    fn warp_to(&mut self, x: i32, y: i32) -> Result<()> {
+        if let Some(ref mut x11) = self.x11 {
+            x11.conn
+                .warp_pointer(x11rb::NONE, x11.root, 0, 0, 0, 0, x as i16, y as i16)?;
+            x11.cursor_hider.show(&x11.conn, x11.root);
+            x11.conn.flush()?;
+        } else {
+            let (min_x, min_y, max_x, max_y) = self.geometry.bounds();
+            let span_x = (max_x - min_x).max(1);
+            let span_y = (max_y - min_y).max(1);
+            self.emit_events(&[(EV_REL, REL_X, -(span_x * 2)), (EV_REL, REL_Y, -(span_y * 2))])?;
+            let ox = x - min_x;
+            let oy = y - min_y;
+            if ox != 0 || oy != 0 {
+                self.emit_events(&[(EV_REL, REL_X, ox), (EV_REL, REL_Y, oy)])?;
             }
         }
-        LockState::default()
+        self.rem_x = 0.0;
+        self.rem_y = 0.0;
+        self.est_x = x as f32;
+        self.est_y = y as f32;
+        self.edge_push_accum = 0.0;
+        self.last_pointer_sync = Instant::now();
+        Ok(())
+    }
+
+    fn sync_pointer(&mut self) -> Result<(i32, i32)> {
+        if let Some(ref x11) = self.x11 {
+            let reply = x11.conn.query_pointer(x11.root)?.reply()?;
+            self.est_x = reply.root_x as f32;
+            self.est_y = reply.root_y as f32;
+            self.last_pointer_sync = Instant::now();
+            Ok((reply.root_x as i32, reply.root_y as i32))
+        } else {
+            Ok((self.est_x.round() as i32, self.est_y.round() as i32))
+        }
+    }
+
+    fn query_x11_lock_state(&self) -> Option<LockState> {
+        let x11 = self.x11.as_ref()?;
+        let reply = x11.conn.get_keyboard_control().ok()?.reply().ok()?;
+        Some(LockState {
+            caps_lock: (reply.led_mask & 1) != 0,
+            num_lock: (reply.led_mask & 2) != 0,
+        })
     }
 }
 
 impl InputInjector for UinputInjector {
     fn os_kind(&self) -> OsKind {
-        OsKind::LinuxX11
+        if self.wayland {
+            OsKind::LinuxWayland
+        } else {
+            OsKind::LinuxX11
+        }
     }
 
     fn desktop_geometry(&mut self) -> Result<DesktopGeometry> {
-        self.geometry = query_desktop_geometry(&self.conn, self.screen_num)?;
+        self.refresh_geometry()?;
         Ok(self.geometry.clone())
     }
 
     fn enter(&mut self, edge: Edge, normalized_pos: f32) -> Result<()> {
-        if let Ok(geom) = query_desktop_geometry(&self.conn, self.screen_num) {
-            self.geometry = geom;
-        }
+        let _ = self.refresh_geometry();
         let (x, y) = self.geometry.point_on_edge(edge, normalized_pos, 4);
-        self.conn
-            .warp_pointer(x11rb::NONE, self.root, 0, 0, 0, 0, x as i16, y as i16)?;
-        self.cursor_hider.show(&self.conn, self.root);
-        self.conn.flush()?;
-        self.rem_x = 0.0;
-        self.rem_y = 0.0;
-        self.est_x = x as f32;
-        self.est_y = y as f32;
-        self.edge_push_accum = 0.0;
-        self.last_pointer_sync = Instant::now();
-        Ok(())
+        self.warp_to(x, y)
     }
 
     fn enter_at(&mut self, norm_x: f32, norm_y: f32) -> Result<()> {
-        if let Ok(geom) = query_desktop_geometry(&self.conn, self.screen_num) {
-            self.geometry = geom;
-        }
+        let _ = self.refresh_geometry();
         let (x, y) = self.geometry.denormalize_point(norm_x, norm_y);
-        self.conn
-            .warp_pointer(x11rb::NONE, self.root, 0, 0, 0, 0, x as i16, y as i16)?;
-        self.cursor_hider.show(&self.conn, self.root);
-        self.conn.flush()?;
-        self.rem_x = 0.0;
-        self.rem_y = 0.0;
-        self.est_x = x as f32;
-        self.est_y = y as f32;
-        self.edge_push_accum = 0.0;
-        self.last_pointer_sync = Instant::now();
-        Ok(())
+        self.warp_to(x, y)
     }
 
     fn cursor_norm(&mut self) -> (f32, f32) {
@@ -322,7 +360,9 @@ impl InputInjector for UinputInjector {
     }
 
     fn sync_lock_state(&mut self, desired: LockState) -> Result<()> {
-        let current = self.query_x11_lock_state();
+        let Some(current) = self.query_x11_lock_state() else {
+            return Ok(());
+        };
         if current.caps_lock != desired.caps_lock {
             let caps = HidUsage::keyboard(0x39).to_evdev().unwrap_or(58);
             let _ = self.emit_events(&[(EV_KEY, caps, 1)]);
@@ -476,34 +516,46 @@ impl InputInjector for UinputInjector {
 
     fn leave(&mut self) -> Result<()> {
         let (px, py) = self.geometry.primary_park_corner();
-        let _ = self
-            .conn
-            .warp_pointer(x11rb::NONE, self.root, 0, 0, 0, 0, px as i16, py as i16);
-        self.cursor_hider.hide(&self.conn, self.root);
-        let _ = self.conn.flush();
+        if let Some(ref mut x11) = self.x11 {
+            let _ = x11
+                .conn
+                .warp_pointer(x11rb::NONE, x11.root, 0, 0, 0, 0, px as i16, py as i16);
+            x11.cursor_hider.hide(&x11.conn, x11.root);
+            let _ = x11.conn.flush();
+        } else {
+            let _ = self.warp_to(px, py);
+        }
         self.parked_pos = (px, py);
         self.est_x = px as f32;
         self.est_y = py as f32;
         self.edge_push_accum = 0.0;
-        debug!(px, py, "UinputInjector left screen; cursor hidden & parked");
+        debug!(px, py, "UinputInjector left screen; cursor parked");
         Ok(())
     }
 
     fn show_cursor(&mut self) -> Result<()> {
-        self.cursor_hider.show(&self.conn, self.root);
-        let _ = self.conn.flush();
+        if let Some(ref mut x11) = self.x11 {
+            x11.cursor_hider.show(&x11.conn, x11.root);
+            let _ = x11.conn.flush();
+        }
         Ok(())
     }
 
     fn reveal_if_moved_locally(&mut self) {
-        if !self.cursor_hider.is_hidden() {
+        let hidden = self
+            .x11
+            .as_ref()
+            .is_some_and(|x11| x11.cursor_hider.is_hidden());
+        if !hidden {
             return;
         }
         if let Ok((x, y)) = self.sync_pointer() {
             let (px, py) = self.parked_pos;
             if (x - px).abs() > 4 || (y - py).abs() > 4 {
-                self.cursor_hider.show(&self.conn, self.root);
-                let _ = self.conn.flush();
+                if let Some(ref mut x11) = self.x11 {
+                    x11.cursor_hider.show(&x11.conn, x11.root);
+                    let _ = x11.conn.flush();
+                }
                 debug!(x, y, "Local pointer moved while hidden; cursor revealed");
             }
         }

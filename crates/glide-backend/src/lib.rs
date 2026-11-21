@@ -21,6 +21,8 @@ pub enum TrayAction {
 #[cfg(target_os = "linux")]
 pub mod linux_uinput;
 #[cfg(target_os = "linux")]
+pub mod linux_wayland;
+#[cfg(target_os = "linux")]
 pub mod linux_x11;
 
 #[cfg(target_os = "windows")]
@@ -36,15 +38,17 @@ use glide_proto::{ClipboardPayload, Edge, LockState, OsKind};
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
 
-/// Client input injection backend selector (Linux can opt into kernel `uinput`).
+/// Client input injection backend selector (Linux supports XTest, Wayland Portal/EIS, and kernel `uinput`).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum InputBackendKind {
-    /// Default zero-privilege backend (`XTest` on Linux X11, `SendInput` on Windows).
+    /// Automatically choose the best native backend (`Portal/EIS` on Wayland, `XTest` on X11, `SendInput` on Windows).
     #[default]
     Auto,
     /// Explicitly use X11 XTest on Linux.
     XTest,
+    /// Explicitly use xdg-desktop-portal RemoteDesktop / EIS on Linux Wayland.
+    Portal,
     /// Linux virtual kernel HID device (`/dev/uinput`) for 100% native libinput acceleration & hi-res scroll.
     Uinput,
 }
@@ -224,7 +228,7 @@ pub fn init_platform() {
     windows::init_dpi_awareness();
 }
 
-/// Returns the native [`OsKind`] of the current build target.
+/// Returns the native [`OsKind`] of the current build target (detecting Wayland vs X11 on Linux).
 pub fn current_os_kind() -> OsKind {
     #[cfg(target_os = "windows")]
     {
@@ -232,7 +236,11 @@ pub fn current_os_kind() -> OsKind {
     }
     #[cfg(target_os = "linux")]
     {
-        OsKind::LinuxX11
+        if linux_wayland::is_wayland_session() {
+            OsKind::LinuxWayland
+        } else {
+            OsKind::LinuxX11
+        }
     }
     #[cfg(target_os = "macos")]
     {
@@ -248,7 +256,11 @@ pub fn current_os_kind() -> OsKind {
 pub fn start_capture(config: CaptureConfig) -> Result<CaptureHandle> {
     #[cfg(target_os = "linux")]
     {
-        linux_x11::capture::start_x11_capture(config)
+        if linux_wayland::is_wayland_session() {
+            linux_wayland::capture::start_wayland_capture(config)
+        } else {
+            linux_x11::capture::start_x11_capture(config)
+        }
     }
     #[cfg(target_os = "windows")]
     {
@@ -265,21 +277,45 @@ pub fn create_injector() -> Result<Box<dyn InputInjector>> {
     create_injector_with_kind(InputBackendKind::Auto)
 }
 
-/// Creates the native OS client input injector, honoring `InputBackendKind::Uinput` on Linux.
+/// Creates the native OS client input injector, auto-selecting Wayland Portal/EIS or X11 XTest
+/// and honoring explicit `Portal`, `XTest`, or `Uinput` overrides on Linux.
 pub fn create_injector_with_kind(kind: InputBackendKind) -> Result<Box<dyn InputInjector>> {
     #[cfg(target_os = "linux")]
     {
+        let wayland = linux_wayland::is_wayland_session();
+
         if kind == InputBackendKind::Uinput {
             match linux_uinput::UinputInjector::connect() {
                 Ok(inj) => return Ok(Box::new(inj)),
                 Err(e) => {
                     tracing::warn!(
                         error = %e,
-                        "Requested /dev/uinput backend unavailable; falling back cleanly to XTest"
+                        wayland,
+                        "Requested /dev/uinput backend unavailable; falling back to default session backend"
                     );
                 }
             }
         }
+
+        if kind == InputBackendKind::Portal || (wayland && kind != InputBackendKind::XTest) {
+            match linux_wayland::inject::WaylandInjector::connect() {
+                Ok(inj) => return Ok(Box::new(inj)),
+                Err(e) if kind == InputBackendKind::Portal => return Err(e),
+                Err(e) => {
+                    // On Wayland, if RemoteDesktop portal is unavailable, try /dev/uinput if writable
+                    // before surfacing the portal error.
+                    if let Ok(inj) = linux_uinput::UinputInjector::connect() {
+                        tracing::warn!(
+                            error = %e,
+                            "Wayland RemoteDesktop portal unavailable; using /dev/uinput fallback"
+                        );
+                        return Ok(Box::new(inj));
+                    }
+                    return Err(e);
+                }
+            }
+        }
+
         Ok(Box::new(linux_x11::inject::X11Injector::connect()?))
     }
     #[cfg(target_os = "windows")]
@@ -298,7 +334,11 @@ pub fn create_injector_with_kind(kind: InputBackendKind) -> Result<Box<dyn Input
 pub fn start_clipboard() -> Result<ClipboardHandle> {
     #[cfg(target_os = "linux")]
     {
-        linux_x11::clipboard::start_x11_clipboard()
+        if linux_wayland::is_wayland_session() {
+            linux_wayland::clipboard::start_wayland_clipboard()
+        } else {
+            linux_x11::clipboard::start_x11_clipboard()
+        }
     }
     #[cfg(target_os = "windows")]
     {
@@ -314,7 +354,11 @@ pub fn start_clipboard() -> Result<ClipboardHandle> {
 pub fn run_doctor() -> Result<DoctorReport> {
     #[cfg(target_os = "linux")]
     {
-        linux_x11::run_doctor()
+        if linux_wayland::is_wayland_session() {
+            linux_wayland::run_doctor()
+        } else {
+            linux_x11::run_doctor()
+        }
     }
     #[cfg(target_os = "windows")]
     {

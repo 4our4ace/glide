@@ -45,6 +45,7 @@ impl From<CliEdge> for Edge {
 enum CliBackend {
     Auto,
     Xtest,
+    Portal,
     Uinput,
 }
 
@@ -53,6 +54,7 @@ impl From<CliBackend> for InputBackendKind {
         match value {
             CliBackend::Auto => InputBackendKind::Auto,
             CliBackend::Xtest => InputBackendKind::XTest,
+            CliBackend::Portal => InputBackendKind::Portal,
             CliBackend::Uinput => InputBackendKind::Uinput,
         }
     }

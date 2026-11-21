@@ -144,7 +144,7 @@ Installed-Size: $INSTALLED_KB
 Maintainer: Glide Contributors <glide@local>
 Description: Ultra-low-latency cross-platform software KVM over QUIC
  Share one physical mouse, keyboard, clipboard, and files across Windows 11
- and Linux X11 machines over LAN with zero TCP head-of-line blocking, raw
+ and Linux (X11 & Wayland) machines over LAN with zero TCP head-of-line blocking, raw
  physical USB HID scancodes (full German/ISO AltGr support), high-resolution
  scrolling, multi-monitor HiDPI awareness, zero-config LAN auto-discovery,
  native system tray integration, and a truly native GPU-rendered desktop GUI.

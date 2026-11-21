@@ -18,9 +18,15 @@ tokio.workspace = true
 tracing.workspace = true
 
 [target.'cfg(target_os = "linux")'.dependencies]
+directories.workspace = true
 ksni.workspace = true
 libc.workspace = true
+reis.workspace = true
+wayland-client.workspace = true
+wayland-protocols.workspace = true
+wl-clipboard-rs.workspace = true
 x11rb.workspace = true
+zbus.workspace = true
 
 [target.'cfg(target_os = "windows")'.dependencies]
 windows-sys.workspace = true

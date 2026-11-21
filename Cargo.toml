@@ -13,7 +13,7 @@ members = [
 [workspace.package]
 version = "0.3.0"
 edition = "2021"
-rust-version = "1.80"
+rust-version = "1.85"
 license = "MIT OR Apache-2.0"
 
 [workspace.dependencies]
@@ -44,13 +44,19 @@ tokio = { version = "1.40", features = ["rt-multi-thread", "macros", "sync", "ti
 toml = "0.8"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+ureq = { version = "3", default-features = false, features = ["rustls", "json"] }
 
 # Native GPU-rendered UI (wgpu + winit). Pinned: Rune has no releases yet.
 rune = { git = "https://github.com/anomalyco/rune", rev = "07f1ddde9a1d61def92e69f89beb28319a56bc17", default-features = false, features = ["dbus", "native-file-dialog"] }
 
 # Platform-specific dependencies (pure Rust, zero system C dev libraries)
 ksni = { version = "0.3", default-features = false, features = ["tokio"] }
+reis = { version = "0.7", default-features = false }
+wayland-client = "0.31"
+wayland-protocols = { version = "0.32", features = ["client", "unstable"] }
+wl-clipboard-rs = "0.9"
 x11rb = { version = "0.13", features = ["randr", "xinput", "xtest", "xfixes"] }
+zbus = { version = "5", default-features = false, features = ["tokio", "blocking-api"] }
 windows-sys = { version = "0.59", features = [
     "Win32_Foundation",
     "Win32_Graphics_Gdi",

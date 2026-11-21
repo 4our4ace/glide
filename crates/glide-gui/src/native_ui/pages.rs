@@ -7,8 +7,9 @@ use super::widgets::{
     slider_row, text_field, toggle, xs_button, BtnKind,
 };
 use super::{DeskDrag, DragKind, Role, Tab, Ui};
+use crate::updater::UpdateCheckState;
 use glide_backend::InputBackendKind;
-use glide_proto::{ClipboardFormat, Edge};
+use glide_proto::{ClipboardFormat, Edge, OsKind};
 use rune::{
     col, el, row, rule, spacer, text, Align, Color, Cursor, Drag, El, FileDialogOptions, Phase,
     ScrollSpec, Tx,
@@ -427,7 +428,7 @@ fn hit_test_slot(cx: f32, cy: f32) -> Option<Edge> {
             let sx = x + w * 0.5;
             let sy = y + h * 0.5;
             let dist = (cx - sx).hypot(cy - sy);
-            if best.map_or(true, |(_, d)| dist < d) {
+            if best.is_none_or(|(_, d)| dist < d) {
                 best = Some((edge, dist));
             }
         }
@@ -869,10 +870,9 @@ fn ghost_slot(
 
 fn server_connection_col(s: &Ui, p: Palette) -> El {
     let addr_display = if let Some(first) = s.local_ips.first() {
-        let port = s.current_port();
         row()
             .center_y()
-            .child(text(format!("{first}:{port}")).font(ty::MONO).color(p.text))
+            .child(text(first.clone()).font(ty::MONO).color(p.text))
     } else {
         row().child(
             text("No network connection")
@@ -1541,19 +1541,34 @@ fn input_client_cols(s: &Ui, p: Palette) -> El {
     ];
 
     if !s.is_windows {
+        let is_wayland = matches!(s.os_kind, OsKind::LinuxWayland);
+        let backend_options: &[(InputBackendKind, &str)] = if is_wayland {
+            &[
+                (InputBackendKind::Auto, "Auto"),
+                (InputBackendKind::Portal, "Portal"),
+                (InputBackendKind::Uinput, "uinput"),
+            ]
+        } else {
+            &[
+                (InputBackendKind::Auto, "Auto"),
+                (InputBackendKind::XTest, "XTest"),
+                (InputBackendKind::Uinput, "uinput"),
+            ]
+        };
+        let backend_sub = if is_wayland {
+            "Wayland: Portal (EIS) or uinput"
+        } else {
+            "Linux only"
+        };
         pointer_rows.push(setting_row(
             p,
             "backend-row",
             "Input method",
-            Some("Linux only"),
+            Some(backend_sub),
             segmented(
                 p,
                 "backend-seg",
-                &[
-                    (InputBackendKind::Auto, "Auto"),
-                    (InputBackendKind::XTest, "XTest"),
-                    (InputBackendKind::Uinput, "uinput"),
-                ],
+                backend_options,
                 s.config.client.input_backend,
                 true,
                 |s, kind, _| {
@@ -2339,6 +2354,72 @@ fn settings_page(s: &Ui, p: Palette) -> El {
             ),
         ));
     }
+
+    let (update_desc, update_btn) = match &s.update_state {
+        UpdateCheckState::Idle => (
+            "Check GitHub for new releases".to_owned(),
+            xs_button(
+                p,
+                "update-check-btn",
+                "Check",
+                BtnKind::Default,
+                false,
+                |s, tx| s.check_for_updates(tx),
+            ),
+        ),
+        UpdateCheckState::Checking => (
+            "Checking GitHub…".to_owned(),
+            xs_button(
+                p,
+                "update-check-btn",
+                "Checking…",
+                BtnKind::Default,
+                true,
+                |_, _| {},
+            ),
+        ),
+        UpdateCheckState::UpToDate { latest } => (
+            format!("You're up to date ({latest})"),
+            xs_button(
+                p,
+                "update-check-btn",
+                "Check",
+                BtnKind::Default,
+                false,
+                |s, tx| s.check_for_updates(tx),
+            ),
+        ),
+        UpdateCheckState::Available { version, .. } => (
+            format!("{version} is available"),
+            xs_button(
+                p,
+                "update-download-btn",
+                "Download",
+                BtnKind::Primary,
+                false,
+                |s, tx| s.open_update_download(tx),
+            ),
+        ),
+        UpdateCheckState::Error(msg) => (
+            msg.clone(),
+            xs_button(
+                p,
+                "update-retry-btn",
+                "Retry",
+                BtnKind::Default,
+                false,
+                |s, tx| s.check_for_updates(tx),
+            ),
+        ),
+    };
+
+    general_rows.push(setting_row(
+        p,
+        "updates-row",
+        "Updates",
+        Some(&update_desc),
+        update_btn,
+    ));
 
     let general_card = card_rows(p, "general-card", general_rows);
 

@@ -5,6 +5,7 @@ mod pages;
 mod theme;
 mod widgets;
 
+use crate::updater::{self, UpdateCheckState};
 use crate::{launch_browser_window, AppController, GUI_HEIGHT, GUI_WIDTH};
 use bytes::Bytes;
 use glide_backend::os_integration::{
@@ -112,6 +113,7 @@ pub struct Ui {
     pub discovered: Vec<DiscoveredPeer>,
     pub scanning: bool,
     pub show_advanced: bool,
+    pub update_state: UpdateCheckState,
 
     // Editable text fields + last committed snapshots
     pub port_edit: TextEdit,
@@ -180,6 +182,7 @@ impl Ui {
             discovered: Vec::new(),
             scanning: false,
             show_advanced: false,
+            update_state: UpdateCheckState::Idle,
             port_edit: TextEdit::new(&port_str),
             server_edit: TextEdit::new(&server_str),
             remap_from: TextEdit::default(),
@@ -468,9 +471,57 @@ impl Ui {
             self.toast("No local network address found", tx);
             return;
         };
-        let addr = format!("{first}:{}", self.current_port());
+        let port = self.current_port();
+        let addr = if port == glide_core::config::DEFAULT_QUIC_PORT {
+            first.clone()
+        } else {
+            format!("{first}:{port}")
+        };
         tx.copy(addr.clone());
         self.toast(format!("Copied {addr}"), tx);
+    }
+
+    pub fn check_for_updates(&mut self, tx: &mut Tx) {
+        if matches!(self.update_state, UpdateCheckState::Checking) {
+            return;
+        }
+        self.update_state = UpdateCheckState::Checking;
+        let handle = self.handle.clone();
+        let current = env!("CARGO_PKG_VERSION");
+        self.rt.spawn(async move {
+            let state = tokio::task::spawn_blocking(move || updater::check_latest_release(current))
+                .await
+                .unwrap_or_else(|_| UpdateCheckState::Error("Update check failed".into()));
+            if let Some(h) = handle {
+                h.update(move |s, tx| {
+                    match &state {
+                        UpdateCheckState::UpToDate { latest } => {
+                            s.toast(format!("Glide {latest} is up to date"), tx);
+                        }
+                        UpdateCheckState::Available { version, .. } => {
+                            s.toast(format!("Glide {version} is available"), tx);
+                        }
+                        UpdateCheckState::Error(msg) => {
+                            s.toast(msg.clone(), tx);
+                        }
+                        _ => {}
+                    }
+                    s.update_state = state;
+                });
+            }
+        });
+        let _ = tx;
+    }
+
+    pub fn open_update_download(&mut self, tx: &mut Tx) {
+        let url = match &self.update_state {
+            UpdateCheckState::Available { url, .. } => url.clone(),
+            _ => updater::RELEASES_PAGE_URL.to_owned(),
+        };
+        match updater::open_url(&url) {
+            Ok(()) => self.toast("Opened releases page in browser", tx),
+            Err(e) => self.toast(format!("Could not open browser: {e}"), tx),
+        }
     }
 
     pub fn copy_fingerprint(&mut self, tx: &mut Tx) {
@@ -875,7 +926,7 @@ pub(crate) fn run(
     }
 
     #[cfg(target_os = "linux")]
-    {
+    if !glide_backend::linux_wayland::is_wayland_session() {
         app = app.on_window(|_| {
             glide_backend::linux_x11::window_brand::spawn_x11_window_brander(GUI_WIDTH, GUI_HEIGHT);
         });
