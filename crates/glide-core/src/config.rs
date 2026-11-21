@@ -134,8 +134,8 @@ pub struct GlideConfigFile {
     /// Hide clipboard history entries behind a privacy cover until explicitly revealed.
     #[serde(default)]
     pub hide_clipboard_history: bool,
-    /// Allow dragging local files straight across active screen edges onto the other PC.
-    #[serde(default = "default_true")]
+    /// Allow dragging local files straight across active screen edges onto the other PC (experimental, opt-in).
+    #[serde(default)]
     pub drag_drop_files: bool,
     /// Maximum single file transfer size in megabytes (default `256`, safely clamped to `1..=4096`).
     #[serde(default = "default_max_file_mb")]
@@ -159,7 +159,7 @@ impl Default for GlideConfigFile {
             auto_start_on_launch: false,
             clipboard_history: true,
             hide_clipboard_history: false,
-            drag_drop_files: true,
+            drag_drop_files: false,
             max_file_mb: DEFAULT_MAX_FILE_MB,
             receive_dir: None,
             update_channel: default_update_channel(),
@@ -304,7 +304,7 @@ impl Default for ServerConfig {
             sync_lock_keys: true,
             pin_media_keys_local: true,
             clipboard: true,
-            drag_drop_files: true,
+            drag_drop_files: false,
             motion_coalesce_us: 1000,
             identity_dir: None,
             max_file_bytes: None,
@@ -408,7 +408,7 @@ impl Default for ClientConfig {
             input_backend: InputBackendKind::Auto,
             key_remap: Vec::new(),
             clipboard: true,
-            drag_drop_files: true,
+            drag_drop_files: false,
             tofu_store_path: None,
             max_file_bytes: None,
             receive_dir: None,
@@ -729,9 +729,9 @@ mod tests {
         assert!(!legacy.auto_start_on_launch);
         assert!(legacy.clipboard_history);
         assert!(!legacy.hide_clipboard_history);
-        assert!(legacy.drag_drop_files);
-        assert!(legacy.server.drag_drop_files);
-        assert!(legacy.client.drag_drop_files);
+        assert!(!legacy.drag_drop_files);
+        assert!(!legacy.server.drag_drop_files);
+        assert!(!legacy.client.drag_drop_files);
         assert_eq!(legacy.max_file_mb, DEFAULT_MAX_FILE_MB);
         assert_eq!(legacy.max_file_bytes(), glide_proto::DEFAULT_MAX_FILE_BYTES);
         assert_eq!(legacy.server.edge_threshold_px, 6);
@@ -742,7 +742,7 @@ mod tests {
             auto_start_on_launch: true,
             clipboard_history: false,
             hide_clipboard_history: true,
-            drag_drop_files: false,
+            drag_drop_files: true,
             max_file_mb: 1024,
             ..GlideConfigFile::default()
         };
@@ -753,7 +753,7 @@ mod tests {
         assert!(parsed.auto_start_on_launch);
         assert!(!parsed.clipboard_history);
         assert!(parsed.hide_clipboard_history);
-        assert!(!parsed.drag_drop_files);
+        assert!(parsed.drag_drop_files);
         assert_eq!(parsed.max_file_mb, 1024);
         assert_eq!(parsed.max_file_bytes(), 1024 * 1024 * 1024);
         assert_eq!(

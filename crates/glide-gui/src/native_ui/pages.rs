@@ -2538,7 +2538,7 @@ fn clipboard_page(s: &Ui, p: Palette) -> El {
         "dnd-toggle-row",
         icons::drag_files_icon(p.text_2),
         "Drag files across edges",
-        Some("Pull files past a screen edge"),
+        Some("Experimental · drag past screen edges"),
         toggle(
             p,
             "dnd-toggle",

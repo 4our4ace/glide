@@ -731,19 +731,26 @@ unsafe extern "system" fn mouse_ll_proc(code: i32, wparam: WPARAM, lparam: LPARA
                             }
                         }
                         WM_LBUTTONDOWN => {
-                            let edge_mask = state.active_edges.load();
-                            let (started_on_edge, fullscreen_blocked) = if edge_mask != 0 {
-                                let geom = state.geometry.read();
-                                let on_edge = ALL_EDGES.iter().any(|&e| {
-                                    (edge_mask & edge_bit(e)) != 0
-                                        && geom.distance_to_edge(e, ms.pt.x, ms.pt.y) <= 4
-                                });
-                                let fs_block = state.auto_lock_fullscreen.load(Ordering::Relaxed)
-                                    && is_foreground_fullscreen(&geom);
-                                (on_edge, fs_block)
+                            let dnd_enabled = state.drag_drop_files.load(Ordering::Relaxed);
+                            let edge_mask = if dnd_enabled {
+                                state.active_edges.load()
                             } else {
-                                (false, false)
+                                0
                             };
+                            let (started_on_edge, fullscreen_blocked) =
+                                if dnd_enabled && edge_mask != 0 {
+                                    let geom = state.geometry.read();
+                                    let on_edge = ALL_EDGES.iter().any(|&e| {
+                                        (edge_mask & edge_bit(e)) != 0
+                                            && geom.distance_to_edge(e, ms.pt.x, ms.pt.y) <= 4
+                                    });
+                                    let fs_block =
+                                        state.auto_lock_fullscreen.load(Ordering::Relaxed)
+                                            && is_foreground_fullscreen(&geom);
+                                    (on_edge, fs_block)
+                                } else {
+                                    (false, false)
+                                };
                             state
                                 .lmb_started_on_edge
                                 .store(started_on_edge, Ordering::Relaxed);
@@ -754,10 +761,10 @@ unsafe extern "system" fn mouse_ll_proc(code: i32, wparam: WPARAM, lparam: LPARA
                             // Arm pre-created 4px edge strips IMMEDIATELY on interior LMB down
                             // (matching client.rs) unless a fullscreen game/app is foreground
                             // (preserving DirectFlip / MPO zero-copy presentation).
-                            if !started_on_edge
+                            if dnd_enabled
+                                && !started_on_edge
                                 && !fullscreen_blocked
                                 && edge_mask != 0
-                                && state.drag_drop_files.load(Ordering::Relaxed)
                                 && !state.locked.load(Ordering::Relaxed)
                                 && !state.drag_strip_armed.swap(true, Ordering::SeqCst)
                             {
