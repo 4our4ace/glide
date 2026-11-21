@@ -107,6 +107,12 @@ pub enum CaptureEvent {
     HotkeyToggleLock,
     /// Display topology, resolution, or DPI scaling changed (monitor hotplug / scale update).
     GeometryChanged(DesktopGeometry),
+    /// OS is suspending or locking the interactive session — unconditionally release remote
+    /// control, restore local cursor visibility, and release held keys on remote peers.
+    SystemSuspended,
+    /// OS woke from sleep/suspend or unlocked the session — refresh geometry, local LAN IPs,
+    /// and connection health immediately.
+    SystemResumed,
 }
 
 /// Control handle to switch the OS capture backend between local and remote modes
@@ -206,6 +212,18 @@ pub trait InputInjector: Send {
     /// the last check, updating cached geometry and returning the new layout if it changed.
     fn poll_geometry_changed(&mut self) -> Option<DesktopGeometry> {
         None
+    }
+
+    /// Returns `true` once if the OS entered sleep/suspend or locked the session since the last
+    /// poll (callers should immediately release held keys and clear focus).
+    fn poll_system_suspended(&mut self) -> bool {
+        false
+    }
+
+    /// Returns `true` once if the OS resumed from sleep/suspend or unlocked the session since the
+    /// last poll (callers should probe connection health and reset reconnect backoff).
+    fn poll_system_resumed(&mut self) -> bool {
+        false
     }
 }
 

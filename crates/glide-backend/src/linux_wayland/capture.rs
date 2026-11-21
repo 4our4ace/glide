@@ -476,7 +476,13 @@ fn start_wayland_capture_blocking(config: CaptureConfig) -> Result<CaptureHandle
                                 }
                             }
                             "Deactivated" | "Disabled" => {
-                                shared_sig.in_remote.store(false, Ordering::SeqCst);
+                                if shared_sig.in_remote.swap(false, Ordering::SeqCst) {
+                                    debug!(
+                                        signal = %member,
+                                        "Wayland InputCapture ended by compositor; releasing remote session"
+                                    );
+                                    let _ = ev_tx_sig.send(CaptureEvent::SystemSuspended);
+                                }
                             }
                             "ZonesChanged" => {
                                 // Serialize GetZones + SetPointerBarriers on the command thread so

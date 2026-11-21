@@ -652,6 +652,62 @@ pub async fn run_server_with_backends(
                             });
                         }
                     }
+
+                    CaptureEvent::SystemSuspended => {
+                        if let Some(pid) = active_remote.take() {
+                            if let Some(peer) = peers.get(&pid) {
+                                info!(
+                                    peer = %peer.name,
+                                    "System suspending/locking; releasing remote control and held keys"
+                                );
+                                let _ = peer.ctrl_tx.send(ControlMessage::ReleaseAll);
+                                let _ = peer.ctrl_tx.send(ControlMessage::Leave {
+                                    edge: peer.edge.opposite(),
+                                    normalized_pos: 0.5,
+                                    cursor_norm_x: 0.5,
+                                    cursor_norm_y: 0.5,
+                                });
+                            }
+                        }
+                        active_edge = None;
+                        remote_modifiers = ModifierMask::EMPTY;
+                        pending_dx = 0.0;
+                        pending_dy = 0.0;
+                        coalesce_armed = false;
+                        let (lx, ly) = capture_ctrl.last_local_cursor_norm();
+                        let _ = capture_ctrl.leave_remote_at(lx, ly);
+                        sync_runtime_peers(&runtime, &peers, active_remote, locked);
+                    }
+
+                    CaptureEvent::SystemResumed => {
+                        info!("System resumed/unlocked; refreshing server geometry and ensuring local focus");
+                        if let Some(pid) = active_remote.take() {
+                            if let Some(peer) = peers.get(&pid) {
+                                let _ = peer.ctrl_tx.send(ControlMessage::ReleaseAll);
+                                let _ = peer.ctrl_tx.send(ControlMessage::Leave {
+                                    edge: peer.edge.opposite(),
+                                    normalized_pos: 0.5,
+                                    cursor_norm_x: 0.5,
+                                    cursor_norm_y: 0.5,
+                                });
+                            }
+                            active_edge = None;
+                            remote_modifiers = ModifierMask::EMPTY;
+                            pending_dx = 0.0;
+                            pending_dy = 0.0;
+                            coalesce_armed = false;
+                            let (lx, ly) = capture_ctrl.last_local_cursor_norm();
+                            let _ = capture_ctrl.leave_remote_at(lx, ly);
+                        }
+                        let fresh_geom = capture_ctrl.desktop_geometry();
+                        server_scale.store(fresh_geom.primary_scale().to_bits(), Ordering::Relaxed);
+                        if let Some(ref rt) = runtime {
+                            rt.update(|s| {
+                                s.geometry = fresh_geom;
+                            });
+                        }
+                        sync_runtime_peers(&runtime, &peers, active_remote, locked);
+                    }
                 }
             }
 

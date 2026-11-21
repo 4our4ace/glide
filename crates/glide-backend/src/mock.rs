@@ -116,6 +116,8 @@ pub enum InjectedAction {
 pub struct MockInjector {
     pub geometry: DesktopGeometry,
     pub pending_geometry: Arc<Mutex<Option<DesktopGeometry>>>,
+    pub suspended_flag: Arc<AtomicBool>,
+    pub resumed_flag: Arc<AtomicBool>,
     pub cursor_x: f32,
     pub cursor_y: f32,
     pub pressed_keys: HashSet<HidUsage>,
@@ -131,6 +133,8 @@ impl MockInjector {
         let me = Self {
             geometry,
             pending_geometry: Arc::new(Mutex::new(None)),
+            suspended_flag: Arc::new(AtomicBool::new(false)),
+            resumed_flag: Arc::new(AtomicBool::new(false)),
             cursor_x: cx as f32,
             cursor_y: cy as f32,
             pressed_keys: HashSet::new(),
@@ -162,6 +166,19 @@ impl InputInjector for MockInjector {
             return Some(new_geom);
         }
         None
+    }
+
+    fn poll_system_suspended(&mut self) -> bool {
+        if self.suspended_flag.swap(false, Ordering::SeqCst) {
+            let _ = self.release_all();
+            true
+        } else {
+            false
+        }
+    }
+
+    fn poll_system_resumed(&mut self) -> bool {
+        self.resumed_flag.swap(false, Ordering::SeqCst)
     }
 
     fn enter(&mut self, edge: Edge, normalized_pos: f32) -> Result<()> {

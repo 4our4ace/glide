@@ -16,6 +16,9 @@ use std::time::{Duration, Instant};
 use tracing::{debug, trace};
 use windows_sys::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, WPARAM};
 use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
+use windows_sys::Win32::System::RemoteDesktop::{
+    WTSRegisterSessionNotification, WTSUnRegisterSessionNotification, NOTIFY_FOR_THIS_SESSION,
+};
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
     GetKeyState, SendInput, INPUT, INPUT_0, INPUT_KEYBOARD, INPUT_MOUSE, KEYBDINPUT,
     KEYEVENTF_EXTENDEDKEY, KEYEVENTF_KEYUP, KEYEVENTF_SCANCODE, MOUSEEVENTF_HWHEEL,
@@ -25,12 +28,15 @@ use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GetCursorPos, GetMessageW,
-    PostMessageW, RegisterClassW, SetCursorPos, TranslateMessage, MSG, WM_DISPLAYCHANGE,
-    WM_DPICHANGED, WM_QUIT, WNDCLASSW, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_OVERLAPPED,
-    XBUTTON1, XBUTTON2,
+    PostMessageW, RegisterClassW, SetCursorPos, TranslateMessage, MSG, PBT_APMRESUMEAUTOMATIC,
+    PBT_APMRESUMECRITICAL, PBT_APMRESUMESUSPEND, PBT_APMSUSPEND, WM_DISPLAYCHANGE, WM_DPICHANGED,
+    WM_POWERBROADCAST, WM_QUIT, WM_WTSSESSION_CHANGE, WNDCLASSW, WS_EX_NOACTIVATE,
+    WS_EX_TOOLWINDOW, WS_OVERLAPPED, WTS_SESSION_LOCK, WTS_SESSION_UNLOCK, XBUTTON1, XBUTTON2,
 };
 
 static INJECTOR_DISPLAY_GEN: AtomicU64 = AtomicU64::new(0);
+static INJECTOR_SUSPEND_GEN: AtomicU64 = AtomicU64::new(0);
+static INJECTOR_RESUME_GEN: AtomicU64 = AtomicU64::new(0);
 
 unsafe extern "system" fn injector_watch_wnd_proc(
     hwnd: HWND,
@@ -43,12 +49,36 @@ unsafe extern "system" fn injector_watch_wnd_proc(
             INJECTOR_DISPLAY_GEN.fetch_add(1, Ordering::Release);
             0
         }
+        WM_POWERBROADCAST => match wparam as u32 {
+            PBT_APMSUSPEND => {
+                INJECTOR_SUSPEND_GEN.fetch_add(1, Ordering::Release);
+                1
+            }
+            PBT_APMRESUMEAUTOMATIC | PBT_APMRESUMESUSPEND | PBT_APMRESUMECRITICAL => {
+                INJECTOR_DISPLAY_GEN.fetch_add(1, Ordering::Release);
+                INJECTOR_RESUME_GEN.fetch_add(1, Ordering::Release);
+                1
+            }
+            _ => unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) },
+        },
+        WM_WTSSESSION_CHANGE => match wparam as u32 {
+            WTS_SESSION_LOCK => {
+                INJECTOR_SUSPEND_GEN.fetch_add(1, Ordering::Release);
+                0
+            }
+            WTS_SESSION_UNLOCK => {
+                INJECTOR_DISPLAY_GEN.fetch_add(1, Ordering::Release);
+                INJECTOR_RESUME_GEN.fetch_add(1, Ordering::Release);
+                0
+            }
+            _ => 0,
+        },
         _ => unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) },
     }
 }
 
-/// Spawns a lightweight hidden top-level window listening for `WM_DISPLAYCHANGE` and
-/// `WM_DPICHANGED` broadcasts (best-effort; falls back cleanly to periodic refresh on failure).
+/// Spawns a lightweight hidden top-level window listening for display/DPI changes,
+/// sleep/wake power broadcasts, and WTS session lock/unlock events (best-effort).
 fn spawn_display_watcher() -> AtomicIsize {
     let (tx, rx) = std::sync::mpsc::sync_channel::<isize>(1);
     let spawn_res = thread::Builder::new()
@@ -71,7 +101,8 @@ fn spawn_display_watcher() -> AtomicIsize {
             unsafe {
                 RegisterClassW(&wc);
             }
-            // Must be a hidden top-level window (NOT HWND_MESSAGE) to receive WM_DISPLAYCHANGE / WM_DPICHANGED.
+            // Must be a hidden top-level window (NOT HWND_MESSAGE) to receive WM_DISPLAYCHANGE,
+            // WM_POWERBROADCAST, WM_DPICHANGED, and WM_WTSSESSION_CHANGE.
             let hwnd = unsafe {
                 CreateWindowExW(
                     WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE,
@@ -92,6 +123,8 @@ fn spawn_display_watcher() -> AtomicIsize {
                 let _ = tx.send(0);
                 return;
             }
+            let wts_registered =
+                unsafe { WTSRegisterSessionNotification(hwnd, NOTIFY_FOR_THIS_SESSION) } != 0;
             let _ = tx.send(hwnd as isize);
             let mut msg: MSG = unsafe { std::mem::zeroed() };
             while unsafe { GetMessageW(&mut msg, ptr::null_mut(), 0, 0) } > 0 {
@@ -101,6 +134,9 @@ fn spawn_display_watcher() -> AtomicIsize {
                 }
             }
             unsafe {
+                if wts_registered {
+                    WTSUnRegisterSessionNotification(hwnd);
+                }
                 DestroyWindow(hwnd);
             }
         });
@@ -117,6 +153,8 @@ pub struct WindowsInjector {
     geometry: DesktopGeometry,
     watch_hwnd: AtomicIsize,
     seen_display_gen: u64,
+    seen_suspend_gen: u64,
+    seen_resume_gen: u64,
     last_geom_refresh: Instant,
     rem_x: f32,
     rem_y: f32,
@@ -130,11 +168,15 @@ impl WindowsInjector {
         init_dpi_awareness();
         let watch_hwnd = spawn_display_watcher();
         let seen_display_gen = INJECTOR_DISPLAY_GEN.load(Ordering::Acquire);
+        let seen_suspend_gen = INJECTOR_SUSPEND_GEN.load(Ordering::Acquire);
+        let seen_resume_gen = INJECTOR_RESUME_GEN.load(Ordering::Acquire);
         let geometry = query_desktop_geometry()?;
         Ok(Self {
             geometry,
             watch_hwnd,
             seen_display_gen,
+            seen_suspend_gen,
+            seen_resume_gen,
             last_geom_refresh: Instant::now(),
             rem_x: 0.0,
             rem_y: 0.0,
@@ -231,6 +273,25 @@ impl InputInjector for WindowsInjector {
         } else {
             None
         }
+    }
+
+    fn poll_system_suspended(&mut self) -> bool {
+        let gen = INJECTOR_SUSPEND_GEN.load(Ordering::Acquire);
+        if gen != self.seen_suspend_gen {
+            self.seen_suspend_gen = gen;
+            let _ = self.release_all();
+            return true;
+        }
+        false
+    }
+
+    fn poll_system_resumed(&mut self) -> bool {
+        let gen = INJECTOR_RESUME_GEN.load(Ordering::Acquire);
+        if gen != self.seen_resume_gen {
+            self.seen_resume_gen = gen;
+            return true;
+        }
+        false
     }
 
     fn enter(&mut self, edge: Edge, normalized_pos: f32) -> Result<()> {
