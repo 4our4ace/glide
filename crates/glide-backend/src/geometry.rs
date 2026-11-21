@@ -151,19 +151,16 @@ impl DesktopGeometry {
         self.primary_center()
     }
 
-    /// Returns all monitors whose boundary lies on the specified outer edge of the desktop.
-    fn monitors_on_edge(&self, edge: Edge) -> Vec<&MonitorRect> {
-        let (min_x, min_y, max_x, max_y) = self.bounds();
+    #[inline]
+    fn monitor_on_edge(m: &MonitorRect, edge: Edge, bounds: (i32, i32, i32, i32)) -> bool {
         const TOL: i32 = 4;
-        self.monitors
-            .iter()
-            .filter(|m| match edge {
-                Edge::Left => (m.left() - min_x).abs() <= TOL,
-                Edge::Right => (m.right() - max_x).abs() <= TOL,
-                Edge::Top => (m.top() - min_y).abs() <= TOL,
-                Edge::Bottom => (m.bottom() - max_y).abs() <= TOL,
-            })
-            .collect()
+        let (min_x, min_y, max_x, max_y) = bounds;
+        match edge {
+            Edge::Left => (m.left() - min_x).abs() <= TOL,
+            Edge::Right => (m.right() - max_x).abs() <= TOL,
+            Edge::Top => (m.top() - min_y).abs() <= TOL,
+            Edge::Bottom => (m.bottom() - max_y).abs() <= TOL,
+        }
     }
 
     /// Checks whether cursor coordinate `(x, y)` is touching/beyond the given outer `edge`
@@ -183,34 +180,65 @@ impl DesktopGeometry {
         margin_px: i32,
         dead_corner_px: i32,
     ) -> Option<f32> {
-        let edge_mons = self.monitors_on_edge(edge);
-        if edge_mons.is_empty() {
+        if self.monitors.is_empty() {
             return None;
         }
+        let bounds = self.bounds();
         let margin = margin_px.max(0);
         let dead = dead_corner_px.max(0);
-        let touching = edge_mons.iter().any(|m| match edge {
-            Edge::Left => {
-                let d = dead.min(m.height / 4);
-                x <= m.left() + margin && y >= m.top() + d && y <= m.bottom() - d
+        let mut touching = false;
+        let mut span_min = i32::MAX;
+        let mut span_max = i32::MIN;
+
+        for m in &self.monitors {
+            if !Self::monitor_on_edge(m, edge, bounds) {
+                continue;
             }
-            Edge::Right => {
-                let d = dead.min(m.height / 4);
-                x >= m.right() - 1 - margin && y >= m.top() + d && y <= m.bottom() - d
+            match edge {
+                Edge::Left => {
+                    span_min = span_min.min(m.top());
+                    span_max = span_max.max(m.bottom());
+                    let d = dead.min(m.height / 4);
+                    if x <= m.left() + margin && y >= m.top() + d && y <= m.bottom() - d {
+                        touching = true;
+                    }
+                }
+                Edge::Right => {
+                    span_min = span_min.min(m.top());
+                    span_max = span_max.max(m.bottom());
+                    let d = dead.min(m.height / 4);
+                    if x >= m.right() - 1 - margin && y >= m.top() + d && y <= m.bottom() - d {
+                        touching = true;
+                    }
+                }
+                Edge::Top => {
+                    span_min = span_min.min(m.left());
+                    span_max = span_max.max(m.right());
+                    let d = dead.min(m.width / 4);
+                    if y <= m.top() + margin && x >= m.left() + d && x <= m.right() - d {
+                        touching = true;
+                    }
+                }
+                Edge::Bottom => {
+                    span_min = span_min.min(m.left());
+                    span_max = span_max.max(m.right());
+                    let d = dead.min(m.width / 4);
+                    if y >= m.bottom() - 1 - margin && x >= m.left() + d && x <= m.right() - d {
+                        touching = true;
+                    }
+                }
             }
-            Edge::Top => {
-                let d = dead.min(m.width / 4);
-                y <= m.top() + margin && x >= m.left() + d && x <= m.right() - d
-            }
-            Edge::Bottom => {
-                let d = dead.min(m.width / 4);
-                y >= m.bottom() - 1 - margin && x >= m.left() + d && x <= m.right() - d
-            }
-        });
-        if !touching {
+        }
+
+        if !touching || span_min == i32::MAX {
             return None;
         }
-        Some(self.normalize_along_edge(edge, x, y, &edge_mons))
+        let span = (span_max - span_min).max(1) as f32;
+        let coord = match edge {
+            Edge::Left | Edge::Right => y,
+            Edge::Top | Edge::Bottom => x,
+        };
+        Some(((coord - span_min) as f32 / span).clamp(0.0, 1.0))
     }
 
     /// Distance in pixels from `(x, y)` to the outer `edge` (0 when on/past the edge).
@@ -224,41 +252,35 @@ impl DesktopGeometry {
         }
     }
 
-    fn normalize_along_edge(&self, edge: Edge, x: i32, y: i32, edge_mons: &[&MonitorRect]) -> f32 {
-        match edge {
-            Edge::Left | Edge::Right => {
-                let min_y = edge_mons.iter().map(|m| m.top()).min().unwrap_or(0);
-                let max_y = edge_mons.iter().map(|m| m.bottom()).max().unwrap_or(1080);
-                let span = (max_y - min_y).max(1) as f32;
-                ((y - min_y) as f32 / span).clamp(0.0, 1.0)
-            }
-            Edge::Top | Edge::Bottom => {
-                let min_x = edge_mons.iter().map(|m| m.left()).min().unwrap_or(0);
-                let max_x = edge_mons.iter().map(|m| m.right()).max().unwrap_or(1920);
-                let span = (max_x - min_x).max(1) as f32;
-                ((x - min_x) as f32 / span).clamp(0.0, 1.0)
-            }
-        }
-    }
-
     /// Computes a safe cursor entry point `(x, y)` inside a real monitor touching `edge`,
     /// inset by `inset_px` pixels so it does not immediately bounce back across the boundary.
     pub fn point_on_edge(&self, edge: Edge, normalized_pos: f32, inset_px: i32) -> (i32, i32) {
-        let t = normalized_pos.clamp(0.0, 1.0);
-        let edge_mons = self.monitors_on_edge(edge);
-        if edge_mons.is_empty() {
+        if self.monitors.is_empty() {
             return self.primary_center();
         }
+        let t = normalized_pos.clamp(0.0, 1.0);
+        let bounds = self.bounds();
         let inset = inset_px.max(1);
 
         match edge {
             Edge::Left | Edge::Right => {
-                let min_y = edge_mons.iter().map(|m| m.top()).min().unwrap_or(0);
-                let max_y = edge_mons.iter().map(|m| m.bottom()).max().unwrap_or(1080);
+                let mut min_y = i32::MAX;
+                let mut max_y = i32::MIN;
+                for m in &self.monitors {
+                    if Self::monitor_on_edge(m, edge, bounds) {
+                        min_y = min_y.min(m.top());
+                        max_y = max_y.max(m.bottom());
+                    }
+                }
+                if min_y == i32::MAX {
+                    return self.primary_center();
+                }
                 let target_y = min_y + ((max_y - min_y - 1).max(0) as f32 * t).round() as i32;
                 // Pick the monitor on this edge whose vertical range is closest to target_y
-                let mon = edge_mons
+                let Some(mon) = self
+                    .monitors
                     .iter()
+                    .filter(|m| Self::monitor_on_edge(m, edge, bounds))
                     .min_by_key(|m| {
                         if target_y < m.top() {
                             m.top() - target_y
@@ -268,7 +290,9 @@ impl DesktopGeometry {
                             0
                         }
                     })
-                    .unwrap();
+                else {
+                    return self.primary_center();
+                };
                 let clamped_y = target_y.clamp(mon.top() + 1, (mon.bottom() - 2).max(mon.top()));
                 let x = match edge {
                     Edge::Left => (mon.left() + inset).min(mon.right() - 1),
@@ -278,11 +302,22 @@ impl DesktopGeometry {
                 (x, clamped_y)
             }
             Edge::Top | Edge::Bottom => {
-                let min_x = edge_mons.iter().map(|m| m.left()).min().unwrap_or(0);
-                let max_x = edge_mons.iter().map(|m| m.right()).max().unwrap_or(1920);
+                let mut min_x = i32::MAX;
+                let mut max_x = i32::MIN;
+                for m in &self.monitors {
+                    if Self::monitor_on_edge(m, edge, bounds) {
+                        min_x = min_x.min(m.left());
+                        max_x = max_x.max(m.right());
+                    }
+                }
+                if min_x == i32::MAX {
+                    return self.primary_center();
+                }
                 let target_x = min_x + ((max_x - min_x - 1).max(0) as f32 * t).round() as i32;
-                let mon = edge_mons
+                let Some(mon) = self
+                    .monitors
                     .iter()
+                    .filter(|m| Self::monitor_on_edge(m, edge, bounds))
                     .min_by_key(|m| {
                         if target_x < m.left() {
                             m.left() - target_x
@@ -292,7 +327,9 @@ impl DesktopGeometry {
                             0
                         }
                     })
-                    .unwrap();
+                else {
+                    return self.primary_center();
+                };
                 let clamped_x = target_x.clamp(mon.left() + 1, (mon.right() - 2).max(mon.left()));
                 let y = match edge {
                     Edge::Top => (mon.top() + inset).min(mon.bottom() - 1),
