@@ -2353,5 +2353,226 @@ mod tests {
         assert!(rt.find("known-servers-toggle").is_none());
         assert!(rt.find("known-servers-card").is_none());
     }
+
+    #[tokio::test]
+    async fn settings_rows_render_icons_without_clipping() {
+        let preview_dir = std::env::var_os("GLIDE_RENDER_PREVIEW_DIR").map(PathBuf::from);
+        if let Some(dir) = &preview_dir {
+            std::fs::create_dir_all(dir).expect("create preview dir");
+        }
+
+        let dir = std::env::temp_dir().join(format!(
+            "glide-ui-settings-icons-test-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        struct CleanupDir(PathBuf);
+        impl Drop for CleanupDir {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+        let _cleanup = CleanupDir(dir.clone());
+
+        let (quit_tx, _quit_rx) = tokio::sync::mpsc::unbounded_channel();
+        let ctrl = Arc::new(AppController::new(
+            dir.join("config.toml"),
+            "http://127.0.0.1:0".into(),
+            quit_tx,
+        ));
+
+        let check_scenes: &[(&str, &[&str])] = &[
+            (
+                "settings-light",
+                &[
+                    "theme-row",
+                    "autostart-row",
+                    "update-channel-row",
+                    "updates-row",
+                    "advanced-row",
+                    "sc-jump",
+                    "sc-lock",
+                    "sc-home",
+                ],
+            ),
+            (
+                "settings-dark",
+                &[
+                    "theme-row",
+                    "autostart-row",
+                    "update-channel-row",
+                    "updates-row",
+                    "advanced-row",
+                    "sc-jump",
+                    "sc-lock",
+                    "sc-home",
+                ],
+            ),
+            (
+                "settings-windows-light",
+                &[
+                    "theme-row",
+                    "autostart-row",
+                    "elevated-row",
+                    "update-channel-row",
+                    "updates-row",
+                    "advanced-row",
+                ],
+            ),
+            (
+                "settings-advanced-light",
+                &[
+                    "theme-row",
+                    "advanced-row",
+                    "fp-row",
+                    "trust-row",
+                    "firewall-row",
+                    "max-file-mb-row",
+                    "diag-head",
+                ],
+            ),
+            (
+                "settings-update-ready",
+                &["elevated-row", "update-channel-row", "updates-row"],
+            ),
+            (
+                "clipboard-filled",
+                &[
+                    "clip-toggle-row",
+                    "clip-hist-toggle-row",
+                    "dnd-toggle-row",
+                    "save-folder-row",
+                ],
+            ),
+            (
+                "input-server-light",
+                &[
+                    "srv-thresh-row",
+                    "srv-corner-row",
+                    "srv-dwell-row",
+                    "fs-lock-row",
+                    "srv-sync-lock-row",
+                    "srv-pin-media-row",
+                ],
+            ),
+            (
+                "input-client-light",
+                &[
+                    "sens-row",
+                    "scroll-row",
+                    "dpi-row",
+                    "invert-row",
+                    "backend-row",
+                    "cli-thresh-row",
+                    "cli-corner-row",
+                    "cli-sync-lock-row",
+                ],
+            ),
+            ("server-live", &["row-addr", "row-port", "row-discovery"]),
+            ("client-connected", &["row-server", "row-pos"]),
+        ];
+
+        for &(scene_name, expected_rows) in check_scenes {
+            let scene_fn = SCENES
+                .iter()
+                .find(|(n, _)| *n == scene_name)
+                .map(|(_, f)| *f)
+                .unwrap_or_else(|| panic!("scene {scene_name} not found"));
+
+            let vis = Arc::new(WindowVisibility::new(true));
+            let mut ui = Ui::new(ctrl.clone(), tokio::runtime::Handle::current(), vis);
+            scene_fn(&mut ui);
+            let dark = ui.theme.is_dark(false);
+
+            let scale = if preview_dir.is_some() { 2.0 } else { 1.0 };
+            let text_sys = rune::text::TextSystem::new(FONTS, ("Inter", "JetBrains Mono"));
+            let mut rt = rune::Runtime::with_text(
+                ui,
+                view,
+                (GUI_WIDTH as f32, GUI_HEIGHT as f32),
+                rune::Env::new(dark, scale),
+                text_sys,
+            );
+            rt.set_srgb_blend(true);
+            rt.frame(0.0);
+            rt.settle_all();
+            rt.frame(0.0);
+
+            let elems = rt.elements();
+            for row_key in expected_rows {
+                let info = elems
+                    .iter()
+                    .find(|e| e.key.as_deref() == Some(*row_key))
+                    .unwrap_or_else(|| {
+                        panic!("row `{row_key}` missing in scene `{scene_name}`")
+                    });
+                let min_h = if *row_key == "diag-head" { 24.0 } else { 36.0 };
+                assert!(
+                    info.rect[2] > 180.0 && info.rect[3] >= min_h,
+                    "row `{row_key}` in `{scene_name}` has cramped bounds {:?}",
+                    info.rect
+                );
+                assert!(
+                    info.rect[0] + info.rect[2] <= GUI_WIDTH as f32 + 1.0,
+                    "row `{row_key}` in `{scene_name}` overflows right edge: {:?}",
+                    info.rect
+                );
+            }
+
+            if let Some(dir) = &preview_dir {
+                let render_png = |rt: &mut rune::Runtime<Ui>, filename: &str| {
+                    let w = (GUI_WIDTH as f32 * scale) as u32;
+                    let h = (GUI_HEIGHT as f32 * scale) as u32;
+                    rune::render::cpu_boot::fill_masks(&mut rt.text.atlas, 2);
+                    let scene = rune::render::cpu_boot::Scene::new(
+                        &rt.instances,
+                        &rt.text.atlas,
+                        &rt.images,
+                        (w, h),
+                        rt.clear_color(),
+                    )
+                    .srgb_blend(rt.srgb_blend())
+                    .font_smoothing(rt.font_smoothing());
+                    let mut bgra = vec![0u8; (w as usize) * (h as usize) * 4];
+                    let mut target = rune::render::cpu_boot::Target::with_stride(
+                        &mut bgra,
+                        w,
+                        h,
+                        w as usize * 4,
+                    );
+                    rune::render::cpu_boot::paint(&scene, &mut target, 2)
+                        .unwrap_or_else(|e| panic!("cpu paint failed for {filename}: {e:?}"));
+                    for px in bgra.chunks_exact_mut(4) {
+                        px.swap(0, 2);
+                    }
+                    let out = dir.join(filename);
+                    rune::render::write_png(&out, w, h, &bgra).expect("write preview png");
+                };
+
+                render_png(&mut rt, &format!("{scene_name}.png"));
+
+                if scene_name == "settings-advanced-light" {
+                    // Scroll left column down so Security & firewall + Max file size are fully visible.
+                    if let Some((lx, ly)) = rt.find("settings-left") {
+                        rt.wheel(lx, ly, -360.0);
+                        rt.frame(0.0);
+                        rt.settle_all();
+                        rt.frame(0.0);
+                        render_png(&mut rt, "settings-advanced-light-scrolled.png");
+                    }
+                    // Also render dark mode advanced view.
+                    rt.state.theme = ThemePref::Dark;
+                    rt.env = rune::Env::new(true, scale);
+                    rt.invalidate();
+                    rt.frame(0.0);
+                    rt.settle_all();
+                    rt.frame(0.0);
+                    render_png(&mut rt, "settings-advanced-dark.png");
+                }
+            }
+        }
+    }
 }
+
 

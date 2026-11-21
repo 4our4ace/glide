@@ -4,7 +4,7 @@ use super::icons;
 use super::theme::{ty, Palette, ThemePref};
 use super::widgets::{
     badge, button, card, card_rows, empty_box, kbd, password_field, section_head, segmented,
-    setting_row, slider_row, text_field, toggle, xs_button, BtnKind,
+    setting_icon_badge, setting_row, slider_row, text_field, toggle, xs_button, BtnKind,
 };
 use super::{DeskDrag, DragKind, Role, Tab, Ui};
 use crate::updater::UpdateCheckState;
@@ -1036,6 +1036,7 @@ fn server_connection_col(s: &Ui, p: Palette) -> El {
     let addr_row = setting_row(
         p,
         "row-addr",
+        icons::network_icon(p.text_2),
         "Address",
         None,
         row()
@@ -1057,6 +1058,7 @@ fn server_connection_col(s: &Ui, p: Palette) -> El {
     let port_row = setting_row(
         p,
         "row-port",
+        icons::port_icon(p.text_2),
         "Port",
         None,
         text_field(
@@ -1074,8 +1076,9 @@ fn server_connection_col(s: &Ui, p: Palette) -> El {
     let disc_row = setting_row(
         p,
         "row-discovery",
+        icons::broadcast_icon(p.text_2),
         "Discoverable",
-        Some("Clients on this network find it automatically"),
+        Some("Auto-discovered on local network"),
         toggle(
             p,
             "disc-toggle",
@@ -1214,6 +1217,7 @@ fn client_connection_col(s: &Ui, p: Palette) -> El {
     let server_row = setting_row(
         p,
         "row-server",
+        icons::monitor_icon(p.text_2),
         "Server",
         None,
         text_field(
@@ -1231,6 +1235,7 @@ fn client_connection_col(s: &Ui, p: Palette) -> El {
     let pos_row = setting_row(
         p,
         "row-pos",
+        icons::position_icon(p.text_2),
         "Position",
         None,
         segmented(
@@ -1636,6 +1641,7 @@ fn input_server_cols(s: &Ui, p: Palette) -> El {
         slider_row(
             p,
             "srv-thresh-row",
+            icons::edge_distance_icon(p.text_2),
             "Switch distance",
             format!("{thresh} px"),
             (thresh as f32 - 1.0) / (24.0 - 1.0),
@@ -1650,6 +1656,7 @@ fn input_server_cols(s: &Ui, p: Palette) -> El {
         slider_row(
             p,
             "srv-corner-row",
+            icons::corner_guard_icon(p.text_2),
             "Corner guard",
             format!("{dead} px"),
             dead as f32 / 80.0,
@@ -1664,6 +1671,7 @@ fn input_server_cols(s: &Ui, p: Palette) -> El {
         slider_row(
             p,
             "srv-dwell-row",
+            icons::timer_icon(p.text_2),
             "Edge delay",
             format!("{dwell} ms"),
             dwell as f32 / 200.0,
@@ -1678,6 +1686,7 @@ fn input_server_cols(s: &Ui, p: Palette) -> El {
         setting_row(
             p,
             "fs-lock-row",
+            icons::fullscreen_icon(p.text_2),
             "Pause in fullscreen apps",
             Some("Games keep the cursor"),
             toggle(
@@ -1694,6 +1703,7 @@ fn input_server_cols(s: &Ui, p: Palette) -> El {
         setting_row(
             p,
             "srv-sync-lock-row",
+            icons::keyboard_icon(p.text_2),
             "Sync Caps & Num Lock",
             Some("Send keyboard light state to clients"),
             toggle(
@@ -1710,6 +1720,7 @@ fn input_server_cols(s: &Ui, p: Palette) -> El {
         setting_row(
             p,
             "srv-pin-media-row",
+            icons::volume_icon(p.text_2),
             "Keep media & volume keys on this PC",
             Some("Volume & playback keys stay local"),
             toggle(
@@ -1822,6 +1833,7 @@ fn input_client_cols(s: &Ui, p: Palette) -> El {
         slider_row(
             p,
             "sens-row",
+            icons::mouse_icon(p.text_2),
             "Mouse speed",
             format!("{sens:.2}x"),
             (sens - 0.25) / (3.0 - 0.25),
@@ -1836,6 +1848,7 @@ fn input_client_cols(s: &Ui, p: Palette) -> El {
         slider_row(
             p,
             "scroll-row",
+            icons::scroll_icon(p.text_2),
             "Scroll speed",
             format!("{scroll_sp:.2}x"),
             (scroll_sp - 0.25) / (4.0 - 0.25),
@@ -1850,6 +1863,7 @@ fn input_client_cols(s: &Ui, p: Palette) -> El {
         setting_row(
             p,
             "dpi-row",
+            icons::dpi_scale_icon(p.text_2),
             "Match display scaling",
             Some("Same pointer feel across HiDPI screens"),
             toggle(
@@ -1866,6 +1880,7 @@ fn input_client_cols(s: &Ui, p: Palette) -> El {
         setting_row(
             p,
             "invert-row",
+            icons::invert_scroll_icon(p.text_2),
             "Natural scrolling",
             Some("Invert scroll wheel direction"),
             toggle(
@@ -1904,6 +1919,7 @@ fn input_client_cols(s: &Ui, p: Palette) -> El {
         pointer_rows.push(setting_row(
             p,
             "backend-row",
+            icons::terminal_input_icon(p.text_2),
             "Input method",
             Some(backend_sub),
             segmented(
@@ -1927,6 +1943,7 @@ fn input_client_cols(s: &Ui, p: Palette) -> El {
         slider_row(
             p,
             "cli-thresh-row",
+            icons::edge_distance_icon(p.text_2),
             "Switch distance",
             format!("{thresh} px"),
             (thresh as f32 - 1.0) / (24.0 - 1.0),
@@ -1941,6 +1958,7 @@ fn input_client_cols(s: &Ui, p: Palette) -> El {
         slider_row(
             p,
             "cli-corner-row",
+            icons::corner_guard_icon(p.text_2),
             "Corner guard",
             format!("{dead} px"),
             dead as f32 / 80.0,
@@ -1955,6 +1973,7 @@ fn input_client_cols(s: &Ui, p: Palette) -> El {
         setting_row(
             p,
             "cli-sync-lock-row",
+            icons::keyboard_icon(p.text_2),
             "Sync Caps & Num Lock",
             Some("Follow the server’s keyboard lights"),
             toggle(
@@ -2196,6 +2215,7 @@ fn clipboard_page(s: &Ui, p: Palette) -> El {
             setting_row(
                 p,
                 "clip-toggle-row",
+                icons::clipboard_icon(p.text_2),
                 "Shared clipboard",
                 Some("Sync between both PCs"),
                 toggle(
@@ -2214,6 +2234,7 @@ fn clipboard_page(s: &Ui, p: Palette) -> El {
             setting_row(
                 p,
                 "clip-hist-toggle-row",
+                icons::history_icon(p.text_2),
                 "Save history",
                 Some("Keep recent items to re-send"),
                 toggle(
@@ -2424,6 +2445,7 @@ fn clipboard_page(s: &Ui, p: Palette) -> El {
     let dnd_row = setting_row(
         p,
         "dnd-toggle-row",
+        icons::drag_files_icon(p.text_2),
         "Drag files across edges",
         Some("Pull files past a screen edge"),
         toggle(
@@ -2525,16 +2547,22 @@ fn clipboard_page(s: &Ui, p: Palette) -> El {
     let save_folder_row = col()
         .key("save-folder-row")
         .w_full()
-        .px(10.0)
+        .px(11.0)
         .py(8.0)
-        .gap(6.0)
+        .gap(7.0)
         .child(
             row()
                 .w_full()
                 .center_y()
                 .justify_between()
                 .gap(8.0)
-                .child(text("Save folder").font(ty::SUB_MED).color(p.text_2))
+                .child(
+                    row()
+                        .gap(9.0)
+                        .center_y()
+                        .child(setting_icon_badge(p, icons::folder_icon(p.text_2)))
+                        .child(text("Save folder").font(ty::BODY_MED).color(p.text)),
+                )
                 .child(folder_btns),
         )
         .child(text_field(
@@ -2735,6 +2763,7 @@ fn settings_page(s: &Ui, p: Palette) -> El {
         setting_row(
             p,
             "theme-row",
+            icons::theme_icon(p.text_2),
             "Theme",
             None,
             segmented(
@@ -2756,6 +2785,7 @@ fn settings_page(s: &Ui, p: Palette) -> El {
         setting_row(
             p,
             "autostart-row",
+            icons::autostart_icon(p.text_2),
             "Start on login",
             Some(autostart_desc),
             toggle(
@@ -2774,8 +2804,9 @@ fn settings_page(s: &Ui, p: Palette) -> El {
         general_rows.push(setting_row(
             p,
             "elevated-row",
+            icons::shield_check_icon(p.text_2),
             "Control admin windows",
-            Some("Let Glide control UAC / admin apps"),
+            Some("Control UAC & admin apps"),
             xs_button(
                 p,
                 "elevated-btn",
@@ -2789,11 +2820,12 @@ fn settings_page(s: &Ui, p: Palette) -> El {
 
     let channel_desc = match s.config.update_channel {
         UpdateChannel::Stable => "Official tested releases",
-        UpdateChannel::Nightly => "Dev builds · auto-checks",
+        UpdateChannel::Nightly => "Latest dev builds",
     };
     general_rows.push(setting_row(
         p,
         "update-channel-row",
+        icons::update_channel_icon(p.text_2),
         "Update channel",
         Some(channel_desc),
         segmented(
@@ -2813,7 +2845,7 @@ fn settings_page(s: &Ui, p: Palette) -> El {
         UpdateCheckState::Idle => (
             Cow::Borrowed(match s.config.update_channel {
                 UpdateChannel::Stable => "Check GitHub for new releases",
-                UpdateChannel::Nightly => "Check GitHub for the latest nightly build",
+                UpdateChannel::Nightly => "Check GitHub for nightly builds",
             }),
             xs_button(
                 p,
@@ -2848,9 +2880,9 @@ fn settings_page(s: &Ui, p: Palette) -> El {
         ),
         UpdateCheckState::Available(avail) => {
             let desc = if avail.is_channel_switch {
-                format!("Switch to {}", avail.version)
+                format!("Switch to {}", avail.short_label)
             } else {
-                format!("{} is available", avail.version)
+                format!("{} ready", avail.short_label)
             };
             let btn = if avail.can_self_update() {
                 xs_button(
@@ -2926,9 +2958,18 @@ fn settings_page(s: &Ui, p: Palette) -> El {
         ),
     };
 
+    let update_icon = match &s.update_state {
+        UpdateCheckState::Available(_)
+        | UpdateCheckState::Downloading { .. }
+        | UpdateCheckState::Installing { .. }
+        | UpdateCheckState::AwaitingSudoPassword { .. } => icons::download_icon(p.accent),
+        _ => icons::refresh_icon(p.text_2),
+    };
+
     general_rows.push(setting_row(
         p,
         "updates-row",
+        update_icon,
         "Updates",
         Some(&update_desc),
         update_btn,
@@ -2942,8 +2983,9 @@ fn settings_page(s: &Ui, p: Palette) -> El {
         [setting_row(
             p,
             "advanced-row",
+            icons::sliders_icon(p.text_2),
             "Show advanced settings",
-            Some("Security fingerprint, firewall & diagnostics"),
+            Some("Fingerprint, firewall & diagnostics"),
             toggle(
                 p,
                 "advanced-toggle",
@@ -3013,7 +3055,7 @@ fn settings_page(s: &Ui, p: Palette) -> El {
                     .map_or(fp.len(), |(idx, _)| idx);
                 Cow::Owned(format!("Trusted server: {}…", &fp[..end]))
             }
-            None => Cow::Borrowed("Trusts the first server it sees"),
+            None => Cow::Borrowed("Trusts first server seen"),
         };
 
         let security_card = card_rows(
@@ -3023,9 +3065,11 @@ fn settings_page(s: &Ui, p: Palette) -> El {
                 row()
                     .key("fp-row")
                     .w_full()
-                    .padding(12.0)
-                    .gap(10.0)
+                    .px(11.0)
+                    .py(11.0)
+                    .gap(9.0)
                     .items_start()
+                    .child(setting_icon_badge(p, icons::fingerprint_icon(p.text_2)))
                     .child(
                         col()
                             .key("fp-box")
@@ -3061,18 +3105,28 @@ fn settings_page(s: &Ui, p: Palette) -> El {
                     .key("trust-row")
                     .w_full()
                     .min_h(40.0)
-                    .px(12.0)
+                    .px(11.0)
                     .py(7.0)
                     .gap(8.0)
                     .center_y()
                     .justify_between()
                     .child(
-                        text(trust_label.into_owned())
-                            .font(ty::SUB)
-                            .color(p.muted)
+                        row()
                             .grow(1.0)
                             .shrink()
-                            .truncate(),
+                            .min_w(0.0)
+                            .gap(9.0)
+                            .center_y()
+                            .child(setting_icon_badge(p, icons::key_icon(p.text_2)))
+                            .child(
+                                text(trust_label.into_owned())
+                                    .font(ty::SUB)
+                                    .color(p.muted)
+                                    .grow(1.0)
+                                    .shrink()
+                                    .min_w(0.0)
+                                    .truncate(),
+                            ),
                     )
                     .child(xs_button(
                         p,
@@ -3085,8 +3139,9 @@ fn settings_page(s: &Ui, p: Palette) -> El {
                 setting_row(
                     p,
                     "firewall-row",
+                    icons::shield_icon(p.text_2),
                     "Allow through firewall",
-                    Some("Local network only · UDP 24800–24801"),
+                    Some("Local LAN · UDP 24800–24801"),
                     xs_button(
                         p,
                         "firewall-btn",
@@ -3107,8 +3162,9 @@ fn settings_page(s: &Ui, p: Palette) -> El {
             vec![setting_row(
                 p,
                 "max-file-mb-row",
+                icons::gauge_icon(p.text_2),
                 "Max file size",
-                Some("Single file transfer ceiling (1–4096 MB)"),
+                Some("Per-file limit (1–4096 MB)"),
                 row()
                     .gap(6.0)
                     .center_y()
@@ -3169,10 +3225,11 @@ fn settings_page(s: &Ui, p: Palette) -> El {
             setting_row(
                 p,
                 "sc-jump",
+                icons::swap_horizontal_icon(p.text_2),
                 "Jump to a side",
                 None,
                 row()
-                    .gap(4.0)
+                    .gap(3.0)
                     .center_y()
                     .child(kbd(p, "Ctrl"))
                     .child(plus())
@@ -3183,10 +3240,11 @@ fn settings_page(s: &Ui, p: Palette) -> El {
             setting_row(
                 p,
                 "sc-lock",
-                "Lock to current screen",
+                icons::lock_setting_icon(p.text_2),
+                "Lock current screen",
                 None,
                 row()
-                    .gap(4.0)
+                    .gap(3.0)
                     .center_y()
                     .child(kbd(p, "Ctrl"))
                     .child(plus())
@@ -3197,6 +3255,7 @@ fn settings_page(s: &Ui, p: Palette) -> El {
             setting_row(
                 p,
                 "sc-home",
+                icons::home_icon(p.text_2),
                 "Bring cursor home",
                 None,
                 kbd(p, "Scroll Lock"),
@@ -3235,12 +3294,22 @@ fn settings_page(s: &Ui, p: Palette) -> El {
             .center_y()
             .justify_between()
             .child(
-                text(diag_title)
-                    .font(ty::SECTION)
-                    .color(p.muted)
+                row()
                     .grow(1.0)
                     .shrink()
-                    .truncate(),
+                    .min_w(0.0)
+                    .gap(6.0)
+                    .center_y()
+                    .child(icons::diagnostics_icon(p.muted))
+                    .child(
+                        text(diag_title)
+                            .font(ty::SECTION)
+                            .color(p.muted)
+                            .grow(1.0)
+                            .shrink()
+                            .min_w(0.0)
+                            .truncate(),
+                    ),
             )
             .child(badge(p, "diag-os", s.os_label, false, false));
 
@@ -3288,7 +3357,7 @@ fn settings_page(s: &Ui, p: Palette) -> El {
                 .w_full()
                 .grow(1.0)
                 .min_h(0.0)
-                .gap(18.0)
+                .gap(14.0)
                 .child(left_col)
                 .child(right_col),
         )

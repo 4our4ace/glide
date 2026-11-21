@@ -142,7 +142,7 @@ pub fn segmented<T: Copy + PartialEq + 'static>(
 ) -> El {
     let pad = 2.0_f32;
     let h = if small { 24.0 } else { 26.0 };
-    let px = if small { 9.0 } else { 12.0 };
+    let px = if small { 8.0 } else { 12.0 };
 
     let mut strip = row()
         .key(key)
@@ -183,18 +183,30 @@ pub fn segmented<T: Copy + PartialEq + 'static>(
     strip
 }
 
-/// Interactive horizontal slider with live value readout (supports drag, track click, Esc cancel).
+/// Subtle rounded icon badge (26x26) placing every setting row title on an aligned vertical rail.
+pub fn setting_icon_badge(p: Palette, glyph: El) -> El {
+    el().size(26.0, 26.0)
+        .radius(7.0)
+        .fill(p.icon_bg)
+        .border(1.0, p.icon_border)
+        .center()
+        .a11y_hidden()
+        .child(glyph)
+}
+
+/// Interactive horizontal slider with leading icon and live value readout (supports drag, track click, Esc cancel).
 #[allow(clippy::too_many_arguments)]
 pub fn slider_row(
     p: Palette,
     key: &'static str,
+    leading_icon: El,
     label: &'static str,
     value_text: String,
     norm: f32,
     on_set: impl Fn(&mut Ui, f32, bool) + Copy + 'static,
 ) -> El {
     let norm = norm.clamp(0.0, 1.0);
-    let (w, h, k, bar) = (132.0_f32, 20.0_f32, 14.0_f32, 4.0_f32);
+    let (w, h, k, bar) = (116.0_f32, 20.0_f32, 14.0_f32, 4.0_f32);
     let travel = w - k;
     let to_norm = move |x: f32| ((x - k * 0.5) / travel).clamp(0.0, 1.0);
 
@@ -265,27 +277,37 @@ pub fn slider_row(
                 .a11y_hidden(),
         );
 
-    row()
-        .key(key)
-        .w_full()
-        .min_h(36.0)
-        .px(12.0)
-        .py(6.0)
-        .gap(10.0)
+    let left = row()
+        .grow(1.0)
+        .shrink()
+        .min_w(0.0)
+        .gap(9.0)
         .center_y()
-        .justify_between()
+        .child(setting_icon_badge(p, leading_icon))
         .child(
             text(label)
                 .font(ty::BODY_MED)
                 .color(p.text)
                 .grow(1.0)
                 .shrink()
+                .min_w(0.0)
                 .truncate(),
-        )
+        );
+
+    row()
+        .key(key)
+        .w_full()
+        .min_h(38.0)
+        .px(11.0)
+        .py(6.0)
+        .gap(8.0)
+        .center_y()
+        .justify_between()
+        .child(left)
         .child(slider)
         .child(
             text(value_text)
-                .w(46.0)
+                .w(44.0)
                 .font(ty::SUB)
                 .color(p.muted)
                 .align(Align::End),
@@ -319,30 +341,39 @@ pub fn card_rows(
     c
 }
 
-/// Standard label + optional description + right-side control row inside a card.
+/// Standard leading-icon + label + optional description + right-side control row inside a card.
 pub fn setting_row(
     p: Palette,
     key: impl Into<String>,
+    leading_icon: El,
     label: &str,
     desc: Option<&str>,
     control: El,
 ) -> El {
-    let mut left = col()
+    let mut text_col = col()
         .grow(1.0)
         .shrink()
         .min_w(0.0)
         .gap(1.0)
         .child(text(label).font(ty::BODY_MED).color(p.text).truncate());
     if let Some(d) = desc {
-        left = left.child(text(d).font(ty::SUB).color(p.muted).truncate());
+        text_col = text_col.child(text(d).font(ty::SUB).color(p.muted).truncate());
     }
+    let left = row()
+        .grow(1.0)
+        .shrink()
+        .min_w(0.0)
+        .gap(9.0)
+        .center_y()
+        .child(setting_icon_badge(p, leading_icon))
+        .child(text_col);
     row()
         .key(key)
         .w_full()
         .min_h(if desc.is_some() { 46.0 } else { 38.0 })
-        .px(12.0)
+        .px(11.0)
         .py(if desc.is_some() { 8.0 } else { 6.0 })
-        .gap(12.0)
+        .gap(8.0)
         .center_y()
         .justify_between()
         .child(left)
@@ -398,7 +429,7 @@ pub fn badge(
 pub fn kbd(p: Palette, label: &str) -> El {
     row()
         .h(20.0)
-        .px(6.0)
+        .px(5.0)
         .center()
         .radius(5.0)
         .fill(p.surface)
