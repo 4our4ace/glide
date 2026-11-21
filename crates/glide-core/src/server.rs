@@ -19,8 +19,8 @@ use glide_hid::ModifierMask;
 use glide_net::discovery::spawn_server_beacon;
 use glide_net::tls::ServerIdentity;
 use glide_net::{
-    recv_bulk_on, send_clipboard_on, send_file_on, sha256_bytes, Connection, GlideServerEndpoint,
-    GlideSession,
+    recv_bulk_stream, send_clipboard_on, send_file_on, sha256_bytes, Connection,
+    GlideServerEndpoint, GlideSession,
 };
 use glide_proto::{
     BulkTransfer, ClipboardPayload, ControlMessage, DatagramMessage, Edge, FilePayload, LockState,
@@ -144,25 +144,32 @@ pub async fn run_server_with_backends(
     let server_name = config.name.clone();
     let accept_tx = peer_tx.clone();
     let _accept_guard = AbortOnDrop(tokio::spawn(async move {
-        loop {
-            match endpoint.accept().await {
-                Ok(session) => {
-                    let sname = server_name.clone();
-                    let tx = accept_tx.clone();
-                    tokio::spawn(async move {
-                        if let Err(e) =
-                            handle_incoming_session(session, sname, server_scale, tx).await
-                        {
-                            warn!(error = %e, "Incoming client handshake failed");
-                        }
-                    });
+        while let Some(incoming) = endpoint.accept_incoming().await {
+            let sname = server_name.clone();
+            let tx = accept_tx.clone();
+            tokio::spawn(async move {
+                let session = match tokio::time::timeout(
+                    Duration::from_secs(5),
+                    GlideServerEndpoint::complete_incoming(incoming),
+                )
+                .await
+                {
+                    Ok(Ok(session)) => session,
+                    Ok(Err(e)) => {
+                        warn!(error = %e, "Incoming client QUIC handshake failed");
+                        return;
+                    }
+                    Err(_) => {
+                        warn!("Timed out waiting for incoming client QUIC handshake");
+                        return;
+                    }
+                };
+                if let Err(e) = handle_incoming_session(session, sname, server_scale, tx).await {
+                    warn!(error = %e, "Incoming client handshake failed");
                 }
-                Err(e) => {
-                    warn!(error = %e, "QUIC accept loop ended");
-                    break;
-                }
-            }
+            });
         }
+        debug!("QUIC accept loop ended (server endpoint closed)");
     }));
 
     let mut peers: HashMap<u64, ConnectedPeer> = HashMap::new();
@@ -325,6 +332,20 @@ pub async fn run_server_with_backends(
                     }
                     RuntimeCommand::SwitchToEdge(edge) => {
                         if let Some(&peer_id) = edge_to_peer.get(&edge) {
+                            if active_remote == Some(peer_id) {
+                                continue;
+                            }
+                            if let Some(old_pid) = active_remote.take() {
+                                if let Some(old_peer) = peers.get(&old_pid) {
+                                    let _ = old_peer.ctrl_tx.send(ControlMessage::ReleaseAll);
+                                    let _ = old_peer.ctrl_tx.send(ControlMessage::Leave {
+                                        edge: old_peer.edge.opposite(),
+                                        normalized_pos: 0.5,
+                                        cursor_norm_x: 0.5,
+                                        cursor_norm_y: 0.5,
+                                    });
+                                }
+                            }
                             if let Some(peer) = peers.get(&peer_id) {
                                 let lock_state = if config.sync_lock_keys {
                                     capture_ctrl.lock_state()
@@ -334,6 +355,9 @@ pub async fn run_server_with_backends(
                                 active_remote = Some(peer_id);
                                 active_edge = Some(edge);
                                 remote_modifiers = ModifierMask::EMPTY;
+                                pending_dx = 0.0;
+                                pending_dy = 0.0;
+                                coalesce_armed = false;
                                 let _ = capture_ctrl.enter_remote();
                                 let (nx, ny) = peer.last_cursor_norm;
                                 let _ = peer.ctrl_tx.send(ControlMessage::EnterAt {
@@ -358,6 +382,10 @@ pub async fn run_server_with_backends(
                             }
                         }
                         active_edge = None;
+                        remote_modifiers = ModifierMask::EMPTY;
+                        pending_dx = 0.0;
+                        pending_dy = 0.0;
+                        coalesce_armed = false;
                         let (lx, ly) = capture_ctrl.last_local_cursor_norm();
                         let _ = capture_ctrl.leave_remote_at(lx, ly);
                         sync_runtime_peers(&runtime, &peers, active_remote, locked);
@@ -456,10 +484,26 @@ pub async fn run_server_with_backends(
                 match ev {
                     CaptureEvent::EdgeCrossed { edge, normalized_pos } => {
                         if locked {
+                            pending_dx = 0.0;
+                            pending_dy = 0.0;
+                            coalesce_armed = false;
                             let _ = capture_ctrl.leave_remote(edge, normalized_pos);
                             continue;
                         }
                         if let Some(&peer_id) = edge_to_peer.get(&edge) {
+                            if let Some(old_pid) = active_remote.take() {
+                                if old_pid != peer_id {
+                                    if let Some(old_peer) = peers.get(&old_pid) {
+                                        let _ = old_peer.ctrl_tx.send(ControlMessage::ReleaseAll);
+                                        let _ = old_peer.ctrl_tx.send(ControlMessage::Leave {
+                                            edge: old_peer.edge.opposite(),
+                                            normalized_pos: 0.5,
+                                            cursor_norm_x: 0.5,
+                                            cursor_norm_y: 0.5,
+                                        });
+                                    }
+                                }
+                            }
                             if let Some(peer) = peers.get(&peer_id) {
                                 info!(peer = %peer.name, ?edge, normalized_pos, "Switching focus to client");
                                 let lock_state = if config.sync_lock_keys {
@@ -470,6 +514,9 @@ pub async fn run_server_with_backends(
                                 active_remote = Some(peer_id);
                                 active_edge = Some(edge);
                                 remote_modifiers = ModifierMask::EMPTY;
+                                pending_dx = 0.0;
+                                pending_dy = 0.0;
+                                coalesce_armed = false;
                                 let _ = capture_ctrl.enter_remote();
                                 let _ = peer.ctrl_tx.send(ControlMessage::Enter {
                                     edge: edge.opposite(),
@@ -477,8 +524,17 @@ pub async fn run_server_with_backends(
                                     lock_state,
                                 });
                                 sync_runtime_peers(&runtime, &peers, active_remote, locked);
+                            } else {
+                                active_edge = None;
+                                pending_dx = 0.0;
+                                pending_dy = 0.0;
+                                coalesce_armed = false;
+                                let _ = capture_ctrl.leave_remote(edge, normalized_pos);
                             }
                         } else {
+                            pending_dx = 0.0;
+                            pending_dy = 0.0;
+                            coalesce_armed = false;
                             let _ = capture_ctrl.leave_remote(edge, normalized_pos);
                         }
                     }
@@ -498,6 +554,10 @@ pub async fn run_server_with_backends(
                                 }
                                 active_remote = None;
                                 active_edge = None;
+                                remote_modifiers = ModifierMask::EMPTY;
+                                pending_dx = 0.0;
+                                pending_dy = 0.0;
+                                coalesce_armed = false;
                                 let (lx, ly) = capture_ctrl.last_local_cursor_norm();
                                 let _ = capture_ctrl.leave_remote_at(lx, ly);
                                 sync_runtime_peers(&runtime, &peers, active_remote, locked);
@@ -513,6 +573,9 @@ pub async fn run_server_with_backends(
                                 active_remote = Some(peer_id);
                                 active_edge = Some(direction);
                                 remote_modifiers = ModifierMask::EMPTY;
+                                pending_dx = 0.0;
+                                pending_dy = 0.0;
+                                coalesce_armed = false;
                                 let _ = capture_ctrl.enter_remote();
                                 let (nx, ny) = peer.last_cursor_norm;
                                 let _ = peer.ctrl_tx.send(ControlMessage::EnterAt {
@@ -648,6 +711,10 @@ pub async fn run_server_with_backends(
                             }
                             if active_remote == Some(old_id) {
                                 active_remote = None;
+                                remote_modifiers = ModifierMask::EMPTY;
+                                pending_dx = 0.0;
+                                pending_dy = 0.0;
+                                coalesce_armed = false;
                                 if let Some(edge) = active_edge.take() {
                                     let _ = capture_ctrl.leave_remote(edge, 0.5);
                                 }
@@ -862,6 +929,20 @@ pub async fn run_server_with_backends(
         }
     }
 
+    if let Some(pid) = active_remote.take() {
+        if let Some(peer) = peers.get(&pid) {
+            let _ = peer.ctrl_tx.send(ControlMessage::ReleaseAll);
+            let _ = peer.ctrl_tx.send(ControlMessage::Leave {
+                edge: peer.edge.opposite(),
+                normalized_pos: 0.5,
+                cursor_norm_x: 0.5,
+                cursor_norm_y: 0.5,
+            });
+        }
+        let (lx, ly) = capture_ctrl.last_local_cursor_norm();
+        let _ = capture_ctrl.leave_remote_at(lx, ly);
+    }
+
     drop(_accept_guard);
     drop(_beacon_guard);
     drop(_endpoint_guard);
@@ -941,13 +1022,30 @@ async fn handle_incoming_session(
 
     let bulk_conn = conn.clone();
     let bulk_tx = peer_tx.clone();
-    tokio::spawn(async move {
-        while let Ok(transfer) = recv_bulk_on(&bulk_conn).await {
-            if bulk_tx.send(PeerEvent::Bulk { peer_id, transfer }).is_err() {
+    let _bulk_guard = AbortOnDrop(tokio::spawn(async move {
+        let sem = std::sync::Arc::new(tokio::sync::Semaphore::new(4));
+        loop {
+            let uni = match bulk_conn.accept_uni().await {
+                Ok(u) => u,
+                Err(_) => break,
+            };
+            let Ok(permit) = sem.clone().acquire_owned().await else {
                 break;
-            }
+            };
+            let tx = bulk_tx.clone();
+            tokio::spawn(async move {
+                let _permit = permit;
+                match recv_bulk_stream(uni).await {
+                    Ok(transfer) => {
+                        let _ = tx.send(PeerEvent::Bulk { peer_id, transfer });
+                    }
+                    Err(e) => {
+                        warn!(peer_id, error = %e, "Failed receiving bulk stream from client");
+                    }
+                }
+            });
         }
-    });
+    }));
 
     let _ = peer_tx.send(PeerEvent::Connected {
         peer: ConnectedPeer {

@@ -122,19 +122,31 @@ impl GlideServerEndpoint {
         self.endpoint.close(0u32.into(), b"server stopped");
     }
 
-    /// Accepts the next incoming QUIC connection and opens the control bidirectional stream.
-    pub async fn accept(&self) -> Result<GlideSession> {
-        let incoming = self
-            .endpoint
-            .accept()
-            .await
-            .ok_or_else(|| anyhow!("QUIC server endpoint closed"))?;
+    /// Accepts the next incoming QUIC connection handle.
+    ///
+    /// Returns `None` only when this server endpoint has been closed.
+    pub async fn accept_incoming(&self) -> Option<quinn::Incoming> {
+        self.endpoint.accept().await
+    }
+
+    /// Completes the QUIC handshake and opens the bidirectional control stream
+    /// for an incoming connection returned by [`Self::accept_incoming`].
+    pub async fn complete_incoming(incoming: quinn::Incoming) -> Result<GlideSession> {
         let conn = incoming.await.context("QUIC server handshake failed")?;
         let (ctrl_send, ctrl_recv) = conn
             .accept_bi()
             .await
             .context("client did not open control stream")?;
         Ok(GlideSession::new(conn, ctrl_send, ctrl_recv))
+    }
+
+    /// Accepts the next incoming QUIC connection and opens the control bidirectional stream.
+    pub async fn accept(&self) -> Result<GlideSession> {
+        let incoming = self
+            .accept_incoming()
+            .await
+            .ok_or_else(|| anyhow!("QUIC server endpoint closed"))?;
+        Self::complete_incoming(incoming).await
     }
 }
 
@@ -292,14 +304,12 @@ pub async fn send_bulk_on(conn: &Connection, transfer: &glide_proto::BulkTransfe
     Ok(())
 }
 
-/// Accepts and validates the next unidirectional bulk stream (clipboard or file) on `conn`.
-pub async fn recv_bulk_on(conn: &Connection) -> Result<glide_proto::BulkTransfer> {
+/// Reads and validates a single unidirectional bulk stream (clipboard or file).
+pub async fn recv_bulk_stream(mut uni: RecvStream) -> Result<glide_proto::BulkTransfer> {
     use glide_proto::{
         sanitize_filename, BulkTransfer, FilePayload, BULK_KIND_CLIPBOARD, BULK_KIND_FILE,
         MAX_FILE_BYTES,
     };
-
-    let mut uni = conn.accept_uni().await.context("bulk uni stream closed")?;
 
     let mut kind = [0u8; 1];
     uni.read_exact(&mut kind)
@@ -359,6 +369,12 @@ pub async fn recv_bulk_on(conn: &Connection) -> Result<glide_proto::BulkTransfer
         }
         other => Err(anyhow!("unknown bulk transfer kind: 0x{other:02X}")),
     }
+}
+
+/// Accepts and validates the next unidirectional bulk stream (clipboard or file) on `conn`.
+pub async fn recv_bulk_on(conn: &Connection) -> Result<glide_proto::BulkTransfer> {
+    let uni = conn.accept_uni().await.context("bulk uni stream closed")?;
+    recv_bulk_stream(uni).await
 }
 
 /// Accepts the next clipboard payload (for tests/backwards callers).
