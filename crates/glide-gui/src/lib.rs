@@ -450,6 +450,7 @@ async fn serve(
 pub fn run_gui_blocking(opts: GuiOptions) -> Result<()> {
     let launch_t0 = std::time::Instant::now();
     glide_backend::init_platform();
+    updater::wait_for_relaunch_parent();
     updater::cleanup_old_binary();
 
     let Some(std_listener) = bind_or_focus_existing(opts.port, opts.minimized)? else {
@@ -618,6 +619,8 @@ pub fn run_gui_blocking(opts: GuiOptions) -> Result<()> {
         }
     });
     rt.shutdown_timeout(Duration::from_millis(300));
+    #[cfg(target_os = "windows")]
+    glide_backend::windows::tray::shutdown_windows_tray();
     let relaunch_exe = ctrl.relaunch_after_exit.lock().take();
     if let Some(exe) = relaunch_exe {
         if let Err(e) = updater::spawn_relaunch(&exe, opts.config_path.as_deref()) {

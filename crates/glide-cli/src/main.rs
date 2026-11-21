@@ -402,6 +402,7 @@ fn main() -> Result<()> {
     attach_parent_console_if_cli();
 
     glide_backend::init_platform();
+    glide_gui::updater::wait_for_relaunch_parent();
     glide_gui::updater::cleanup_old_binary();
     let cli = Cli::parse();
     init_logging(cli.verbose);

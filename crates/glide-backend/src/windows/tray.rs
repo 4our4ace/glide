@@ -6,6 +6,7 @@ pub use crate::TrayAction;
 use parking_lot::Mutex;
 use std::mem::size_of;
 use std::ptr;
+use std::sync::atomic::{AtomicIsize, Ordering};
 use std::sync::OnceLock;
 use std::thread;
 use tokio::sync::mpsc;
@@ -20,16 +21,18 @@ use windows_sys::Win32::UI::Shell::{
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     AppendMenuW, CreateIconIndirect, CreatePopupMenu, CreateWindowExW, DefWindowProcW, DestroyIcon,
-    DestroyMenu, DispatchMessageW, GetCursorPos, GetMessageW, LoadIconW, PostQuitMessage,
-    RegisterClassW, SetForegroundWindow, TrackPopupMenu, TranslateMessage, HICON, ICONINFO,
-    IDI_APPLICATION, MF_SEPARATOR, MF_STRING, MSG, TPM_BOTTOMALIGN, TPM_LEFTALIGN, WM_APP,
-    WM_COMMAND, WM_LBUTTONDBLCLK, WM_LBUTTONUP, WM_RBUTTONUP, WNDCLASSW,
+    DestroyMenu, DispatchMessageW, GetCursorPos, GetMessageW, LoadIconW, PostMessageW,
+    PostQuitMessage, RegisterClassW, SetForegroundWindow, TrackPopupMenu, TranslateMessage, HICON,
+    ICONINFO, IDI_APPLICATION, MF_SEPARATOR, MF_STRING, MSG, TPM_BOTTOMALIGN, TPM_LEFTALIGN,
+    WM_APP, WM_COMMAND, WM_LBUTTONDBLCLK, WM_LBUTTONUP, WM_QUIT, WM_RBUTTONUP, WNDCLASSW,
 };
 
 const WM_TRAY_ICON: u32 = WM_APP + 50;
 const MENU_OPEN_UI: usize = 1001;
 const MENU_TOGGLE_LOCK: usize = 1002;
 const MENU_QUIT: usize = 1003;
+
+static TRAY_HWND: AtomicIsize = AtomicIsize::new(0);
 
 /// Builds a crisp 32x32 ARGB HICON from our pure-Rust Glide icon renderer.
 unsafe fn create_glide_hicon() -> HICON {
@@ -202,6 +205,7 @@ pub fn spawn_windows_tray() -> mpsc::UnboundedReceiver<TrayAction> {
             if hwnd.is_null() {
                 return;
             }
+            TRAY_HWND.store(hwnd as isize, Ordering::Release);
 
             let mut nid: NOTIFYICONDATAW = unsafe { std::mem::zeroed() };
             nid.cbSize = size_of::<NOTIFYICONDATAW>() as u32;
@@ -233,6 +237,7 @@ pub fn spawn_windows_tray() -> mpsc::UnboundedReceiver<TrayAction> {
                 }
             }
 
+            TRAY_HWND.store(0, Ordering::Release);
             unsafe {
                 Shell_NotifyIconW(NIM_DELETE, &nid);
                 if !custom_icon.is_null() {
@@ -242,4 +247,16 @@ pub fn spawn_windows_tray() -> mpsc::UnboundedReceiver<TrayAction> {
         });
 
     rx
+}
+
+/// Requests the Windows system tray thread to remove its icon (`NIM_DELETE`) and exit cleanly.
+pub fn shutdown_windows_tray() {
+    let hwnd = TRAY_HWND.swap(0, Ordering::AcqRel) as HWND;
+    if !hwnd.is_null() {
+        unsafe {
+            PostMessageW(hwnd, WM_QUIT, 0, 0);
+        }
+        // Give the tray thread a brief moment to run Shell_NotifyIconW(NIM_DELETE).
+        thread::sleep(std::time::Duration::from_millis(60));
+    }
 }

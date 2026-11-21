@@ -845,6 +845,47 @@ fn windows_set_autostart(enabled: bool, args: &str) -> Result<()> {
     Ok(())
 }
 
+/// Waits up to `max_wait` for process `pid` to exit cleanly.
+///
+/// Used by a freshly relaunched Glide process right after self-update so the previous instance
+/// finishes releasing its executable lock (`.exe.old`) and network ports before startup continues.
+pub fn wait_for_process_exit(pid: u32, max_wait: std::time::Duration) {
+    if pid == 0 || pid == std::process::id() {
+        return;
+    }
+
+    #[cfg(target_os = "windows")]
+    {
+        use windows_sys::Win32::Foundation::CloseHandle;
+        use windows_sys::Win32::System::Threading::{
+            OpenProcess, WaitForSingleObject, PROCESS_SYNCHRONIZE,
+        };
+
+        let timeout_ms = max_wait.as_millis().min(u32::MAX as u128) as u32;
+        unsafe {
+            let handle = OpenProcess(PROCESS_SYNCHRONIZE, 0, pid);
+            if !handle.is_null() {
+                let _ = WaitForSingleObject(handle, timeout_ms);
+                CloseHandle(handle);
+            }
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        let proc_dir = PathBuf::from(format!("/proc/{pid}"));
+        let deadline = std::time::Instant::now() + max_wait;
+        while proc_dir.exists() && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(25));
+        }
+    }
+
+    #[cfg(not(any(target_os = "windows", target_os = "linux")))]
+    {
+        let _ = max_wait;
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

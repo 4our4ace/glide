@@ -1251,6 +1251,10 @@ pub(crate) fn run(
     launch_t0: Instant,
     pending_auto_start: Arc<parking_lot::Mutex<Option<String>>>,
 ) -> Result<(), String> {
+    // Rune defaults to fast_exit (TerminateProcess / _exit inside the event loop), which would
+    // skip engine/IPC/tray teardown and post-update relaunch in run_gui_blocking.
+    rune::orderly_exit();
+
     #[cfg(target_os = "linux")]
     rune::set_app_id("Glide");
 

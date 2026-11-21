@@ -39,6 +39,7 @@ const WINDOWS_BINARY_ASSET: &str = "glide-windows-x86_64.exe";
 const LINUX_BINARY_ASSET: &str = "glide-linux-x86_64";
 const MAX_CHECKSUMS_BYTES: usize = 64 * 1024;
 const MAX_BINARY_BYTES: u64 = 128 * 1024 * 1024;
+const RELAUNCH_WAIT_PID_ENV: &str = "GLIDE_RELAUNCH_WAIT_PID";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UpdateAsset {
@@ -622,6 +623,7 @@ where
 
     let current_exe = std::env::current_exe()
         .and_then(fs::canonicalize)
+        .map(|p| strip_windows_verbatim_prefix(&p))
         .map_err(|e| format!("Failed locating current Glide executable: {e}"))?;
 
     let agent = ureq::Agent::config_builder()
@@ -814,18 +816,78 @@ where
     }
 }
 
-/// Removes any leftover `<current_exe>.old` backup left behind by a Windows self-update.
-/// Runs asynchronously on a tiny background thread so startup latency is never affected.
+/// Strips Windows `\\?\` verbatim drive prefixes returned by `fs::canonicalize` (e.g.
+/// `\\?\C:\Users\...\glide.exe` -> `C:\Users\...\glide.exe`) while leaving UNC paths intact.
+fn strip_windows_verbatim_prefix(path: &Path) -> PathBuf {
+    let Some(s) = path.to_str() else {
+        return path.to_path_buf();
+    };
+    if let Some(rest) = s.strip_prefix(r"\\?\") {
+        let bytes = rest.as_bytes();
+        if bytes.len() >= 3 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':' && bytes[2] == b'\\'
+        {
+            return PathBuf::from(rest);
+        }
+    }
+    path.to_path_buf()
+}
+
+/// If Glide was just relaunched by an older Glide process after self-updating, blocks briefly
+/// (at most 8s) until that parent PID has fully exited so its `.old` binary lock and network
+/// ports are completely released before startup continues.
+pub fn wait_for_relaunch_parent() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        let Some(pid) = std::env::var_os(RELAUNCH_WAIT_PID_ENV)
+            .and_then(|v| v.to_str().and_then(|s| s.trim().parse::<u32>().ok()))
+        else {
+            return;
+        };
+        if pid != 0 && pid != std::process::id() {
+            debug!(pid, "Waiting for previous Glide instance to finish exiting after update");
+            glide_backend::os_integration::wait_for_process_exit(pid, Duration::from_secs(8));
+        }
+    });
+}
+
+/// Removes any leftover `<current_exe>.old` backup or abandoned `<current_exe>.new.*` staging
+/// files left behind by a Windows self-update.
+///
+/// Attempts immediate removal once (which typically succeeds right after `wait_for_relaunch_parent`),
+/// and falls back to a tiny background retry thread if Windows Defender / process teardown still
+/// holds a brief handle on `.old`.
 pub fn cleanup_old_binary() {
-    let Ok(exe) = std::env::current_exe() else {
+    let Ok(exe) = std::env::current_exe().map(|p| strip_windows_verbatim_prefix(&p)) else {
         return;
     };
     let backup = append_os_suffix(&exe, ".old");
-    if !backup.exists() {
+    let new_prefix = exe
+        .file_name()
+        .map(|n| format!("{}.new.", n.to_string_lossy()));
+    let parent_dir = exe.parent().map(Path::to_path_buf);
+
+    let mut pending_old = backup.exists();
+    if pending_old && fs::remove_file(&backup).is_ok() {
+        debug!(path = %backup.display(), "Cleaned up previous Glide binary after update");
+        pending_old = false;
+    }
+
+    if let (Some(dir), Some(prefix)) = (parent_dir, new_prefix) {
+        if let Ok(entries) = fs::read_dir(&dir) {
+            for entry in entries.flatten() {
+                let name = entry.file_name();
+                if name.to_string_lossy().starts_with(&prefix) {
+                    let _ = fs::remove_file(entry.path());
+                }
+            }
+        }
+    }
+
+    if !pending_old {
         return;
     }
     std::thread::spawn(move || {
-        for _ in 0..16 {
+        for _ in 0..24 {
             match fs::remove_file(&backup) {
                 Ok(()) => {
                     debug!(path = %backup.display(), "Cleaned up previous Glide binary after update");
@@ -841,14 +903,52 @@ pub fn cleanup_old_binary() {
 
 /// Relaunches Glide cleanly after the exiting process has released all sockets, hooks, and tray.
 pub fn spawn_relaunch(exe_path: &Path, config_path: Option<&Path>) -> Result<(), String> {
-    let mut cmd = std::process::Command::new(exe_path);
-    if let Some(cfg) = config_path {
-        cmd.arg("--config").arg(cfg);
+    use std::process::Stdio;
+
+    let clean_exe = strip_windows_verbatim_prefix(exe_path);
+    let pid = std::process::id().to_string();
+
+    let build_cmd = || {
+        let mut cmd = std::process::Command::new(&clean_exe);
+        if let Some(cfg) = config_path {
+            cmd.arg("--config").arg(cfg);
+        }
+        cmd.arg("gui")
+            .env(RELAUNCH_WAIT_PID_ENV, &pid)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        cmd
+    };
+
+    #[cfg(target_os = "windows")]
+    {
+        use std::os::windows::process::CommandExt;
+        const DETACHED_PROCESS: u32 = 0x0000_0008;
+        const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
+        const CREATE_BREAKAWAY_FROM_JOB: u32 = 0x0100_0000;
+
+        let base_flags = DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP;
+        let mut cmd = build_cmd();
+        cmd.creation_flags(base_flags | CREATE_BREAKAWAY_FROM_JOB);
+        if cmd.spawn().is_ok() {
+            return Ok(());
+        }
+        let mut fallback = build_cmd();
+        fallback.creation_flags(base_flags);
+        fallback
+            .spawn()
+            .map(|_| ())
+            .map_err(|e| format!("Failed relaunching {}: {e}", clean_exe.display()))
     }
-    cmd.arg("gui");
-    cmd.spawn()
-        .map(|_| ())
-        .map_err(|e| format!("Failed relaunching {}: {e}", exe_path.display()))
+
+    #[cfg(not(target_os = "windows"))]
+    {
+        let mut cmd = build_cmd();
+        cmd.spawn()
+            .map(|_| ())
+            .map_err(|e| format!("Failed relaunching {}: {e}", clean_exe.display()))
+    }
 }
 
 /// Opens a verified Glide GitHub release `https://` URL in the user's default browser.
@@ -1063,5 +1163,21 @@ mod tests {
             }
             other => panic!("expected Available for Nightly->Stable rollback, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn strips_windows_verbatim_prefix_safely() {
+        assert_eq!(
+            strip_windows_verbatim_prefix(Path::new(r"\\?\C:\Users\alice\glide.exe")),
+            PathBuf::from(r"C:\Users\alice\glide.exe")
+        );
+        assert_eq!(
+            strip_windows_verbatim_prefix(Path::new(r"\\?\UNC\server\share\glide.exe")),
+            PathBuf::from(r"\\?\UNC\server\share\glide.exe")
+        );
+        assert_eq!(
+            strip_windows_verbatim_prefix(Path::new("/usr/bin/glide")),
+            PathBuf::from("/usr/bin/glide")
+        );
     }
 }
