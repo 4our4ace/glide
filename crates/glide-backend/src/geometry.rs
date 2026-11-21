@@ -92,12 +92,25 @@ impl DesktopGeometry {
         }
     }
 
-    /// Returns the extreme bottom-right pixel `(x, y)` of the primary monitor (for invisible cursor parking on Windows).
+    /// Returns a safe right-edge parking pixel `(x, y)` on the primary monitor, staying
+    /// clear of both the bottom taskbar / Windows 11 "Show Desktop" corner and the top-right
+    /// window Close (`X`) button.
     pub fn primary_park_corner(&self) -> (i32, i32) {
         if let Some(m) = self.primary() {
-            ((m.right() - 1).max(m.left()), (m.bottom() - 1).max(m.top()))
+            let scale = m.scale.max(1.0);
+            let bottom_clearance = (96.0 * scale).round() as i32;
+            let top_clearance = (64.0 * scale).round() as i32;
+            let py = if m.height > bottom_clearance + top_clearance {
+                m.bottom() - bottom_clearance
+            } else {
+                m.y + m.height / 2
+            };
+            (
+                (m.right() - 1).max(m.left()),
+                py.clamp(m.top(), (m.bottom() - 1).max(m.top())),
+            )
         } else {
-            (1919, 1079)
+            (1919, 984)
         }
     }
 
@@ -444,7 +457,7 @@ mod tests {
         let (rx, ry) = single.denormalize_point(0.95, 0.5);
         assert!((0..1920).contains(&rx) && (0..1080).contains(&ry));
         let (px, py) = single.primary_park_corner();
-        assert_eq!((px, py), (1919, 1079));
+        assert_eq!((px, py), (1919, 984));
 
         // DPI change on same resolution is detected by PartialEq and updates primary_scale()
         let scaled = DesktopGeometry::new(vec![MonitorRect {
@@ -458,5 +471,65 @@ mod tests {
         }]);
         assert_ne!(single, scaled);
         assert!((scaled.primary_scale() - 1.5).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn primary_park_corner_avoids_taskbar_and_titlebar_across_scales() {
+        // 1080p @ 100%
+        let hd = DesktopGeometry::new(vec![MonitorRect {
+            name: "HD".into(),
+            x: 0,
+            y: 0,
+            width: 1920,
+            height: 1080,
+            scale: 1.0,
+            primary: true,
+        }]);
+        let (px, py) = hd.primary_park_corner();
+        assert_eq!(px, 1919);
+        assert!(py <= 1080 - 96, "must stay clear above bottom taskbar/Show Desktop: py={py}");
+        assert!(py >= 64, "must stay clear below top-right Close button: py={py}");
+
+        // 4K @ 200% (Windows 11 taskbar is ~96px tall at 200% DPI)
+        let uhd = DesktopGeometry::new(vec![MonitorRect {
+            name: "UHD".into(),
+            x: 0,
+            y: 0,
+            width: 3840,
+            height: 2160,
+            scale: 2.0,
+            primary: true,
+        }]);
+        let (px, py) = uhd.primary_park_corner();
+        assert_eq!(px, 3839);
+        assert!(py <= 2160 - 192, "must stay clear above 200%-scaled taskbar: py={py}");
+        assert!(py >= 128, "must stay clear below 200%-scaled titlebar: py={py}");
+
+        // Offset monitor with non-zero origin
+        let offset = DesktopGeometry::new(vec![MonitorRect {
+            name: "Offset".into(),
+            x: 1920,
+            y: 200,
+            width: 2560,
+            height: 1440,
+            scale: 1.5,
+            primary: true,
+        }]);
+        let (px, py) = offset.primary_park_corner();
+        assert_eq!(px, 1920 + 2560 - 1);
+        assert_eq!(py, 200 + 1440 - 144);
+        assert!(offset.monitors[0].contains(px, py));
+
+        // Tiny virtual monitor (height <= 160) falls back to vertical midpoint
+        let tiny = DesktopGeometry::new(vec![MonitorRect {
+            name: "Tiny".into(),
+            x: 0,
+            y: 0,
+            width: 640,
+            height: 120,
+            scale: 1.0,
+            primary: true,
+        }]);
+        assert_eq!(tiny.primary_park_corner(), (639, 60));
     }
 }

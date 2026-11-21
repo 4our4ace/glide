@@ -133,6 +133,7 @@ pub async fn run_server_with_dnd(
     let mut last_local_ips = local_ipv4_addresses();
     dnd.set_enabled(config.drag_drop_files);
     capture.control.set_drag_drop_files(config.drag_drop_files);
+    capture.control.set_dnd_probe(Arc::clone(&dnd));
 
     if let Some(ref rt) = runtime {
         rt.update(|s| {
@@ -813,9 +814,10 @@ pub async fn run_server_with_dnd(
                                     .map(|paths| collect_local_drag_files(paths, limit))
                                     .filter(|(infos, _)| !infos.is_empty());
 
-                                if drag_files.is_some() {
+                                if drag_files.is_some() || staged_paths.is_some() {
                                     // Cancel local OS drag (e.g. Explorer DoDragDrop / Nautilus XDND)
-                                    // BEFORE entering remote capture grab so the transition is seamless.
+                                    // BEFORE `enter_remote()` parks the cursor so the transition is
+                                    // seamless even if dragged items were filtered out (e.g. folders).
                                     dnd.cancel_local_drag();
                                 } else {
                                     dnd.set_drag_armed(false);

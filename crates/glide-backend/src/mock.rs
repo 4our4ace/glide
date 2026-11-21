@@ -381,6 +381,17 @@ impl crate::dnd::DndBackend for MockDndBackend {
         self.state.armed.store(effective, Ordering::SeqCst);
     }
 
+    fn staged_edge_mask(&self) -> u8 {
+        if !self.state.enabled.load(Ordering::Acquire) {
+            return 0;
+        }
+        self.state
+            .staged
+            .lock()
+            .as_ref()
+            .map_or(0, |(e, p)| if p.is_empty() { 0 } else { crate::edge_bit(*e) })
+    }
+
     fn take_staged_files(&self, edge: Edge) -> Option<Vec<std::path::PathBuf>> {
         if !self.state.enabled.load(Ordering::Acquire) {
             return None;

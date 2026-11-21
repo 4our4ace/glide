@@ -35,8 +35,9 @@ pub mod macos;
 
 use anyhow::Result;
 use geometry::DesktopGeometry;
-use glide_hid::{HidUsage, MouseButton};
+use glide_hid::{HidUsage, ModifierMask, MouseButton};
 use glide_proto::{ClipboardPayload, Edge, LockState, OsKind};
+use std::sync::atomic::{AtomicU8, Ordering};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use tokio::sync::mpsc;
@@ -45,7 +46,6 @@ use tokio::sync::mpsc;
 #[cfg(any(target_os = "linux", target_os = "windows"))]
 pub(crate) const ALL_EDGES: [Edge; 4] = [Edge::Left, Edge::Right, Edge::Top, Edge::Bottom];
 
-#[cfg(any(target_os = "linux", target_os = "windows"))]
 #[inline]
 pub(crate) const fn edge_bit(edge: Edge) -> u8 {
     match edge {
@@ -58,7 +58,7 @@ pub(crate) const fn edge_bit(edge: Edge) -> u8 {
 
 /// Lock-free bitmask of active screen edges (replaces `Mutex<Vec<Edge>>` on 1000Hz hot paths).
 #[cfg(any(target_os = "linux", target_os = "windows"))]
-pub(crate) struct AtomicEdgeMask(std::sync::atomic::AtomicU8);
+pub(crate) struct AtomicEdgeMask(AtomicU8);
 
 #[cfg(any(target_os = "linux", target_os = "windows"))]
 impl AtomicEdgeMask {
@@ -245,6 +245,96 @@ pub const fn is_windows_consumer_or_media_vk(vk_code: u32, scan_code: u32, flags
     (flags & LLKHF_EXTENDED_FLAG) != 0 && scan_code != 0
 }
 
+/// Windows virtual-key code for `L` (`VK_L`).
+///
+/// `win32k` triggers Lock Workstation on the active keyboard layout's `VK_L` (so this
+/// matches `Win+L` across QWERTY, German QWERTZ, AZERTY, Dvorak, and Colemak).
+pub const VK_L_CODE: u32 = 0x4C;
+
+/// Returns `true` when the keystroke triggers Windows' unhookable kernel Lock Workstation
+/// shortcut (`Win+L`, without Ctrl/Alt/Shift).
+#[inline]
+pub const fn is_windows_workstation_lock_chord(
+    mask: ModifierMask,
+    vk_code: u32,
+    pressed: bool,
+) -> bool {
+    pressed
+        && vk_code == VK_L_CODE
+        && mask.meta()
+        && !mask.ctrl()
+        && !mask.alt()
+        && !mask.shift()
+}
+
+/// Lock-free deferral state for bare Windows `MetaLeft` / `MetaRight` key-down events
+/// while in remote mode.
+///
+/// Pressing `Win+L` triggers Windows' kernel workstation lock below `WH_KEYBOARD_LL`.
+/// Deferring a fresh bare Meta key-down until the next non-repeat key, button, or scroll
+/// event ensures `Win+L` never leaks a lone `Super` down+up tap to a Linux client (which
+/// would open the GNOME/KDE Activities Overview), while genuine bare `Super` taps,
+/// `Win+E`, `Win+Shift+S`, `Super+Click`, and `Super+Scroll` continue working seamlessly.
+#[derive(Debug, Default)]
+pub struct WindowsPendingMeta(AtomicU8);
+
+impl WindowsPendingMeta {
+    pub const fn new() -> Self {
+        Self(AtomicU8::new(0))
+    }
+
+    #[inline]
+    pub fn clear(&self) {
+        self.0.store(0, Ordering::Release);
+    }
+
+    #[inline]
+    pub fn is_empty(&self) -> bool {
+        self.0.load(Ordering::Acquire) == 0
+    }
+
+    /// Evaluates whether a key event in remote mode should be deferred as a pending bare Meta press.
+    ///
+    /// Returns `true` if the caller should suppress forwarding `usage` for now (either a fresh
+    /// bare `MetaLeft`/`MetaRight` press, or a typematic repeat while still deferred).
+    #[inline]
+    pub fn try_defer(
+        &self,
+        prev_mask: ModifierMask,
+        mask: ModifierMask,
+        usage: HidUsage,
+        pressed: bool,
+    ) -> bool {
+        if !pressed || (usage != HidUsage::META_LEFT && usage != HidUsage::META_RIGHT) {
+            return false;
+        }
+        let bit = usage.modifier_bit();
+        let current = self.0.load(Ordering::Acquire);
+        if (current & bit) != 0 {
+            // Typematic WM_KEYDOWN repeat while this Meta key is still deferred.
+            return true;
+        }
+        if !prev_mask.contains(bit) && !mask.ctrl() && !mask.alt() && !mask.shift() {
+            self.0.fetch_or(bit, Ordering::AcqRel);
+            return true;
+        }
+        false
+    }
+
+    /// Atomically takes any deferred `MetaLeft` / `MetaRight` key-down usages to flush to the client.
+    #[inline]
+    pub fn take_pending(&self) -> [Option<HidUsage>; 2] {
+        if self.0.load(Ordering::Acquire) == 0 {
+            return [None, None];
+        }
+        let bits = self.0.swap(0, Ordering::AcqRel);
+        [
+            ((bits & ModifierMask::META_LEFT) != 0).then_some(HidUsage::META_LEFT),
+            ((bits & ModifierMask::META_RIGHT) != 0).then_some(HidUsage::META_RIGHT),
+        ]
+    }
+}
+
 /// Low-latency input events emitted by the server's OS capture thread.
 #[derive(Debug, Clone)]
 pub enum CaptureEvent {
@@ -260,8 +350,8 @@ pub enum CaptureEvent {
     /// used to arm edge drop targets and detect local drop releases).
     LocalLeftButton { pressed: bool },
     /// Hints that the local cursor with LMB held is approaching (`true`) or moved away from
-    /// (`false`) an active outer edge, so invisible 1px edge-strip drop targets are only shown
-    /// when a drag approaches the border.
+    /// (`false`) an active outer edge, so invisible edge-strip drop targets are only shown
+    /// while a local drag is armed.
     DragStripArmed(bool),
     /// Physical USB HID key transition while in remote mode.
     Key { usage: HidUsage, pressed: bool },
@@ -299,6 +389,9 @@ pub trait CaptureControl: Send + Sync {
     fn set_sync_lock_keys(&self, _enabled: bool) {}
     /// Updates whether cross-edge file drag-and-drop assistance is enabled.
     fn set_drag_drop_files(&self, _enabled: bool) {}
+    /// Attaches the active DnD backend so capture can perform lock-free staged-file checks
+    /// before crossing an outer screen edge while LMB is held.
+    fn set_dnd_probe(&self, _dnd: Arc<dyn dnd::DndBackend>) {}
     /// Updates whether USB Consumer Control media/volume keys remain pinned to the local server OS.
     fn set_pin_media_keys_local(&self, _enabled: bool) {}
     /// Enters remote mode: suppresses/grabs local input and parks/hides cursor cleanly.
@@ -704,5 +797,297 @@ mod tests {
         // Regular non-extended unmapped key is NOT misclassified
         assert!(!is_windows_consumer_or_media_vk(0x41, 0x1E, 0));
         assert!(!is_windows_consumer_or_media_vk(0x00, 0x00, 0x01));
+    }
+
+    #[test]
+    fn windows_workstation_lock_chord_matches_only_bare_win_l_press() {
+        const VK_E: u32 = 0x45;
+
+        assert!(is_windows_workstation_lock_chord(
+            ModifierMask(ModifierMask::META_LEFT),
+            VK_L_CODE,
+            true
+        ));
+        assert!(is_windows_workstation_lock_chord(
+            ModifierMask(ModifierMask::META_RIGHT),
+            VK_L_CODE,
+            true
+        ));
+        assert!(is_windows_workstation_lock_chord(
+            ModifierMask(ModifierMask::META_LEFT | ModifierMask::META_RIGHT),
+            VK_L_CODE,
+            true
+        ));
+        // Release, other keys, or extra modifiers (Ctrl/Alt/Shift) must NOT match
+        assert!(!is_windows_workstation_lock_chord(
+            ModifierMask(ModifierMask::META_LEFT),
+            VK_L_CODE,
+            false
+        ));
+        assert!(!is_windows_workstation_lock_chord(
+            ModifierMask(ModifierMask::META_LEFT),
+            VK_E,
+            true
+        ));
+        assert!(!is_windows_workstation_lock_chord(
+            ModifierMask(ModifierMask::META_LEFT | ModifierMask::CONTROL_LEFT),
+            VK_L_CODE,
+            true
+        ));
+        assert!(!is_windows_workstation_lock_chord(
+            ModifierMask(ModifierMask::META_LEFT | ModifierMask::CONTROL_RIGHT),
+            VK_L_CODE,
+            true
+        ));
+        assert!(!is_windows_workstation_lock_chord(
+            ModifierMask(ModifierMask::META_LEFT | ModifierMask::SHIFT_LEFT),
+            VK_L_CODE,
+            true
+        ));
+        assert!(!is_windows_workstation_lock_chord(
+            ModifierMask(ModifierMask::META_LEFT | ModifierMask::ALT_LEFT),
+            VK_L_CODE,
+            true
+        ));
+        assert!(!is_windows_workstation_lock_chord(
+            ModifierMask::EMPTY,
+            VK_L_CODE,
+            true
+        ));
+    }
+
+    #[test]
+    fn windows_pending_meta_prevents_win_l_super_leak_and_preserves_chords() {
+        const VK_E: u32 = 0x45;
+        const VK_S: u32 = 0x53;
+        const VK_LEFT: u32 = 0x25;
+        const VK_LWIN: u32 = 0x5B;
+        const VK_RWIN: u32 = 0x5C;
+        const VK_LCTRL: u32 = 0xA2;
+        const VK_LSHIFT: u32 = 0xA0;
+
+        let key_l = HidUsage::from_name("KeyL").unwrap();
+        let key_p = HidUsage::from_name("KeyP").unwrap(); // physical KeyP maps to VK_L on Dvorak
+        let key_e = HidUsage::from_name("KeyE").unwrap();
+        let key_s = HidUsage::from_name("KeyS").unwrap();
+        let key_left = HidUsage::from_name("ArrowLeft").unwrap();
+
+        struct SimHook {
+            mods: ModifierMask,
+            pending: WindowsPendingMeta,
+            emitted: Vec<(HidUsage, bool)>,
+            suspended: usize,
+        }
+
+        impl SimHook {
+            fn new() -> Self {
+                Self {
+                    mods: ModifierMask::EMPTY,
+                    pending: WindowsPendingMeta::new(),
+                    emitted: Vec::new(),
+                    suspended: 0,
+                }
+            }
+
+            fn feed(&mut self, usage: HidUsage, vk_code: u32, pressed: bool) {
+                let prev_mask = self.mods;
+                self.mods.update(usage, pressed);
+                let mask = self.mods;
+                if is_windows_workstation_lock_chord(mask, vk_code, pressed) {
+                    self.pending.clear();
+                    self.mods = ModifierMask::EMPTY;
+                    self.suspended += 1;
+                    return;
+                }
+                if self.pending.try_defer(prev_mask, mask, usage, pressed) {
+                    return;
+                }
+                for pending_meta in self.pending.take_pending().into_iter().flatten() {
+                    self.emitted.push((pending_meta, true));
+                }
+                self.emitted.push((usage, pressed));
+            }
+        }
+
+        // 1. Bare Win+L (QWERTY/QWERTZ/AZERTY and Dvorak where physical KeyP produces VK_L):
+        //    ZERO Meta events emitted!
+        for (meta_usage, meta_vk, phys_l) in [
+            (HidUsage::META_LEFT, VK_LWIN, key_l),
+            (HidUsage::META_RIGHT, VK_RWIN, key_l),
+            (HidUsage::META_LEFT, VK_LWIN, key_p),
+        ] {
+            let mut sim = SimHook::new();
+            sim.feed(meta_usage, meta_vk, true);
+            assert!(sim.emitted.is_empty(), "bare Meta down must be deferred");
+            assert!(!sim.pending.is_empty());
+            sim.feed(phys_l, VK_L_CODE, true);
+            assert_eq!(sim.suspended, 1);
+            assert!(sim.emitted.is_empty(), "Win+L must never leak Super to client");
+            assert!(sim.pending.is_empty());
+        }
+
+        // 2. Win hold typematic repeats + L -> still ZERO Meta emitted!
+        {
+            let mut sim = SimHook::new();
+            sim.feed(HidUsage::META_LEFT, VK_LWIN, true);
+            sim.feed(HidUsage::META_LEFT, VK_LWIN, true);
+            sim.feed(HidUsage::META_LEFT, VK_LWIN, true);
+            assert!(sim.emitted.is_empty());
+            sim.feed(key_l, VK_L_CODE, true);
+            assert_eq!(sim.suspended, 1);
+            assert!(sim.emitted.is_empty());
+            assert!(sim.pending.is_empty());
+        }
+
+        // 3. Genuine bare Win tap (down then up) -> flushes down then emits up!
+        {
+            let mut sim = SimHook::new();
+            sim.feed(HidUsage::META_LEFT, VK_LWIN, true);
+            assert!(sim.emitted.is_empty());
+            sim.feed(HidUsage::META_LEFT, VK_LWIN, false);
+            assert_eq!(
+                sim.emitted,
+                vec![(HidUsage::META_LEFT, true), (HidUsage::META_LEFT, false)]
+            );
+            assert!(sim.pending.is_empty());
+            assert_eq!(sim.suspended, 0);
+        }
+
+        // 4. Win+E, Win+Left, Win+Shift+S all flush Meta down immediately before next key
+        {
+            let mut sim = SimHook::new();
+            sim.feed(HidUsage::META_LEFT, VK_LWIN, true);
+            sim.feed(key_e, VK_E, true);
+            sim.feed(key_e, VK_E, false);
+            sim.feed(HidUsage::META_LEFT, VK_LWIN, false);
+            assert_eq!(
+                sim.emitted,
+                vec![
+                    (HidUsage::META_LEFT, true),
+                    (key_e, true),
+                    (key_e, false),
+                    (HidUsage::META_LEFT, false),
+                ]
+            );
+        }
+        {
+            let mut sim = SimHook::new();
+            sim.feed(HidUsage::META_LEFT, VK_LWIN, true);
+            sim.feed(key_left, VK_LEFT, true);
+            assert_eq!(
+                sim.emitted,
+                vec![(HidUsage::META_LEFT, true), (key_left, true)]
+            );
+        }
+        {
+            let mut sim = SimHook::new();
+            sim.feed(HidUsage::META_LEFT, VK_LWIN, true);
+            sim.feed(HidUsage::SHIFT_LEFT, VK_LSHIFT, true);
+            sim.feed(key_s, VK_S, true);
+            assert_eq!(
+                sim.emitted,
+                vec![
+                    (HidUsage::META_LEFT, true),
+                    (HidUsage::SHIFT_LEFT, true),
+                    (key_s, true),
+                ]
+            );
+        }
+
+        // 5. Ctrl+Win+L and Shift+Win+L in BOTH key orders -> NOT lock, all forwarded!
+        for (mod_key, mod_vk) in [
+            (HidUsage::CONTROL_LEFT, VK_LCTRL),
+            (HidUsage::SHIFT_LEFT, VK_LSHIFT),
+        ] {
+            // Order A: modifier first, then Win, then L
+            let mut sim_a = SimHook::new();
+            sim_a.feed(mod_key, mod_vk, true);
+            sim_a.feed(HidUsage::META_LEFT, VK_LWIN, true);
+            // Meta must NOT be deferred because Ctrl/Shift is already held!
+            assert_eq!(
+                sim_a.emitted,
+                vec![(mod_key, true), (HidUsage::META_LEFT, true)]
+            );
+            assert!(sim_a.pending.is_empty());
+            sim_a.feed(key_l, VK_L_CODE, true);
+            assert_eq!(sim_a.suspended, 0);
+            assert_eq!(
+                sim_a.emitted,
+                vec![(mod_key, true), (HidUsage::META_LEFT, true), (key_l, true)]
+            );
+
+            // Order B: Win first (deferred), then modifier (flushes Win), then L
+            let mut sim_b = SimHook::new();
+            sim_b.feed(HidUsage::META_LEFT, VK_LWIN, true);
+            assert!(sim_b.emitted.is_empty());
+            sim_b.feed(mod_key, mod_vk, true);
+            assert_eq!(
+                sim_b.emitted,
+                vec![(HidUsage::META_LEFT, true), (mod_key, true)]
+            );
+            sim_b.feed(key_l, VK_L_CODE, true);
+            assert_eq!(sim_b.suspended, 0);
+            assert_eq!(
+                sim_b.emitted,
+                vec![(HidUsage::META_LEFT, true), (mod_key, true), (key_l, true)]
+            );
+        }
+
+        // 6. MetaLeft + MetaRight held together
+        {
+            let mut sim = SimHook::new();
+            sim.feed(HidUsage::META_LEFT, VK_LWIN, true);
+            sim.feed(HidUsage::META_RIGHT, VK_RWIN, true);
+            assert!(sim.emitted.is_empty());
+            sim.feed(key_l, VK_L_CODE, true);
+            assert_eq!(sim.suspended, 1);
+            assert!(sim.emitted.is_empty());
+            assert!(sim.pending.is_empty());
+        }
+        {
+            let mut sim = SimHook::new();
+            sim.feed(HidUsage::META_LEFT, VK_LWIN, true);
+            sim.feed(HidUsage::META_RIGHT, VK_RWIN, true);
+            sim.feed(key_e, VK_E, true);
+            assert_eq!(
+                sim.emitted,
+                vec![
+                    (HidUsage::META_LEFT, true),
+                    (HidUsage::META_RIGHT, true),
+                    (key_e, true),
+                ]
+            );
+        }
+
+        // 7. Post-flush Meta repeat is NOT re-deferred
+        {
+            let mut sim = SimHook::new();
+            sim.feed(HidUsage::META_LEFT, VK_LWIN, true);
+            sim.feed(key_e, VK_E, true);
+            assert!(sim.pending.is_empty());
+            // Typematic repeat of MetaLeft while still held after already flushed:
+            sim.feed(HidUsage::META_LEFT, VK_LWIN, true);
+            assert!(sim.pending.is_empty());
+            assert_eq!(
+                sim.emitted,
+                vec![
+                    (HidUsage::META_LEFT, true),
+                    (key_e, true),
+                    (HidUsage::META_LEFT, true),
+                ]
+            );
+        }
+
+        // 8. clear() on suspend/leave/escape drops deferred Meta without flushing
+        {
+            let pending = WindowsPendingMeta::new();
+            let prev = ModifierMask::EMPTY;
+            let mask = ModifierMask(ModifierMask::META_LEFT);
+            assert!(pending.try_defer(prev, mask, HidUsage::META_LEFT, true));
+            assert!(!pending.is_empty());
+            pending.clear();
+            assert!(pending.is_empty());
+            assert_eq!(pending.take_pending(), [None, None]);
+        }
     }
 }

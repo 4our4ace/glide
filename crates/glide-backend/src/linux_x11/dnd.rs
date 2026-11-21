@@ -15,7 +15,7 @@
 use crate::dnd::{
     clamp_hint_popup_pos, compute_edge_strip_rects, format_drag_extension_badge,
     format_drag_preview_label, format_gnome_copied_files, format_uri_list, parse_uri_list,
-    DndBackend, DropDeliveryOutcome, EdgeStripRect,
+    DndBackend, DropDeliveryOutcome, EdgeStripRect, StagedEdgeTracker,
 };
 use crate::geometry::DesktopGeometry;
 use crate::linux_x11::query_desktop_geometry;
@@ -138,6 +138,7 @@ struct SharedX11Dnd {
     dead_corner_px: AtomicI32,
     active_edges: Mutex<Vec<Edge>>,
     staged: Mutex<Option<StagedDrag>>,
+    staged_tracker: StagedEdgeTracker,
     cmds: Mutex<VecDeque<DndCmd>>,
 }
 
@@ -177,6 +178,7 @@ impl DndBackend for X11DndBackend {
         self.shared.enabled.store(enabled, Ordering::SeqCst);
         if !enabled {
             self.shared.armed.store(false, Ordering::SeqCst);
+            self.shared.staged_tracker.clear();
             *self.shared.staged.lock() = None;
         }
         self.enqueue(DndCmd::SyncStrips);
@@ -194,6 +196,7 @@ impl DndBackend for X11DndBackend {
         let effective = armed && self.shared.enabled.load(Ordering::Acquire);
         let prev = self.shared.armed.swap(effective, Ordering::SeqCst);
         if !effective {
+            self.shared.staged_tracker.clear();
             *self.shared.staged.lock() = None;
         }
         if prev != effective {
@@ -203,6 +206,13 @@ impl DndBackend for X11DndBackend {
                 DndCmd::HideStrips
             });
         }
+    }
+
+    fn staged_edge_mask(&self) -> u8 {
+        if !self.shared.enabled.load(Ordering::Acquire) {
+            return 0;
+        }
+        self.shared.staged_tracker.active_mask()
     }
 
     fn take_staged_files(&self, edge: Edge) -> Option<Vec<PathBuf>> {
@@ -216,15 +226,18 @@ impl DndBackend for X11DndBackend {
         }
         if staged.staged_at.elapsed() > STAGED_MAX_AGE {
             *guard = None;
+            self.shared.staged_tracker.clear();
             return None;
         }
         if let Some(left) = staged.left_at {
             if left.elapsed() > STAGED_LEAVE_GRACE {
                 *guard = None;
+                self.shared.staged_tracker.clear();
                 return None;
             }
         }
         let paths = guard.take()?.paths;
+        self.shared.staged_tracker.clear();
         if paths.is_empty() {
             None
         } else {
@@ -234,6 +247,7 @@ impl DndBackend for X11DndBackend {
 
     fn cancel_local_drag(&self) {
         self.shared.armed.store(false, Ordering::SeqCst);
+        self.shared.staged_tracker.clear();
         *self.shared.staged.lock() = None;
         self.enqueue(DndCmd::CancelLocalDrag);
     }
@@ -328,6 +342,7 @@ pub fn start_x11_dnd() -> Result<Arc<dyn DndBackend>> {
         dead_corner_px: AtomicI32::new(24),
         active_edges: Mutex::new(Vec::new()),
         staged: Mutex::new(None),
+        staged_tracker: StagedEdgeTracker::new(STAGED_MAX_AGE, STAGED_LEAVE_GRACE),
         cmds: Mutex::new(VecDeque::new()),
     });
 
@@ -415,7 +430,7 @@ fn sync_x11_strips(
     let Ok(geom) = query_desktop_geometry(conn, screen_num) else {
         return;
     };
-    let desired = compute_edge_strip_rects(&geom, &edges, dead_corner, 1);
+    let desired = compute_edge_strip_rects(&geom, &edges, dead_corner, 4);
 
     let needs_rebuild = strips.len() != desired.len()
         || strips
@@ -1843,6 +1858,7 @@ fn run_x11_dnd_loop(
                             if staged.edge == inb.edge {
                                 staged.staged_at = Instant::now();
                                 staged.left_at = None;
+                                shared.staged_tracker.touch(inb.edge);
                             }
                         }
                         send_xdnd_status(&conn, &atoms, source_win, cm.window, true);
@@ -1859,6 +1875,7 @@ fn run_x11_dnd_loop(
                         if let Some(ref mut staged) = *shared.staged.lock() {
                             if staged.edge == inb.edge {
                                 staged.left_at = Some(Instant::now());
+                                shared.staged_tracker.mark_left(inb.edge);
                             }
                         }
                     } else {
@@ -1915,6 +1932,7 @@ fn run_x11_dnd_loop(
                                 staged_at: Instant::now(),
                                 left_at: None,
                             });
+                            shared.staged_tracker.mark_staged(edge, false);
                         }
                     }
                 }

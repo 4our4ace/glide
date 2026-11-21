@@ -21,7 +21,8 @@
 
 use crate::dnd::{
     clamp_hint_popup_pos, compute_edge_strip_rects, format_drag_extension_badge,
-    format_drag_preview_label, DndBackend, DropDeliveryOutcome, EdgeStripRect,
+    format_drag_preview_label, should_defer_live_ole_drag, DndBackend, DropDeliveryOutcome,
+    EdgeStripRect, StagedEdgeTracker,
 };
 use crate::windows::{init_dpi_awareness, query_desktop_geometry, GLIDE_EXTRA_INFO};
 use anyhow::{anyhow, Context, Result};
@@ -69,8 +70,8 @@ use windows_sys::Win32::System::Ole::{
 };
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
     GetAsyncKeyState, SendInput, INPUT, INPUT_0, INPUT_KEYBOARD, INPUT_MOUSE, KEYBDINPUT,
-    KEYEVENTF_KEYUP, KEYEVENTF_SCANCODE, MOUSEEVENTF_LEFTDOWN, MOUSEEVENTF_LEFTUP,
-    MOUSEEVENTF_MOVE, MOUSEINPUT, VK_LBUTTON,
+    KEYEVENTF_KEYUP, MOUSEEVENTF_LEFTDOWN, MOUSEEVENTF_LEFTUP, MOUSEEVENTF_MOVE, MOUSEINPUT,
+    VK_ESCAPE, VK_LBUTTON,
 };
 use windows_sys::Win32::UI::Shell::Common::ITEMIDLIST;
 use windows_sys::Win32::UI::Shell::{
@@ -79,12 +80,14 @@ use windows_sys::Win32::UI::Shell::{
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GetClientRect, GetCursorPos,
-    GetMessageW, GetWindowLongPtrW, KillTimer, PeekMessageW, PostMessageW, RegisterClassW,
-    SetLayeredWindowAttributes, SetTimer, SetWindowLongPtrW, SetWindowPos, ShowWindow,
-    TranslateMessage, GWLP_USERDATA, HWND_MESSAGE, HWND_TOPMOST, LWA_ALPHA, MSG, PM_REMOVE,
-    SWP_NOACTIVATE, SWP_NOSIZE, SW_HIDE, SW_SHOW, SW_SHOWNOACTIVATE, WM_APP, WM_ERASEBKGND,
-    WM_LBUTTONDOWN, WM_PAINT, WM_QUIT, WM_TIMER, WNDCLASSW, WS_EX_LAYERED, WS_EX_NOACTIVATE,
-    WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_EX_TRANSPARENT, WS_POPUP,
+    GetMessageW, GetSystemMetrics, GetWindowLongPtrW, KillTimer, PeekMessageW, PostMessageW,
+    RegisterClassW, SetLayeredWindowAttributes, SetTimer, SetWindowLongPtrW, SetWindowPos,
+    ShowWindow, TranslateMessage, GWLP_USERDATA, GWL_EXSTYLE, HWND_MESSAGE, HWND_TOPMOST,
+    LWA_ALPHA, MSG, PM_REMOVE, SM_CXVIRTUALSCREEN, SM_CYVIRTUALSCREEN, SM_XVIRTUALSCREEN,
+    SM_YVIRTUALSCREEN, SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_NOSIZE, SWP_NOZORDER, SWP_SHOWWINDOW,
+    SW_HIDE, SW_SHOW, SW_SHOWNOACTIVATE, WM_APP, WM_ERASEBKGND, WM_LBUTTONDOWN, WM_PAINT, WM_QUIT,
+    WM_TIMER, WNDCLASSW, WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST,
+    WS_EX_TRANSPARENT, WS_POPUP,
 };
 
 const WM_APP_SYNC_STRIPS: u32 = WM_APP + 21;
@@ -137,6 +140,7 @@ struct PreviewState {
 enum SessionResult {
     Outcome(DropDeliveryOutcome),
     Cancelled,
+    LiveDeferred,
 }
 
 struct LiveOleSession {
@@ -166,11 +170,17 @@ struct SharedDnd {
     ctrl_hwnd: AtomicIsize,
     active_edges: Mutex<Vec<Edge>>,
     staged: Mutex<Option<StagedDrag>>,
+    staged_tracker: StagedEdgeTracker,
     preview: Mutex<PreviewState>,
     live_session: Mutex<Option<Arc<LiveOleSession>>>,
 }
 
 impl SharedDnd {
+    fn clear_staged(&self) {
+        self.staged_tracker.clear();
+        *self.staged.lock() = None;
+    }
+
     fn post_ctrl(&self, msg: u32) {
         let hwnd = self.ctrl_hwnd.load(Ordering::Acquire) as HWND;
         if !hwnd.is_null() {
@@ -211,7 +221,9 @@ impl WindowsDndBackend {
         if let Some(session) = self.shared.live_session.lock().take() {
             session.cancel_requested.store(true, Ordering::Release);
             if !session.done.load(Ordering::Acquire) {
-                if session.synthesized_lmb_down.load(Ordering::Acquire) {
+                if session.synthesized_lmb_down.load(Ordering::Acquire)
+                    && (unsafe { GetAsyncKeyState(VK_LBUTTON as i32) } as u16 & 0x8000) != 0
+                {
                     send_mouse_button_input(MOUSEEVENTF_LEFTUP);
                 }
                 send_synthetic_escape();
@@ -237,7 +249,7 @@ impl DndBackend for WindowsDndBackend {
         self.shared.enabled.store(enabled, Ordering::SeqCst);
         if !enabled {
             self.shared.armed.store(false, Ordering::SeqCst);
-            *self.shared.staged.lock() = None;
+            self.shared.clear_staged();
         }
         self.post_sync();
     }
@@ -254,11 +266,22 @@ impl DndBackend for WindowsDndBackend {
         let effective = armed && self.shared.enabled.load(Ordering::Acquire);
         let prev = self.shared.armed.swap(effective, Ordering::SeqCst);
         if !effective {
-            *self.shared.staged.lock() = None;
+            self.shared.clear_staged();
         }
         if prev != effective {
-            self.post_sync();
+            if effective {
+                self.post_sync();
+            } else {
+                self.shared.post_hide_strips();
+            }
         }
+    }
+
+    fn staged_edge_mask(&self) -> u8 {
+        if !self.shared.enabled.load(Ordering::Acquire) {
+            return 0;
+        }
+        self.shared.staged_tracker.active_mask()
     }
 
     fn take_staged_files(&self, edge: Edge) -> Option<Vec<PathBuf>> {
@@ -272,15 +295,18 @@ impl DndBackend for WindowsDndBackend {
         }
         if staged.staged_at.elapsed() > STAGED_MAX_AGE {
             *guard = None;
+            self.shared.staged_tracker.clear();
             return None;
         }
         if let Some(left) = staged.left_at {
             if left.elapsed() > STAGED_LEAVE_GRACE {
                 *guard = None;
+                self.shared.staged_tracker.clear();
                 return None;
             }
         }
         let paths = guard.take()?.paths;
+        self.shared.staged_tracker.clear();
         if paths.is_empty() {
             None
         } else {
@@ -290,12 +316,20 @@ impl DndBackend for WindowsDndBackend {
 
     fn cancel_local_drag(&self) {
         self.shared.armed.store(false, Ordering::SeqCst);
-        *self.shared.staged.lock() = None;
+        self.shared.clear_staged();
         self.shared.post_hide_strips();
-        // Send a synthetic Escape tap tagged with GLIDE_EXTRA_INFO so Explorer's modal
-        // DoDragDrop loop cancels cleanly without moving/deleting files and our LL keyboard
-        // hook ignores the injected key.
+        // 1. Send a synthetic Escape tap (both VK_ESCAPE + scancode, tagged GLIDE_EXTRA_INFO)
+        //    so Explorer's modal DoDragDrop loop cancels cleanly without moving/deleting files
+        //    and our LL keyboard hook ignores the injected key.
         send_synthetic_escape();
+        // 2. Give Explorer a brief moment to process VK_ESCAPE and exit DoDragDrop cleanly
+        //    before cursor parking or releasing local VK_LBUTTON.
+        thread::sleep(Duration::from_millis(20));
+        // 3. Release Windows' kernel VK_LBUTTON if still down (tagged GLIDE_EXTRA_INFO so
+        //    mouse_ll_proc ignores it and HookState.lmb_down stays `true` for the remote drag).
+        if (unsafe { GetAsyncKeyState(VK_LBUTTON as i32) } as u16 & 0x8000) != 0 {
+            send_mouse_button_input(MOUSEEVENTF_LEFTUP);
+        }
     }
 
     fn supports_live_os_drag(&self) -> bool {
@@ -375,7 +409,9 @@ impl DndBackend for WindowsDndBackend {
         if let Some(session) = self.shared.live_session.lock().take() {
             session.drop_requested.store(true, Ordering::Release);
             if !session.done.load(Ordering::Acquire) {
-                if session.synthesized_lmb_down.load(Ordering::Acquire) {
+                if session.synthesized_lmb_down.load(Ordering::Acquire)
+                    && (unsafe { GetAsyncKeyState(VK_LBUTTON as i32) } as u16 & 0x8000) != 0
+                {
                     send_mouse_button_input(MOUSEEVENTF_LEFTUP);
                 }
                 // Backup nudge in case physical LMB was already up or cursor was stationary.
@@ -389,16 +425,29 @@ impl DndBackend for WindowsDndBackend {
             }
             if let Some(rx) = session.result_rx.lock().take() {
                 match rx.recv_timeout(Duration::from_secs(6)) {
-                    Ok(Ok(SessionResult::Outcome(outcome))) => return Ok(outcome),
+                    Ok(Ok(SessionResult::Outcome(outcome))) => {
+                        self.shared.post_preview_hide();
+                        return Ok(outcome);
+                    }
                     Ok(Ok(SessionResult::Cancelled)) => {
+                        self.shared.post_preview_hide();
                         debug!("Live Windows OLE drag was explicitly cancelled by user");
                         return Ok(DropDeliveryOutcome::DroppedIntoTarget);
                     }
-                    Ok(Err(e)) => return Err(e),
+                    Ok(Ok(SessionResult::LiveDeferred)) => {
+                        debug!(
+                            "Live Windows OLE drag deferred; performing ImmediatePostRelease drop at target cursor"
+                        );
+                    }
+                    Ok(Err(e)) => {
+                        self.shared.post_preview_hide();
+                        return Err(e);
+                    }
                     Err(_) => {
                         warn!("Timed out waiting for live Windows OLE drop; using clipboard fallback");
                         session.cancel_requested.store(true, Ordering::Release);
                         send_synthetic_escape();
+                        self.shared.post_preview_hide();
                         set_clipboard_hdrop(&paths)?;
                         spawn_windows_fallback_hint();
                         return Ok(DropDeliveryOutcome::ClipboardFallback);
@@ -407,8 +456,12 @@ impl DndBackend for WindowsDndBackend {
             }
         }
 
-        // Post-release drop path (e.g. large/slow file that finished transferring after LMB up):
-        // run SHDoDragDrop on a dedicated STA thread with real foreground capture & wiggle.
+        // Ensure floating preview is hidden before ImmediatePostRelease runs at the target cursor.
+        self.shared.post_preview_hide();
+
+        // Post-release drop path (e.g. large/slow file that finished transferring after LMB up,
+        // or a Live session that deferred early): run SHDoDragDrop on a dedicated STA thread with
+        // real foreground capture & wiggle at the user's real drop coordinate.
         let paths_clone = paths.clone();
         let shared_clone = Arc::clone(&self.shared);
         let (_, dummy_rx) = std::sync::mpsc::channel();
@@ -427,9 +480,12 @@ impl DndBackend for WindowsDndBackend {
             .join()
             .map_err(|_| anyhow!("Windows OLE drop thread panicked"))??;
 
+        self.shared.post_preview_hide();
         match outcome {
             SessionResult::Outcome(o) => Ok(o),
-            SessionResult::Cancelled => Ok(DropDeliveryOutcome::ClipboardFallback),
+            SessionResult::Cancelled | SessionResult::LiveDeferred => {
+                Ok(DropDeliveryOutcome::ClipboardFallback)
+            }
         }
     }
 }
@@ -444,6 +500,7 @@ pub fn start_windows_dnd() -> Result<Arc<dyn DndBackend>> {
         ctrl_hwnd: AtomicIsize::new(0),
         active_edges: Mutex::new(Vec::new()),
         staged: Mutex::new(None),
+        staged_tracker: StagedEdgeTracker::new(STAGED_MAX_AGE, STAGED_LEAVE_GRACE),
         preview: Mutex::new(PreviewState::default()),
         live_session: Mutex::new(None),
     });
@@ -903,8 +960,8 @@ fn sync_strips(ctx: &mut StripThreadCtx) {
     let edges = ctx.shared.active_edges.lock().clone();
     let dead_corner = ctx.shared.dead_corner_px.load(Ordering::Relaxed);
 
-    if !enabled || !armed || edges.is_empty() {
-        hide_all_strips(&mut ctx.strips);
+    if !enabled || edges.is_empty() {
+        destroy_all_strips(&mut ctx.strips);
         return;
     }
 
@@ -912,7 +969,9 @@ fn sync_strips(ctx: &mut StripThreadCtx) {
         Ok(g) => g,
         Err(_) => return,
     };
-    let desired = compute_edge_strip_rects(&geom, &edges, dead_corner, 1);
+    // 4px width completely covers `hit_outer_edge_guarded(..., margin_px = 2, ...)` (the 3px
+    // edge band) with margin to spare so Explorer's COM DragEnter always hits before crossing.
+    let desired = compute_edge_strip_rects(&geom, &edges, dead_corner, 4);
 
     let needs_rebuild = ctx.strips.len() != desired.len()
         || ctx
@@ -926,6 +985,8 @@ fn sync_strips(ctx: &mut StripThreadCtx) {
         let hinstance = unsafe { GetModuleHandleW(ptr::null()) };
         for rect in desired {
             let ex_style = WS_EX_LAYERED | WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE;
+            // Pre-created hidden (WS_VISIBLE omitted) and COM-registered ahead of time so
+            // arming on WM_LBUTTONDOWN only needs a <1ms SetWindowPos(SWP_SHOWWINDOW).
             let hwnd = unsafe {
                 CreateWindowExW(
                     ex_style,
@@ -973,7 +1034,17 @@ fn sync_strips(ctx: &mut StripThreadCtx) {
         }
     }
 
+    if !armed {
+        hide_all_strips(&mut ctx.strips);
+        return;
+    }
+
     for s in &mut ctx.strips {
+        let flags = if s.visible {
+            SWP_NOACTIVATE
+        } else {
+            SWP_SHOWWINDOW | SWP_NOACTIVATE
+        };
         unsafe {
             SetWindowPos(
                 s.hwnd,
@@ -982,13 +1053,10 @@ fn sync_strips(ctx: &mut StripThreadCtx) {
                 s.rect.y,
                 s.rect.width,
                 s.rect.height,
-                SWP_NOACTIVATE,
+                flags,
             );
-            if !s.visible {
-                ShowWindow(s.hwnd, SW_SHOWNOACTIVATE);
-                s.visible = true;
-            }
         }
+        s.visible = true;
     }
 }
 
@@ -1140,9 +1208,9 @@ fn send_synthetic_escape() {
             r#type: INPUT_KEYBOARD,
             Anonymous: INPUT_0 {
                 ki: KEYBDINPUT {
-                    wVk: 0,
+                    wVk: VK_ESCAPE,
                     wScan: 0x01, // Escape scancode
-                    dwFlags: KEYEVENTF_SCANCODE,
+                    dwFlags: 0,
                     time: 0,
                     dwExtraInfo: GLIDE_EXTRA_INFO,
                 },
@@ -1152,9 +1220,9 @@ fn send_synthetic_escape() {
             r#type: INPUT_KEYBOARD,
             Anonymous: INPUT_0 {
                 ki: KEYBDINPUT {
-                    wVk: 0,
+                    wVk: VK_ESCAPE,
                     wScan: 0x01,
-                    dwFlags: KEYEVENTF_SCANCODE | KEYEVENTF_KEYUP,
+                    dwFlags: KEYEVENTF_KEYUP,
                     time: 0,
                     dwExtraInfo: GLIDE_EXTRA_INFO,
                 },
@@ -1370,6 +1438,7 @@ unsafe extern "system" fn edge_dt_drag_enter(
             staged_at: Instant::now(),
             left_at: None,
         });
+        me.shared.staged_tracker.mark_staged(me.edge, false);
         if !pdw_effect.is_null() {
             unsafe {
                 *pdw_effect = DROPEFFECT_COPY;
@@ -1379,6 +1448,7 @@ unsafe extern "system" fn edge_dt_drag_enter(
         // Non-file OLE drag (e.g. selected text or browser tab): do not intercept,
         // disarm & hide the edge strip immediately so normal desktop dragging is unimpeded.
         me.shared.armed.store(false, Ordering::SeqCst);
+        me.shared.clear_staged();
         me.shared.post_hide_strips();
         if !pdw_effect.is_null() {
             unsafe {
@@ -1401,6 +1471,7 @@ unsafe extern "system" fn edge_dt_drag_over(
         if staged.edge == me.edge {
             staged.staged_at = Instant::now();
             staged.left_at = None;
+            me.shared.staged_tracker.touch(me.edge);
             true
         } else {
             false
@@ -1425,6 +1496,7 @@ unsafe extern "system" fn edge_dt_drag_leave(this: *mut c_void) -> HRESULT {
     if let Some(ref mut staged) = *me.shared.staged.lock() {
         if staged.edge == me.edge {
             staged.left_at = Some(Instant::now());
+            me.shared.staged_tracker.mark_left(me.edge);
         }
     }
     S_OK
@@ -1446,6 +1518,7 @@ unsafe extern "system" fn edge_dt_drop(
             staged_at: Instant::now(),
             left_at: Some(Instant::now()),
         });
+        me.shared.staged_tracker.mark_staged(me.edge, true);
     }
     // Never return DROPEFFECT_MOVE so Explorer never deletes the original file locally.
     if !pdw_effect.is_null() {
@@ -2612,11 +2685,10 @@ unsafe extern "system" fn drop_src_query_continue_drag(
                 }
                 return S_OK;
             }
-            // Drop immediately when LMB is released (physical release on Server or synthetic
-            // MOUSEEVENTF_LEFTUP injected by deliver_drop on Client).
+            // Wait at least 100ms before treating MK_LBUTTON==0 as a release so starter-click
+            // input state has settled and SHDoDragDrop never drops prematurely on entry.
             if (key_state & MK_LBUTTON) == 0
-                && (me.feedback_seen.load(Ordering::Acquire)
-                    || me.started.elapsed() >= Duration::from_millis(60))
+                && me.started.elapsed() >= Duration::from_millis(100)
             {
                 return DRAGDROP_S_DROP;
             }
@@ -2645,10 +2717,29 @@ unsafe extern "system" fn drop_src_give_feedback(this: *mut c_void, _dw_effect: 
     DRAGDROP_S_USEDEFAULTCURSORS
 }
 
-// --- Invisible 16×16 drag-starter window (grants real foreground SetCapture to SHDoDragDrop) ---
+// --- Invisible virtual-desktop drag-starter window (grants real foreground SetCapture to SHDoDragDrop) ---
 
 struct StarterState {
     got_lbutton_down: bool,
+}
+
+/// Makes `starter_hwnd` completely click-through and parks it 1×1 off-screen while KEEPING it
+/// visible & foreground on this STA thread — critically avoiding `ShowWindow(SW_HIDE)`, which
+/// would synchronously deactivate the window and cause `ole32!DoDragDrop`'s `SetCapture()` to fail.
+unsafe fn park_starter_click_through(hwnd: HWND) {
+    let ex = unsafe { GetWindowLongPtrW(hwnd, GWL_EXSTYLE) };
+    unsafe {
+        SetWindowLongPtrW(hwnd, GWL_EXSTYLE, ex | (WS_EX_TRANSPARENT as isize));
+        SetWindowPos(
+            hwnd,
+            ptr::null_mut(),
+            -32000,
+            -32000,
+            1,
+            1,
+            SWP_NOACTIVATE | SWP_NOZORDER | SWP_FRAMECHANGED,
+        );
+    }
 }
 
 unsafe extern "system" fn starter_wnd_proc(
@@ -2664,9 +2755,11 @@ unsafe extern "system" fn starter_wnd_proc(
                 (*raw).got_lbutton_down = true;
             }
         }
-        // Hide immediately so WindowFromPoint hits File Explorer / Desktop / target app underneath!
+        // Keep the window visible & active (foreground) so ole32!DoDragDrop's SetCapture()
+        // succeeds globally, while immediately making it click-through and moving it off-screen
+        // so WindowFromPoint hits File Explorer / Desktop / target app underneath!
         unsafe {
-            ShowWindow(hwnd, SW_HIDE);
+            park_starter_click_through(hwnd);
         }
         return 0;
     }
@@ -2680,6 +2773,21 @@ fn acquire_ole_drag_capture_window(
     unsafe {
         let _ = GetCursorPos(&mut pt);
     }
+
+    // Cover the entire virtual desktop during the ~3ms capture click so fast inward mouse
+    // motion can never escape the starter window before SendInput(LEFTDOWN) lands.
+    let raw_vw = unsafe { GetSystemMetrics(SM_CXVIRTUALSCREEN) };
+    let raw_vh = unsafe { GetSystemMetrics(SM_CYVIRTUALSCREEN) };
+    let (vx, vy, vw, vh) = if raw_vw > 0 && raw_vh > 0 {
+        (
+            unsafe { GetSystemMetrics(SM_XVIRTUALSCREEN) },
+            unsafe { GetSystemMetrics(SM_YVIRTUALSCREEN) },
+            raw_vw,
+            raw_vh,
+        )
+    } else {
+        (pt.x - 64, pt.y - 64, 128, 128)
+    };
 
     let class_name = encode_wide("GlideOleDragStarter");
     let hinstance = unsafe { GetModuleHandleW(ptr::null()) };
@@ -2709,10 +2817,10 @@ fn acquire_ole_drag_capture_window(
             class_name.as_ptr(),
             ptr::null(),
             WS_POPUP,
-            pt.x - 8,
-            pt.y - 8,
-            16,
-            16,
+            vx,
+            vy,
+            vw,
+            vh,
             ptr::null_mut(),
             ptr::null_mut(),
             hinstance,
@@ -2733,7 +2841,7 @@ fn acquire_ole_drag_capture_window(
             &mut starter_state as *mut StarterState as isize,
         );
         SetLayeredWindowAttributes(hwnd, 0, 1, LWA_ALPHA);
-        SetWindowPos(hwnd, HWND_TOPMOST, pt.x - 8, pt.y - 8, 16, 16, 0);
+        SetWindowPos(hwnd, HWND_TOPMOST, vx, vy, vw, vh, 0);
         ShowWindow(hwnd, SW_SHOW);
     }
 
@@ -2741,7 +2849,7 @@ fn acquire_ole_drag_capture_window(
     if phys_lmb_down {
         // Server receiving Client -> Server drag while user physically holds LMB:
         // bounce UP -> DOWN (tagged GLIDE_EXTRA_INFO so mouse_ll_proc ignores both) onto
-        // our invisible 16×16 starter window so ole32 receives valid mouse capture.
+        // our invisible full-desktop starter window so ole32 receives valid mouse capture.
         let inputs = [
             INPUT {
                 r#type: INPUT_MOUSE,
@@ -2774,8 +2882,8 @@ fn acquire_ole_drag_capture_window(
             SendInput(inputs.len() as u32, inputs.as_ptr(), size_of::<INPUT>() as i32);
         }
     } else {
-        // Client receiving Server -> Client drag (physical LMB is held on Server, not here):
-        // synthesize LMB down onto our 16×16 starter window and remember to release it later!
+        // Client receiving Server -> Client drag (or Server after remote LMB suppression):
+        // synthesize LMB down onto our starter window and remember to release it later!
         session.synthesized_lmb_down.store(true, Ordering::Release);
         send_mouse_button_input(MOUSEEVENTF_LEFTDOWN);
     }
@@ -2804,7 +2912,12 @@ fn acquire_ole_drag_capture_window(
 
     unsafe {
         SetWindowLongPtrW(hwnd, GWLP_USERDATA, 0);
-        ShowWindow(hwnd, SW_HIDE);
+        if starter_state.got_lbutton_down {
+            // Ensure click-through & off-screen WITHOUT calling ShowWindow(SW_HIDE)!
+            park_starter_click_through(hwnd);
+        } else {
+            ShowWindow(hwnd, SW_HIDE);
+        }
     }
 
     Some((hwnd, starter_state.got_lbutton_down))
@@ -2821,11 +2934,15 @@ fn run_windows_ole_drag_session(
     let hr_init = unsafe { OleInitialize(ptr::null()) };
     if hr_init < 0 {
         session.done.store(true, Ordering::Release);
-        shared.post_preview_hide();
         warn!(
             hr = hr_init,
-            "OleInitialize failed during drop handoff; using clipboard fallback"
+            ?mode,
+            "OleInitialize failed during drop handoff"
         );
+        if mode == DragRunMode::Live {
+            return Ok(SessionResult::LiveDeferred);
+        }
+        shared.post_preview_hide();
         set_clipboard_hdrop(paths)?;
         spawn_windows_fallback_hint();
         return Ok(SessionResult::Outcome(DropDeliveryOutcome::ClipboardFallback));
@@ -2837,6 +2954,9 @@ fn run_windows_ole_drag_session(
         attach_shell_drag_image(data_obj, paths);
     }
 
+    let starter = acquire_ole_drag_capture_window(session);
+    let (starter_hwnd, got_capture) = starter.unwrap_or((ptr::null_mut(), false));
+
     let feedback_seen = Arc::new(AtomicBool::new(false));
     let user_escaped = Arc::new(AtomicBool::new(false));
     let drop_src = LiveDropSource::new_raw(
@@ -2847,9 +2967,7 @@ fn run_windows_ole_drag_session(
         Arc::clone(&user_escaped),
     );
 
-    let starter = acquire_ole_drag_capture_window(session);
-    let (starter_hwnd, got_capture) = starter.unwrap_or((ptr::null_mut(), false));
-
+    let ole_started = Instant::now();
     let mut effect: u32 = DROPEFFECT_NONE;
     let hr = if got_capture && !session.cancel_requested.load(Ordering::Acquire) {
         let session_bg = Arc::clone(session);
@@ -2884,18 +3002,23 @@ fn run_windows_ole_drag_session(
             }
         });
 
+        // Passing `ptr::null_mut()` preserves our custom `IDragSourceHelper2::InitializeFromBitmap`
+        // drag image (avoiding Shell's `DI_GETDRAGIMAGE` override), while `starter_hwnd` staying
+        // visible & foreground on this same STA thread grants `ole32!DoDragDrop` valid `SetCapture`.
         unsafe { SHDoDragDrop(ptr::null_mut(), data_obj, drop_src, DROPEFFECT_COPY, &mut effect) }
     } else {
         debug!(
             got_capture,
             cancelled = session.cancel_requested.load(Ordering::Acquire),
-            "Could not capture starter click for SHDoDragDrop (likely elevated UIPI window); falling back"
+            "Could not capture starter click for SHDoDragDrop (likely elevated UIPI window); deferring/falling back"
         );
         DRAGDROP_S_CANCEL
     };
+    let ole_elapsed_ms = ole_started.elapsed().as_millis() as u64;
+    let lmb_still_down =
+        (unsafe { GetAsyncKeyState(VK_LBUTTON as i32) } as u16 & 0x8000) != 0;
 
     session.done.store(true, Ordering::Release);
-    shared.post_preview_hide();
 
     if !starter_hwnd.is_null() {
         unsafe {
@@ -2916,8 +3039,17 @@ fn run_windows_ole_drag_session(
         OleUninitialize();
     }
 
-    trace!(?mode, hr, effect, "Windows Shell SHDoDragDrop completed");
+    trace!(
+        ?mode,
+        hr,
+        effect,
+        got_capture,
+        lmb_still_down,
+        ole_elapsed_ms,
+        "Windows Shell SHDoDragDrop completed"
+    );
     if hr == DRAGDROP_S_DROP && effect != DROPEFFECT_NONE {
+        shared.post_preview_hide();
         debug!(
             count = paths.len(),
             effect,
@@ -2928,11 +3060,45 @@ fn run_windows_ole_drag_session(
         ));
     }
 
-    if session.cancel_requested.load(Ordering::Acquire) || user_escaped.load(Ordering::Acquire) {
+    let cancelled_or_escaped =
+        session.cancel_requested.load(Ordering::Acquire) || user_escaped.load(Ordering::Acquire);
+    if cancelled_or_escaped {
+        shared.post_preview_hide();
         debug!("Windows Shell SHDoDragDrop cancelled cleanly");
         return Ok(SessionResult::Cancelled);
     }
 
+    let drop_requested = session.drop_requested.load(Ordering::Acquire);
+    if should_defer_live_ole_drag(
+        mode == DragRunMode::Live,
+        drop_requested,
+        cancelled_or_escaped,
+        got_capture,
+        hr == DRAGDROP_S_DROP,
+        lmb_still_down,
+        ole_elapsed_ms,
+    ) {
+        debug!(
+            got_capture,
+            hr,
+            effect,
+            lmb_still_down,
+            ole_elapsed_ms,
+            "Live Windows OLE drag exited before real drop; keeping preview visible until LMB release"
+        );
+        // If GiveFeedback had briefly hidden our floating preview before SHDoDragDrop exited
+        // early, restore it while the drag is still in flight so the user keeps smooth feedback.
+        if feedback_seen.load(Ordering::Acquire)
+            && !session.drop_requested.load(Ordering::Acquire)
+            && !session.cancel_requested.load(Ordering::Acquire)
+        {
+            shared.preview.lock().visible = true;
+            shared.post_preview_show();
+        }
+        return Ok(SessionResult::LiveDeferred);
+    }
+
+    shared.post_preview_hide();
     debug!(
         hr,
         effect,

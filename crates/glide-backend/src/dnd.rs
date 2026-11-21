@@ -2,11 +2,14 @@
 //! percent-encoding/decoding (`text/uri-list` per RFC 2483 / RFC 3986), and
 //! edge-strip placement geometry shared across Windows, Linux X11, and Linux Wayland.
 
+use crate::edge_bit;
 use crate::geometry::DesktopGeometry;
 use anyhow::Result;
 use glide_proto::Edge;
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, AtomicU8, Ordering};
+use std::time::{Duration, Instant};
 
 /// Outcome of delivering received cross-edge files to the receiving desktop.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -22,7 +25,7 @@ pub enum DropDeliveryOutcome {
 /// Platform-agnostic cross-edge file drag-and-drop backend.
 ///
 /// Implementations manage two halves without blocking normal pointer input:
-/// 1. **Drag-out:** Invisible 1px edge-strip drop target window(s) placed along active
+/// 1. **Drag-out:** Invisible edge-strip drop target window(s) placed along active
 ///    outer edges, shown ONLY while a local left-button drag is armed so normal clicks,
 ///    scrollbars, and window resizing are never obstructed.
 /// 2. **Drag-in:** Native OS drop handoff (`DoDragDrop` on Windows, XDND v5 on Linux X11,
@@ -38,6 +41,18 @@ pub trait DndBackend: Send + Sync {
     /// Arms or disarms the invisible edge-strip drop targets.
     /// Callers MUST only arm while the left mouse button is held during a potential local drag.
     fn set_drag_armed(&self, armed: bool);
+
+    /// Returns a lock-free bitmask of outer edges (`edge_bit(edge)`) that currently have
+    /// valid staged local files ready for cross-edge handoff.
+    fn staged_edge_mask(&self) -> u8 {
+        0
+    }
+
+    /// Lock-free check returning `true` when local files are currently staged on `edge`
+    /// and ready for immediate cross-edge handoff.
+    fn has_staged_files(&self, edge: Edge) -> bool {
+        (self.staged_edge_mask() & edge_bit(edge)) != 0
+    }
 
     /// Returns and consumes any local file paths staged on `edge` by a local drag-out.
     fn take_staged_files(&self, edge: Edge) -> Option<Vec<PathBuf>>;
@@ -72,6 +87,136 @@ pub trait DndBackend: Send + Sync {
     fn deliver_drop(&self, paths: Vec<PathBuf>) -> Result<DropDeliveryOutcome>;
 }
 
+/// Lock-free readiness tracker for staged drag-out files with `max_age` and `leave_grace` expiry.
+///
+/// Backends update this alongside their mutex-protected `StagedDrag` payload so 1000Hz capture
+/// hot-paths can test `has_staged_files(edge)` with zero mutex contention or allocations.
+#[derive(Debug)]
+pub struct StagedEdgeTracker {
+    mask: AtomicU8,
+    start: Instant,
+    staged_at_ms: AtomicU64,
+    left_at_ms: AtomicU64,
+    max_age_ms: u64,
+    leave_grace_ms: u64,
+}
+
+impl StagedEdgeTracker {
+    pub fn new(max_age: Duration, leave_grace: Duration) -> Self {
+        Self {
+            mask: AtomicU8::new(0),
+            start: Instant::now(),
+            staged_at_ms: AtomicU64::new(0),
+            left_at_ms: AtomicU64::new(0),
+            max_age_ms: max_age.as_millis() as u64,
+            leave_grace_ms: leave_grace.as_millis() as u64,
+        }
+    }
+
+    #[inline]
+    fn now_ms(&self) -> u64 {
+        // Offset by +1 so 0 unambiguously represents "unset".
+        (self.start.elapsed().as_millis() as u64).saturating_add(1)
+    }
+
+    /// Marks `edge` as having staged files right now (optionally already left, e.g. on drop).
+    #[inline]
+    pub fn mark_staged(&self, edge: Edge, left: bool) {
+        self.mark_staged_at(edge, left, self.now_ms());
+    }
+
+    #[inline]
+    pub fn mark_staged_at(&self, edge: Edge, left: bool, now_ms: u64) {
+        let ts = now_ms.max(1);
+        self.staged_at_ms.store(ts, Ordering::Release);
+        self.left_at_ms
+            .store(if left { ts } else { 0 }, Ordering::Release);
+        self.mask.store(edge_bit(edge), Ordering::Release);
+    }
+
+    /// Refreshes staged freshness when `DragOver` continues on `edge`.
+    #[inline]
+    pub fn touch(&self, edge: Edge) {
+        self.touch_at(edge, self.now_ms());
+    }
+
+    #[inline]
+    pub fn touch_at(&self, edge: Edge, now_ms: u64) {
+        let bit = edge_bit(edge);
+        if (self.mask.load(Ordering::Acquire) & bit) != 0 {
+            let ts = now_ms.max(1);
+            self.staged_at_ms.store(ts, Ordering::Release);
+            self.left_at_ms.store(0, Ordering::Release);
+        }
+    }
+
+    /// Starts the `leave_grace` timer when the drag leaves `edge`'s strip window.
+    #[inline]
+    pub fn mark_left(&self, edge: Edge) {
+        self.mark_left_at(edge, self.now_ms());
+    }
+
+    #[inline]
+    pub fn mark_left_at(&self, edge: Edge, now_ms: u64) {
+        let bit = edge_bit(edge);
+        if (self.mask.load(Ordering::Acquire) & bit) != 0 {
+            self.left_at_ms.store(now_ms.max(1), Ordering::Release);
+        }
+    }
+
+    /// Clears staged state immediately (on take, cancel, disarm, or disable).
+    #[inline]
+    pub fn clear(&self) {
+        self.mask.store(0, Ordering::Release);
+        self.left_at_ms.store(0, Ordering::Release);
+    }
+
+    /// Returns the active staged edge bitmask (`0` if empty or expired).
+    #[inline]
+    pub fn active_mask(&self) -> u8 {
+        self.active_mask_at(self.now_ms())
+    }
+
+    #[inline]
+    pub fn active_mask_at(&self, now_ms: u64) -> u8 {
+        let mask = self.mask.load(Ordering::Acquire);
+        if mask == 0 {
+            return 0;
+        }
+        let ts = now_ms.max(1);
+        let staged = self.staged_at_ms.load(Ordering::Acquire);
+        if staged == 0 || ts.saturating_sub(staged) > self.max_age_ms {
+            self.mask.store(0, Ordering::Release);
+            return 0;
+        }
+        let left = self.left_at_ms.load(Ordering::Acquire);
+        if left != 0 && ts.saturating_sub(left) > self.leave_grace_ms {
+            self.mask.store(0, Ordering::Release);
+            return 0;
+        }
+        mask
+    }
+}
+
+/// Decides whether an incomplete `Live` Windows OLE `SHDoDragDrop` session should defer
+/// back to the floating preview (to retry at real drop coordinates via `ImmediatePostRelease`)
+/// rather than prematurely publishing clipboard fallback and showing the fallback hint card.
+#[inline]
+pub const fn should_defer_live_ole_drag(
+    is_live_mode: bool,
+    drop_requested: bool,
+    cancelled_or_escaped: bool,
+    got_capture: bool,
+    hr_is_drop: bool,
+    lmb_still_down: bool,
+    ole_elapsed_ms: u64,
+) -> bool {
+    if !is_live_mode || drop_requested || cancelled_or_escaped {
+        return false;
+    }
+    !got_capture || !hr_is_drop || lmb_still_down || ole_elapsed_ms < 120
+}
+
 /// Safe no-op backend used on unsupported platforms (e.g. macOS) or when DnD initialization fails.
 #[derive(Debug, Default)]
 pub struct NoopDndBackend;
@@ -89,7 +234,7 @@ impl DndBackend for NoopDndBackend {
     }
 }
 
-/// Physical/virtual-desktop rectangle for an invisible 1px edge-strip drop target.
+/// Physical/virtual-desktop rectangle for an invisible edge-strip drop target.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct EdgeStripRect {
     pub edge: Edge,
@@ -671,5 +816,81 @@ mod tests {
             "+2"
         );
         assert_eq!(format_drag_extension_badge(&["README".to_string()]), "FILE");
+    }
+
+    #[test]
+    fn staged_edge_tracker_tracks_edge_grace_expiry_and_clear() {
+        let tracker = StagedEdgeTracker::new(Duration::from_secs(4), Duration::from_millis(350));
+        assert_eq!(tracker.active_mask_at(100), 0);
+
+        // Stage Right edge at t=100ms
+        tracker.mark_staged_at(Edge::Right, false, 100);
+        assert_eq!(tracker.active_mask_at(100), edge_bit(Edge::Right));
+        assert_ne!(tracker.active_mask_at(2_000) & edge_bit(Edge::Right), 0);
+        assert_eq!(tracker.active_mask_at(2_000) & edge_bit(Edge::Left), 0);
+
+        // DragLeave starts the 350ms grace period
+        tracker.mark_left_at(Edge::Right, 2_000);
+        assert_eq!(tracker.active_mask_at(2_350), edge_bit(Edge::Right));
+
+        // DragOver re-entering cancels leave grace and refreshes staged timestamp
+        tracker.touch_at(Edge::Right, 2_300);
+        assert_eq!(tracker.active_mask_at(3_500), edge_bit(Edge::Right));
+
+        // Past leave grace without re-entering expires cleanly
+        tracker.mark_left_at(Edge::Right, 3_500);
+        assert_eq!(tracker.active_mask_at(3_851), 0);
+
+        // Max-age expiry (4000ms)
+        tracker.mark_staged_at(Edge::Left, false, 5_000);
+        assert_eq!(tracker.active_mask_at(9_000), edge_bit(Edge::Left));
+        assert_eq!(tracker.active_mask_at(9_001), 0);
+
+        // Explicit clear
+        tracker.mark_staged_at(Edge::Top, false, 10_000);
+        assert_eq!(tracker.active_mask_at(10_010), edge_bit(Edge::Top));
+        tracker.clear();
+        assert_eq!(tracker.active_mask_at(10_010), 0);
+    }
+
+    #[test]
+    fn should_defer_live_ole_drag_prevents_premature_fallback_tooltip() {
+        // ImmediatePostRelease never defers
+        assert!(!should_defer_live_ole_drag(
+            false, false, false, false, false, true, 0
+        ));
+
+        // Explicit drop_requested or cancel never defers
+        assert!(!should_defer_live_ole_drag(
+            true, true, false, false, false, true, 10
+        ));
+        assert!(!should_defer_live_ole_drag(
+            true, false, true, false, false, true, 10
+        ));
+
+        // Live mode defers when starter capture missed
+        assert!(should_defer_live_ole_drag(
+            true, false, false, false, false, false, 500
+        ));
+        // Live mode defers when SHDoDragDrop exited without DRAGDROP_S_DROP
+        assert!(should_defer_live_ole_drag(
+            true, false, false, true, false, false, 500
+        ));
+        // Live mode defers when LMB is still physically held
+        assert!(should_defer_live_ole_drag(
+            true, false, false, true, true, true, 500
+        ));
+        // Live mode defers when SHDoDragDrop exited in < 120ms startup settle window
+        assert!(should_defer_live_ole_drag(
+            true, false, false, true, true, false, 80
+        ));
+
+        // Genuine release after >= 120ms with capture & DRAGDROP_S_DROP & LMB up does NOT defer
+        assert!(!should_defer_live_ole_drag(
+            true, false, false, true, true, false, 120
+        ));
+        assert!(!should_defer_live_ole_drag(
+            true, false, false, true, true, false, 650
+        ));
     }
 }
