@@ -9,7 +9,7 @@
 ### One mouse and keyboard across all your PCs.
 
 Move your cursor off the edge of one screen and straight onto the next.<br>
-Share your clipboard, paste screenshots, and drop files across your desk — directly over your local network.
+Share your clipboard, paste screenshots, and drag files straight across screen edges — directly over your local network.
 
 **No account. No cloud. No internet required.**
 
@@ -36,28 +36,28 @@ Share your clipboard, paste screenshots, and drop files across your desk — dir
 **Glide** is a fast, native software KVM for Windows and Linux. Put two computers next to each other, open Glide on both, and they feel like one seamless multi-monitor workstation.
 
 - **Effortless screen switching** — Drag your PCs into place on the visual screen map and slide your mouse naturally from monitor to monitor. Your cursor hides cleanly on the idle PC so no ghost pointer lingers at the edge.
-- **Built for real desks & gaming** — A gentle corner guard keeps you from slipping onto another PC when clicking a close button or taskbar, and fullscreen games automatically lock your cursor in place.
-- **Shared clipboard, including screenshots** — Copy text, code, or screenshots (`Win+Shift+S`, Snipping Tool, browsers, Flameshot) on one PC and paste straight onto the other. Includes a quick clipboard history with one-click re-send and a privacy **Hide** cover whenever you want it.
-- **Built-in file drop** — Drag any file onto Glide to send it straight to your other PC's `Downloads/Glide` folder at full local network speed — no USB drives, no cloud uploads, no extra apps.
-- **Zero setup, private by default** — Glide automatically discovers your other PCs on the same Wi-Fi or Ethernet network and encrypts everything directly between them. It remembers your last role (Server or Client) and reconnects automatically next time you launch it.
-- **Truly native & lightweight** — One clean native app with no browser engine, no Electron bloat, and zero runtime DLLs to install on Windows.
+- **Drag files straight across screen edges** — Grab a file on Windows, pull it past the edge onto Linux, and drop it straight into an open window (or drop large files into Glide's window). If an app blocks external drops, Glide saves the file to your receive folder, puts it on your clipboard for `Ctrl+V`, and shows a subtle hint next to your cursor.
+- **Built for real desks & gaming** — A gentle corner guard keeps you from slipping onto another PC near close buttons or taskbars, fullscreen games auto-lock your cursor, and volume/media keys stay pinned to your main PC by default.
+- **Private shared clipboard & screenshots** — Copy text, code, or screenshots (`Win+Shift+S`, Snipping Tool, browsers, Flameshot) and paste straight onto the other PC. Password-manager secrets (1Password, Bitwarden, KeePassXC) are automatically skipped, and clipboard history has a one-click **Hide** privacy cover.
+- **Zero setup & resilient** — Automatically discovers PCs on your local network with end-to-end TLS 1.3 encryption, remembers saved server profiles for one-click switching, and recovers automatically from sleep/wake, monitor hotplugs, and Wi-Fi ↔ Ethernet changes.
+- **Truly native & whisper-quiet** — Pure-Rust GPU-rendered app with zero Electron bloat, zero Windows runtime DLLs, and zero background redraws or idle LAN scans when tucked in the system tray.
 - **International keyboard friendly** — German and European ISO layouts (`ä ö ü ß`, `AltGr`, `< > |`, dead keys) work cleanly out of the box, alongside synced Caps Lock / Num Lock keyboard lights.
 
 ---
 
-## Shared Clipboard & Instant File Drop
+## Shared Clipboard & Cross-Edge File Drop
 
-Copy on Windows, paste on Linux — or the other way around. Need to move a build, log, or screenshot over? Just drop it straight into the window and it lands in `Downloads/Glide` on the other machine.
+Copy on Windows, paste on Linux — or pull a file straight off one screen and drop it onto the other. Choose a custom save folder, adjust the max file size limit (up to 4 GB) in Settings, and open received files or their folder in one click.
 
 <div align="center">
-  <img alt="Glide Clipboard and File Drop screen" src="assets/readme/clipboard-light.png" width="800">
+  <img alt="Glide Clipboard and File Transfer screen" src="assets/readme/clipboard-light.png" width="800">
 </div>
 
 ---
 
 ## Tuned to Each Machine
 
-Different monitor sizes, mice, or keyboard habits? Adjust pointer speed, scroll speed, natural scrolling, corner guard, and custom key remaps (like `Caps Lock → Escape`) per PC — every change takes effect immediately.
+Different monitor sizes, mice, or keyboard habits? Adjust pointer speed, scroll speed, natural scrolling, corner guard, media-key pinning, and custom key remaps (like `Caps Lock → Escape`) per PC — every change takes effect immediately.
 
 <div align="center">
   <picture>
@@ -116,7 +116,10 @@ sudo apt install ./glide_0.3.0_amd64.deb
 No. Glide talks directly between your PCs over your local network (Wi-Fi or Ethernet) with end-to-end encryption enabled automatically. (You can optionally click **Check** in *Settings → Updates* whenever you want to check GitHub for a newer release.)
 
 ### Does copying screenshots work between Windows and Linux?
-Yes. Screenshots from Windows `Win+Shift+S`, Snipping Tool, Paint, browsers, and Linux tools like Flameshot convert and paste cleanly in both directions.
+Yes. Screenshots from Windows `Win+Shift+S`, Snipping Tool, Paint, browsers, and Linux tools like Flameshot convert and paste cleanly in both directions. Passwords copied from password managers marked concealed/exclude-from-history are skipped automatically.
+
+### What happens if an app doesn't accept a cross-edge file drop?
+Glide always saves the file to your receive folder (`Downloads/Glide` by default), puts it on your clipboard so `Ctrl+V` pastes it anywhere, and pops up a brief white info tooltip right next to your mouse letting you know where it landed.
 
 ### Will my mouse accidentally leave a fullscreen game?
 No. Glide automatically detects fullscreen windows and locks your cursor to the current screen. You can also toggle manual lock anytime with `Ctrl + Alt + L` or the **Lock** button.
@@ -132,11 +135,11 @@ Not at all. It only reads the connection's built-in timing locally and never sen
 ## For Power Users & Developers
 
 <details>
-<summary><strong>CLI / Headless Mode</strong></summary>
+<summary><strong>CLI, Headless Mode & Scripting</strong></summary>
 
 <br>
 
-Glide also runs cleanly from the terminal or as a background service:
+Glide runs cleanly from the terminal, as a background service, or controlled live from scripts/Stream Deck/hotkeys:
 
 ```powershell
 # Windows primary (server)
@@ -150,6 +153,16 @@ glide client --edge right
 # Force a specific Linux input backend (portal on Wayland, xtest on X11, or /dev/uinput)
 glide client --edge right --backend portal
 glide client --edge right --backend uinput
+
+# Control a running Glide session live (works with scripts, hotkeys, Stream Deck)
+glide ctl status
+glide ctl lock
+glide ctl unlock
+glide ctl switch right
+glide ctl switch local
+
+# Beam a file to the connected PC from the terminal
+glide send ./build.tar.gz
 
 # LAN discovery & system check
 glide discover

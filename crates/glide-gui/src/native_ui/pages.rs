@@ -1176,20 +1176,26 @@ fn client_connection_col(s: &Ui, p: Palette) -> El {
                 .on_press_tx(move |s: &mut Ui, tx| s.forget_known_server(rm_key.clone(), tx))
                 .child(icons::close_icon(10.5, p.muted));
 
+            let display_addr = srv
+                .address
+                .strip_suffix(":24800")
+                .unwrap_or(&srv.address)
+                .to_owned();
             let item = row()
                 .key(format!("known-row-{i}"))
                 .w_full()
-                .min_h(36.0)
+                .min_h(32.0)
                 .px(10.0)
-                .py(5.0)
+                .py(4.0)
                 .gap(8.0)
                 .center_y()
                 .child(
-                    col()
+                    row()
                         .grow(1.0)
                         .shrink()
                         .min_w(0.0)
-                        .gap(0.5)
+                        .gap(6.0)
+                        .center_y()
                         .child(
                             text(srv.name.clone())
                                 .font(ty::SUB_MED)
@@ -1197,7 +1203,7 @@ fn client_connection_col(s: &Ui, p: Palette) -> El {
                                 .truncate(),
                         )
                         .child(
-                            text(srv.address.clone())
+                            text(display_addr)
                                 .font(ty::SUB)
                                 .color(p.muted)
                                 .truncate(),
@@ -1227,7 +1233,7 @@ fn client_connection_col(s: &Ui, p: Palette) -> El {
                 .w_full()
                 .grow(1.0)
                 .min_h(0.0)
-                .gap(6.0)
+                .gap(5.0)
                 .child(section_head(p, "known-servers-head", "Saved servers", None))
                 .child(
                     card(p, "known-servers-card")
