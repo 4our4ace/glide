@@ -94,6 +94,18 @@ static ARROW_DOWN: Icon = Icon {
     body: r#"<path d="M8 3V13M4 8.8L8 13L12 8.8" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/>"#,
 };
 
+static CHEVRON_RIGHT: Icon = Icon {
+    name: "chevron-right",
+    view: 16.0,
+    body: r#"<path d="M6 3.5L10.5 8L6 12.5" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/>"#,
+};
+
+static CHEVRON_DOWN: Icon = Icon {
+    name: "chevron-down",
+    view: 16.0,
+    body: r#"<path d="M3.5 6L8 10.5L12.5 6" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/>"#,
+};
+
 /// Crisp sleek vector mouse pointer SVG for the active monitor in the screen map.
 static CURSOR_POINTER: Icon = Icon {
     name: "cursor-pointer",
@@ -215,6 +227,20 @@ pub fn arrow_icon(edge: Edge, size: f32, color: Color) -> El {
         Edge::Bottom => &ARROW_DOWN,
     };
     icon(glyph, size).color(color).a11y_hidden()
+}
+
+/// Disclosure chevron icon (down when expanded, right when collapsed).
+pub fn chevron_icon(expanded: bool, size: f32, color: Color) -> El {
+    icon(
+        if expanded {
+            &CHEVRON_DOWN
+        } else {
+            &CHEVRON_RIGHT
+        },
+        size,
+    )
+    .color(color)
+    .a11y_hidden()
 }
 
 /// Sleek vector pointer SVG shown in the bottom-right corner of the active desk monitor.

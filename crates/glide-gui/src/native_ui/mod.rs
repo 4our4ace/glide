@@ -173,6 +173,7 @@ pub struct Ui {
     pub selected_peer_name: Option<String>,
     pub discovered: Vec<DiscoveredPeer>,
     pub known_servers: Vec<KnownServer>,
+    pub saved_servers_expanded: bool,
     pub scanning: bool,
     pub show_advanced: bool,
     pub update_state: UpdateCheckState,
@@ -259,6 +260,7 @@ impl Ui {
             selected_peer_name: None,
             discovered: Vec::new(),
             known_servers,
+            saved_servers_expanded: false,
             scanning: false,
             show_advanced: false,
             update_state: UpdateCheckState::Idle,
@@ -400,6 +402,9 @@ impl Ui {
 
     pub fn refresh_known_servers(&mut self) {
         self.known_servers = list_known_servers(&self.ctrl.known_servers_path()).unwrap_or_default();
+        if self.known_servers.is_empty() {
+            self.saved_servers_expanded = false;
+        }
     }
 
     fn apply_status_if_newer(&mut self, rev: u64, snap: StatusSnapshot) -> bool {
@@ -1983,6 +1988,29 @@ const SCENES: &[(&str, SceneFn)] = &[
                 last_connected_unix: 1000,
             },
         ];
+        s.saved_servers_expanded = true;
+    }),
+    ("client-profiles-collapsed", |s| {
+        s.theme = ThemePref::Light;
+        scene_client_connected(s);
+        s.status.local_addr = Some("192.168.1.42:24800".into());
+        s.known_servers = vec![
+            KnownServer {
+                name: "workstation".into(),
+                address: "192.168.1.42:24800".into(),
+                fingerprint: Some("ab:cd:ef".into()),
+                edge: Edge::Right,
+                last_connected_unix: 2000,
+            },
+            KnownServer {
+                name: "studio-pc".into(),
+                address: "192.168.1.88:24800".into(),
+                fingerprint: Some("12:34:56".into()),
+                edge: Edge::Left,
+                last_connected_unix: 1000,
+            },
+        ];
+        s.saved_servers_expanded = false;
     }),
     ("input-server-light", |s| {
         s.theme = ThemePref::Light;
@@ -2146,6 +2174,184 @@ mod tests {
             .await
             .expect("hide waiter should wake on close")
             .unwrap());
+    }
+
+    #[tokio::test]
+    async fn saved_servers_collapse_expand_and_reset_on_empty() {
+        use glide_core::config::record_known_server;
+
+        struct CleanupDir(PathBuf);
+        impl Drop for CleanupDir {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+
+        let dir = std::env::temp_dir().join(format!(
+            "glide-ui-saved-servers-test-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let _cleanup = CleanupDir(dir.clone());
+
+        let config_path = dir.join("config.toml");
+        let known_path = glide_core::config::known_servers_path_for_config(&config_path);
+        record_known_server(
+            &known_path,
+            KnownServer {
+                name: "workstation".into(),
+                address: "192.168.1.42:24800".into(),
+                fingerprint: Some("ab:cd:ef".into()),
+                edge: Edge::Right,
+                last_connected_unix: 2000,
+            },
+        )
+        .unwrap();
+        record_known_server(
+            &known_path,
+            KnownServer {
+                name: "studio-pc".into(),
+                address: "192.168.1.88:24800".into(),
+                fingerprint: Some("12:34:56".into()),
+                edge: Edge::Left,
+                last_connected_unix: 1000,
+            },
+        )
+        .unwrap();
+
+        let (quit_tx, _quit_rx) = tokio::sync::mpsc::unbounded_channel();
+        let ctrl = Arc::new(AppController::new(
+            config_path,
+            "http://127.0.0.1:0".into(),
+            quit_tx,
+        ));
+        let vis = Arc::new(WindowVisibility::new(true));
+        let mut ui = Ui::new(ctrl, tokio::runtime::Handle::current(), vis);
+
+        // Saved servers starts collapsed by default even when known servers exist.
+        assert_eq!(ui.known_servers.len(), 2);
+        assert!(!ui.saved_servers_expanded);
+
+        ui.tab = Tab::Devices;
+        ui.role = Role::Client;
+
+        let mut rt = rune::Runtime::new(
+            ui,
+            view,
+            (GUI_WIDTH as f32, GUI_HEIGHT as f32),
+            rune::Env::new(false, 1.0),
+        );
+        rt.frame(0.0);
+
+        // Collapsed state: toggle button is present with expanded=false, card is omitted,
+        // and the section sits compactly at 26px height.
+        let toggle_info = rt
+            .elements()
+            .into_iter()
+            .find(|e| e.key.as_deref() == Some("known-servers-toggle"))
+            .expect("known-servers-toggle should render when known_servers is non-empty");
+        assert_eq!(toggle_info.role, "button");
+        assert_eq!(toggle_info.expanded, Some(false));
+        assert_eq!(toggle_info.label.as_deref(), Some("Saved servers (2)"));
+        assert!(toggle_info.focusable);
+        assert!(rt.find("known-servers-card").is_none());
+
+        let sec_collapsed_h = rt
+            .elements()
+            .into_iter()
+            .find(|e| e.key.as_deref() == Some("known-servers-sec"))
+            .expect("known-servers-sec should render")
+            .rect[3];
+        assert!(
+            (sec_collapsed_h - 26.0).abs() < 1.0,
+            "collapsed section should be 26px tall, got {sec_collapsed_h}"
+        );
+
+        // Click the disclosure toggle to expand.
+        let (tx, ty) = rt.find("known-servers-toggle").unwrap();
+        rt.pointer_down(tx, ty);
+        rt.pointer_up(tx, ty);
+        rt.frame(0.0);
+        rt.settle_all();
+        rt.frame(0.0);
+
+        assert!(rt.state.saved_servers_expanded);
+        let toggle_expanded = rt
+            .elements()
+            .into_iter()
+            .find(|e| e.key.as_deref() == Some("known-servers-toggle"))
+            .unwrap();
+        assert_eq!(toggle_expanded.expanded, Some(true));
+        assert!(rt.find("known-servers-card").is_some());
+        assert!(rt.find("known-row-0").is_some());
+        let sec_expanded = rt
+            .elements()
+            .into_iter()
+            .find(|e| e.key.as_deref() == Some("known-servers-sec"))
+            .unwrap();
+        let card_expanded = rt
+            .elements()
+            .into_iter()
+            .find(|e| e.key.as_deref() == Some("known-servers-card"))
+            .unwrap();
+        assert!(
+            sec_expanded.rect[3] > sec_collapsed_h + 20.0,
+            "expanded section should grow to hold the list, got rect={} target={} vs collapsed={sec_collapsed_h}",
+            sec_expanded.rect[3],
+            sec_expanded.target[3]
+        );
+        assert!(
+            card_expanded.rect[3] > 20.0,
+            "expanded card should receive remaining height, got rect={} target={}",
+            card_expanded.rect[3],
+            card_expanded.target[3]
+        );
+
+        // Click again to collapse cleanly.
+        let (tx, ty) = rt.find("known-servers-toggle").unwrap();
+        rt.pointer_down(tx, ty);
+        rt.pointer_up(tx, ty);
+        rt.frame(0.0);
+        rt.settle_all();
+        rt.frame(0.0);
+
+        assert!(!rt.state.saved_servers_expanded);
+        assert!(rt.find("known-servers-card").is_none());
+        let toggle_recollapsed = rt
+            .elements()
+            .into_iter()
+            .find(|e| e.key.as_deref() == Some("known-servers-toggle"))
+            .unwrap();
+        assert_eq!(toggle_recollapsed.expanded, Some(false));
+        let sec_recollapsed_h = rt
+            .elements()
+            .into_iter()
+            .find(|e| e.key.as_deref() == Some("known-servers-sec"))
+            .unwrap()
+            .rect[3];
+        assert!(
+            (sec_recollapsed_h - 26.0).abs() < 1.0,
+            "re-collapsed section should return to 26px tall, got {sec_recollapsed_h}"
+        );
+
+        // Expand, remove one server: list is non-empty so expanded state is preserved.
+        rt.state.saved_servers_expanded = true;
+        remove_known_server(&known_path, "12:34:56").unwrap();
+        rt.state.refresh_known_servers();
+        assert_eq!(rt.state.known_servers.len(), 1);
+        assert!(rt.state.saved_servers_expanded);
+
+        // Remove the last server and refresh: saved_servers_expanded resets to false.
+        remove_known_server(&known_path, "ab:cd:ef").unwrap();
+        rt.state.refresh_known_servers();
+        assert!(rt.state.known_servers.is_empty());
+        assert!(!rt.state.saved_servers_expanded);
+
+        rt.invalidate();
+        rt.frame(0.0);
+        assert!(rt.find("known-servers-toggle").is_none());
+        assert!(rt.find("known-servers-card").is_none());
     }
 }
 

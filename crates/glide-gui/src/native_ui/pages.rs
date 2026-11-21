@@ -1265,129 +1265,171 @@ fn client_connection_col(s: &Ui, p: Palette) -> El {
         );
 
     if !s.known_servers.is_empty() {
-        let connected = s.client_connected();
-        let active_addr = s.status.local_addr.as_deref();
-        let active_fp = s
-            .status
-            .remote_fingerprint
-            .as_deref()
-            .or(s.config.client.trusted_fingerprint.as_deref())
-            .map(glide_core::config::normalize_known_fingerprint)
-            .filter(|fp| !fp.is_empty());
         let count = s.known_servers.len();
-        let mut list = col().key("known-servers-list").w_full();
-        for (i, srv) in s.known_servers.iter().enumerate() {
-            let srv_fp = srv
-                .fingerprint
+        let expanded = s.saved_servers_expanded;
+
+        let toggle_head = row()
+            .key("known-servers-toggle")
+            .role("button")
+            .expanded(expanded)
+            .label(format!("Saved servers ({count})"))
+            .w_full()
+            .h(26.0)
+            .px(4.0)
+            .radius(6.0)
+            .center_y()
+            .justify_between()
+            .hover(p.hover)
+            .press(p.press)
+            .cursor(Cursor::Pointer)
+            .focusable(true)
+            .on_press(|s: &mut Ui| s.saved_servers_expanded = !s.saved_servers_expanded)
+            .child(
+                row()
+                    .gap(5.0)
+                    .center_y()
+                    .child(icons::chevron_icon(expanded, 12.0, p.muted))
+                    .child(
+                        text("Saved servers")
+                            .font(ty::SECTION)
+                            .color(p.muted)
+                            .a11y_hidden(),
+                    )
+                    .child(
+                        badge(p, "known-servers-count", count.to_string(), false, false)
+                            .a11y_hidden(),
+                    ),
+            )
+            .child(
+                text(if expanded { "Hide" } else { "Show" })
+                    .font(ty::SUB)
+                    .color(p.faint)
+                    .a11y_hidden(),
+            );
+
+        let mut sec = col()
+            .key("known-servers-sec")
+            .w_full()
+            .gap(5.0)
+            .child(toggle_head);
+
+        if expanded {
+            let connected = s.client_connected();
+            let active_addr = s.status.local_addr.as_deref();
+            let active_fp = s
+                .status
+                .remote_fingerprint
                 .as_deref()
+                .or(s.config.client.trusted_fingerprint.as_deref())
                 .map(glide_core::config::normalize_known_fingerprint)
                 .filter(|fp| !fp.is_empty());
-            let is_active = connected
-                && match (&active_fp, &srv_fp) {
-                    (Some(cur), Some(saved)) => cur == saved,
-                    _ => active_addr == Some(srv.address.as_str()),
+            let mut list = col().key("known-servers-list").w_full();
+            for (i, srv) in s.known_servers.iter().enumerate() {
+                let srv_fp = srv
+                    .fingerprint
+                    .as_deref()
+                    .map(glide_core::config::normalize_known_fingerprint)
+                    .filter(|fp| !fp.is_empty());
+                let is_active = connected
+                    && match (&active_fp, &srv_fp) {
+                        (Some(cur), Some(saved)) => cur == saved,
+                        _ => active_addr == Some(srv.address.as_str()),
+                    };
+                let srv_connect = srv.clone();
+                let rm_key = srv
+                    .fingerprint
+                    .as_deref()
+                    .filter(|fp| !fp.trim().is_empty())
+                    .unwrap_or(&srv.address)
+                    .to_owned();
+                let action = if is_active {
+                    badge(p, format!("known-active-{i}"), "Active", true, false)
+                } else {
+                    button(
+                        p,
+                        format!("known-conn-{i}"),
+                        if connected { "Switch" } else { "Connect" },
+                        BtnKind::Primary,
+                        22.0,
+                        8.0,
+                        false,
+                        move |s, tx| s.connect_known_server(srv_connect.clone(), tx),
+                    )
                 };
-            let srv_connect = srv.clone();
-            let rm_key = srv
-                .fingerprint
-                .as_deref()
-                .filter(|fp| !fp.trim().is_empty())
-                .unwrap_or(&srv.address)
-                .to_owned();
-            let action = if is_active {
-                badge(p, format!("known-active-{i}"), "Active", true, false)
-            } else {
-                button(
-                    p,
-                    format!("known-conn-{i}"),
-                    if connected { "Switch" } else { "Connect" },
-                    BtnKind::Primary,
-                    22.0,
-                    8.0,
-                    false,
-                    move |s, tx| s.connect_known_server(srv_connect.clone(), tx),
-                )
-            };
-            let rm_btn = row()
-                .key(format!("known-rm-{i}"))
-                .role("button")
-                .label(format!("Forget {}", srv.name))
-                .size(22.0, 22.0)
-                .center()
-                .radius(5.0)
-                .hover(p.hover)
-                .press(p.press)
-                .cursor(Cursor::Pointer)
-                .focusable(true)
-                .on_press_tx(move |s: &mut Ui, tx| s.forget_known_server(rm_key.clone(), tx))
-                .child(icons::close_icon(10.5, p.muted));
+                let rm_btn = row()
+                    .key(format!("known-rm-{i}"))
+                    .role("button")
+                    .label(format!("Forget {}", srv.name))
+                    .size(22.0, 22.0)
+                    .center()
+                    .radius(5.0)
+                    .hover(p.hover)
+                    .press(p.press)
+                    .cursor(Cursor::Pointer)
+                    .focusable(true)
+                    .on_press_tx(move |s: &mut Ui, tx| s.forget_known_server(rm_key.clone(), tx))
+                    .child(icons::close_icon(10.5, p.muted));
 
-            let display_addr = srv
-                .address
-                .strip_suffix(":24800")
-                .unwrap_or(&srv.address)
-                .to_owned();
-            let item = row()
-                .key(format!("known-row-{i}"))
-                .w_full()
-                .min_h(32.0)
-                .px(10.0)
-                .py(4.0)
-                .gap(8.0)
-                .center_y()
-                .child(
-                    row()
-                        .grow(1.0)
-                        .shrink()
-                        .min_w(0.0)
-                        .gap(6.0)
-                        .center_y()
-                        .child(
-                            text(srv.name.clone())
-                                .font(ty::SUB_MED)
-                                .color(p.text)
-                                .truncate(),
-                        )
-                        .child(
-                            text(display_addr)
-                                .font(ty::SUB)
-                                .color(p.muted)
-                                .truncate(),
-                        ),
-                )
-                .child(row().gap(4.0).center_y().child(action).child(rm_btn));
+                let display_addr = srv
+                    .address
+                    .strip_suffix(":24800")
+                    .unwrap_or(&srv.address)
+                    .to_owned();
+                let item = row()
+                    .key(format!("known-row-{i}"))
+                    .w_full()
+                    .min_h(32.0)
+                    .px(10.0)
+                    .py(4.0)
+                    .gap(8.0)
+                    .center_y()
+                    .child(
+                        row()
+                            .grow(1.0)
+                            .shrink()
+                            .min_w(0.0)
+                            .gap(6.0)
+                            .center_y()
+                            .child(
+                                text(srv.name.clone())
+                                    .font(ty::SUB_MED)
+                                    .color(p.text)
+                                    .truncate(),
+                            )
+                            .child(
+                                text(display_addr)
+                                    .font(ty::SUB)
+                                    .color(p.muted)
+                                    .truncate(),
+                            ),
+                    )
+                    .child(row().gap(4.0).center_y().child(action).child(rm_btn));
 
-            list = list.child(item);
-            if i + 1 < count {
-                list = list.child(rule(1.0, p.line).a11y_hidden());
+                list = list.child(item);
+                if i + 1 < count {
+                    list = list.child(rule(1.0, p.line).a11y_hidden());
+                }
             }
-        }
 
-        let scroll = col()
-            .key("known-servers-scroll")
-            .w_full()
-            .grow(1.0)
-            .min_h(0.0)
-            .scroll(ScrollSpec {
-                stick_bottom: false,
-            })
-            .child(list);
-
-        col_el = col_el.child(
-            col()
-                .key("known-servers-sec")
+            let scroll = col()
+                .key("known-servers-scroll")
                 .w_full()
                 .grow(1.0)
                 .min_h(0.0)
-                .gap(5.0)
-                .child(section_head(p, "known-servers-head", "Saved servers", None))
-                .child(
-                    card(p, "known-servers-card")
-                        .grow(1.0)
-                        .min_h(0.0)
-                        .child(scroll),
-                ),
-        );
+                .scroll(ScrollSpec {
+                    stick_bottom: false,
+                })
+                .child(list);
+
+            sec = sec.grow(1.0).min_h(0.0).child(
+                card(p, "known-servers-card")
+                    .grow(1.0)
+                    .min_h(0.0)
+                    .child(scroll),
+            );
+        }
+
+        col_el = col_el.child(sec);
     }
 
     col_el
