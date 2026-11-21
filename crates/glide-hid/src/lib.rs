@@ -353,6 +353,10 @@ impl ModifierMask {
     pub const fn alt(self) -> bool {
         self.contains(Self::ALT_LEFT) || self.contains(Self::ALT_RIGHT)
     }
+
+    pub const fn meta(self) -> bool {
+        self.contains(Self::META_LEFT) || self.contains(Self::META_RIGHT)
+    }
 }
 
 /// Physical mouse buttons transmitted over the wire.

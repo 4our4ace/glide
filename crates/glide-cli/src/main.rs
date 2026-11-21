@@ -507,8 +507,8 @@ async fn run_command(command: Command, config: Option<PathBuf>) -> Result<()> {
 
             tokio::select! {
                 res = run_native_server_with_runtime(cfg, Some(rt), Some(cmd_rx)) => res?,
-                _ = tokio::signal::ctrl_c() => {
-                    tracing::info!("Shutting down Glide server (Ctrl+C)");
+                sig = shutdown_signal() => {
+                    tracing::info!(signal = sig, "Shutting down Glide server");
                 }
             }
         }
@@ -608,8 +608,8 @@ async fn run_command(command: Command, config: Option<PathBuf>) -> Result<()> {
 
             tokio::select! {
                 res = run_native_client_with_runtime(cfg, Some(rt), Some(cmd_rx)) => res?,
-                _ = tokio::signal::ctrl_c() => {
-                    tracing::info!("Shutting down Glide client (Ctrl+C)");
+                sig = shutdown_signal() => {
+                    tracing::info!(signal = sig, "Shutting down Glide client");
                 }
             }
         }
@@ -932,6 +932,35 @@ async fn run_command(command: Command, config: Option<PathBuf>) -> Result<()> {
     }
 
     Ok(())
+}
+
+async fn shutdown_signal() -> &'static str {
+    let ctrl_c = async {
+        let _ = tokio::signal::ctrl_c().await;
+    };
+
+    #[cfg(unix)]
+    {
+        let terminate = async {
+            match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+                Ok(mut sigterm) => {
+                    sigterm.recv().await;
+                }
+                Err(_) => std::future::pending::<()>().await,
+            }
+        };
+
+        tokio::select! {
+            _ = ctrl_c => "SIGINT",
+            _ = terminate => "SIGTERM",
+        }
+    }
+
+    #[cfg(not(unix))]
+    {
+        ctrl_c.await;
+        "Ctrl+C"
+    }
 }
 
 #[cfg(test)]

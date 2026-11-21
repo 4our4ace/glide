@@ -12,8 +12,8 @@
 
 use crate::config::ServerConfig;
 use crate::dnd::{
-    collect_local_drag_files, next_drag_id, spawn_commit_incoming_drag, spawn_send_drag_files,
-    EarlyDragBuffer, IncomingDragState, OutgoingDragState,
+    collect_local_drag_files, next_drag_id, spawn_send_drag_files, EarlyDragBuffer,
+    IncomingDragState, OutgoingDragState,
 };
 use crate::resilience::{HealthProbe, SleepDetector};
 use crate::runtime::{save_received_file, PeerSummary, RuntimeCommand, RuntimeState};
@@ -424,7 +424,7 @@ pub async fn run_server_with_dnd(
                             early_drag_files.clear();
                             if let Some(inc) = incoming_drag.take() {
                                 if !inc.drop_requested {
-                                    dnd.on_incoming_drag_cancel();
+                                    inc.cancel(Arc::clone(&dnd));
                                 } else {
                                     incoming_drag = Some(inc);
                                 }
@@ -745,10 +745,7 @@ pub async fn run_server_with_dnd(
                                 if inc.is_ready_to_commit() {
                                     if let Some(done) = incoming_drag.take() {
                                         incoming_drag_peer = None;
-                                        let drag_id = done.drag_id;
-                                        spawn_commit_incoming_drag(
-                                            drag_id,
-                                            done.into_files(),
+                                        done.commit(
                                             receive_dir.clone(),
                                             config.receive_dir.clone(),
                                             Arc::clone(&dnd),
@@ -785,7 +782,7 @@ pub async fn run_server_with_dnd(
                                 debug!(drag_id = inc.drag_id, "Cancelled incoming drag after crossing back to peer");
                                 incoming_drag_peer = None;
                                 early_drag_files.remove_drag(inc.drag_id);
-                                dnd.on_incoming_drag_cancel();
+                                inc.cancel(Arc::clone(&dnd));
                             } else {
                                 incoming_drag = Some(inc);
                             }
@@ -1201,7 +1198,7 @@ pub async fn run_server_with_dnd(
                                 early_drag_files.clear();
                                 if let Some(inc) = incoming_drag.take() {
                                     if !inc.drop_requested {
-                                        dnd.on_incoming_drag_cancel();
+                                        inc.cancel(Arc::clone(&dnd));
                                     } else {
                                         incoming_drag = Some(inc);
                                     }
@@ -1265,6 +1262,11 @@ pub async fn run_server_with_dnd(
                             ControlMessage::DragStart { drag_id, files } => {
                                 if config.drag_drop_files {
                                     debug!(peer_id, drag_id, count = files.len(), "Incoming cross-edge drag from client");
+                                    if let Some(prev) = incoming_drag.take() {
+                                        if !prev.drop_requested {
+                                            prev.cancel(Arc::clone(&dnd));
+                                        }
+                                    }
                                     let limit = max_file_bytes.load(Ordering::Relaxed);
                                     if let Some(mut inc) = IncomingDragState::start(drag_id, files, limit) {
                                         for buffered in early_drag_files.drain_for(drag_id) {
@@ -1277,15 +1279,25 @@ pub async fn run_server_with_dnd(
                                         if inc.is_ready_to_commit() {
                                             incoming_drag = None;
                                             incoming_drag_peer = None;
-                                            spawn_commit_incoming_drag(
-                                                inc.drag_id,
-                                                inc.into_files(),
+                                            inc.commit(
                                                 receive_dir.clone(),
                                                 config.receive_dir.clone(),
                                                 Arc::clone(&dnd),
                                                 runtime.clone(),
                                             );
                                         } else {
+                                            if !inc.drop_requested {
+                                                let (nx, ny) = capture_ctrl.last_local_cursor_norm();
+                                                let (px, py) = capture_ctrl
+                                                    .desktop_geometry()
+                                                    .denormalize_point(nx, ny);
+                                                dnd.on_incoming_drag_start(&inc.filenames, px, py);
+                                                inc.maybe_start_live_staging(
+                                                    receive_dir.clone(),
+                                                    config.receive_dir.clone(),
+                                                    Arc::clone(&dnd),
+                                                );
+                                            }
                                             incoming_drag = Some(inc);
                                             incoming_drag_peer = Some(peer_id);
                                         }
@@ -1297,9 +1309,7 @@ pub async fn run_server_with_dnd(
                                     if inc.request_drop(drag_id) && inc.is_ready_to_commit() {
                                         if let Some(done) = incoming_drag.take() {
                                             incoming_drag_peer = None;
-                                            spawn_commit_incoming_drag(
-                                                done.drag_id,
-                                                done.into_files(),
+                                            done.commit(
                                                 receive_dir.clone(),
                                                 config.receive_dir.clone(),
                                                 Arc::clone(&dnd),
@@ -1313,9 +1323,10 @@ pub async fn run_server_with_dnd(
                                 early_drag_files.remove_drag(drag_id);
                                 if incoming_drag.as_ref().is_some_and(|i| i.drag_id == drag_id) {
                                     debug!(peer_id, drag_id, "Cancelled incoming cross-edge drag from client");
-                                    incoming_drag = None;
                                     incoming_drag_peer = None;
-                                    dnd.on_incoming_drag_cancel();
+                                    if let Some(inc) = incoming_drag.take() {
+                                        inc.cancel(Arc::clone(&dnd));
+                                    }
                                 }
                             }
                             ControlMessage::ClipboardRequest { sha256 } => {
@@ -1459,18 +1470,22 @@ pub async fn run_server_with_dnd(
                                     .is_some_and(|i| i.drag_id == drag_file.drag_id)
                                 {
                                     if let Some(ref mut inc) = incoming_drag {
-                                        if inc.push_file(drag_file.drag_id, drag_file.file)
-                                            && inc.is_ready_to_commit()
-                                        {
-                                            if let Some(done) = incoming_drag.take() {
-                                                incoming_drag_peer = None;
-                                                spawn_commit_incoming_drag(
-                                                    done.drag_id,
-                                                    done.into_files(),
+                                        if inc.push_file(drag_file.drag_id, drag_file.file) {
+                                            if inc.is_ready_to_commit() {
+                                                if let Some(done) = incoming_drag.take() {
+                                                    incoming_drag_peer = None;
+                                                    done.commit(
+                                                        receive_dir.clone(),
+                                                        config.receive_dir.clone(),
+                                                        Arc::clone(&dnd),
+                                                        runtime.clone(),
+                                                    );
+                                                }
+                                            } else {
+                                                inc.maybe_start_live_staging(
                                                     receive_dir.clone(),
                                                     config.receive_dir.clone(),
                                                     Arc::clone(&dnd),
-                                                    runtime.clone(),
                                                 );
                                             }
                                         }
@@ -1499,7 +1514,7 @@ pub async fn run_server_with_dnd(
                                 early_drag_files.clear();
                                 if let Some(inc) = incoming_drag.take() {
                                     if !inc.drop_requested {
-                                        dnd.on_incoming_drag_cancel();
+                                        inc.cancel(Arc::clone(&dnd));
                                     } else {
                                         incoming_drag = Some(inc);
                                     }
@@ -1563,6 +1578,11 @@ pub async fn run_server_with_dnd(
         }
     }
 
+    if let Some(inc) = incoming_drag.take() {
+        if !inc.drop_requested {
+            inc.cancel(Arc::clone(&dnd));
+        }
+    }
     if let Some(pid) = active_remote.take() {
         if let Some(peer) = peers.get(&pid) {
             let _ = peer.ctrl_tx.send(ControlMessage::ReleaseAll);

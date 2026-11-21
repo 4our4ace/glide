@@ -383,6 +383,18 @@ fn arrow_to_edge(usage: HidUsage) -> Option<Edge> {
     }
 }
 
+/// Returns `true` when the keystroke triggers Windows' unhookable kernel Lock Workstation
+/// shortcut (`Win+L`, without Ctrl/Alt/Shift).
+#[inline]
+fn is_windows_workstation_lock_chord(mask: ModifierMask, usage: HidUsage, pressed: bool) -> bool {
+    pressed
+        && usage == HidUsage::keyboard(0x0F)
+        && mask.meta()
+        && !mask.ctrl()
+        && !mask.alt()
+        && !mask.shift()
+}
+
 fn translate_ll_key(vk_code: u32, scan_code: u32, flags: u32) -> Option<HidUsage> {
     // Handle Consumer Control / Media VKs explicitly so keyboards/headsets that send
     // scanCode == 0 for volume/playback buttons still resolve reliably.
@@ -534,6 +546,15 @@ unsafe extern "system" fn keyboard_ll_proc(code: i32, wparam: WPARAM, lparam: LP
                     }
 
                     if remote {
+                        // Windows' kernel (win32k) intercepts physical Win+L below WH_KEYBOARD_LL
+                        // and unconditionally locks the local Windows server regardless of hook
+                        // suppression. Never forward `L` to the remote client on Win+L so we
+                        // don't accidentally lock BOTH machines; instead immediately release
+                        // remote control (clearing the held Win/Super key on the client).
+                        if is_windows_workstation_lock_chord(mask, usage, pressed) {
+                            state.release_to_local_on_suspend("Win+L");
+                            return true;
+                        }
                         if usage.is_media_key()
                             && !state.forwarded_media_keys.lock().should_forward(
                                 usage,
@@ -1294,4 +1315,47 @@ fn init_capture_window_and_hooks() -> Result<(HWND, HHOOK, HHOOK, bool)> {
     }
 
     Ok((hwnd, kb_hook, ms_hook, wts_registered))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn windows_workstation_lock_chord_matches_only_bare_win_l_press() {
+        let key_l = HidUsage::keyboard(0x0F);
+        let key_e = HidUsage::keyboard(0x08);
+
+        assert!(is_windows_workstation_lock_chord(
+            ModifierMask(ModifierMask::META_LEFT),
+            key_l,
+            true
+        ));
+        assert!(is_windows_workstation_lock_chord(
+            ModifierMask(ModifierMask::META_RIGHT),
+            key_l,
+            true
+        ));
+        // Key release, other keys, or extra modifiers (Ctrl/Alt/Shift) must NOT match
+        assert!(!is_windows_workstation_lock_chord(
+            ModifierMask(ModifierMask::META_LEFT),
+            key_l,
+            false
+        ));
+        assert!(!is_windows_workstation_lock_chord(
+            ModifierMask(ModifierMask::META_LEFT),
+            key_e,
+            true
+        ));
+        assert!(!is_windows_workstation_lock_chord(
+            ModifierMask(ModifierMask::META_LEFT | ModifierMask::CONTROL_LEFT),
+            key_l,
+            true
+        ));
+        assert!(!is_windows_workstation_lock_chord(
+            ModifierMask(ModifierMask::META_LEFT | ModifierMask::SHIFT_LEFT),
+            key_l,
+            true
+        ));
+    }
 }

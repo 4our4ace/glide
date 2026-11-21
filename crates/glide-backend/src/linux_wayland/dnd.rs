@@ -22,7 +22,7 @@
 
 use crate::dnd::{
     format_gnome_copied_files, format_uri_list, DndBackend, DropDeliveryOutcome,
-    FALLBACK_HINT_SINGLE_LINE,
+    WAYLAND_FALLBACK_HINT_SINGLE_LINE,
 };
 use anyhow::{anyhow, Result};
 use glide_proto::Edge;
@@ -101,7 +101,9 @@ fn spawn_wayland_fallback_notification() {
     let _ = std::thread::Builder::new()
         .name("glide-wl-dnd-hint".into())
         .spawn(|| {
-            if let Err(e) = send_freedesktop_notification("Glide", FALLBACK_HINT_SINGLE_LINE, 4000) {
+            if let Err(e) =
+                send_freedesktop_notification("Glide", WAYLAND_FALLBACK_HINT_SINGLE_LINE, 4500)
+            {
                 debug!(error = %e, "Could not send Wayland desktop notification for DnD fallback");
             }
         });

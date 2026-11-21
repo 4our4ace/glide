@@ -46,10 +46,25 @@ pub trait DndBackend: Send + Sync {
     /// and hides edge strips so Glide can seamlessly transition control to the peer.
     fn cancel_local_drag(&self);
 
+    /// Returns `true` if this backend supports initiating a live OS drag-and-drop session
+    /// (Windows Shell `SHDoDragDrop` or Linux X11 live XDND v5) while the user is still holding LMB.
+    fn supports_live_os_drag(&self) -> bool {
+        false
+    }
+
+    /// Notifies the backend that an incoming cross-edge drag has started from a peer,
+    /// before file payloads have necessarily finished transferring over QUIC.
+    /// Backends can immediately display a floating cursor-tracking file preview badge.
+    fn on_incoming_drag_start(&self, _filenames: &[String], _x: i32, _y: i32) {}
+
+    /// Notifies the backend that all incoming drag files have finished saving to disk while
+    /// the drag is still active, allowing live OS drag initiation (`SHDoDragDrop` / live XDND).
+    fn on_incoming_drag_files_ready(&self, _paths: Vec<PathBuf>) {}
+
     /// Optional live cursor notification while an incoming cross-edge drag moves over this screen.
     fn on_incoming_drag_move(&self, _x: i32, _y: i32) {}
 
-    /// Cancels any live hover state for an incoming cross-edge drag.
+    /// Cancels any live hover state, floating preview, or live OS drag session for an incoming drag.
     fn on_incoming_drag_cancel(&self) {}
 
     /// Hands off received files (already saved on disk in `Downloads/Glide/`) to the target
@@ -171,6 +186,66 @@ pub const FALLBACK_HINT_SUBTITLE: &str = "Saved to Downloads/Glide (Ctrl+V to pa
 /// Combined single-line fallback message (used in desktop notifications on Wayland).
 pub const FALLBACK_HINT_SINGLE_LINE: &str =
     "This app didn't allow the drop — saved to Downloads/Glide (Ctrl+V to paste)";
+/// Wayland-specific desktop notification text explaining the compositor boundary clearly.
+pub const WAYLAND_FALLBACK_HINT_SINGLE_LINE: &str =
+    "Wayland blocks synthetic drag-drop — press Ctrl+V to paste here (saved to Downloads/Glide)";
+
+/// Formats a concise human-readable label for a floating cursor drag preview badge
+/// (e.g. `"report.pdf"`, `"very-long-name…pdf"`, or `"3 files"`).
+pub fn format_drag_preview_label(filenames: &[String]) -> String {
+    match filenames.len() {
+        0 => "1 file".to_string(),
+        1 => {
+            let name = filenames[0].trim();
+            if name.is_empty() {
+                return "1 file".to_string();
+            }
+            const MAX_CHARS: usize = 26;
+            let chars: Vec<char> = name.chars().collect();
+            if chars.len() <= MAX_CHARS {
+                return name.to_string();
+            }
+            // Preserve short file extension if present (e.g. ".pdf", ".png", ".docx").
+            if let Some(dot_pos) = chars.iter().rposition(|&c| c == '.') {
+                let ext_len = chars.len() - dot_pos;
+                if ext_len > 1 && ext_len <= 8 && dot_pos > 4 {
+                    let keep_prefix = MAX_CHARS.saturating_sub(ext_len + 3).max(4);
+                    let prefix: String = chars[..keep_prefix].iter().collect();
+                    let ext: String = chars[dot_pos..].iter().collect();
+                    return format!("{prefix}...{ext}");
+                }
+            }
+            let prefix: String = chars[..MAX_CHARS - 3].iter().collect();
+            format!("{prefix}...")
+        }
+        n => format!("{n} files"),
+    }
+}
+
+/// Extracts a short uppercase file extension badge (up to 4 ASCII chars, e.g. `"PDF"`, `"PNG"`, `"ZIP"`).
+pub fn format_drag_extension_badge(filenames: &[String]) -> String {
+    if filenames.len() > 1 {
+        return format!("+{}", filenames.len());
+    }
+    let Some(first) = filenames.first() else {
+        return "FILE".to_string();
+    };
+    let ext = Path::new(first)
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("");
+    let cleaned: String = ext
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric())
+        .take(4)
+        .map(|c| c.to_ascii_uppercase())
+        .collect();
+    if cleaned.is_empty() {
+        "FILE".to_string()
+    } else {
+        cleaned
+    }
+}
 
 /// Computes a safe screen position `(x, y)` for a cursor-adjacent hint popup of size
 /// `(width, height)` starting at `(cursor_x + 14, cursor_y + 18)`, flipping or clamping inside
@@ -568,5 +643,33 @@ mod tests {
         let (lx, ly) = clamp_hint_popup_pos(&geom, -100, 500, 320, 56);
         assert!(lx >= -1912 && lx + 320 <= -8, "lx={lx} clipped out of Left monitor");
         assert_eq!(ly, 518);
+    }
+
+    #[test]
+    fn drag_preview_label_and_badge_format_cleanly() {
+        assert_eq!(format_drag_preview_label(&[]), "1 file");
+        assert_eq!(
+            format_drag_preview_label(&["report.pdf".to_string()]),
+            "report.pdf"
+        );
+        assert_eq!(
+            format_drag_preview_label(&["a.png".to_string(), "b.png".to_string()]),
+            "2 files"
+        );
+        let long = format_drag_preview_label(&[
+            "super-long-quarterly-presentation-final-v3.pptx".to_string(),
+        ]);
+        assert!(long.ends_with(".pptx"), "should keep extension: {long}");
+        assert!(long.chars().count() <= 26, "should truncate: {long}");
+
+        assert_eq!(
+            format_drag_extension_badge(&["photo.jpeg".to_string()]),
+            "JPEG"
+        );
+        assert_eq!(
+            format_drag_extension_badge(&["a.txt".to_string(), "b.txt".to_string()]),
+            "+2"
+        );
+        assert_eq!(format_drag_extension_badge(&["README".to_string()]), "FILE");
     }
 }
