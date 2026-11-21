@@ -26,6 +26,9 @@ use tokio::sync::mpsc;
 use tracing::{debug, trace, warn};
 use windows_sys::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
 use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
+use windows_sys::Win32::System::RemoteDesktop::{
+    WTSRegisterSessionNotification, WTSUnRegisterSessionNotification, NOTIFY_FOR_THIS_SESSION,
+};
 use windows_sys::Win32::System::Threading::{
     GetCurrentThread, SetThreadPriority, THREAD_PRIORITY_HIGHEST,
 };
@@ -35,13 +38,16 @@ use windows_sys::Win32::UI::Input::{
     RAWINPUTDEVICE, RAWINPUTHEADER, RIDEV_INPUTSINK, RID_INPUT, RIM_TYPEMOUSE,
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::{
-    CallNextHookEx, CreateWindowExW, DefWindowProcW, DispatchMessageW, GetClassNameW, GetCursorPos,
-    GetForegroundWindow, GetMessageW, GetWindowRect, PostMessageW, RegisterClassW, SetCursorPos,
-    SetWindowsHookExW, TranslateMessage, UnhookWindowsHookEx, HHOOK, HWND_MESSAGE, KBDLLHOOKSTRUCT,
-    LLKHF_EXTENDED, MSG, MSLLHOOKSTRUCT, WH_KEYBOARD_LL, WH_MOUSE_LL, WM_APP, WM_INPUT, WM_KEYDOWN,
-    WM_KEYUP, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MBUTTONDOWN, WM_MBUTTONUP, WM_MOUSEHWHEEL,
-    WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_QUIT, WM_RBUTTONDOWN, WM_RBUTTONUP, WM_SYSKEYDOWN, WM_SYSKEYUP,
-    WM_XBUTTONDOWN, WM_XBUTTONUP, WNDCLASSW, XBUTTON1, XBUTTON2,
+    CallNextHookEx, CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW,
+    GetClassNameW, GetCursorPos, GetForegroundWindow, GetMessageW, GetWindowRect, PostMessageW,
+    RegisterClassW, SetCursorPos, SetWindowsHookExW, TranslateMessage, UnhookWindowsHookEx, HHOOK,
+    KBDLLHOOKSTRUCT, LLKHF_EXTENDED, MSG, MSLLHOOKSTRUCT, PBT_APMRESUMEAUTOMATIC,
+    PBT_APMRESUMECRITICAL, PBT_APMRESUMESUSPEND, PBT_APMSUSPEND, WH_KEYBOARD_LL, WH_MOUSE_LL,
+    WM_APP, WM_DISPLAYCHANGE, WM_DPICHANGED, WM_INPUT, WM_KEYDOWN, WM_KEYUP, WM_LBUTTONDOWN,
+    WM_LBUTTONUP, WM_MBUTTONDOWN, WM_MBUTTONUP, WM_MOUSEHWHEEL, WM_MOUSEMOVE, WM_MOUSEWHEEL,
+    WM_POWERBROADCAST, WM_QUIT, WM_RBUTTONDOWN, WM_RBUTTONUP, WM_SYSKEYDOWN, WM_SYSKEYUP,
+    WM_WTSSESSION_CHANGE, WM_XBUTTONDOWN, WM_XBUTTONUP, WNDCLASSW, WS_EX_NOACTIVATE,
+    WS_EX_TOOLWINDOW, WS_OVERLAPPED, WTS_SESSION_LOCK, WTS_SESSION_UNLOCK, XBUTTON1, XBUTTON2,
 };
 
 const WM_APP_ENTER_REMOTE: u32 = WM_APP + 1;
@@ -79,11 +85,43 @@ struct HookState {
     start_instant: Instant,
     last_raw_mouse_ms: AtomicU64,
     last_geom_refresh_ms: AtomicU64,
+    last_resume_emit: Mutex<Option<Instant>>,
 }
 
 impl HookState {
     fn elapsed_ms(&self) -> u64 {
         self.start_instant.elapsed().as_millis() as u64
+    }
+
+    fn refresh_geometry_now(&self) -> bool {
+        self.last_geom_refresh_ms
+            .store(self.elapsed_ms(), Ordering::Relaxed);
+        let Ok(new_geom) = query_desktop_geometry() else {
+            return false;
+        };
+        let changed = {
+            let mut geom = self.geometry.write();
+            if *geom != new_geom {
+                *geom = new_geom.clone();
+                true
+            } else {
+                false
+            }
+        };
+        if changed {
+            *self.edge_push.lock() = (None, 0.0, None);
+            self.edge_push_active.store(false, Ordering::Release);
+            if self.remote_mode.load(Ordering::Acquire) {
+                self.park_cursor_invisibly();
+            }
+            debug!(
+                monitors = new_geom.monitors.len(),
+                primary_scale = new_geom.primary_scale(),
+                "Refreshed Windows desktop geometry"
+            );
+            let _ = self.tx.send(CaptureEvent::GeometryChanged(new_geom));
+        }
+        changed
     }
 
     fn maybe_refresh_geometry(&self) {
@@ -95,9 +133,62 @@ impl HookState {
                 .compare_exchange(prev, now, Ordering::Relaxed, Ordering::Relaxed)
                 .is_ok()
         {
-            if let Ok(geom) = query_desktop_geometry() {
-                *self.geometry.write() = geom;
+            let _ = self.refresh_geometry_now();
+        }
+    }
+
+    fn restore_cursor_visibly(&self) {
+        let (nx, ny) = self.last_local_norm.load();
+        let (x, y) = self.geometry.read().denormalize_point(nx, ny);
+        unsafe {
+            SetCursorPos(x, y);
+        }
+    }
+
+    /// Unconditionally exits remote mode, restores the cursor onto the visible desktop,
+    /// clears stale modifier/edge-push state, and notifies `glide-core` so remote clients
+    /// immediately release any held keys — guaranteeing the user is never locked out of
+    /// their Windows lock screen or wake prompt.
+    fn release_to_local_on_suspend(&self, reason: &str) {
+        let was_remote = self.remote_mode.swap(false, Ordering::SeqCst);
+        self.mods.store(0, Ordering::Relaxed);
+        *self.edge_push.lock() = (None, 0.0, None);
+        self.edge_push_active.store(false, Ordering::Release);
+        *self.pending_leave.lock() = None;
+        if was_remote {
+            self.restore_cursor_visibly();
+        }
+        debug!(
+            reason,
+            was_remote, "Windows capture released to local mode on suspend/session lock"
+        );
+        let _ = self.tx.send(CaptureEvent::SystemSuspended);
+    }
+
+    /// Ensures clean local state after wake or session unlock, immediately refreshes display
+    /// geometry (monitors often change while asleep), and emits a debounced `SystemResumed`.
+    fn handle_resume_or_unlock(&self, reason: &str) {
+        if self.remote_mode.swap(false, Ordering::SeqCst) {
+            self.restore_cursor_visibly();
+        }
+        self.mods.store(0, Ordering::Relaxed);
+        *self.edge_push.lock() = (None, 0.0, None);
+        self.edge_push_active.store(false, Ordering::Release);
+        *self.pending_leave.lock() = None;
+
+        let _ = self.refresh_geometry_now();
+
+        let should_emit = {
+            let mut last = self.last_resume_emit.lock();
+            let emit = last.is_none_or(|t| t.elapsed() >= Duration::from_secs(1));
+            if emit {
+                *last = Some(Instant::now());
             }
+            emit
+        };
+        if should_emit {
+            debug!(reason, "Windows capture detected system resume/unlock");
+            let _ = self.tx.send(CaptureEvent::SystemResumed);
         }
     }
 
@@ -696,6 +787,42 @@ unsafe extern "system" fn capture_wnd_proc(
             });
             0
         }
+        WM_DISPLAYCHANGE | WM_DPICHANGED => {
+            with_hook_state(|state| {
+                state.refresh_geometry_now();
+            });
+            0
+        }
+        WM_POWERBROADCAST => match wparam as u32 {
+            PBT_APMSUSPEND => {
+                with_hook_state(|state| {
+                    state.release_to_local_on_suspend("PBT_APMSUSPEND");
+                });
+                1 // TRUE per Win32 WM_POWERBROADCAST specification
+            }
+            PBT_APMRESUMEAUTOMATIC | PBT_APMRESUMESUSPEND | PBT_APMRESUMECRITICAL => {
+                with_hook_state(|state| {
+                    state.handle_resume_or_unlock("WM_POWERBROADCAST_RESUME");
+                });
+                1
+            }
+            _ => unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) },
+        },
+        WM_WTSSESSION_CHANGE => match wparam as u32 {
+            WTS_SESSION_LOCK => {
+                with_hook_state(|state| {
+                    state.release_to_local_on_suspend("WTS_SESSION_LOCK");
+                });
+                0
+            }
+            WTS_SESSION_UNLOCK => {
+                with_hook_state(|state| {
+                    state.handle_resume_or_unlock("WTS_SESSION_UNLOCK");
+                });
+                0
+            }
+            _ => 0,
+        },
         _ => unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) },
     }
 }
@@ -728,6 +855,7 @@ pub fn start_windows_capture(config: CaptureConfig) -> Result<CaptureHandle> {
         start_instant: Instant::now(),
         last_raw_mouse_ms: AtomicU64::new(0),
         last_geom_refresh_ms: AtomicU64::new(0),
+        last_resume_emit: Mutex::new(None),
     });
 
     let cell = GLOBAL_HOOK_STATE.get_or_init(|| RwLock::new(None));
@@ -742,9 +870,9 @@ pub fn start_windows_capture(config: CaptureConfig) -> Result<CaptureHandle> {
                 let _ = SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_HIGHEST);
             }
             match init_capture_window_and_hooks() {
-                Ok((hwnd, kb_hook, ms_hook)) => {
+                Ok((hwnd, kb_hook, ms_hook, wts_registered)) => {
                     let _ = ready_tx.send(Ok(hwnd as isize));
-                    debug!("Windows Raw Input + LL hooks active");
+                    debug!(wts_registered, "Windows Raw Input + LL hooks active");
 
                     let mut msg: MSG = unsafe { std::mem::zeroed() };
                     while unsafe { GetMessageW(&mut msg, ptr::null_mut(), 0, 0) } > 0 {
@@ -761,6 +889,10 @@ pub fn start_windows_capture(config: CaptureConfig) -> Result<CaptureHandle> {
                         if !ms_hook.is_null() {
                             UnhookWindowsHookEx(ms_hook);
                         }
+                        if wts_registered {
+                            WTSUnRegisterSessionNotification(hwnd);
+                        }
+                        DestroyWindow(hwnd);
                     }
                 }
                 Err(e) => {
@@ -786,7 +918,7 @@ pub fn start_windows_capture(config: CaptureConfig) -> Result<CaptureHandle> {
     })
 }
 
-fn init_capture_window_and_hooks() -> Result<(HWND, HHOOK, HHOOK)> {
+fn init_capture_window_and_hooks() -> Result<(HWND, HHOOK, HHOOK, bool)> {
     let class_name: Vec<u16> = "GlideRawInputCaptureWindow\0".encode_utf16().collect();
     let hinstance = unsafe { GetModuleHandleW(ptr::null()) };
 
@@ -807,17 +939,21 @@ fn init_capture_window_and_hooks() -> Result<(HWND, HHOOK, HHOOK)> {
         RegisterClassW(&wc);
     }
 
+    // Use a hidden top-level window (NOT HWND_MESSAGE): message-only windows never receive
+    // broadcast notifications like WM_DISPLAYCHANGE or WM_POWERBROADCAST. Because WS_VISIBLE
+    // is omitted and ShowWindow is never called, the window remains invisible and never appears
+    // in the taskbar or Alt+Tab.
     let hwnd = unsafe {
         CreateWindowExW(
-            0,
+            WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE,
             class_name.as_ptr(),
             class_name.as_ptr(),
+            WS_OVERLAPPED,
             0,
             0,
             0,
             0,
-            0,
-            HWND_MESSAGE,
+            ptr::null_mut(),
             ptr::null_mut(),
             hinstance,
             ptr::null(),
@@ -834,12 +970,18 @@ fn init_capture_window_and_hooks() -> Result<(HWND, HHOOK, HHOOK)> {
         hwndTarget: hwnd,
     };
     if unsafe { RegisterRawInputDevices(&rid, 1, size_of::<RAWINPUTDEVICE>() as u32) } == 0 {
+        unsafe {
+            DestroyWindow(hwnd);
+        }
         return Err(anyhow!("RegisterRawInputDevices failed for mouse"));
     }
 
     let kb_hook =
         unsafe { SetWindowsHookExW(WH_KEYBOARD_LL, Some(keyboard_ll_proc), hinstance, 0) };
     if kb_hook.is_null() {
+        unsafe {
+            DestroyWindow(hwnd);
+        }
         return Err(anyhow!("SetWindowsHookExW(WH_KEYBOARD_LL) failed"));
     }
 
@@ -847,9 +989,18 @@ fn init_capture_window_and_hooks() -> Result<(HWND, HHOOK, HHOOK)> {
     if ms_hook.is_null() {
         unsafe {
             UnhookWindowsHookEx(kb_hook);
+            DestroyWindow(hwnd);
         }
         return Err(anyhow!("SetWindowsHookExW(WH_MOUSE_LL) failed"));
     }
 
-    Ok((hwnd, kb_hook, ms_hook))
+    // Best-effort session lock/unlock subscription (WM_WTSSESSION_CHANGE) so pressing Win+L
+    // or idle-locking immediately restores local control and cursor visibility.
+    let wts_registered =
+        unsafe { WTSRegisterSessionNotification(hwnd, NOTIFY_FOR_THIS_SESSION) } != 0;
+    if !wts_registered {
+        warn!("WTSRegisterSessionNotification unavailable; session lock detection degraded (WM_POWERBROADCAST remains active)");
+    }
+
+    Ok((hwnd, kb_hook, ms_hook, wts_registered))
 }

@@ -255,6 +255,8 @@ pub fn clear_restore_token() {
 
 #[derive(Default)]
 struct OutputEntry {
+    global_name: u32,
+    removed: bool,
     wl: Option<WlOutput>,
     xdg: Option<ZxdgOutputV1>,
     name: String,
@@ -281,24 +283,35 @@ impl Dispatch<WlRegistry, ()> for OutputQueryState {
         _: &WlConnection,
         qh: &QueueHandle<Self>,
     ) {
-        if let wl_registry::Event::Global {
-            name,
-            interface,
-            version,
-        } = event
-        {
-            if interface == "wl_output" {
-                let idx = state.outputs.len();
-                let wl = registry.bind::<WlOutput, _, _>(name, version.min(4), qh, idx);
-                state.outputs.push(OutputEntry {
-                    wl: Some(wl),
-                    scale: 1,
-                    ..Default::default()
-                });
-            } else if interface == "zxdg_output_manager_v1" && state.xdg_mgr.is_none() {
-                let mgr = registry.bind::<ZxdgOutputManagerV1, _, _>(name, version.min(3), qh, ());
-                state.xdg_mgr = Some(mgr);
+        match event {
+            wl_registry::Event::Global {
+                name,
+                interface,
+                version,
+            } => {
+                if interface == "wl_output" {
+                    let idx = state.outputs.len();
+                    let wl = registry.bind::<WlOutput, _, _>(name, version.min(4), qh, idx);
+                    state.outputs.push(OutputEntry {
+                        global_name: name,
+                        removed: false,
+                        wl: Some(wl),
+                        scale: 1,
+                        ..Default::default()
+                    });
+                } else if interface == "zxdg_output_manager_v1" && state.xdg_mgr.is_none() {
+                    let mgr = registry.bind::<ZxdgOutputManagerV1, _, _>(name, version.min(3), qh, ());
+                    state.xdg_mgr = Some(mgr);
+                }
             }
+            wl_registry::Event::GlobalRemove { name } => {
+                for entry in &mut state.outputs {
+                    if entry.global_name == name {
+                        entry.removed = true;
+                    }
+                }
+            }
+            _ => {}
         }
     }
 }
@@ -385,6 +398,26 @@ impl Dispatch<ZxdgOutputV1, usize> for OutputQueryState {
     }
 }
 
+/// Computes an effective fractional scale factor from physical mode pixels and logical `xdg-output`
+/// dimensions (rotation-invariant via area ratio), falling back to the integer `wl_output` scale.
+pub(crate) fn compute_wayland_effective_scale(
+    wl_w: i32,
+    wl_h: i32,
+    xdg_size: Option<(i32, i32)>,
+    int_scale: i32,
+) -> f32 {
+    if let Some((lw, lh)) = xdg_size {
+        if wl_w > 0 && wl_h > 0 && lw > 0 && lh > 0 {
+            let ratio = ((wl_w as f64 * wl_h as f64) / (lw as f64 * lh as f64)).sqrt();
+            if ratio.is_finite() {
+                let rounded = (ratio * 100.0).round() / 100.0;
+                return (rounded as f32).clamp(0.5, 4.0);
+            }
+        }
+    }
+    (int_scale.max(1) as f32).clamp(0.5, 4.0)
+}
+
 /// Queries the active multi-monitor logical layout directly from the Wayland compositor.
 pub fn query_desktop_geometry() -> Result<DesktopGeometry> {
     let conn = WlConnection::connect_to_env()
@@ -403,8 +436,10 @@ pub fn query_desktop_geometry() -> Result<DesktopGeometry> {
 
     if let Some(mgr) = state.xdg_mgr.clone() {
         for (idx, entry) in state.outputs.iter_mut().enumerate() {
-            if let Some(wl) = entry.wl.as_ref() {
-                entry.xdg = Some(mgr.get_xdg_output(wl, &qh, idx));
+            if !entry.removed {
+                if let Some(wl) = entry.wl.as_ref() {
+                    entry.xdg = Some(mgr.get_xdg_output(wl, &qh, idx));
+                }
             }
         }
         queue
@@ -416,14 +451,19 @@ pub fn query_desktop_geometry() -> Result<DesktopGeometry> {
 
     let mut monitors = Vec::new();
     for (idx, o) in state.outputs.into_iter().enumerate() {
+        if o.removed {
+            continue;
+        }
         let (x, y) = o.xdg_pos.unwrap_or((o.wl_x, o.wl_y));
-        let scale = o.scale.max(1) as f32;
-        let (w, h) = o
-            .xdg_size
-            .unwrap_or(((o.wl_w as f32 / scale).round() as i32, (o.wl_h as f32 / scale).round() as i32));
+        let int_scale = o.scale.max(1) as f32;
+        let (w, h) = o.xdg_size.unwrap_or((
+            (o.wl_w as f32 / int_scale).round() as i32,
+            (o.wl_h as f32 / int_scale).round() as i32,
+        ));
         if w <= 0 || h <= 0 {
             continue;
         }
+        let scale = compute_wayland_effective_scale(o.wl_w, o.wl_h, o.xdg_size, o.scale);
         let name = if o.name.is_empty() {
             format!("Wayland-{idx}")
         } else {
@@ -436,7 +476,7 @@ pub fn query_desktop_geometry() -> Result<DesktopGeometry> {
             width: w,
             height: h,
             scale,
-            primary: idx == 0,
+            primary: monitors.is_empty(),
         });
     }
 
@@ -579,5 +619,19 @@ mod tests {
             "secret-restore-token"
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn wayland_effective_scale_handles_fractional_and_rotated_outputs() {
+        // 4K panel at 150% fractional scaling (landscape)
+        assert!((compute_wayland_effective_scale(3840, 2160, Some((2560, 1440)), 2) - 1.5).abs() < 0.01);
+        // Same panel rotated 90 degrees (portrait logical size)
+        assert!((compute_wayland_effective_scale(3840, 2160, Some((1440, 2560)), 2) - 1.5).abs() < 0.01);
+        // 125% fractional scaling on 1080p
+        assert!((compute_wayland_effective_scale(1920, 1080, Some((1536, 864)), 2) - 1.25).abs() < 0.01);
+        // Fallback to integer wl_output scale when xdg-output unavailable
+        assert!((compute_wayland_effective_scale(3840, 2160, None, 2) - 2.0).abs() < 0.01);
+        // Zero/degenerate sizes safely fall back without NaN
+        assert!((compute_wayland_effective_scale(0, 0, Some((0, 0)), 1) - 1.0).abs() < 0.01);
     }
 }

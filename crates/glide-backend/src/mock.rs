@@ -17,6 +17,7 @@ use tokio::sync::mpsc;
 #[derive(Debug, Default)]
 pub struct MockCaptureState {
     pub active_edges: Mutex<Vec<Edge>>,
+    pub geometry: Mutex<DesktopGeometry>,
     pub remote_mode: AtomicBool,
     pub locked: AtomicBool,
     pub last_leave: Mutex<Option<(Edge, f32)>>,
@@ -26,7 +27,6 @@ pub struct MockCaptureState {
 
 pub struct MockCaptureControl {
     pub state: Arc<MockCaptureState>,
-    pub geometry: DesktopGeometry,
 }
 
 impl CaptureControl for MockCaptureControl {
@@ -63,7 +63,7 @@ impl CaptureControl for MockCaptureControl {
     }
 
     fn desktop_geometry(&self) -> DesktopGeometry {
-        self.geometry.clone()
+        self.state.geometry.lock().clone()
     }
 
     fn lock_state(&self) -> LockState {
@@ -83,10 +83,12 @@ pub fn create_mock_capture(
     Arc<MockCaptureState>,
 ) {
     let (tx, rx) = mpsc::unbounded_channel();
-    let state = Arc::new(MockCaptureState::default());
+    let state = Arc::new(MockCaptureState {
+        geometry: Mutex::new(geometry),
+        ..Default::default()
+    });
     let control = MockCaptureControl {
         state: Arc::clone(&state),
-        geometry,
     };
     (
         CaptureHandle {
@@ -113,6 +115,9 @@ pub enum InjectedAction {
 #[derive(Debug)]
 pub struct MockInjector {
     pub geometry: DesktopGeometry,
+    pub pending_geometry: Arc<Mutex<Option<DesktopGeometry>>>,
+    pub suspended_flag: Arc<AtomicBool>,
+    pub resumed_flag: Arc<AtomicBool>,
     pub cursor_x: f32,
     pub cursor_y: f32,
     pub pressed_keys: HashSet<HidUsage>,
@@ -127,6 +132,9 @@ impl MockInjector {
         let (cx, cy) = geometry.primary_center();
         let me = Self {
             geometry,
+            pending_geometry: Arc::new(Mutex::new(None)),
+            suspended_flag: Arc::new(AtomicBool::new(false)),
+            resumed_flag: Arc::new(AtomicBool::new(false)),
             cursor_x: cx as f32,
             cursor_y: cy as f32,
             pressed_keys: HashSet::new(),
@@ -144,7 +152,33 @@ impl InputInjector for MockInjector {
     }
 
     fn desktop_geometry(&mut self) -> Result<DesktopGeometry> {
+        if let Some(new_geom) = self.pending_geometry.lock().take() {
+            self.geometry = new_geom;
+        }
         Ok(self.geometry.clone())
+    }
+
+    fn poll_geometry_changed(&mut self) -> Option<DesktopGeometry> {
+        let new_geom = self.pending_geometry.lock().take()?;
+        if new_geom != self.geometry {
+            self.geometry = new_geom.clone();
+            self.edge_push_accum = 0.0;
+            return Some(new_geom);
+        }
+        None
+    }
+
+    fn poll_system_suspended(&mut self) -> bool {
+        if self.suspended_flag.swap(false, Ordering::SeqCst) {
+            let _ = self.release_all();
+            true
+        } else {
+            false
+        }
+    }
+
+    fn poll_system_resumed(&mut self) -> bool {
+        self.resumed_flag.swap(false, Ordering::SeqCst)
     }
 
     fn enter(&mut self, edge: Edge, normalized_pos: f32) -> Result<()> {

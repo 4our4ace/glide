@@ -449,6 +449,20 @@ pub fn spawn_server_beacon(
     fingerprint: String,
     os: String,
 ) -> Result<JoinHandle<()>> {
+    spawn_server_beacon_with_refresh(discovery_port, name, quic_port, fingerprint, os, None)
+}
+
+/// Spawns the server-side LAN discovery responder with an optional external refresh trigger
+/// (e.g. signaled immediately on system resume/wake or interface roaming to re-join multicast
+/// and broadcast fresh LAN IPs without waiting for the 3-second polling interval).
+pub fn spawn_server_beacon_with_refresh(
+    discovery_port: u16,
+    name: String,
+    quic_port: u16,
+    fingerprint: String,
+    os: String,
+    refresh_notify: Option<std::sync::Arc<tokio::sync::Notify>>,
+) -> Result<JoinHandle<()>> {
     let initial_ifaces = active_ipv4_interfaces();
     let (socket, mut joined_ifaces) =
         bind_listener_socket_with_ifaces(discovery_port, &initial_ifaces)?;
@@ -456,6 +470,7 @@ pub fn spawn_server_beacon(
     let handle = tokio::spawn(async move {
         let mut buf = [0u8; 1024];
         let mut beacon_tick = tokio::time::interval(Duration::from_millis(500));
+        beacon_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         let mut last_iface_refresh = Instant::now();
         let mut rate_limiter = ProbeRateLimiter::new(Instant::now());
         let mut blaster = BroadcastBlaster::new(&initial_ifaces);
@@ -475,27 +490,99 @@ pub fn spawn_server_beacon(
         let mut cached_ips = ranked_ipv4_addresses(&initial_ifaces);
         let mut cached_payload = make_payload(&cached_ips);
 
+        let refresh_interfaces =
+            |socket: &UdpSocket,
+             joined_ifaces: &mut HashSet<Ipv4Addr>,
+             blaster: &mut BroadcastBlaster,
+             cached_ips: &mut Vec<String>,
+             cached_payload: &mut Vec<u8>,
+             force_rejoin: bool| {
+                let current = active_ipv4_interfaces();
+                if force_rejoin {
+                    // After sleep/wake or link bounce the OS/NIC may drop IGMP membership even
+                    // if it reacquires the same IP address — leave first (avoiding EADDRINUSE
+                    // when the kernel retained state and forcing a fresh IGMP report) then re-join.
+                    for old_ip in joined_ifaces.drain() {
+                        let _ = socket.leave_multicast_v4(DISCOVERY_MULTICAST_ADDR, old_ip);
+                    }
+                    let _ =
+                        socket.leave_multicast_v4(DISCOVERY_MULTICAST_ADDR, Ipv4Addr::UNSPECIFIED);
+                } else {
+                    let live_ips: HashSet<Ipv4Addr> = current.iter().map(|i| i.ip).collect();
+                    joined_ifaces.retain(|ip| {
+                        if live_ips.contains(ip) {
+                            true
+                        } else {
+                            let _ = socket.leave_multicast_v4(DISCOVERY_MULTICAST_ADDR, *ip);
+                            false
+                        }
+                    });
+                }
+                for iface in &current {
+                    if !joined_ifaces.contains(&iface.ip) {
+                        if force_rejoin {
+                            let _ = socket.leave_multicast_v4(DISCOVERY_MULTICAST_ADDR, iface.ip);
+                        }
+                        match socket.join_multicast_v4(DISCOVERY_MULTICAST_ADDR, iface.ip) {
+                            Ok(()) => {
+                                debug!(
+                                    ip = %iface.ip,
+                                    iface = %iface.name,
+                                    force_rejoin,
+                                    "Joined discovery multicast on interface"
+                                );
+                                joined_ifaces.insert(iface.ip);
+                            }
+                            Err(e) if e.kind() == std::io::ErrorKind::AddrInUse => {
+                                joined_ifaces.insert(iface.ip);
+                            }
+                            Err(_) => {}
+                        }
+                    }
+                }
+                if force_rejoin {
+                    let _ =
+                        socket.join_multicast_v4(DISCOVERY_MULTICAST_ADDR, Ipv4Addr::UNSPECIFIED);
+                }
+                blaster.refresh(&current);
+                let new_ips = ranked_ipv4_addresses(&current);
+                if force_rejoin || new_ips != *cached_ips {
+                    *cached_ips = new_ips;
+                    *cached_payload = make_payload(cached_ips);
+                }
+            };
+
         loop {
             tokio::select! {
+                _ = async {
+                    match &refresh_notify {
+                        Some(n) => n.notified().await,
+                        None => std::future::pending().await,
+                    }
+                } => {
+                    debug!("LAN discovery beacon forcing immediate interface & multicast refresh");
+                    last_iface_refresh = Instant::now();
+                    refresh_interfaces(
+                        &socket,
+                        &mut joined_ifaces,
+                        &mut blaster,
+                        &mut cached_ips,
+                        &mut cached_payload,
+                        true,
+                    );
+                    blaster.blast(&cached_payload, discovery_port, true);
+                }
                 _ = beacon_tick.tick() => {
                     if last_iface_refresh.elapsed() >= Duration::from_secs(3) {
                         last_iface_refresh = Instant::now();
-                        let current = active_ipv4_interfaces();
-                        joined_ifaces.retain(|ip| current.iter().any(|i| i.ip == *ip));
-                        for iface in &current {
-                            if !joined_ifaces.contains(&iface.ip)
-                                && socket.join_multicast_v4(DISCOVERY_MULTICAST_ADDR, iface.ip).is_ok()
-                            {
-                                debug!(ip = %iface.ip, iface = %iface.name, "Joined discovery multicast on new interface");
-                                joined_ifaces.insert(iface.ip);
-                            }
-                        }
-                        blaster.refresh(&current);
-                        let new_ips = ranked_ipv4_addresses(&current);
-                        if new_ips != cached_ips {
-                            cached_ips = new_ips;
-                            cached_payload = make_payload(&cached_ips);
-                        }
+                        refresh_interfaces(
+                            &socket,
+                            &mut joined_ifaces,
+                            &mut blaster,
+                            &mut cached_ips,
+                            &mut cached_payload,
+                            false,
+                        );
                     }
                     blaster.blast(&cached_payload, discovery_port, true);
                 }
@@ -555,6 +642,7 @@ pub async fn discover_servers(
     let mut found: HashMap<String, DiscoveredServer> = HashMap::new();
     let deadline = tokio::time::Instant::now() + timeout;
     let mut probe_retry = tokio::time::interval(Duration::from_millis(400));
+    probe_retry.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     probe_retry.tick().await;
 
     let mut buf_a = [0u8; 2048];
@@ -810,5 +898,36 @@ mod tests {
             rl.check(overflow_src, t0 + PROBE_BURST_WINDOW + Duration::from_millis(10)),
             (true, true)
         );
+    }
+
+    #[tokio::test]
+    async fn beacon_refresh_notify_rejoins_and_continues_responding() {
+        let port = 24892;
+        let fp = format!("{}11", "11:".repeat(31));
+        let refresh = std::sync::Arc::new(tokio::sync::Notify::new());
+        let handle = spawn_server_beacon_with_refresh(
+            port,
+            "roaming-host".into(),
+            24810,
+            fp.clone(),
+            "linux-wayland".into(),
+            Some(std::sync::Arc::clone(&refresh)),
+        )
+        .unwrap();
+
+        // Trigger explicit wake/roaming refresh multiple times
+        refresh.notify_one();
+        tokio::time::sleep(Duration::from_millis(60)).await;
+        refresh.notify_one();
+
+        let servers = discover_servers(port, Duration::from_secs(2), Some("roaming-host"), true)
+            .await
+            .unwrap();
+        handle.abort();
+
+        assert!(!servers.is_empty(), "expected beacon after forced refresh");
+        assert_eq!(servers[0].name, "roaming-host");
+        assert_eq!(servers[0].addr.port(), 24810);
+        assert_eq!(servers[0].fingerprint, fp);
     }
 }

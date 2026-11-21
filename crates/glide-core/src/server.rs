@@ -11,12 +11,13 @@
 //! - Live Ping/Pong RTT telemetry & hot-reloadable tuning via [`RuntimeState`] / [`RuntimeCommand`]
 
 use crate::config::ServerConfig;
+use crate::resilience::{HealthProbe, SleepDetector};
 use crate::runtime::{save_received_file, PeerSummary, RuntimeCommand, RuntimeState};
 use anyhow::Result;
 use glide_backend::os_integration::file_receive_dir;
 use glide_backend::{CaptureEvent, CaptureHandle, ClipboardHandle};
 use glide_hid::ModifierMask;
-use glide_net::discovery::spawn_server_beacon;
+use glide_net::discovery::{local_ipv4_addresses, spawn_server_beacon_with_refresh};
 use glide_net::tls::ServerIdentity;
 use glide_net::{
     recv_bulk_stream, send_clipboard_on, send_file_on, sha256_bytes, Connection,
@@ -28,9 +29,10 @@ use glide_proto::{
 };
 use std::collections::HashMap;
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::Duration;
-use tokio::sync::mpsc;
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use std::sync::Arc;
+use std::time::{Duration, Instant};
+use tokio::sync::{mpsc, Notify};
 use tracing::{debug, info, warn};
 
 static NEXT_PEER_ID: AtomicU64 = AtomicU64::new(1);
@@ -44,6 +46,7 @@ struct ConnectedPeer {
     ctrl_tx: mpsc::UnboundedSender<ControlMessage>,
     last_cursor_norm: (f32, f32),
     rtt_ms: Option<f32>,
+    health_probe: HealthProbe,
 }
 
 enum PeerEvent {
@@ -93,7 +96,8 @@ pub async fn run_server_with_backends(
     let local_addr: SocketAddr = endpoint.local_addr();
     let fingerprint = endpoint.fingerprint().to_string();
     let geom = capture.control.desktop_geometry();
-    let server_scale = geom.primary_scale();
+    let server_scale = Arc::new(AtomicU32::new(geom.primary_scale().to_bits()));
+    let mut last_local_ips = local_ipv4_addresses();
 
     if let Some(ref rt) = runtime {
         rt.update(|s| {
@@ -101,6 +105,7 @@ pub async fn run_server_with_backends(
             s.status = "Listening".into();
             s.active_target = "Local".into();
             s.local_addr = Some(local_addr.to_string());
+            s.local_ips = last_local_ips.clone();
             s.fingerprint = Some(fingerprint.clone());
             s.geometry = geom.clone();
             s.last_error = None;
@@ -115,13 +120,15 @@ pub async fn run_server_with_backends(
         "Glide server listening"
     );
 
+    let beacon_refresh = Arc::new(Notify::new());
     let _beacon_guard = if config.discovery {
-        match spawn_server_beacon(
+        match spawn_server_beacon_with_refresh(
             config.discovery_port,
             config.name.clone(),
             local_addr.port(),
             fingerprint.clone(),
             os_label.to_string(),
+            Some(Arc::clone(&beacon_refresh)),
         ) {
             Ok(h) => {
                 info!(
@@ -143,10 +150,12 @@ pub async fn run_server_with_backends(
 
     let server_name = config.name.clone();
     let accept_tx = peer_tx.clone();
+    let accept_scale = Arc::clone(&server_scale);
     let _accept_guard = AbortOnDrop(tokio::spawn(async move {
         while let Some(incoming) = endpoint.accept_incoming().await {
             let sname = server_name.clone();
             let tx = accept_tx.clone();
+            let scale = f32::from_bits(accept_scale.load(Ordering::Relaxed));
             tokio::spawn(async move {
                 let session = match tokio::time::timeout(
                     Duration::from_secs(5),
@@ -164,7 +173,7 @@ pub async fn run_server_with_backends(
                         return;
                     }
                 };
-                if let Err(e) = handle_incoming_session(session, sname, server_scale, tx).await {
+                if let Err(e) = handle_incoming_session(session, sname, scale, tx).await {
                     warn!(error = %e, "Incoming client handshake failed");
                 }
             });
@@ -189,7 +198,10 @@ pub async fn run_server_with_backends(
     tokio::pin!(coalesce_sleep);
 
     let mut ping_interval = tokio::time::interval(Duration::from_millis(500));
+    ping_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     ping_interval.tick().await;
+    let mut sleep_detector = SleepDetector::default();
+    let mut last_ip_check = Instant::now();
 
     let mut capture_events = capture.events;
     let capture_ctrl = capture.control;
@@ -253,6 +265,13 @@ pub async fn run_server_with_backends(
         *coalesce_armed = false;
     };
 
+    let probe_all_peers = |peers: &mut HashMap<u64, ConnectedPeer>, now: Instant| {
+        for peer in peers.values_mut() {
+            let ts_us = peer.health_probe.start_probe(now);
+            let _ = peer.ctrl_tx.send(ControlMessage::Ping { ts_us });
+        }
+    };
+
     loop {
         tokio::select! {
             _ = &mut coalesce_sleep, if coalesce_armed => {
@@ -267,6 +286,104 @@ pub async fn run_server_with_backends(
             }
 
             _ = ping_interval.tick() => {
+                let now = Instant::now();
+
+                // 1. Cross-platform sleep/suspend jump detection (> 5s monotonic or wall-clock leap)
+                if let Some(jump) = sleep_detector.check() {
+                    info!(
+                        jump_secs = jump.as_secs_f32(),
+                        "Detected sleep/wall-clock jump on server; releasing remote focus, refreshing geometry & LAN IPs, and probing peers"
+                    );
+                    if let Some(pid) = active_remote.take() {
+                        if let Some(peer) = peers.get(&pid) {
+                            let _ = peer.ctrl_tx.send(ControlMessage::ReleaseAll);
+                            let _ = peer.ctrl_tx.send(ControlMessage::Leave {
+                                edge: peer.edge.opposite(),
+                                normalized_pos: 0.5,
+                                cursor_norm_x: 0.5,
+                                cursor_norm_y: 0.5,
+                            });
+                        }
+                        active_edge = None;
+                        remote_modifiers = ModifierMask::EMPTY;
+                        pending_dx = 0.0;
+                        pending_dy = 0.0;
+                        coalesce_armed = false;
+                        let (lx, ly) = capture_ctrl.last_local_cursor_norm();
+                        let _ = capture_ctrl.leave_remote_at(lx, ly);
+                    }
+                    let fresh_geom = capture_ctrl.desktop_geometry();
+                    server_scale.store(fresh_geom.primary_scale().to_bits(), Ordering::Relaxed);
+                    let fresh_ips = local_ipv4_addresses();
+                    last_local_ips = fresh_ips.clone();
+                    last_ip_check = now;
+                    if let Some(ref rt) = runtime {
+                        rt.update(|s| {
+                            s.geometry = fresh_geom;
+                            s.local_ips = fresh_ips;
+                        });
+                    }
+                    beacon_refresh.notify_one();
+                    probe_all_peers(&mut peers, now);
+                    sync_runtime_peers(&runtime, &peers, active_remote, locked);
+                } else if now.saturating_duration_since(last_ip_check) >= Duration::from_secs(3) {
+                    // 2. Periodic Wi-Fi <-> Ethernet roaming detection
+                    last_ip_check = now;
+                    let fresh_ips = local_ipv4_addresses();
+                    if fresh_ips != last_local_ips {
+                        info!(
+                            old = ?last_local_ips,
+                            new = ?fresh_ips,
+                            "Server LAN interfaces changed; refreshing discovery beacon and probing peers"
+                        );
+                        last_local_ips = fresh_ips.clone();
+                        if let Some(ref rt) = runtime {
+                            rt.update(|s| {
+                                s.local_ips = fresh_ips;
+                            });
+                        }
+                        beacon_refresh.notify_one();
+                        probe_all_peers(&mut peers, now);
+                    }
+                }
+
+                // 3. Evict any peers whose QUIC connection closed or failed post-resume health ping
+                let dead_ids: Vec<u64> = peers
+                    .iter()
+                    .filter(|(_, p)| {
+                        p.conn.close_reason().is_some() || p.health_probe.is_timed_out(now)
+                    })
+                    .map(|(&id, _)| id)
+                    .collect();
+                for dead_id in dead_ids {
+                    if let Some(peer) = peers.remove(&dead_id) {
+                        let timed_out = peer.health_probe.is_timed_out(now);
+                        warn!(
+                            peer = %peer.name,
+                            timed_out,
+                            "Evicting unresponsive peer after wake/network change"
+                        );
+                        if timed_out {
+                            peer.conn.close(1u32.into(), b"health probe timeout");
+                        }
+                        if edge_to_peer.get(&peer.edge) == Some(&dead_id) {
+                            edge_to_peer.remove(&peer.edge);
+                        }
+                        if active_remote == Some(dead_id) {
+                            active_remote = None;
+                            active_edge = None;
+                            pending_dx = 0.0;
+                            pending_dy = 0.0;
+                            coalesce_armed = false;
+                            remote_modifiers = ModifierMask::EMPTY;
+                            let _ = capture_ctrl.leave_remote(peer.edge, 0.5);
+                        }
+                        let edges: Vec<Edge> = edge_to_peer.keys().copied().collect();
+                        capture_ctrl.set_active_edges(&edges);
+                        sync_runtime_peers(&runtime, &peers, active_remote, locked);
+                    }
+                }
+
                 if !peers.is_empty() {
                     let mut best_rtt: Option<f32> = None;
                     for peer in peers.values_mut() {
@@ -697,6 +814,85 @@ pub async fn run_server_with_backends(
                         coalesce_armed = false;
                         sync_runtime_peers(&runtime, &peers, active_remote, locked);
                     }
+
+                    CaptureEvent::GeometryChanged(new_geom) => {
+                        let new_scale = new_geom.primary_scale();
+                        server_scale.store(new_scale.to_bits(), Ordering::Relaxed);
+                        info!(
+                            monitors = new_geom.monitors.len(),
+                            primary_scale = new_scale,
+                            "Server desktop geometry updated live"
+                        );
+                        if let Some(ref rt) = runtime {
+                            rt.update(|s| {
+                                s.geometry = new_geom;
+                            });
+                        }
+                    }
+
+                    CaptureEvent::SystemSuspended => {
+                        if let Some(pid) = active_remote.take() {
+                            if let Some(peer) = peers.get(&pid) {
+                                info!(
+                                    peer = %peer.name,
+                                    "System suspending/locking; releasing remote control and held keys"
+                                );
+                                let _ = peer.ctrl_tx.send(ControlMessage::ReleaseAll);
+                                let _ = peer.ctrl_tx.send(ControlMessage::Leave {
+                                    edge: peer.edge.opposite(),
+                                    normalized_pos: 0.5,
+                                    cursor_norm_x: 0.5,
+                                    cursor_norm_y: 0.5,
+                                });
+                            }
+                        }
+                        active_edge = None;
+                        remote_modifiers = ModifierMask::EMPTY;
+                        pending_dx = 0.0;
+                        pending_dy = 0.0;
+                        coalesce_armed = false;
+                        let (lx, ly) = capture_ctrl.last_local_cursor_norm();
+                        let _ = capture_ctrl.leave_remote_at(lx, ly);
+                        sync_runtime_peers(&runtime, &peers, active_remote, locked);
+                    }
+
+                    CaptureEvent::SystemResumed => {
+                        let now = Instant::now();
+                        sleep_detector.reset();
+                        info!("System resumed/unlocked; refreshing server geometry, LAN IPs, discovery beacon, and probing peers");
+                        if let Some(pid) = active_remote.take() {
+                            if let Some(peer) = peers.get(&pid) {
+                                let _ = peer.ctrl_tx.send(ControlMessage::ReleaseAll);
+                                let _ = peer.ctrl_tx.send(ControlMessage::Leave {
+                                    edge: peer.edge.opposite(),
+                                    normalized_pos: 0.5,
+                                    cursor_norm_x: 0.5,
+                                    cursor_norm_y: 0.5,
+                                });
+                            }
+                            active_edge = None;
+                            remote_modifiers = ModifierMask::EMPTY;
+                            pending_dx = 0.0;
+                            pending_dy = 0.0;
+                            coalesce_armed = false;
+                            let (lx, ly) = capture_ctrl.last_local_cursor_norm();
+                            let _ = capture_ctrl.leave_remote_at(lx, ly);
+                        }
+                        let fresh_geom = capture_ctrl.desktop_geometry();
+                        server_scale.store(fresh_geom.primary_scale().to_bits(), Ordering::Relaxed);
+                        let fresh_ips = local_ipv4_addresses();
+                        last_local_ips = fresh_ips.clone();
+                        last_ip_check = now;
+                        if let Some(ref rt) = runtime {
+                            rt.update(|s| {
+                                s.geometry = fresh_geom;
+                                s.local_ips = fresh_ips;
+                            });
+                        }
+                        beacon_refresh.notify_one();
+                        probe_all_peers(&mut peers, now);
+                        sync_runtime_peers(&runtime, &peers, active_remote, locked);
+                    }
                 }
             }
 
@@ -734,6 +930,9 @@ pub async fn run_server_with_backends(
                     }
 
                     PeerEvent::Control { peer_id, msg } => {
+                        if let Some(peer) = peers.get_mut(&peer_id) {
+                            peer.health_probe.mark_alive();
+                        }
                         match msg {
                             ControlMessage::Leave {
                                 edge: _,
@@ -822,6 +1021,9 @@ pub async fn run_server_with_backends(
                     }
 
                     PeerEvent::Bulk { peer_id, transfer } => {
+                        if let Some(peer) = peers.get_mut(&peer_id) {
+                            peer.health_probe.mark_alive();
+                        }
                         match transfer {
                             BulkTransfer::Clipboard(payload) => {
                                 if !config.clipboard {
@@ -1033,13 +1235,13 @@ async fn handle_incoming_session(
     let mut ctrl_send = session.ctrl_send;
     let mut ctrl_recv = session.ctrl_recv;
 
-    tokio::spawn(async move {
+    let _ctrl_writer_guard = AbortOnDrop(tokio::spawn(async move {
         while let Some(msg) = ctrl_out_rx.recv().await {
             if ctrl_send.send(&msg).await.is_err() {
                 break;
             }
         }
-    });
+    }));
 
     let bulk_conn = conn.clone();
     let bulk_tx = peer_tx.clone();
@@ -1068,18 +1270,24 @@ async fn handle_incoming_session(
         }
     }));
 
-    let _ = peer_tx.send(PeerEvent::Connected {
-        peer: ConnectedPeer {
-            id: peer_id,
-            name: peer_name,
-            edge,
-            os,
-            conn: conn.clone(),
-            ctrl_tx: ctrl_out_tx,
-            last_cursor_norm: (0.5, 0.5),
-            rtt_ms: None,
-        },
-    });
+    if peer_tx
+        .send(PeerEvent::Connected {
+            peer: ConnectedPeer {
+                id: peer_id,
+                name: peer_name,
+                edge,
+                os,
+                conn: conn.clone(),
+                ctrl_tx: ctrl_out_tx,
+                last_cursor_norm: (0.5, 0.5),
+                rtt_ms: None,
+                health_probe: HealthProbe::default(),
+            },
+        })
+        .is_err()
+    {
+        return Ok(());
+    }
 
     let reason = loop {
         match ctrl_recv.recv().await {

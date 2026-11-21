@@ -645,11 +645,35 @@ impl InputInjector for WaylandInjector {
     }
 
     fn desktop_geometry(&mut self) -> Result<DesktopGeometry> {
+        self.last_geom_refresh = Instant::now();
         if let Ok(g) = query_desktop_geometry() {
             self.geometry = g;
         }
         self.last_geom_refresh = Instant::now();
         Ok(self.geometry.clone())
+    }
+
+    fn poll_geometry_changed(&mut self) -> Option<DesktopGeometry> {
+        if self.last_geom_refresh.elapsed() < Duration::from_secs(3) {
+            return None;
+        }
+        self.last_geom_refresh = Instant::now();
+        if let Ok(new_geom) = query_desktop_geometry() {
+            if new_geom != self.geometry {
+                self.geometry = new_geom;
+                self.edge_push_accum = 0.0;
+                let (min_x, min_y, max_x, max_y) = self.geometry.bounds();
+                self.est_x = self.est_x.clamp(min_x as f32, (max_x - 1) as f32);
+                self.est_y = self.est_y.clamp(min_y as f32, (max_y - 1) as f32);
+                debug!(
+                    monitors = self.geometry.monitors.len(),
+                    primary_scale = self.geometry.primary_scale(),
+                    "WaylandInjector refreshed desktop geometry"
+                );
+                return Some(self.geometry.clone());
+            }
+        }
+        None
     }
 
     fn enter(&mut self, edge: Edge, normalized_pos: f32) -> Result<()> {

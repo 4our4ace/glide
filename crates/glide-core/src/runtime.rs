@@ -48,6 +48,8 @@ pub struct StatusSnapshot {
     pub active_target: String,
     pub locked: bool,
     pub local_addr: Option<String>,
+    #[serde(default)]
+    pub local_ips: Vec<String>,
     pub fingerprint: Option<String>,
     pub rtt_ms: Option<f32>,
     pub rtt_history: Vec<f32>,
@@ -66,6 +68,7 @@ impl Default for StatusSnapshot {
             active_target: "Local".into(),
             locked: false,
             local_addr: None,
+            local_ips: Vec::new(),
             fingerprint: None,
             rtt_ms: None,
             rtt_history: Vec::new(),

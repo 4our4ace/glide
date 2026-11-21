@@ -2,7 +2,9 @@
 //! XRandR multi-monitor edge detection, dead-corner guards, edge dwell, and hotkeys.
 
 use crate::geometry::DesktopGeometry;
-use crate::linux_x11::{query_desktop_geometry, X11CursorHider};
+use crate::linux_x11::{
+    query_desktop_geometry, subscribe_randr_events, unsubscribe_randr_events, X11CursorHider,
+};
 use crate::{
     edge_bit, AtomicEdgeMask, AtomicNormPoint, CaptureConfig, CaptureControl, CaptureEvent,
     CaptureHandle, ALL_EDGES,
@@ -233,6 +235,11 @@ pub fn start_x11_capture(config: CaptureConfig) -> Result<CaptureHandle> {
     conn.xinput_xi_select_events(root, &[event_mask])?
         .check()
         .context("XInput2 xi_select_events failed")?;
+    if subscribe_randr_events(&conn, root) {
+        debug!("Subscribed to XRandR screen/output/CRTC change events");
+    } else {
+        warn!("XRandR event subscription unavailable; using periodic geometry fallback");
+    }
     conn.flush()?;
 
     let shared = Arc::new(SharedState {
@@ -364,6 +371,46 @@ fn run_capture_loop(
         debug!("X11Capture ungrabbed pointer & keyboard (local mode)");
     };
 
+    let refresh_geometry = |conn: &RustConnection,
+                            shared: &SharedState,
+                            local_geom: &mut DesktopGeometry,
+                            grabbed: bool,
+                            edge_push_edge: &mut Option<Edge>,
+                            edge_push_accum: &mut f32,
+                            edge_dwell_start: &mut Option<Instant>,
+                            last_geom_refresh: &mut Instant,
+                            tx: &mpsc::UnboundedSender<CaptureEvent>| {
+        *last_geom_refresh = Instant::now();
+        let Ok(new_geom) = query_desktop_geometry(conn, screen_num) else {
+            return;
+        };
+        let changed = {
+            let mut geom = shared.geometry.write();
+            if *geom != new_geom {
+                *geom = new_geom.clone();
+                true
+            } else {
+                false
+            }
+        };
+        if changed {
+            *local_geom = new_geom.clone();
+            *edge_push_edge = None;
+            *edge_push_accum = 0.0;
+            *edge_dwell_start = None;
+            if grabbed {
+                let (cx, cy) = new_geom.primary_center();
+                let _ = conn.warp_pointer(x11rb::NONE, root, 0, 0, 0, 0, cx as i16, cy as i16);
+                let _ = conn.flush();
+            }
+            debug!(
+                monitors = new_geom.monitors.len(),
+                "X11Capture refreshed desktop geometry"
+            );
+            let _ = tx.send(CaptureEvent::GeometryChanged(new_geom));
+        }
+    };
+
     loop {
         let ev = match conn.wait_for_event() {
             Ok(ev) => ev,
@@ -378,14 +425,33 @@ fn run_capture_loop(
         if !shared.remote_mode.load(Ordering::Acquire)
             && last_geom_refresh.elapsed() >= Duration::from_secs(5)
         {
-            if let Ok(geom) = query_desktop_geometry(&conn, screen_num) {
-                local_geom = geom.clone();
-                *shared.geometry.write() = geom;
-            }
-            last_geom_refresh = Instant::now();
+            refresh_geometry(
+                &conn,
+                &shared,
+                &mut local_geom,
+                grabbed,
+                &mut edge_push_edge,
+                &mut edge_push_accum,
+                &mut edge_dwell_start,
+                &mut last_geom_refresh,
+                &tx,
+            );
         }
 
         match ev {
+            Event::RandrScreenChangeNotify(_) | Event::RandrNotify(_) => {
+                refresh_geometry(
+                    &conn,
+                    &shared,
+                    &mut local_geom,
+                    grabbed,
+                    &mut edge_push_edge,
+                    &mut edge_push_accum,
+                    &mut edge_dwell_start,
+                    &mut last_geom_refresh,
+                    &tx,
+                );
+            }
             Event::ClientMessage(cm) if cm.type_ == wake_atom => {
                 let cmd = cm.data.as_data32()[0];
                 match cmd {
@@ -648,6 +714,7 @@ fn run_capture_loop(
         let _ = conn.ungrab_keyboard(x11rb::CURRENT_TIME);
     }
     cursor_hider.show(&conn, root);
-    let _ = conn.flush();
     let _ = xinput::xi_select_events(&*conn, root, &[]);
+    unsubscribe_randr_events(&conn, root);
+    let _ = conn.flush();
 }
