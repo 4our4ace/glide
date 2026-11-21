@@ -1,6 +1,6 @@
 //! Pure-Rust Linux X11 cross-edge file drag-and-drop backend powered by `x11rb`.
 //!
-//! - **Drag-out (X11 -> Peer):** Maps invisible 1px `InputOnly` `override_redirect`
+//! - **Drag-out (X11 -> Peer):** Maps invisible 4px `InputOnly` `override_redirect`
 //!   `XdndAware` (v5) edge-strip windows along active outer edges ONLY while a local
 //!   left-button drag is armed. Accepts `XdndEnter`/`XdndPosition`, reads `text/uri-list`
 //!   (`file://` paths) via `XdndSelection`, and cancels the local X11 drag cleanly on handoff.
@@ -142,6 +142,14 @@ struct SharedX11Dnd {
     cmds: Mutex<VecDeque<DndCmd>>,
 }
 
+impl SharedX11Dnd {
+    fn clear_staged(&self) {
+        let mut guard = self.staged.lock();
+        *guard = None;
+        self.staged_tracker.clear();
+    }
+}
+
 pub struct X11DndBackend {
     conn: Arc<RustConnection>,
     src_win: Window,
@@ -178,8 +186,7 @@ impl DndBackend for X11DndBackend {
         self.shared.enabled.store(enabled, Ordering::SeqCst);
         if !enabled {
             self.shared.armed.store(false, Ordering::SeqCst);
-            self.shared.staged_tracker.clear();
-            *self.shared.staged.lock() = None;
+            self.shared.clear_staged();
         }
         self.enqueue(DndCmd::SyncStrips);
     }
@@ -196,8 +203,7 @@ impl DndBackend for X11DndBackend {
         let effective = armed && self.shared.enabled.load(Ordering::Acquire);
         let prev = self.shared.armed.swap(effective, Ordering::SeqCst);
         if !effective {
-            self.shared.staged_tracker.clear();
-            *self.shared.staged.lock() = None;
+            self.shared.clear_staged();
         }
         if prev != effective {
             self.enqueue(if effective {
@@ -247,8 +253,7 @@ impl DndBackend for X11DndBackend {
 
     fn cancel_local_drag(&self) {
         self.shared.armed.store(false, Ordering::SeqCst);
-        self.shared.staged_tracker.clear();
-        *self.shared.staged.lock() = None;
+        self.shared.clear_staged();
         self.enqueue(DndCmd::CancelLocalDrag);
     }
 
@@ -1926,7 +1931,8 @@ fn run_x11_dnd_loop(
                                 count = paths.len(),
                                 "Captured text/uri-list paths on X11 edge strip"
                             );
-                            *shared.staged.lock() = Some(StagedDrag {
+                            let mut guard = shared.staged.lock();
+                            *guard = Some(StagedDrag {
                                 edge,
                                 paths,
                                 staged_at: Instant::now(),
@@ -2497,7 +2503,7 @@ mod tests {
         dnd.set_drag_armed(true);
         thread::sleep(Duration::from_millis(60));
 
-        // Find the mapped 1px XdndAware strip at the right edge (x = max_x - 1, y = height / 2)
+        // Find the mapped 4px XdndAware strip at the right edge (x = max_x - 1, y = height / 2)
         let geom = query_desktop_geometry(&warp_conn, warp_screen).unwrap();
         let (_min_x, min_y, max_x, max_y) = geom.bounds();
         let sx = (max_x - 1) as i16;

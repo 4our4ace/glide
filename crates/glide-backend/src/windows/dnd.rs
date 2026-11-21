@@ -1,7 +1,7 @@
 //! Pure-Rust Windows 11 cross-edge file drag-and-drop backend via Win32 COM/OLE (`windows-sys`).
 //!
 //! - **Drag-out (Windows -> Peer):** Registers pure-Rust COM `IDropTarget` instances on
-//!   invisible 1px topmost layered edge-strip windows (`WS_EX_LAYERED | WS_EX_TOPMOST |
+//!   invisible 4px topmost layered edge-strip windows (`WS_EX_LAYERED | WS_EX_TOPMOST |
 //!   WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE`) placed along active outer edges (inset by
 //!   `dead_corner_px`). Strips remain hidden (`SW_HIDE`) at all times except while a local
 //!   left-button drag is armed so normal clicks, scrollbars, and window resizing are never
@@ -13,7 +13,7 @@
 //!      Windows Shell `IDataObject` (`SHCreateDataObject` + `IDragSourceHelper2` with
 //!      `DSH_ALLOWDROPDESCRIPTIONTEXT`, falling back to a `SetData`-capable `CF_HDROP` +
 //!      `Preferred DropEffect` `FileDataObject`), acquires real foreground capture via an
-//!      invisible 16×16 starter click, and runs **live `SHDoDragDrop`** so Windows 11 File
+//!      invisible full virtual-desktop starter click, and runs **live `SHDoDragDrop`** so Windows 11 File
 //!      Explorer highlights folders live, shows `"+ Copy to <Folder>"` tooltips, and drops
 //!      files directly into the hovered folder, Desktop, Chrome, Discord, or VS Code.
 //!   3. Automatically falls back to `CF_HDROP` on the Windows clipboard + cursor hint card
@@ -177,8 +177,9 @@ struct SharedDnd {
 
 impl SharedDnd {
     fn clear_staged(&self) {
+        let mut guard = self.staged.lock();
+        *guard = None;
         self.staged_tracker.clear();
-        *self.staged.lock() = None;
     }
 
     fn post_ctrl(&self, msg: u32) {
@@ -315,21 +316,25 @@ impl DndBackend for WindowsDndBackend {
     }
 
     fn cancel_local_drag(&self) {
+        // 1. Disarm and clear staged state under the staged lock (keep the 4px strip visible
+        //    until AFTER LEFTUP so if Explorer ignores/delays Escape, releasing VK_LBUTTON
+        //    lands on our EdgeDropTarget returning DROPEFFECT_NONE instead of dropping/moving
+        //    files into whatever local window sits underneath the screen edge).
         self.shared.armed.store(false, Ordering::SeqCst);
         self.shared.clear_staged();
-        self.shared.post_hide_strips();
-        // 1. Send a synthetic Escape tap (both VK_ESCAPE + scancode, tagged GLIDE_EXTRA_INFO)
+        // 2. Send a synthetic Escape tap (both VK_ESCAPE + scancode, tagged GLIDE_EXTRA_INFO)
         //    so Explorer's modal DoDragDrop loop cancels cleanly without moving/deleting files
         //    and our LL keyboard hook ignores the injected key.
         send_synthetic_escape();
-        // 2. Give Explorer a brief moment to process VK_ESCAPE and exit DoDragDrop cleanly
-        //    before cursor parking or releasing local VK_LBUTTON.
+        // 3. Give Explorer a brief moment to process VK_ESCAPE and exit DoDragDrop cleanly.
         thread::sleep(Duration::from_millis(20));
-        // 3. Release Windows' kernel VK_LBUTTON if still down (tagged GLIDE_EXTRA_INFO so
+        // 4. Release Windows' kernel VK_LBUTTON if still down (tagged GLIDE_EXTRA_INFO so
         //    mouse_ll_proc ignores it and HookState.lmb_down stays `true` for the remote drag).
         if (unsafe { GetAsyncKeyState(VK_LBUTTON as i32) } as u16 & 0x8000) != 0 {
             send_mouse_button_input(MOUSEEVENTF_LEFTUP);
         }
+        // 5. Now hide the edge strips.
+        self.shared.post_hide_strips();
     }
 
     fn supports_live_os_drag(&self) -> bool {
@@ -393,8 +398,10 @@ impl DndBackend for WindowsDndBackend {
     }
 
     fn on_incoming_drag_cancel(&self) {
-        self.shared.post_preview_hide();
+        // Detach and cancel any live session BEFORE hiding the preview so a concurrent
+        // LiveDeferred exit cannot re-show the preview after we hide it.
         self.cancel_live_session_inner();
+        self.shared.post_preview_hide();
     }
 
     fn deliver_drop(&self, paths: Vec<PathBuf>) -> Result<DropDeliveryOutcome> {
@@ -414,11 +421,16 @@ impl DndBackend for WindowsDndBackend {
                 {
                     send_mouse_button_input(MOUSEEVENTF_LEFTUP);
                 }
-                // Backup nudge in case physical LMB was already up or cursor was stationary.
+                // Multi-step backup wiggle loop in case physical LMB was already up or cursor is
+                // stationary during a fast flick-drop (spans past QueryContinueDrag's 260ms
+                // threshold so SHDoDragDrop can never stall waiting for a message).
                 let nudge_session = Arc::clone(&session);
                 thread::spawn(move || {
-                    thread::sleep(Duration::from_millis(25));
-                    if !nudge_session.done.load(Ordering::Acquire) {
+                    for delay in [25u64, 60, 110, 120] {
+                        thread::sleep(Duration::from_millis(delay));
+                        if nudge_session.done.load(Ordering::Acquire) {
+                            return;
+                        }
                         send_mouse_wiggle();
                     }
                 });
@@ -524,7 +536,7 @@ pub fn start_windows_dnd() -> Result<Arc<dyn DndBackend>> {
 }
 
 // ---------------------------------------------------------------------------
-// STA thread hosting invisible 1px topmost edge-strip IDropTarget windows
+// STA thread hosting invisible 4px topmost edge-strip IDropTarget windows
 // + click-through floating drag preview card
 // ---------------------------------------------------------------------------
 
@@ -1425,14 +1437,31 @@ unsafe extern "system" fn edge_dt_drag_enter(
     pdw_effect: *mut u32,
 ) -> HRESULT {
     let me = unsafe { &*(this as *const EdgeDropTarget) };
+    if !me.shared.armed.load(Ordering::Acquire) {
+        if !pdw_effect.is_null() {
+            unsafe {
+                *pdw_effect = DROPEFFECT_NONE;
+            }
+        }
+        return S_OK;
+    }
     let paths = unsafe { extract_hdrop_paths(data_obj) };
     if !paths.is_empty() {
+        let mut guard = me.shared.staged.lock();
+        if !me.shared.armed.load(Ordering::Acquire) {
+            if !pdw_effect.is_null() {
+                unsafe {
+                    *pdw_effect = DROPEFFECT_NONE;
+                }
+            }
+            return S_OK;
+        }
         debug!(
             edge = ?me.edge,
             count = paths.len(),
             "Captured CF_HDROP files on Windows edge strip"
         );
-        *me.shared.staged.lock() = Some(StagedDrag {
+        *guard = Some(StagedDrag {
             edge: me.edge,
             paths,
             staged_at: Instant::now(),
@@ -1466,13 +1495,25 @@ unsafe extern "system" fn edge_dt_drag_over(
     pdw_effect: *mut u32,
 ) -> HRESULT {
     let me = unsafe { &*(this as *const EdgeDropTarget) };
+    if !me.shared.armed.load(Ordering::Acquire) {
+        if !pdw_effect.is_null() {
+            unsafe {
+                *pdw_effect = DROPEFFECT_NONE;
+            }
+        }
+        return S_OK;
+    }
     let mut guard = me.shared.staged.lock();
-    let has_files = if let Some(ref mut staged) = *guard {
-        if staged.edge == me.edge {
-            staged.staged_at = Instant::now();
-            staged.left_at = None;
-            me.shared.staged_tracker.touch(me.edge);
-            true
+    let has_files = if me.shared.armed.load(Ordering::Acquire) {
+        if let Some(ref mut staged) = *guard {
+            if staged.edge == me.edge {
+                staged.staged_at = Instant::now();
+                staged.left_at = None;
+                me.shared.staged_tracker.touch(me.edge);
+                true
+            } else {
+                false
+            }
         } else {
             false
         }
@@ -1510,15 +1551,20 @@ unsafe extern "system" fn edge_dt_drop(
     pdw_effect: *mut u32,
 ) -> HRESULT {
     let me = unsafe { &*(this as *const EdgeDropTarget) };
-    let paths = unsafe { extract_hdrop_paths(data_obj) };
-    if !paths.is_empty() {
-        *me.shared.staged.lock() = Some(StagedDrag {
-            edge: me.edge,
-            paths,
-            staged_at: Instant::now(),
-            left_at: Some(Instant::now()),
-        });
-        me.shared.staged_tracker.mark_staged(me.edge, true);
+    if me.shared.armed.load(Ordering::Acquire) {
+        let paths = unsafe { extract_hdrop_paths(data_obj) };
+        if !paths.is_empty() {
+            let mut guard = me.shared.staged.lock();
+            if me.shared.armed.load(Ordering::Acquire) {
+                *guard = Some(StagedDrag {
+                    edge: me.edge,
+                    paths,
+                    staged_at: Instant::now(),
+                    left_at: Some(Instant::now()),
+                });
+                me.shared.staged_tracker.mark_staged(me.edge, true);
+            }
+        }
     }
     // Never return DROPEFFECT_MOVE so Explorer never deletes the original file locally.
     if !pdw_effect.is_null() {
@@ -3087,13 +3133,18 @@ fn run_windows_ole_drag_session(
             "Live Windows OLE drag exited before real drop; keeping preview visible until LMB release"
         );
         // If GiveFeedback had briefly hidden our floating preview before SHDoDragDrop exited
-        // early, restore it while the drag is still in flight so the user keeps smooth feedback.
-        if feedback_seen.load(Ordering::Acquire)
-            && !session.drop_requested.load(Ordering::Acquire)
-            && !session.cancel_requested.load(Ordering::Acquire)
-        {
-            shared.preview.lock().visible = true;
-            shared.post_preview_show();
+        // early, restore it ONLY while this exact session is still the active `live_session`
+        // (holding `live_session` across `preview` + `post_preview_show` serializes against
+        // `on_incoming_drag_cancel` and `deliver_drop` so the preview can never get stuck).
+        if feedback_seen.load(Ordering::Acquire) {
+            let cur = shared.live_session.lock();
+            if cur.as_ref().is_some_and(|s| Arc::ptr_eq(s, session))
+                && !session.drop_requested.load(Ordering::Acquire)
+                && !session.cancel_requested.load(Ordering::Acquire)
+            {
+                shared.preview.lock().visible = true;
+                shared.post_preview_show();
+            }
         }
         return Ok(SessionResult::LiveDeferred);
     }

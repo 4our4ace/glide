@@ -135,6 +135,7 @@ impl StagedEdgeTracker {
     }
 
     /// Refreshes staged freshness when `DragOver` continues on `edge`.
+    /// Callers must hold the paired `staged` mutex after verifying `staged.edge == edge`.
     #[inline]
     pub fn touch(&self, edge: Edge) {
         self.touch_at(edge, self.now_ms());
@@ -142,12 +143,7 @@ impl StagedEdgeTracker {
 
     #[inline]
     pub fn touch_at(&self, edge: Edge, now_ms: u64) {
-        let bit = edge_bit(edge);
-        if (self.mask.load(Ordering::Acquire) & bit) != 0 {
-            let ts = now_ms.max(1);
-            self.staged_at_ms.store(ts, Ordering::Release);
-            self.left_at_ms.store(0, Ordering::Release);
-        }
+        self.mark_staged_at(edge, false, now_ms);
     }
 
     /// Starts the `leave_grace` timer when the drag leaves `edge`'s strip window.
@@ -172,6 +168,8 @@ impl StagedEdgeTracker {
     }
 
     /// Returns the active staged edge bitmask (`0` if empty or expired).
+    /// Strictly read-only so concurrent readers can never clobber a fresh `mark_staged`
+    /// or lock out subsequent `touch()` refreshes after a >4s hover.
     #[inline]
     pub fn active_mask(&self) -> u8 {
         self.active_mask_at(self.now_ms())
@@ -186,12 +184,10 @@ impl StagedEdgeTracker {
         let ts = now_ms.max(1);
         let staged = self.staged_at_ms.load(Ordering::Acquire);
         if staged == 0 || ts.saturating_sub(staged) > self.max_age_ms {
-            self.mask.store(0, Ordering::Release);
             return 0;
         }
         let left = self.left_at_ms.load(Ordering::Acquire);
         if left != 0 && ts.saturating_sub(left) > self.leave_grace_ms {
-            self.mask.store(0, Ordering::Release);
             return 0;
         }
         mask
@@ -837,20 +833,32 @@ mod tests {
         tracker.touch_at(Edge::Right, 2_300);
         assert_eq!(tracker.active_mask_at(3_500), edge_bit(Edge::Right));
 
-        // Past leave grace without re-entering expires cleanly
+        // Past leave grace without re-entering reports 0, and subsequent touch_at recovers cleanly
         tracker.mark_left_at(Edge::Right, 3_500);
         assert_eq!(tracker.active_mask_at(3_851), 0);
+        tracker.touch_at(Edge::Right, 3_900);
+        assert_eq!(tracker.active_mask_at(3_910), edge_bit(Edge::Right));
 
-        // Max-age expiry (4000ms)
+        // Max-age expiry (4000ms) is strictly read-only: reading past 4s returns 0, then
+        // touch_at (hovering >4s with DragOver) recovers cleanly and never locks out!
         tracker.mark_staged_at(Edge::Left, false, 5_000);
         assert_eq!(tracker.active_mask_at(9_000), edge_bit(Edge::Left));
         assert_eq!(tracker.active_mask_at(9_001), 0);
+        // Re-reading at an earlier timestamp or after touch_at confirms mask was never clobbered
+        assert_eq!(tracker.active_mask_at(8_999), edge_bit(Edge::Left));
+        tracker.touch_at(Edge::Left, 9_100);
+        assert_eq!(tracker.active_mask_at(9_200), edge_bit(Edge::Left));
+
+        // Fresh mark_staged_at after an expired read stays intact
+        assert_eq!(tracker.active_mask_at(20_000), 0);
+        tracker.mark_staged_at(Edge::Bottom, false, 20_000);
+        assert_eq!(tracker.active_mask_at(20_050), edge_bit(Edge::Bottom));
 
         // Explicit clear
-        tracker.mark_staged_at(Edge::Top, false, 10_000);
-        assert_eq!(tracker.active_mask_at(10_010), edge_bit(Edge::Top));
+        tracker.mark_staged_at(Edge::Top, false, 25_000);
+        assert_eq!(tracker.active_mask_at(25_010), edge_bit(Edge::Top));
         tracker.clear();
-        assert_eq!(tracker.active_mask_at(10_010), 0);
+        assert_eq!(tracker.active_mask_at(25_010), 0);
     }
 
     #[test]
