@@ -144,25 +144,32 @@ pub async fn run_server_with_backends(
     let server_name = config.name.clone();
     let accept_tx = peer_tx.clone();
     let _accept_guard = AbortOnDrop(tokio::spawn(async move {
-        loop {
-            match endpoint.accept().await {
-                Ok(session) => {
-                    let sname = server_name.clone();
-                    let tx = accept_tx.clone();
-                    tokio::spawn(async move {
-                        if let Err(e) =
-                            handle_incoming_session(session, sname, server_scale, tx).await
-                        {
-                            warn!(error = %e, "Incoming client handshake failed");
-                        }
-                    });
+        while let Some(incoming) = endpoint.accept_incoming().await {
+            let sname = server_name.clone();
+            let tx = accept_tx.clone();
+            tokio::spawn(async move {
+                let session = match tokio::time::timeout(
+                    Duration::from_secs(5),
+                    GlideServerEndpoint::complete_incoming(incoming),
+                )
+                .await
+                {
+                    Ok(Ok(session)) => session,
+                    Ok(Err(e)) => {
+                        warn!(error = %e, "Incoming client QUIC handshake failed");
+                        return;
+                    }
+                    Err(_) => {
+                        warn!("Timed out waiting for incoming client QUIC handshake");
+                        return;
+                    }
+                };
+                if let Err(e) = handle_incoming_session(session, sname, server_scale, tx).await {
+                    warn!(error = %e, "Incoming client handshake failed");
                 }
-                Err(e) => {
-                    warn!(error = %e, "QUIC accept loop ended");
-                    break;
-                }
-            }
+            });
         }
+        debug!("QUIC accept loop ended (server endpoint closed)");
     }));
 
     let mut peers: HashMap<u64, ConnectedPeer> = HashMap::new();

@@ -240,4 +240,92 @@ mod tests {
         cli_task.abort();
         srv_task.abort();
     }
+
+    #[tokio::test]
+    async fn server_accept_loop_survives_failed_client_handshake() {
+        let identity = ServerIdentity::generate_ephemeral().unwrap();
+        let good_fp = identity.fingerprint.clone();
+        let endpoint =
+            GlideServerEndpoint::bind("127.0.0.1:0".parse().unwrap(), &identity).unwrap();
+        let addr = endpoint.local_addr();
+
+        let (capture_handle, _cap_tx, cap_state) =
+            create_mock_capture(DesktopGeometry::fallback());
+        let srv_cfg = ServerConfig {
+            name: "srv-resilience".into(),
+            discovery: false,
+            clipboard: false,
+            ..Default::default()
+        };
+        let srv_task = tokio::spawn(async move {
+            let _ = run_server_with_backends(
+                srv_cfg,
+                endpoint,
+                capture_handle,
+                None,
+                "linux-x11",
+                None,
+                None,
+            )
+            .await;
+        });
+
+        // 1. Connect with an intentionally mismatched pinned fingerprint -> TLS handshake fails.
+        let bad_fp = "00:".repeat(31) + "00";
+        let mut bad_cfg = ClientConfig {
+            name: "bad-client".into(),
+            server: Some(addr.to_string()),
+            edge: Edge::Right,
+            trusted_fingerprint: Some(bad_fp),
+            clipboard: false,
+            ..Default::default()
+        };
+        let (mut bad_inj, _) = MockInjector::new(DesktopGeometry::fallback());
+        let mut none_clip = None;
+        let bad_res =
+            run_client_session(&mut bad_cfg, addr, &mut bad_inj, &mut none_clip, None, None).await;
+        assert!(
+            bad_res.is_err(),
+            "mismatched fingerprint must fail handshake"
+        );
+
+        // 2. Now connect a valid client — server accept loop must still be alive!
+        let mut good_cfg = ClientConfig {
+            name: "good-client".into(),
+            server: Some(addr.to_string()),
+            edge: Edge::Left,
+            trusted_fingerprint: Some(good_fp),
+            clipboard: false,
+            ..Default::default()
+        };
+        let (mut good_inj, _) = MockInjector::new(DesktopGeometry::fallback());
+        let cli_task = tokio::spawn(async move {
+            let mut none_clip = None;
+            let _ = run_client_session(
+                &mut good_cfg,
+                addr,
+                &mut good_inj,
+                &mut none_clip,
+                None,
+                None,
+            )
+            .await;
+        });
+
+        let mut connected = false;
+        for _ in 0..30 {
+            if *cap_state.active_edges.lock() == vec![Edge::Left] {
+                connected = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(
+            connected,
+            "valid client must connect after an earlier failed client TLS handshake"
+        );
+
+        cli_task.abort();
+        srv_task.abort();
+    }
 }
