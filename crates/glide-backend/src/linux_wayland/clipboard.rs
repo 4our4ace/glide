@@ -27,7 +27,7 @@ struct SharedState {
 }
 
 struct WaylandClipboardBackend {
-    shared: Arc<SharedState>,
+    write_tx: Mutex<std::sync::mpsc::Sender<ClipboardPayload>>,
     cancel: CancelHandle,
 }
 
@@ -39,52 +39,59 @@ impl Drop for WaylandClipboardBackend {
 
 impl ClipboardBackend for WaylandClipboardBackend {
     fn set(&self, payload: ClipboardPayload) -> Result<()> {
-        let mut opts = Options::new();
-        opts.clipboard(CopyClipboardType::Regular)
-            .seat(CopySeat::All)
-            .foreground(true);
-
-        let prepared = match payload.format {
-            ClipboardFormat::TextUtf8 => {
-                // Normalize CRLF -> LF for clean Linux pasting; reuse the existing
-                // SHA-256 when no CRLF replacement was needed.
-                let (normalized, hash) = match std::str::from_utf8(&payload.data) {
-                    Ok(s) if s.contains("\r\n") => {
-                        let bytes = s.replace("\r\n", "\n").into_bytes();
-                        let h = sha256_bytes(&bytes);
-                        (bytes, h)
-                    }
-                    _ => (payload.data.to_vec(), payload.sha256),
-                };
-                *self.shared.last_written_hash.lock() = Some(hash);
-                // CopyMimeType::Text registers all standard UTF-8/text MIME types sharing a single Arc<[u8]>.
-                opts.prepare_copy(Source::Bytes(normalized.into()), CopyMimeType::Text)
-                    .map_err(|e| anyhow!("Wayland clipboard prepare_copy text failed: {e}"))?
-            }
-            ClipboardFormat::ImagePng => {
-                *self.shared.last_written_hash.lock() = Some(payload.sha256);
-                let data = payload.data.to_vec();
-                opts.prepare_copy(
-                    Source::Bytes(data.into()),
-                    CopyMimeType::Specific("image/png".into()),
-                )
-                .map_err(|e| anyhow!("Wayland clipboard prepare_copy image failed: {e}"))?
-            }
-        };
-
-        // Serve selection requests in-process on a background thread (never fork!).
-        // The compositor automatically cancels this source when another app or our next
-        // `set()` takes ownership, causing `serve()` to return cleanly.
-        std::thread::Builder::new()
-            .name("glide-wl-clip-serve".into())
-            .spawn(move || {
-                if let Err(e) = prepared.serve() {
-                    debug!(error = %e, "Wayland clipboard source serve ended");
-                }
-            })?;
-
-        Ok(())
+        self.write_tx
+            .lock()
+            .send(payload)
+            .map_err(|_| anyhow!("Wayland clipboard writer thread stopped"))
     }
+}
+
+fn apply_wayland_clipboard_payload(shared: &SharedState, payload: ClipboardPayload) -> Result<()> {
+    let mut opts = Options::new();
+    opts.clipboard(CopyClipboardType::Regular)
+        .seat(CopySeat::All)
+        .foreground(true);
+
+    let prepared = match payload.format {
+        ClipboardFormat::TextUtf8 => {
+            // Normalize CRLF -> LF for clean Linux pasting; reuse the existing
+            // SHA-256 when no CRLF replacement was needed.
+            let (normalized, hash) = match std::str::from_utf8(&payload.data) {
+                Ok(s) if s.contains("\r\n") => {
+                    let bytes = s.replace("\r\n", "\n").into_bytes();
+                    let h = sha256_bytes(&bytes);
+                    (bytes, h)
+                }
+                _ => (payload.data.to_vec(), payload.sha256),
+            };
+            *shared.last_written_hash.lock() = Some(hash);
+            // CopyMimeType::Text registers all standard UTF-8/text MIME types sharing a single Arc<[u8]>.
+            opts.prepare_copy(Source::Bytes(normalized.into()), CopyMimeType::Text)
+                .map_err(|e| anyhow!("Wayland clipboard prepare_copy text failed: {e}"))?
+        }
+        ClipboardFormat::ImagePng => {
+            *shared.last_written_hash.lock() = Some(payload.sha256);
+            let data = payload.data.to_vec();
+            opts.prepare_copy(
+                Source::Bytes(data.into()),
+                CopyMimeType::Specific("image/png".into()),
+            )
+            .map_err(|e| anyhow!("Wayland clipboard prepare_copy image failed: {e}"))?
+        }
+    };
+
+    // Serve selection requests in-process on a background thread (never fork!).
+    // The compositor automatically cancels this source when another app or our next
+    // `set()` takes ownership, causing `serve()` to return cleanly.
+    std::thread::Builder::new()
+        .name("glide-wl-clip-serve".into())
+        .spawn(move || {
+            if let Err(e) = prepared.serve() {
+                debug!(error = %e, "Wayland clipboard source serve ended");
+            }
+        })?;
+
+    Ok(())
 }
 
 fn pick_best_mime(mime_types: &[String]) -> Option<(ClipboardFormat, String)> {
@@ -195,9 +202,28 @@ pub fn start_wayland_clipboard() -> Result<ClipboardHandle> {
                     }
                 })?;
 
+            let (write_tx, write_rx) = std::sync::mpsc::channel::<ClipboardPayload>();
+            let shared_writer = Arc::clone(&shared);
+            std::thread::Builder::new()
+                .name("glide-wl-clip-writer".into())
+                .spawn(move || {
+                    while let Ok(mut payload) = write_rx.recv() {
+                        // Latest-wins coalescing if multiple remote updates arrived back-to-back.
+                        while let Ok(newer) = write_rx.try_recv() {
+                            payload = newer;
+                        }
+                        if let Err(e) = apply_wayland_clipboard_payload(&shared_writer, payload) {
+                            warn!(error = %e, "Failed setting Wayland clipboard");
+                        }
+                    }
+                })?;
+
             info!("Wayland native clipboard active (ext-data-control / wlr-data-control)");
             Ok(ClipboardHandle {
-                backend: Box::new(WaylandClipboardBackend { shared, cancel }),
+                backend: Box::new(WaylandClipboardBackend {
+                    write_tx: Mutex::new(write_tx),
+                    cancel,
+                }),
                 local_changes: rx,
             })
         }

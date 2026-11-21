@@ -18,12 +18,16 @@ use crate::dnd::{
     DndBackend, DropDeliveryOutcome, EdgeStripRect, StagedEdgeTracker,
 };
 use crate::geometry::DesktopGeometry;
-use crate::linux_x11::query_desktop_geometry;
+use crate::linux_x11::{
+    poll_fd_and_wake, query_desktop_geometry, subscribe_randr_events, unsubscribe_randr_events,
+    wake_pipe, WakeReceiver, WakeSender,
+};
 use anyhow::{anyhow, Context, Result};
 use glide_hid::HidUsage;
 use glide_proto::Edge;
 use parking_lot::Mutex;
 use std::collections::VecDeque;
+use std::os::fd::AsRawFd;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 use std::sync::Arc;
@@ -68,7 +72,6 @@ struct XdndAtoms {
     wm_state: Atom,
     prop_data: Atom,
     prop_time: Atom,
-    wake: Atom,
 }
 
 impl XdndAtoms {
@@ -95,7 +98,6 @@ impl XdndAtoms {
             wm_state: intern(b"WM_STATE")?,
             prop_data: intern(b"GLIDE_XDND_DATA")?,
             prop_time: intern(b"GLIDE_XDND_TIME")?,
-            wake: intern(b"GLIDE_XDND_WAKE")?,
         })
     }
 }
@@ -109,6 +111,7 @@ struct StagedDrag {
 
 enum DndCmd {
     SyncStrips,
+    RefreshGeomAndSyncStrips,
     HideStrips,
     CancelLocalDrag,
     IncomingDragStart {
@@ -151,27 +154,14 @@ impl SharedX11Dnd {
 }
 
 pub struct X11DndBackend {
-    conn: Arc<RustConnection>,
-    src_win: Window,
-    wake_atom: Atom,
+    wake: WakeSender,
     shared: Arc<SharedX11Dnd>,
 }
 
 impl X11DndBackend {
     fn enqueue(&self, cmd: DndCmd) {
         self.shared.cmds.lock().push_back(cmd);
-        let ev = ClientMessageEvent {
-            response_type: CLIENT_MESSAGE_EVENT,
-            format: 32,
-            sequence: 0,
-            window: self.src_win,
-            type_: self.wake_atom,
-            data: ClientMessageData::from([1u32, 0, 0, 0, 0]),
-        };
-        let _ = self
-            .conn
-            .send_event(false, self.src_win, EventMask::NO_EVENT, ev);
-        let _ = self.conn.flush();
+        self.wake.wake();
     }
 }
 
@@ -196,7 +186,7 @@ impl DndBackend for X11DndBackend {
         self.shared
             .dead_corner_px
             .store(dead_corner_px.max(0), Ordering::Relaxed);
-        self.enqueue(DndCmd::SyncStrips);
+        self.enqueue(DndCmd::RefreshGeomAndSyncStrips);
     }
 
     fn set_drag_armed(&self, armed: bool) {
@@ -287,18 +277,7 @@ impl DndBackend for X11DndBackend {
         }
         q.push_back(DndCmd::IncomingDragMove { x, y });
         drop(q);
-        let ev = ClientMessageEvent {
-            response_type: CLIENT_MESSAGE_EVENT,
-            format: 32,
-            sequence: 0,
-            window: self.src_win,
-            type_: self.wake_atom,
-            data: ClientMessageData::from([1u32, 0, 0, 0, 0]),
-        };
-        let _ = self
-            .conn
-            .send_event(false, self.src_win, EventMask::NO_EVENT, ev);
-        let _ = self.conn.flush();
+        self.wake.wake();
     }
 
     fn on_incoming_drag_cancel(&self) {
@@ -320,9 +299,10 @@ impl DndBackend for X11DndBackend {
 pub fn start_x11_dnd() -> Result<Arc<dyn DndBackend>> {
     let (conn, screen_num) =
         RustConnection::connect(None).context("failed to connect to X11 display for DnD")?;
-    let conn = Arc::new(conn);
     let root = conn.setup().roots[screen_num].root;
     let atoms = XdndAtoms::intern(&conn)?;
+    let randr_subscribed = subscribe_randr_events(&conn, root);
+    let initial_geom = query_desktop_geometry(&conn, screen_num).unwrap_or_default();
 
     let src_win = conn.generate_id()?;
     let aux = CreateWindowAux::new().event_mask(EventMask::PROPERTY_CHANGE);
@@ -341,6 +321,7 @@ pub fn start_x11_dnd() -> Result<Arc<dyn DndBackend>> {
     )?;
     conn.flush()?;
 
+    let (wake_tx, wake_rx) = wake_pipe()?;
     let shared = Arc::new(SharedX11Dnd {
         enabled: AtomicBool::new(true),
         armed: AtomicBool::new(false),
@@ -351,20 +332,26 @@ pub fn start_x11_dnd() -> Result<Arc<dyn DndBackend>> {
         cmds: Mutex::new(VecDeque::new()),
     });
 
-    let wake_atom = atoms.wake;
-    let thread_conn = Arc::clone(&conn);
     let thread_shared = Arc::clone(&shared);
     thread::Builder::new()
         .name("glide-x11-dnd".into())
         .spawn(move || {
-            run_x11_dnd_loop(thread_conn, screen_num, root, src_win, atoms, thread_shared);
+            run_x11_dnd_loop(
+                conn,
+                screen_num,
+                root,
+                src_win,
+                atoms,
+                randr_subscribed,
+                initial_geom,
+                wake_rx,
+                thread_shared,
+            );
         })
         .context("failed to spawn glide-x11-dnd thread")?;
 
     Ok(Arc::new(X11DndBackend {
-        conn,
-        src_win,
-        wake_atom,
+        wake: wake_tx,
         shared,
     }))
 }
@@ -416,10 +403,10 @@ fn unmap_strips(conn: &RustConnection, strips: &mut [StripWin]) {
 
 fn sync_x11_strips(
     conn: &RustConnection,
-    screen_num: usize,
     root: Window,
     atoms: &XdndAtoms,
     shared: &SharedX11Dnd,
+    geom: &DesktopGeometry,
     strips: &mut Vec<StripWin>,
 ) {
     let enabled = shared.enabled.load(Ordering::Acquire);
@@ -432,10 +419,7 @@ fn sync_x11_strips(
         return;
     }
 
-    let Ok(geom) = query_desktop_geometry(conn, screen_num) else {
-        return;
-    };
-    let desired = compute_edge_strip_rects(&geom, &edges, dead_corner, 4);
+    let desired = compute_edge_strip_rects(geom, &edges, dead_corner, 4);
 
     let needs_rebuild = strips.len() != desired.len()
         || strips
@@ -917,17 +901,18 @@ struct X11DragPreview {
 }
 
 impl X11DragPreview {
+    #[allow(clippy::too_many_arguments)]
     fn create(
         conn: &RustConnection,
         screen_num: usize,
         root: Window,
+        geom: DesktopGeometry,
         label: String,
         badge: String,
         cursor_x: i32,
         cursor_y: i32,
     ) -> Result<Self> {
         let screen = &conn.setup().roots[screen_num];
-        let geom = query_desktop_geometry(conn, screen_num).unwrap_or_default();
         let width: u16 = 252;
         let height: u16 = 46;
         let (x, y) = clamp_hint_popup_pos(&geom, cursor_x, cursor_y, width as i32, height as i32);
@@ -1583,12 +1568,16 @@ fn build_ignore_list(
     ignore
 }
 
+#[allow(clippy::too_many_arguments)]
 fn run_x11_dnd_loop(
-    conn: Arc<RustConnection>,
+    conn: RustConnection,
     screen_num: usize,
     root: Window,
     src_win: Window,
     atoms: XdndAtoms,
+    randr_subscribed: bool,
+    mut cached_geom: DesktopGeometry,
+    wake_rx: WakeReceiver,
     shared: Arc<SharedX11Dnd>,
 ) {
     let mut strips: Vec<StripWin> = Vec::new();
@@ -1597,175 +1586,152 @@ fn run_x11_dnd_loop(
     let mut preview: Option<X11DragPreview> = None;
     let mut live_xdnd: Option<ActiveLiveXdnd> = None;
     let mut last_poll_ptr: (i16, i16) = (i16::MIN, i16::MIN);
+    let mut last_ptr_poll = Instant::now() - Duration::from_secs(1);
+    let mut wake_closed = false;
 
     'outer: loop {
-        // Idle mode: block with 0% CPU until an X11 event or wake command arrives.
-        // Active incoming drag mode: poll at ~80Hz so local Server drags also move the
-        // floating preview pill and drive live XDND folder highlighting smoothly.
-        let ev = if preview.is_some() || live_xdnd.is_some() {
-            match conn.poll_for_event() {
-                Ok(Some(ev)) => ev,
-                Ok(None) => {
-                    if let Ok(cookie) = conn.query_pointer(root) {
-                        if let Ok(ptr) = cookie.reply() {
-                            if (ptr.root_x, ptr.root_y) != last_poll_ptr {
-                                last_poll_ptr = (ptr.root_x, ptr.root_y);
-                                if let Some(ref mut p) = preview {
-                                    p.move_to(&conn, ptr.root_x as i32, ptr.root_y as i32);
-                                }
-                                if let Some(ref mut live) = live_xdnd {
-                                    let ignore =
-                                        build_ignore_list(src_win, &strips, preview.as_ref());
-                                    update_live_xdnd_hover(
-                                        &conn,
-                                        root,
-                                        src_win,
-                                        &atoms,
-                                        live,
-                                        ptr.root_x,
-                                        ptr.root_y,
-                                        &ignore,
-                                    );
-                                    if let Some(ref mut p) = preview {
-                                        let st = if live.target.is_none() {
-                                            X11PreviewStatus::Ready
-                                        } else if live.accepted {
-                                            X11PreviewStatus::Accepted
-                                        } else {
-                                            X11PreviewStatus::Ready
-                                        };
-                                        p.set_status(&conn, st);
-                                    }
-                                }
-                            }
+        // 1. Drain all queued backend commands immediately (never contends on RustConnection).
+        loop {
+            let next = shared.cmds.lock().pop_front();
+            let Some(cmd) = next else { break };
+            match cmd {
+                DndCmd::SyncStrips => {
+                    sync_x11_strips(&conn, root, &atoms, &shared, &cached_geom, &mut strips);
+                }
+                DndCmd::RefreshGeomAndSyncStrips => {
+                    if let Ok(new_geom) = query_desktop_geometry(&conn, screen_num) {
+                        cached_geom = new_geom;
+                        if let Some(ref mut p) = preview {
+                            p.geom = cached_geom.clone();
                         }
                     }
-                    thread::sleep(Duration::from_millis(12));
-                    continue;
+                    sync_x11_strips(&conn, root, &atoms, &shared, &cached_geom, &mut strips);
                 }
-                Err(e) => {
-                    debug!(error = %e, "X11 DnD connection closed");
-                    break;
+                DndCmd::HideStrips => {
+                    active_inbound = None;
+                    unmap_strips(&conn, &mut strips);
+                }
+                DndCmd::CancelLocalDrag => {
+                    if let Some(inb) = active_inbound.take() {
+                        send_xdnd_status(&conn, &atoms, inb.source_win, inb.strip_win, false);
+                    }
+                    unmap_strips(&conn, &mut strips);
+                    send_synthetic_escape_xtest(&conn);
+                }
+                DndCmd::IncomingDragStart { label, badge, x, y } => {
+                    if let Some(old) = preview.take() {
+                        old.destroy(&conn);
+                    }
+                    if let Some(old_live) = live_xdnd.take() {
+                        finish_live_xdnd_cancel(&conn, src_win, &atoms, old_live);
+                    }
+                    let (px, py) = conn
+                        .query_pointer(root)
+                        .ok()
+                        .and_then(|c| c.reply().ok())
+                        .map(|p| (p.root_x as i32, p.root_y as i32))
+                        .unwrap_or((x, y));
+                    last_poll_ptr = (px as i16, py as i16);
+                    match X11DragPreview::create(
+                        &conn,
+                        screen_num,
+                        root,
+                        cached_geom.clone(),
+                        label,
+                        badge,
+                        px,
+                        py,
+                    ) {
+                        Ok(p) => preview = Some(p),
+                        Err(e) => debug!(error = %e, "Could not create X11 drag preview pill"),
+                    }
+                }
+                DndCmd::IncomingDragMove { x, y } => {
+                    last_poll_ptr = (x as i16, y as i16);
+                    if let Some(ref mut p) = preview {
+                        p.move_to(&conn, x, y);
+                    }
+                    if let Some(ref mut live) = live_xdnd {
+                        let ignore = build_ignore_list(src_win, &strips, preview.as_ref());
+                        update_live_xdnd_hover(
+                            &conn,
+                            root,
+                            src_win,
+                            &atoms,
+                            live,
+                            x as i16,
+                            y as i16,
+                            &ignore,
+                        );
+                    }
+                }
+                DndCmd::IncomingDragFilesReady { paths } => {
+                    if let Some(old_live) = live_xdnd.take() {
+                        finish_live_xdnd_cancel(&conn, src_win, &atoms, old_live);
+                    }
+                    let ignore = build_ignore_list(src_win, &strips, preview.as_ref());
+                    live_xdnd =
+                        start_live_xdnd_session(&conn, root, src_win, &atoms, &paths, &ignore);
+                    if let Some(ref mut p) = preview {
+                        p.set_status(&conn, X11PreviewStatus::Ready);
+                    }
+                }
+                DndCmd::IncomingDragCancel => {
+                    if let Some(old) = preview.take() {
+                        old.destroy(&conn);
+                    }
+                    if let Some(old_live) = live_xdnd.take() {
+                        finish_live_xdnd_cancel(&conn, src_win, &atoms, old_live);
+                    }
+                    last_poll_ptr = (i16::MIN, i16::MIN);
+                }
+                DndCmd::DeliverDrop { paths, reply } => {
+                    if let Some(old) = preview.take() {
+                        old.destroy(&conn);
+                    }
+                    let live = live_xdnd.take();
+                    last_poll_ptr = (i16::MIN, i16::MIN);
+                    let res = perform_xdnd_drop_or_fallback(
+                        &conn,
+                        root,
+                        src_win,
+                        &atoms,
+                        &strips,
+                        &paths,
+                        live,
+                        &mut clipboard_offer,
+                    );
+                    let _ = reply.send(res);
+                }
+                DndCmd::Shutdown => {
+                    break 'outer;
                 }
             }
-        } else {
-            match conn.wait_for_event() {
-                Ok(ev) => ev,
-                Err(e) => {
-                    debug!(error = %e, "X11 DnD connection closed");
-                    break;
-                }
-            }
-        };
+        }
+        if wake_closed {
+            break 'outer;
+        }
 
-        match ev {
-            Event::ClientMessage(cm) if cm.type_ == atoms.wake => {
-                loop {
-                    let next = shared.cmds.lock().pop_front();
-                    let Some(cmd) = next else { break };
-                    match cmd {
-                        DndCmd::SyncStrips => {
-                            sync_x11_strips(
-                                &conn,
-                                screen_num,
-                                root,
-                                &atoms,
-                                &shared,
-                                &mut strips,
-                            );
+        // 2. Drain all queued/readable X11 events non-blockingly before sleeping in poll(2).
+        loop {
+            let ev = match conn.poll_for_event() {
+                Ok(Some(ev)) => ev,
+                Ok(None) => break,
+                Err(e) => {
+                    debug!(error = %e, "X11 DnD connection closed");
+                    break 'outer;
+                }
+            };
+
+            match ev {
+            Event::RandrScreenChangeNotify(_) | Event::RandrNotify(_) => {
+                if let Ok(new_geom) = query_desktop_geometry(&conn, screen_num) {
+                    if new_geom != cached_geom {
+                        cached_geom = new_geom;
+                        if let Some(ref mut p) = preview {
+                            p.geom = cached_geom.clone();
                         }
-                        DndCmd::HideStrips => {
-                            active_inbound = None;
-                            unmap_strips(&conn, &mut strips);
-                        }
-                        DndCmd::CancelLocalDrag => {
-                            if let Some(inb) = active_inbound.take() {
-                                send_xdnd_status(&conn, &atoms, inb.source_win, inb.strip_win, false);
-                            }
-                            unmap_strips(&conn, &mut strips);
-                            send_synthetic_escape_xtest(&conn);
-                        }
-                        DndCmd::IncomingDragStart { label, badge, x, y } => {
-                            if let Some(old) = preview.take() {
-                                old.destroy(&conn);
-                            }
-                            if let Some(old_live) = live_xdnd.take() {
-                                finish_live_xdnd_cancel(&conn, src_win, &atoms, old_live);
-                            }
-                            let (px, py) = conn
-                                .query_pointer(root)
-                                .ok()
-                                .and_then(|c| c.reply().ok())
-                                .map(|p| (p.root_x as i32, p.root_y as i32))
-                                .unwrap_or((x, y));
-                            last_poll_ptr = (px as i16, py as i16);
-                            match X11DragPreview::create(
-                                &conn, screen_num, root, label, badge, px, py,
-                            ) {
-                                Ok(p) => preview = Some(p),
-                                Err(e) => debug!(error = %e, "Could not create X11 drag preview pill"),
-                            }
-                        }
-                        DndCmd::IncomingDragMove { x, y } => {
-                            last_poll_ptr = (x as i16, y as i16);
-                            if let Some(ref mut p) = preview {
-                                p.move_to(&conn, x, y);
-                            }
-                            if let Some(ref mut live) = live_xdnd {
-                                let ignore = build_ignore_list(src_win, &strips, preview.as_ref());
-                                update_live_xdnd_hover(
-                                    &conn,
-                                    root,
-                                    src_win,
-                                    &atoms,
-                                    live,
-                                    x as i16,
-                                    y as i16,
-                                    &ignore,
-                                );
-                            }
-                        }
-                        DndCmd::IncomingDragFilesReady { paths } => {
-                            if let Some(old_live) = live_xdnd.take() {
-                                finish_live_xdnd_cancel(&conn, src_win, &atoms, old_live);
-                            }
-                            let ignore = build_ignore_list(src_win, &strips, preview.as_ref());
-                            live_xdnd =
-                                start_live_xdnd_session(&conn, root, src_win, &atoms, &paths, &ignore);
-                            if let Some(ref mut p) = preview {
-                                p.set_status(&conn, X11PreviewStatus::Ready);
-                            }
-                        }
-                        DndCmd::IncomingDragCancel => {
-                            if let Some(old) = preview.take() {
-                                old.destroy(&conn);
-                            }
-                            if let Some(old_live) = live_xdnd.take() {
-                                finish_live_xdnd_cancel(&conn, src_win, &atoms, old_live);
-                            }
-                            last_poll_ptr = (i16::MIN, i16::MIN);
-                        }
-                        DndCmd::DeliverDrop { paths, reply } => {
-                            if let Some(old) = preview.take() {
-                                old.destroy(&conn);
-                            }
-                            let live = live_xdnd.take();
-                            last_poll_ptr = (i16::MIN, i16::MIN);
-                            let res = perform_xdnd_drop_or_fallback(
-                                &conn,
-                                root,
-                                src_win,
-                                &atoms,
-                                &strips,
-                                &paths,
-                                live,
-                                &mut clipboard_offer,
-                            );
-                            let _ = reply.send(res);
-                        }
-                        DndCmd::Shutdown => {
-                            break 'outer;
-                        }
+                        sync_x11_strips(&conn, root, &atoms, &shared, &cached_geom, &mut strips);
                     }
                 }
             }
@@ -1960,6 +1926,81 @@ fn run_x11_dnd_loop(
             }
 
             _ => {}
+            }
+        }
+
+        if !shared.cmds.lock().is_empty() {
+            continue;
+        }
+
+        // 3. Active incoming drag mode: poll pointer at ~80Hz so local Server drags also move
+        //    the floating preview pill and drive live XDND folder highlighting smoothly.
+        let timeout_ms = if preview.is_some() || live_xdnd.is_some() {
+            if last_ptr_poll.elapsed() >= Duration::from_millis(12) {
+                last_ptr_poll = Instant::now();
+                if let Ok(cookie) = conn.query_pointer(root) {
+                    if let Ok(ptr) = cookie.reply() {
+                        if (ptr.root_x, ptr.root_y) != last_poll_ptr {
+                            last_poll_ptr = (ptr.root_x, ptr.root_y);
+                            if let Some(ref mut p) = preview {
+                                p.move_to(&conn, ptr.root_x as i32, ptr.root_y as i32);
+                            }
+                            if let Some(ref mut live) = live_xdnd {
+                                let ignore =
+                                    build_ignore_list(src_win, &strips, preview.as_ref());
+                                update_live_xdnd_hover(
+                                    &conn,
+                                    root,
+                                    src_win,
+                                    &atoms,
+                                    live,
+                                    ptr.root_x,
+                                    ptr.root_y,
+                                    &ignore,
+                                );
+                                if let Some(ref mut p) = preview {
+                                    let st = if live.target.is_none() {
+                                        X11PreviewStatus::Ready
+                                    } else if live.accepted {
+                                        X11PreviewStatus::Accepted
+                                    } else {
+                                        X11PreviewStatus::Ready
+                                    };
+                                    p.set_status(&conn, st);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            12i32
+                .saturating_sub(last_ptr_poll.elapsed().as_millis().min(12) as i32)
+                .max(1)
+        } else {
+            -1
+        };
+
+        if !shared.cmds.lock().is_empty() {
+            continue;
+        }
+
+        // 4. Block in poll(2) with 0% CPU when idle or <= 12ms during active drag until an
+        //    X11 event arrives or a non-blocking wake byte is written to the pipe.
+        let _ = conn.flush();
+        match poll_fd_and_wake(conn.stream().as_raw_fd(), &wake_rx, timeout_ms) {
+            Ok(st) => {
+                if st.fd_error {
+                    debug!("X11 DnD connection error");
+                    break 'outer;
+                }
+                if st.wake_closed {
+                    wake_closed = true;
+                }
+            }
+            Err(e) => {
+                debug!(error = %e, "X11 DnD poll failed");
+                break 'outer;
+            }
         }
     }
 
@@ -1970,6 +2011,9 @@ fn run_x11_dnd_loop(
         finish_live_xdnd_cancel(&conn, src_win, &atoms, old_live);
     }
     destroy_strips(&conn, &mut strips);
+    if randr_subscribed {
+        unsubscribe_randr_events(&conn, root);
+    }
     let _ = conn.destroy_window(src_win);
     let _ = conn.flush();
 }

@@ -9,6 +9,8 @@
 //! edge-return boundary checks.
 
 use crate::geometry::DesktopGeometry;
+use crate::linux_wayland::WaylandGeometryWatcher;
+use crate::linux_x11::inject::should_sync_x11_pointer;
 use crate::linux_x11::{
     poll_randr_event, query_desktop_geometry, subscribe_randr_events, unsubscribe_randr_events,
     X11CursorHider,
@@ -113,6 +115,7 @@ struct X11Helper {
 pub struct UinputInjector {
     file: File,
     x11: Option<X11Helper>,
+    wayland_geom: Option<WaylandGeometryWatcher>,
     wayland: bool,
     geometry: DesktopGeometry,
     last_geom_refresh: Instant,
@@ -191,10 +194,14 @@ impl UinputInjector {
         }
 
         let wayland = crate::linux_wayland::is_wayland_session();
-        let (x11, geometry) = if wayland {
-            let geom = crate::linux_wayland::query_desktop_geometry()
-                .unwrap_or_else(|_| DesktopGeometry::fallback());
-            (None, geom)
+        let (x11, wayland_geom, geometry) = if wayland {
+            match WaylandGeometryWatcher::start() {
+                Ok(watcher) => {
+                    let geom = watcher.current();
+                    (None, Some(watcher), geom)
+                }
+                Err(_) => (None, None, DesktopGeometry::fallback()),
+            }
         } else {
             let (conn, screen_num) = RustConnection::connect(None)
                 .context("failed to connect to X11 for geometry/warp")?;
@@ -210,6 +217,7 @@ impl UinputInjector {
                     randr_subscribed,
                     cursor_hider,
                 }),
+                None,
                 geometry,
             )
         };
@@ -224,6 +232,7 @@ impl UinputInjector {
         Ok(Self {
             file,
             x11,
+            wayland_geom,
             wayland,
             geometry,
             last_geom_refresh: now,
@@ -284,8 +293,9 @@ impl UinputInjector {
         if let Some(ref x11) = self.x11 {
             let _ = poll_randr_event(&x11.conn);
             self.geometry = query_desktop_geometry(&x11.conn, x11.screen_num)?;
-        } else if let Ok(geom) = crate::linux_wayland::query_desktop_geometry() {
-            self.geometry = geom;
+        } else if let Some(ref watcher) = self.wayland_geom {
+            let _ = watcher.poll_changed();
+            self.geometry = watcher.current();
         }
         self.last_geom_refresh = Instant::now();
         Ok(())
@@ -296,23 +306,20 @@ impl UinputInjector {
     }
 
     fn refresh_geometry_if_needed(&mut self) -> bool {
-        let randr_dirty = self
-            .x11
-            .as_ref()
-            .is_some_and(|x11| x11.randr_subscribed && poll_randr_event(&x11.conn));
-        let fallback = if self.x11.is_some() {
-            Duration::from_secs(5)
-        } else {
-            Duration::from_secs(3)
-        };
-        if !randr_dirty && self.last_geom_refresh.elapsed() < fallback {
-            return false;
-        }
-        self.last_geom_refresh = Instant::now();
         let next = if let Some(ref x11) = self.x11 {
+            if x11.randr_subscribed {
+                if !poll_randr_event(&x11.conn) {
+                    return false;
+                }
+            } else if self.last_geom_refresh.elapsed() < Duration::from_secs(15) {
+                return false;
+            }
+            self.last_geom_refresh = Instant::now();
             query_desktop_geometry(&x11.conn, x11.screen_num).ok()
+        } else if let Some(ref watcher) = self.wayland_geom {
+            watcher.poll_changed()
         } else {
-            crate::linux_wayland::query_desktop_geometry().ok()
+            None
         };
         if let Some(new_geom) = next {
             if new_geom != self.geometry {
@@ -410,12 +417,8 @@ impl InputInjector for UinputInjector {
     }
 
     fn cursor_norm(&mut self) -> (f32, f32) {
-        if let Ok((x, y)) = self.sync_pointer() {
-            self.geometry.normalize_point(x, y)
-        } else {
-            self.geometry
-                .normalize_point(self.est_x.round() as i32, self.est_y.round() as i32)
-        }
+        self.geometry
+            .normalize_point(self.est_x.round() as i32, self.est_y.round() as i32)
     }
 
     fn sync_lock_state(&mut self, desired: LockState) -> Result<()> {
@@ -482,30 +485,47 @@ impl InputInjector for UinputInjector {
             return Ok(None);
         }
 
+        // Normal mouse motion anywhere away from the return edge (> 48px) executes ZERO
+        // blocking X11 roundtrips (kernel uinput write only).
         let dist = self.geometry.distance_to_edge(
             edge,
             self.est_x.round() as i32,
             self.est_y.round() as i32,
         );
-        let elapsed = self.last_pointer_sync.elapsed();
-        let should_sync = dist <= 8
-            || self.edge_push_accum > 0.0
-            || (dist <= 96 && elapsed >= Duration::from_millis(4))
-            || elapsed >= Duration::from_millis(35);
-        if !should_sync {
+        if dist > 48 {
+            self.edge_push_accum = 0.0;
             return Ok(None);
         }
 
-        self.refresh_geometry_if_needed();
-        let (rx, ry) = self.sync_pointer()?;
+        let mut synced_this_call = false;
+        if should_sync_x11_pointer(dist, self.edge_push_accum, self.last_pointer_sync.elapsed()) {
+            let _ = self.sync_pointer()?;
+            synced_this_call = true;
+        }
+
+        let px = self.est_x.round() as i32;
+        let py = self.est_y.round() as i32;
         if let Some(norm) = self
             .geometry
-            .hit_outer_edge_guarded(edge, rx, ry, 2, dead_corner_px)
+            .hit_outer_edge_guarded(edge, px, py, 2, dead_corner_px)
         {
             self.edge_push_accum += outward;
             if self.edge_push_accum >= edge_threshold_px.max(1) as f32 {
+                let confirmed_norm = if synced_this_call {
+                    norm
+                } else {
+                    let (rx, ry) = self.sync_pointer()?;
+                    let Some(confirmed) = self
+                        .geometry
+                        .hit_outer_edge_guarded(edge, rx, ry, 2, dead_corner_px)
+                    else {
+                        self.edge_push_accum = 0.0;
+                        return Ok(None);
+                    };
+                    confirmed
+                };
                 self.edge_push_accum = 0.0;
-                return Ok(Some((edge, norm)));
+                return Ok(Some((edge, confirmed_norm)));
             }
         } else {
             self.edge_push_accum = 0.0;

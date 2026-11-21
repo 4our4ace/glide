@@ -94,7 +94,11 @@ impl X11Injector {
 
     fn refresh_geometry_if_needed(&mut self) -> bool {
         let randr_dirty = self.randr_subscribed && poll_randr_event(&self.conn);
-        if !randr_dirty && self.last_geom_refresh.elapsed() < Duration::from_secs(5) {
+        if self.randr_subscribed {
+            if !randr_dirty {
+                return false;
+            }
+        } else if self.last_geom_refresh.elapsed() < Duration::from_secs(15) {
             return false;
         }
         self.last_geom_refresh = Instant::now();
@@ -212,12 +216,8 @@ impl InputInjector for X11Injector {
     }
 
     fn cursor_norm(&mut self) -> (f32, f32) {
-        if let Ok((x, y)) = self.sync_pointer() {
-            self.geometry.normalize_point(x, y)
-        } else {
-            self.geometry
-                .normalize_point(self.est_x.round() as i32, self.est_y.round() as i32)
-        }
+        self.geometry
+            .normalize_point(self.est_x.round() as i32, self.est_y.round() as i32)
     }
 
     fn sync_lock_state(&mut self, desired: glide_proto::LockState) -> Result<()> {
@@ -289,42 +289,59 @@ impl InputInjector for X11Injector {
             Edge::Bottom => dy,
         };
 
-        // Only query the actual X11 pointer when close to the return edge or periodically
-        // while moving toward it, keeping normal mouse movement completely roundtrip-free!
+        if outward <= 0.0 {
+            self.edge_push_accum = 0.0;
+            self.edge_push_start = None;
+            return Ok(None);
+        }
+
+        // Normal mouse motion anywhere away from the return edge (> 48px) executes ZERO
+        // blocking X11 roundtrips (xtest_fake_input + flush only).
         let dist = self.geometry.distance_to_edge(
             edge,
             self.est_x.round() as i32,
             self.est_y.round() as i32,
         );
-
-        if outward <= 0.0 {
+        if dist > 48 {
             self.edge_push_accum = 0.0;
+            self.edge_push_start = None;
             return Ok(None);
         }
 
-        let elapsed = self.last_pointer_sync.elapsed();
-        let should_sync = dist <= 8
-            || self.edge_push_accum > 0.0
-            || (dist <= 96 && elapsed >= Duration::from_millis(4))
-            || elapsed >= Duration::from_millis(35);
-        if !should_sync {
-            return Ok(None);
+        let mut synced_this_call = false;
+        if should_sync_x11_pointer(dist, self.edge_push_accum, self.last_pointer_sync.elapsed()) {
+            let _ = self.sync_pointer()?;
+            synced_this_call = true;
         }
 
-        self.refresh_geometry_if_needed();
-        let (rx, ry) = self.sync_pointer()?;
+        let px = self.est_x.round() as i32;
+        let py = self.est_y.round() as i32;
         if let Some(norm) = self
             .geometry
-            .hit_outer_edge_guarded(edge, rx, ry, 2, dead_corner_px)
+            .hit_outer_edge_guarded(edge, px, py, 2, dead_corner_px)
         {
             let lmb_held = self.pressed_buttons.contains(&MouseButton::Left.to_x11_button());
             let start = *self.edge_push_start.get_or_insert_with(Instant::now);
             self.edge_push_accum += outward;
             let drag_dwell_ok = !lmb_held || start.elapsed() >= Duration::from_millis(25);
             if self.edge_push_accum >= edge_threshold_px.max(1) as f32 && drag_dwell_ok {
+                let confirmed_norm = if synced_this_call {
+                    norm
+                } else {
+                    let (rx, ry) = self.sync_pointer()?;
+                    let Some(confirmed) = self
+                        .geometry
+                        .hit_outer_edge_guarded(edge, rx, ry, 2, dead_corner_px)
+                    else {
+                        self.edge_push_accum = 0.0;
+                        self.edge_push_start = None;
+                        return Ok(None);
+                    };
+                    confirmed
+                };
                 self.edge_push_accum = 0.0;
                 self.edge_push_start = None;
-                return Ok(Some((edge, norm)));
+                return Ok(Some((edge, confirmed_norm)));
             }
         } else {
             self.edge_push_accum = 0.0;
@@ -483,5 +500,47 @@ impl Drop for X11Injector {
             unsubscribe_randr_events(&self.conn, self.root);
             let _ = self.conn.flush();
         }
+    }
+}
+
+/// Returns `true` only when `move_relative` should issue a rate-limited X11 `query_pointer`
+/// calibration roundtrip near the return edge (<= 48px). Mid-screen motion (> 48px) always
+/// returns `false` so normal pointer movement stays 100% roundtrip-free.
+#[inline]
+pub(crate) fn should_sync_x11_pointer(
+    dist_px: i32,
+    edge_push_accum: f32,
+    elapsed: Duration,
+) -> bool {
+    if dist_px > 48 {
+        return false;
+    }
+    if edge_push_accum > 0.0 {
+        elapsed >= Duration::from_millis(12)
+    } else {
+        elapsed >= Duration::from_millis(25)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn x11_pointer_sync_never_fires_mid_screen_and_rate_limits_near_edge() {
+        // Mid-screen (> 48px): NEVER sync regardless of elapsed time or accum
+        assert!(!should_sync_x11_pointer(49, 0.0, Duration::from_secs(10)));
+        assert!(!should_sync_x11_pointer(500, 0.0, Duration::from_secs(60)));
+        assert!(!should_sync_x11_pointer(60, 5.0, Duration::from_secs(10)));
+
+        // Approaching return edge (<= 48px): rate-limited to >= 25ms
+        assert!(!should_sync_x11_pointer(48, 0.0, Duration::from_millis(24)));
+        assert!(should_sync_x11_pointer(48, 0.0, Duration::from_millis(25)));
+        assert!(!should_sync_x11_pointer(0, 0.0, Duration::from_millis(10)));
+        assert!(should_sync_x11_pointer(0, 0.0, Duration::from_millis(25)));
+
+        // Actively pushing into edge (edge_push_accum > 0): rate-limited to >= 12ms
+        assert!(!should_sync_x11_pointer(0, 2.0, Duration::from_millis(11)));
+        assert!(should_sync_x11_pointer(0, 2.0, Duration::from_millis(12)));
     }
 }

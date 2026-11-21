@@ -18,13 +18,16 @@ use crate::DoctorReport;
 use anyhow::{anyhow, Context, Result};
 use glide_hid::MouseButton;
 use glide_proto::OsKind;
+use parking_lot::RwLock;
 use std::collections::HashMap;
+use std::os::fd::AsRawFd;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 use wayland_client::protocol::wl_output::{self, WlOutput};
 use wayland_client::protocol::wl_registry::{self, WlRegistry};
-use wayland_client::{Connection as WlConnection, Dispatch, QueueHandle};
+use wayland_client::{Connection as WlConnection, Dispatch, Proxy as WlProxy, QueueHandle};
 use wayland_protocols::xdg::xdg_output::zv1::client::zxdg_output_manager_v1::ZxdgOutputManagerV1;
 use wayland_protocols::xdg::xdg_output::zv1::client::zxdg_output_v1::{self, ZxdgOutputV1};
 use zbus::blocking::{Connection as DbusConnection, MessageIterator, Proxy};
@@ -295,6 +298,7 @@ struct OutputEntry {
 struct OutputQueryState {
     xdg_mgr: Option<ZxdgOutputManagerV1>,
     outputs: Vec<OutputEntry>,
+    mutated: bool,
 }
 
 impl Dispatch<WlRegistry, ()> for OutputQueryState {
@@ -315,22 +319,45 @@ impl Dispatch<WlRegistry, ()> for OutputQueryState {
                 if interface == "wl_output" {
                     let idx = state.outputs.len();
                     let wl = registry.bind::<WlOutput, _, _>(name, version.min(4), qh, idx);
+                    let xdg = state
+                        .xdg_mgr
+                        .as_ref()
+                        .map(|mgr| mgr.get_xdg_output(&wl, qh, idx));
                     state.outputs.push(OutputEntry {
                         global_name: name,
                         removed: false,
                         wl: Some(wl),
+                        xdg,
                         scale: 1,
                         ..Default::default()
                     });
+                    state.mutated = true;
                 } else if interface == "zxdg_output_manager_v1" && state.xdg_mgr.is_none() {
                     let mgr = registry.bind::<ZxdgOutputManagerV1, _, _>(name, version.min(3), qh, ());
+                    for (idx, entry) in state.outputs.iter_mut().enumerate() {
+                        if !entry.removed && entry.xdg.is_none() {
+                            if let Some(wl) = entry.wl.as_ref() {
+                                entry.xdg = Some(mgr.get_xdg_output(wl, qh, idx));
+                            }
+                        }
+                    }
                     state.xdg_mgr = Some(mgr);
+                    state.mutated = true;
                 }
             }
             wl_registry::Event::GlobalRemove { name } => {
                 for entry in &mut state.outputs {
-                    if entry.global_name == name {
+                    if entry.global_name == name && !entry.removed {
                         entry.removed = true;
+                        if let Some(xdg) = entry.xdg.take() {
+                            xdg.destroy();
+                        }
+                        if let Some(wl) = entry.wl.take() {
+                            if wl.version() >= 3 {
+                                wl.release();
+                            }
+                        }
+                        state.mutated = true;
                     }
                 }
             }
@@ -355,6 +382,7 @@ impl Dispatch<WlOutput, usize> for OutputQueryState {
             wl_output::Event::Geometry { x, y, .. } => {
                 entry.wl_x = x;
                 entry.wl_y = y;
+                state.mutated = true;
             }
             wl_output::Event::Mode {
                 flags,
@@ -369,13 +397,19 @@ impl Dispatch<WlOutput, usize> for OutputQueryState {
                 if is_current || entry.wl_w == 0 {
                     entry.wl_w = width;
                     entry.wl_h = height;
+                    state.mutated = true;
                 }
             }
             wl_output::Event::Scale { factor } => {
                 entry.scale = factor.max(1);
+                state.mutated = true;
             }
             wl_output::Event::Name { name } if entry.name.is_empty() => {
                 entry.name = name;
+                state.mutated = true;
+            }
+            wl_output::Event::Done => {
+                state.mutated = true;
             }
             _ => {}
         }
@@ -409,12 +443,18 @@ impl Dispatch<ZxdgOutputV1, usize> for OutputQueryState {
         match event {
             zxdg_output_v1::Event::LogicalPosition { x, y } => {
                 entry.xdg_pos = Some((x, y));
+                state.mutated = true;
             }
             zxdg_output_v1::Event::LogicalSize { width, height } => {
                 entry.xdg_size = Some((width, height));
+                state.mutated = true;
             }
             zxdg_output_v1::Event::Name { name } if !name.is_empty() => {
                 entry.name = name;
+                state.mutated = true;
+            }
+            zxdg_output_v1::Event::Done => {
+                state.mutated = true;
             }
             _ => {}
         }
@@ -441,42 +481,14 @@ pub(crate) fn compute_wayland_effective_scale(
     (int_scale.max(1) as f32).clamp(0.5, 4.0)
 }
 
-/// Queries the active multi-monitor logical layout directly from the Wayland compositor.
-pub fn query_desktop_geometry() -> Result<DesktopGeometry> {
-    let conn = WlConnection::connect_to_env()
-        .context("failed to connect to Wayland display (is WAYLAND_DISPLAY set?)")?;
-    let mut queue = conn.new_event_queue();
-    let qh = queue.handle();
-    let _registry = conn.display().get_registry(&qh, ());
-
-    let mut state = OutputQueryState {
-        xdg_mgr: None,
-        outputs: Vec::new(),
-    };
-    queue
-        .roundtrip(&mut state)
-        .context("Wayland registry roundtrip failed")?;
-
-    if let Some(mgr) = state.xdg_mgr.clone() {
-        for (idx, entry) in state.outputs.iter_mut().enumerate() {
-            if !entry.removed {
-                if let Some(wl) = entry.wl.as_ref() {
-                    entry.xdg = Some(mgr.get_xdg_output(wl, &qh, idx));
-                }
-            }
-        }
-        queue
-            .roundtrip(&mut state)
-            .context("Wayland xdg-output roundtrip failed")?;
-    } else {
-        let _ = queue.roundtrip(&mut state);
-    }
-
+fn build_desktop_geometry(outputs: &[OutputEntry]) -> Option<DesktopGeometry> {
     let mut monitors = Vec::new();
-    for (idx, o) in state.outputs.into_iter().enumerate() {
+    let mut any_live = false;
+    for (idx, o) in outputs.iter().enumerate() {
         if o.removed {
             continue;
         }
+        any_live = true;
         let (x, y) = o.xdg_pos.unwrap_or((o.wl_x, o.wl_y));
         let int_scale = o.scale.max(1) as f32;
         let (w, h) = o.xdg_size.unwrap_or((
@@ -490,7 +502,7 @@ pub fn query_desktop_geometry() -> Result<DesktopGeometry> {
         let name = if o.name.is_empty() {
             format!("Wayland-{idx}")
         } else {
-            o.name
+            o.name.clone()
         };
         monitors.push(MonitorRect {
             name,
@@ -504,9 +516,165 @@ pub fn query_desktop_geometry() -> Result<DesktopGeometry> {
     }
 
     if monitors.is_empty() {
-        return Ok(DesktopGeometry::fallback());
+        if any_live {
+            // Live outputs exist but haven't reported their Mode/LogicalSize yet.
+            None
+        } else {
+            Some(DesktopGeometry::fallback())
+        }
+    } else {
+        Some(DesktopGeometry::new(monitors))
     }
-    Ok(DesktopGeometry::new(monitors))
+}
+
+/// Queries the active multi-monitor logical layout directly from the Wayland compositor.
+pub fn query_desktop_geometry() -> Result<DesktopGeometry> {
+    let conn = WlConnection::connect_to_env()
+        .context("failed to connect to Wayland display (is WAYLAND_DISPLAY set?)")?;
+    let mut queue = conn.new_event_queue();
+    let qh = queue.handle();
+    let _registry = conn.display().get_registry(&qh, ());
+
+    let mut state = OutputQueryState {
+        xdg_mgr: None,
+        outputs: Vec::new(),
+        mutated: false,
+    };
+    queue
+        .roundtrip(&mut state)
+        .context("Wayland registry roundtrip failed")?;
+    let _ = queue.roundtrip(&mut state);
+
+    Ok(build_desktop_geometry(&state.outputs).unwrap_or_else(DesktopGeometry::fallback))
+}
+
+/// Persistent background `wl_output` / `zxdg_output_v1` observer holding a single Wayland
+/// connection so `poll_geometry_changed()` is a lock-free `AtomicBool::swap` check with zero
+/// blocking roundtrips or socket reconnects on the input hot path.
+pub struct WaylandGeometryWatcher {
+    geometry: Arc<RwLock<DesktopGeometry>>,
+    dirty: Arc<AtomicBool>,
+    wake: crate::linux_x11::WakeSender,
+}
+
+impl WaylandGeometryWatcher {
+    pub fn start() -> Result<Self> {
+        let conn = WlConnection::connect_to_env()
+            .context("failed to connect to Wayland display (is WAYLAND_DISPLAY set?)")?;
+        let mut queue = conn.new_event_queue::<OutputQueryState>();
+        let qh = queue.handle();
+        let registry = conn.display().get_registry(&qh, ());
+
+        let mut state = OutputQueryState {
+            xdg_mgr: None,
+            outputs: Vec::new(),
+            mutated: false,
+        };
+        queue
+            .roundtrip(&mut state)
+            .context("Wayland registry roundtrip failed")?;
+        let _ = queue.roundtrip(&mut state);
+        state.mutated = false;
+
+        let initial =
+            build_desktop_geometry(&state.outputs).unwrap_or_else(DesktopGeometry::fallback);
+        let (wake_tx, wake_rx) = crate::linux_x11::wake_pipe()?;
+        let geometry = Arc::new(RwLock::new(initial.clone()));
+        let dirty = Arc::new(AtomicBool::new(false));
+
+        let shared_geom = Arc::clone(&geometry);
+        let shared_dirty = Arc::clone(&dirty);
+        std::thread::Builder::new()
+            .name("glide-wl-geom".into())
+            .spawn(move || {
+                // Keep registry proxy alive for the lifetime of the observer connection.
+                let _registry = registry;
+                let mut last_geom = initial;
+                loop {
+                    if let Err(e) = queue.dispatch_pending(&mut state) {
+                        tracing::debug!(error = %e, "Wayland geometry observer dispatch failed");
+                        break;
+                    }
+                    if let Err(e) = conn.flush() {
+                        match e {
+                            wayland_client::backend::WaylandError::Io(ref io_err)
+                                if io_err.kind() == std::io::ErrorKind::WouldBlock => {}
+                            _ => {
+                                tracing::debug!(error = %e, "Wayland geometry observer flush failed");
+                                break;
+                            }
+                        }
+                    }
+                    if state.mutated {
+                        state.mutated = false;
+                        if let Some(next) = build_desktop_geometry(&state.outputs) {
+                            if next != last_geom {
+                                *shared_geom.write() = next.clone();
+                                last_geom = next;
+                                shared_dirty.store(true, Ordering::Release);
+                            }
+                        }
+                    }
+
+                    let Some(read_guard) = queue.prepare_read() else {
+                        continue;
+                    };
+                    let wl_fd = read_guard.connection_fd().as_raw_fd();
+                    match crate::linux_x11::poll_fd_and_wake(wl_fd, &wake_rx, -1) {
+                        Ok(st) if st.wake_ready || st.wake_closed || st.fd_error => {
+                            drop(read_guard);
+                            break;
+                        }
+                        Ok(st) if st.fd_ready => match read_guard.read() {
+                            Ok(0) if st.fd_hup => break,
+                            Ok(_) => {}
+                            Err(wayland_client::backend::WaylandError::Io(ref io_err))
+                                if io_err.kind() == std::io::ErrorKind::WouldBlock => {}
+                            Err(e) => {
+                                tracing::debug!(error = %e, "Wayland geometry observer disconnected");
+                                break;
+                            }
+                        },
+                        Ok(_) => {
+                            drop(read_guard);
+                        }
+                        Err(e) => {
+                            drop(read_guard);
+                            tracing::debug!(error = %e, "Wayland geometry observer poll failed");
+                            break;
+                        }
+                    }
+                }
+            })
+            .context("failed to spawn glide-wl-geom thread")?;
+
+        Ok(Self {
+            geometry,
+            dirty,
+            wake: wake_tx,
+        })
+    }
+
+    /// Lock-free check returning `Some(DesktopGeometry)` only when Wayland outputs changed.
+    #[inline]
+    pub fn poll_changed(&self) -> Option<DesktopGeometry> {
+        if self.dirty.swap(false, Ordering::AcqRel) {
+            Some(self.geometry.read().clone())
+        } else {
+            None
+        }
+    }
+
+    /// Returns the latest cached multi-monitor geometry without any Wayland roundtrip.
+    pub fn current(&self) -> DesktopGeometry {
+        self.geometry.read().clone()
+    }
+}
+
+impl Drop for WaylandGeometryWatcher {
+    fn drop(&mut self) {
+        self.wake.wake();
+    }
 }
 
 fn probe_portal_version(conn: &DbusConnection, iface: &str) -> Option<u32> {
