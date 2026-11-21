@@ -165,14 +165,14 @@ jobs:
             done
             gh release edit nightly \
               -R "$GITHUB_REPOSITORY" \
-              --title "Glide Nightly (${SHORT_SHA})" \
+              --title "Glide Nightly — Beta (${SHORT_SHA})" \
               --notes-file nightly-notes.md \
               --prerelease \
               --latest=false
           else
             gh release create nightly release-assets/* \
               -R "$GITHUB_REPOSITORY" \
-              --title "Glide Nightly (${SHORT_SHA})" \
+              --title "Glide Nightly — Beta (${SHORT_SHA})" \
               --notes-file nightly-notes.md \
               --prerelease \
               --latest=false
