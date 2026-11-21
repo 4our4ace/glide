@@ -35,9 +35,12 @@ pub const NIGHTLY_RELEASE_API_URL: &str =
     "https://api.github.com/repos/4our4ace/glide/releases/tags/nightly";
 
 const CHECKSUMS_ASSET_NAME: &str = "SHA256SUMS.txt";
-const WINDOWS_BINARY_ASSET: &str = "glide-windows-x86_64.exe";
-const WINDOWS_MSI_ASSET: &str = "glide-windows-x86_64.msi";
-const LINUX_BINARY_ASSET: &str = "glide-linux-x86_64";
+const WINDOWS_BINARY_ASSET: &str = "glide-windows-x86_64-standalone.exe";
+const WINDOWS_BINARY_LEGACY_ASSET: &str = "glide-windows-x86_64.exe";
+const WINDOWS_MSI_ASSET: &str = "glide-windows-x86_64-installer.msi";
+const WINDOWS_MSI_LEGACY_ASSET: &str = "glide-windows-x86_64.msi";
+const LINUX_BINARY_ASSET: &str = "glide-linux-x86_64-standalone";
+const LINUX_BINARY_LEGACY_ASSET: &str = "glide-linux-x86_64";
 const MAX_CHECKSUMS_BYTES: usize = 64 * 1024;
 const MAX_BINARY_BYTES: u64 = 128 * 1024 * 1024;
 const RELAUNCH_WAIT_PID_ENV: &str = "GLIDE_RELAUNCH_WAIT_PID";
@@ -60,9 +63,9 @@ pub struct AvailableUpdate {
     pub html_url: String,
     /// True when switching between Stable and Nightly rather than updating within the same track.
     pub is_channel_switch: bool,
-    /// Standalone executable asset for the current OS (`glide-windows-x86_64.exe` / `glide-linux-x86_64`).
+    /// Standalone executable asset for the current OS (`glide-windows-x86_64-standalone.exe` / `glide-linux-x86_64-standalone`).
     pub binary_asset: Option<UpdateAsset>,
-    /// Windows `.msi` installer asset (`glide-windows-x86_64.msi`).
+    /// Windows `.msi` installer asset (`glide-windows-x86_64-installer.msi`).
     pub msi_asset: Option<UpdateAsset>,
     /// Debian/Ubuntu `.deb` package asset (Linux only, used when running from `/usr/bin/glide`).
     pub deb_asset: Option<UpdateAsset>,
@@ -269,7 +272,9 @@ struct PlatformAssets {
 
 fn select_assets_for_platform(assets: &[GithubAsset], want_windows: bool) -> PlatformAssets {
     let mut binary_asset = None;
+    let mut legacy_binary_asset = None;
     let mut msi_asset = None;
+    let mut legacy_msi_asset = None;
     let mut deb_asset = None;
     let mut checksums_url = None;
 
@@ -281,40 +286,33 @@ fn select_assets_for_platform(assets: &[GithubAsset], want_windows: bool) -> Pla
             checksums_url = Some(a.browser_download_url.clone());
             continue;
         }
+        let make_asset = || UpdateAsset {
+            name: a.name.clone(),
+            download_url: a.browser_download_url.clone(),
+            size: a.size,
+        };
         if want_windows {
             if a.name == WINDOWS_BINARY_ASSET {
-                binary_asset = Some(UpdateAsset {
-                    name: a.name.clone(),
-                    download_url: a.browser_download_url.clone(),
-                    size: a.size,
-                });
+                binary_asset = Some(make_asset());
+            } else if a.name == WINDOWS_BINARY_LEGACY_ASSET {
+                legacy_binary_asset = Some(make_asset());
             } else if a.name == WINDOWS_MSI_ASSET {
-                msi_asset = Some(UpdateAsset {
-                    name: a.name.clone(),
-                    download_url: a.browser_download_url.clone(),
-                    size: a.size,
-                });
+                msi_asset = Some(make_asset());
+            } else if a.name == WINDOWS_MSI_LEGACY_ASSET {
+                legacy_msi_asset = Some(make_asset());
             }
-        } else {
-            if a.name == LINUX_BINARY_ASSET {
-                binary_asset = Some(UpdateAsset {
-                    name: a.name.clone(),
-                    download_url: a.browser_download_url.clone(),
-                    size: a.size,
-                });
-            } else if a.name.starts_with("glide_") && a.name.ends_with("_amd64.deb") {
-                deb_asset = Some(UpdateAsset {
-                    name: a.name.clone(),
-                    download_url: a.browser_download_url.clone(),
-                    size: a.size,
-                });
-            }
+        } else if a.name == LINUX_BINARY_ASSET {
+            binary_asset = Some(make_asset());
+        } else if a.name == LINUX_BINARY_LEGACY_ASSET {
+            legacy_binary_asset = Some(make_asset());
+        } else if a.name.starts_with("glide_") && a.name.ends_with("_amd64.deb") {
+            deb_asset = Some(make_asset());
         }
     }
 
     PlatformAssets {
-        binary_asset,
-        msi_asset,
+        binary_asset: binary_asset.or(legacy_binary_asset),
+        msi_asset: msi_asset.or(legacy_msi_asset),
         deb_asset,
         checksums_url,
     }
@@ -1594,5 +1592,55 @@ mod tests {
         assert!(!ok_dir.exists());
         assert!(other_dir.exists());
         let _ = fs::remove_dir_all(&other_dir);
+    }
+
+    #[test]
+    fn legacy_and_descriptive_asset_names_both_resolve() {
+        // Legacy v0.3.0 release filenames still resolve cleanly for Nightly -> Stable rollback.
+        let legacy_assets = vec![
+            GithubAsset {
+                name: WINDOWS_BINARY_LEGACY_ASSET.into(),
+                browser_download_url: format!("{ASSET_URL_PREFIX}v0.3.0/{WINDOWS_BINARY_LEGACY_ASSET}"),
+                size: 20_000_000,
+            },
+            GithubAsset {
+                name: LINUX_BINARY_LEGACY_ASSET.into(),
+                browser_download_url: format!("{ASSET_URL_PREFIX}v0.3.0/{LINUX_BINARY_LEGACY_ASSET}"),
+                size: 30_000_000,
+            },
+            GithubAsset {
+                name: CHECKSUMS_ASSET_NAME.into(),
+                browser_download_url: format!("{ASSET_URL_PREFIX}v0.3.0/{CHECKSUMS_ASSET_NAME}"),
+                size: 256,
+            },
+        ];
+        let win_legacy = select_assets_for_platform(&legacy_assets, true);
+        assert_eq!(
+            win_legacy.binary_asset.as_ref().map(|a| a.name.as_str()),
+            Some(WINDOWS_BINARY_LEGACY_ASSET)
+        );
+        let lin_legacy = select_assets_for_platform(&legacy_assets, false);
+        assert_eq!(
+            lin_legacy.binary_asset.as_ref().map(|a| a.name.as_str()),
+            Some(LINUX_BINARY_LEGACY_ASSET)
+        );
+
+        // When both legacy and new names exist, new descriptive names win.
+        let mut mixed = legacy_assets;
+        mixed.extend(sample_assets("nightly"));
+        let win_new = select_assets_for_platform(&mixed, true);
+        assert_eq!(
+            win_new.binary_asset.as_ref().map(|a| a.name.as_str()),
+            Some(WINDOWS_BINARY_ASSET)
+        );
+        assert_eq!(
+            win_new.msi_asset.as_ref().map(|a| a.name.as_str()),
+            Some(WINDOWS_MSI_ASSET)
+        );
+        let lin_new = select_assets_for_platform(&mixed, false);
+        assert_eq!(
+            lin_new.binary_asset.as_ref().map(|a| a.name.as_str()),
+            Some(LINUX_BINARY_ASSET)
+        );
     }
 }

@@ -1,6 +1,6 @@
 param(
     [string]$ExePath = "target\release\glide.exe",
-    [string]$OutPath = "dist\glide-windows-x86_64.msi"
+    [string]$OutPath = "dist\glide-windows-x86_64-installer.msi"
 )
 
 $ErrorActionPreference = "Stop"
@@ -33,4 +33,5 @@ if ($LASTEXITCODE -ne 0) {
     exit $LASTEXITCODE
 }
 
+Remove-Item -Force -ErrorAction SilentlyContinue ([System.IO.Path]::ChangeExtension($OutPath, ".wixpdb"))
 Write-Host "Built Windows MSI installer: $OutPath"

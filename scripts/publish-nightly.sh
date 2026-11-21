@@ -25,7 +25,7 @@ echo "==> Building Glide Nightly (${SHORT_SHA}) with CARGO_BUILD_JOBS=${JOBS}...
 # 1. Linux release binary + .deb
 GLIDE_BUILD_CHANNEL=nightly GLIDE_BUILD_SHA="$SHORT_SHA" \
     CARGO_BUILD_JOBS="$JOBS" cargo build --release --locked --bin glide
-cp target/release/glide "$OUT_DIR/glide-linux-x86_64"
+cp target/release/glide "$OUT_DIR/glide-linux-x86_64-standalone"
 ./scripts/build-deb.sh target/release/glide
 DEB_PATH="$(ls -t dist/glide_*_amd64.deb | head -n 1)"
 cp "$DEB_PATH" "$OUT_DIR/"
@@ -36,10 +36,10 @@ GLIDE_BUILD_CHANNEL=nightly GLIDE_BUILD_SHA="$SHORT_SHA" \
     CARGO_BUILD_JOBS="$JOBS" \
     CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_RUSTFLAGS="-C target-feature=+crt-static" \
     cargo-xwin build --release --locked --bin glide --target x86_64-pc-windows-msvc
-cp target/x86_64-pc-windows-msvc/release/glide.exe "$OUT_DIR/glide-windows-x86_64.exe"
+cp target/x86_64-pc-windows-msvc/release/glide.exe "$OUT_DIR/glide-windows-x86_64-standalone.exe"
 
 # 3. Checksums
-(cd "$OUT_DIR" && sha256sum glide-windows-x86_64.exe glide-linux-x86_64 "$DEB_FILE" > SHA256SUMS.txt)
+(cd "$OUT_DIR" && sha256sum glide-windows-x86_64-standalone.exe glide-linux-x86_64-standalone "$DEB_FILE" > SHA256SUMS.txt)
 cat "$OUT_DIR/SHA256SUMS.txt"
 
 # 4. Update rolling nightly tag + GitHub Prerelease (never --latest)
@@ -59,13 +59,13 @@ Switch to **Settings → Update channel → Nightly** inside Glide to receive au
 ${RECENT_COMMITS}
 
 ### Downloads
-- **Windows 11:** \`glide-windows-x86_64.exe\` *(standalone — no installer or extra DLLs needed)*
+- **Windows 11 Standalone (Portable):** \`glide-windows-x86_64-standalone.exe\` *(no installer or extra DLLs needed)*
 - **Ubuntu / Debian Linux (X11 & Wayland):** \`${DEB_FILE}\`
-- **Linux standalone binary:** \`glide-linux-x86_64\`
+- **Linux Standalone (Portable):** \`glide-linux-x86_64-standalone\`
 - **Checksums:** \`SHA256SUMS.txt\`
 EOF
 
-ASSETS=("$OUT_DIR/glide-windows-x86_64.exe" "$OUT_DIR/glide-linux-x86_64" "$OUT_DIR/$DEB_FILE" "$OUT_DIR/SHA256SUMS.txt")
+ASSETS=("$OUT_DIR/glide-windows-x86_64-standalone.exe" "$OUT_DIR/glide-linux-x86_64-standalone" "$OUT_DIR/$DEB_FILE" "$OUT_DIR/SHA256SUMS.txt")
 if gh release view nightly >/dev/null 2>&1; then
     gh release upload nightly "${ASSETS[@]}" --clobber
     gh release edit nightly \

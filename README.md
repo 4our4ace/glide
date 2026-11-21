@@ -75,10 +75,10 @@ Grab the latest build from [Releases](https://github.com/4our4ace/glide/releases
 
 ### Windows 11
 
-Download and double-click **`glide-windows-x86_64.exe`**.
+Download and run **`glide-windows-x86_64-installer.msi`** *(recommended — per-user install with Start Menu shortcut, clean Apps & Features uninstaller, and no admin prompt)*, or run **`glide-windows-x86_64-standalone.exe`** directly without installing.
 
 > [!NOTE]
-> Glide is completely standalone on Windows — no installer, no Visual C++ Redistributable, and no extra DLLs required.
+> Glide has zero runtime dependencies on Windows — no Visual C++ Redistributable and no extra DLLs required.
 
 1. Click **Start Server** on the PC with your mouse and keyboard.
 2. If Windows Firewall pops up, allow access on **Private networks**.
@@ -142,8 +142,9 @@ Not at all. It only reads the connection's built-in timing locally and never sen
 Glide runs cleanly from the terminal, as a background service, or controlled live from scripts/Stream Deck/hotkeys:
 
 ```powershell
-# Windows primary (server)
-.\glide-windows-x86_64.exe server
+# Windows primary (server) — installed via .msi (on PATH) or standalone .exe
+glide server
+# or: .\glide-windows-x86_64-standalone.exe server
 ```
 
 ```bash
