@@ -2516,6 +2516,9 @@ fn scene_client_connected(s: &mut Ui) {
 
 fn scene_clipboard_filled(s: &mut Ui) {
     s.tab = Tab::Clipboard;
+    s.hostname = "ubuntu-dev".into();
+    s.os_kind = OsKind::LinuxX11;
+    s.os_label = "Linux";
     s.status.clipboard_history = vec![
         ClipboardHistoryEntry {
             id: 1,
@@ -2536,8 +2539,8 @@ fn scene_clipboard_filled(s: &mut Ui) {
     ];
     s.status.recent_files = vec![
         FileTransferEntry {
-            filename: "glide-0.3.0-amd64.deb".into(),
-            bytes: 5_242_880,
+            filename: "glide_0.5.0_amd64.deb".into(),
+            bytes: 10_620_844,
             direction: "sent".into(),
             saved_path: None,
         },
@@ -2643,14 +2646,20 @@ const SCENES: &[(&str, SceneFn)] = &[
         s.theme = ThemePref::Light;
         s.tab = Tab::Input;
         s.role = Role::Client;
+        s.hostname = "ubuntu-dev".into();
         s.is_windows = false;
         s.os_kind = OsKind::LinuxX11;
         s.os_label = "Linux";
+        s.config.client.key_remap.push(KeyRemapRule {
+            from: "CapsLock".into(),
+            to: "Escape".into(),
+        });
     }),
     ("input-client-dark", |s| {
         s.theme = ThemePref::Dark;
         s.tab = Tab::Input;
         s.role = Role::Client;
+        s.hostname = "ubuntu-dev".into();
         s.is_windows = false;
         s.os_kind = OsKind::LinuxX11;
         s.os_label = "Linux";
@@ -2671,6 +2680,10 @@ const SCENES: &[(&str, SceneFn)] = &[
         s.theme = ThemePref::Light;
         scene_clipboard_filled(s);
     }),
+    ("clipboard-filled-dark", |s| {
+        s.theme = ThemePref::Dark;
+        scene_clipboard_filled(s);
+    }),
     ("clipboard-hidden", |s| {
         s.theme = ThemePref::Dark;
         scene_clipboard_filled(s);
@@ -2684,15 +2697,21 @@ const SCENES: &[(&str, SceneFn)] = &[
     ("settings-light", |s| {
         s.theme = ThemePref::Light;
         s.tab = Tab::Settings;
+        s.hostname = "ubuntu-dev".into();
         s.is_windows = false;
+        s.os_kind = OsKind::LinuxX11;
         s.os_label = "Linux";
+        s.config.update_channel = UpdateChannel::Stable;
         s.show_advanced = false;
     }),
     ("settings-dark", |s| {
         s.theme = ThemePref::Dark;
         s.tab = Tab::Settings;
+        s.hostname = "ubuntu-dev".into();
         s.is_windows = false;
+        s.os_kind = OsKind::LinuxX11;
         s.os_label = "Linux";
+        s.config.update_channel = UpdateChannel::Stable;
         s.show_advanced = false;
     }),
     ("settings-windows-light", |s| {
@@ -2745,9 +2764,9 @@ const SCENES: &[(&str, SceneFn)] = &[
                 size: 8_658_944,
             }),
             deb_asset: Some(updater::UpdateAsset {
-                name: "glide_0.3.0_amd64.deb".into(),
-                download_url: format!("{}nightly/glide_0.3.0_amd64.deb", updater::ASSET_URL_PREFIX),
-                size: 10_384_704,
+                name: "glide_0.5.0_amd64.deb".into(),
+                download_url: format!("{}nightly/glide_0.5.0_amd64.deb", updater::ASSET_URL_PREFIX),
+                size: 10_620_844,
             }),
             checksums_url: Some(format!("{}nightly/SHA256SUMS.txt", updater::ASSET_URL_PREFIX)),
         }));

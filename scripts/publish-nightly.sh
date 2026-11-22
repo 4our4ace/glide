@@ -20,7 +20,7 @@ if [ ! -d "$(rustc --print sysroot)/lib/rustlib/x86_64-pc-windows-msvc" ] && [ -
 fi
 export XWIN_CACHE_DIR="${XWIN_CACHE_DIR:-$HOME/.cache/xwin}"
 
-echo "==> Building Glide Nightly (${SHORT_SHA}) with CARGO_BUILD_JOBS=${JOBS}..."
+echo "==> Building Glide Nightly — Beta (${SHORT_SHA}) with CARGO_BUILD_JOBS=${JOBS}..."
 
 # 1. Linux release binary + .deb
 GLIDE_BUILD_CHANNEL=nightly GLIDE_BUILD_SHA="$SHORT_SHA" \
@@ -69,16 +69,16 @@ ASSETS=("$OUT_DIR/glide-windows-x86_64-standalone.exe" "$OUT_DIR/glide-linux-x86
 if gh release view nightly >/dev/null 2>&1; then
     gh release upload nightly "${ASSETS[@]}" --clobber
     gh release edit nightly \
-        --title "Glide Nightly (${SHORT_SHA})" \
+        --title "Glide Nightly — Beta (${SHORT_SHA})" \
         --notes-file "$NOTES_FILE" \
         --prerelease \
         --latest=false
 else
     gh release create nightly "${ASSETS[@]}" \
-        --title "Glide Nightly (${SHORT_SHA})" \
+        --title "Glide Nightly — Beta (${SHORT_SHA})" \
         --notes-file "$NOTES_FILE" \
         --prerelease \
         --latest=false
 fi
 
-echo "==> Published Glide Nightly (${SHORT_SHA})!"
+echo "==> Published Glide Nightly — Beta (${SHORT_SHA})!"

@@ -1,10 +1,10 @@
 # Glide Roadmap & TO-DO
 
-Long-horizon engineering plan to make **Glide** a genuinely native, zero-lag, zero-tech-debt Deskflow replacement — prioritizing **Windows 11 (Server) ↔ Ubuntu 22.04 X11 (Client)** first, then expanding cleanly to Wayland and macOS.
+Engineering roadmap for **Glide** — a lean, pure-Rust, zero-cloud software KVM for **Windows 11**, **Linux (X11 & Wayland)**, and **macOS (planned)**.
 
 ---
 
-## Completed Foundation (v0.1.0 + v0.2.0)
+## Completed Foundation (v0.1.0 – v0.2.0)
 
 - [x] 3-lane QUIC / TLS 1.3 transport (`glide-net`: unreliable datagrams for motion/scroll, reliable control stream for keys/buttons/transitions, independent uni streams for clipboard & files)
 - [x] Persistent Ed25519 TLS identity + SHA-256 pinning & automatic TOFU
@@ -12,75 +12,64 @@ Long-horizon engineering plan to make **Glide** a genuinely native, zero-lag, ze
 - [x] Strictly bijective USB HID Usage scancode table (`glide-hid`) with German ISO (`< > |`, `#/'`, dead keys, umlauts) and Windows fake-`LCtrl` (`0x21D`) `AltGr` filter
 - [x] Multi-monitor & mixed-HiDPI normalized edge geometry (`Per-Monitor DPI Awareness V2` on Windows, XRandR on X11)
 - [x] Bidirectional event-driven clipboard (UTF-8 text with `\r\n` ↔ `\n` normalization + universal PNG/`CF_DIB`/`CF_DIBV5` screenshots, SHA-256 anti-loop, lazy transfer > 256 KB)
-- [x] Static Linux musl binary + `.deb` package (`glide_0.2.0_amd64.deb`) and standalone static-CRT Windows binary (`glide-windows-x86_64.exe`)
+- [x] Standalone Linux binary + `.deb` package and standalone static-CRT Windows binary
 
 ---
 
-## Completed Daily-Driver Milestones (Steps 1–7 & 10)
+## Completed Daily-Driver Milestones (v0.3.0 – v0.5.0)
 
 ### 1. Native Desktop GUI + System Tray (`glide-gui`)
-- [x] Decoupled pure-Rust `glide-gui` crate sharing `glide-core` (headless CLI/daemon intact; zero C GUI deps)
-- [x] Interactive visual monitor & edge layout editor showing real detected monitors, resolutions, and DPI %
-- [x] Live LocalSend-style discovered LAN devices list with one-click connect & automatic fingerprint pinning
-- [x] Native Windows 11 System Tray (`Shell_NotifyIconW`) + frameless desktop app window (`--app` mode) on Windows 11 & Ubuntu + live sensitivity / scroll / dead-corner / dwell sliders without restarting
+- [x] Pure-Rust GPU-rendered desktop UI (Rune: `wgpu` + `winit` + `taffy` + `parley`) with light/dark themes and monochrome vector icons
+- [x] Interactive visual monitor & edge layout editor with drag-to-arrange screens
+- [x] Live LAN discovered devices list + collapsible saved server profiles (`known_servers.toml`) with one-click connect & automatic fingerprint pinning
+- [x] Native Windows 11 System Tray (`Shell_NotifyIconW`) & Linux `StatusNotifierItem` tray + zero background redraws or idle LAN scans when hidden
 
-### 2. Seamless Windows Remote Cursor Hiding & Clean Parking
-- [x] Park the Windows cursor cleanly in the invisible bottom-right corner pixel while controlling Ubuntu (no ghost cursor stuck on the monitor border)
-- [x] Guaranteed cursor restoration on return, escape hotkey (`ScrollLock`), client disconnect, or process exit (`Drop`)
+### 2. Seamless Cursor Hiding, Clean Parking & Gaming Guards
+- [x] Clean cursor parking on Windows and `XFixes` cursor hiding on Linux (no ghost cursor stuck on the monitor border), with guaranteed restoration on return, escape hotkey, disconnect, or exit
+- [x] Configurable corner dead-zone (24 px default), edge dwell delay, and switch distance
+- [x] Fullscreen game/app auto-lock (Windows & Linux X11) + manual lock toggle, media-key pinning to primary PC, and clean `Win+L` handling without double-locking
 
-### 3. Universal Image Clipboard (`CF_DIB` / `CF_DIBV5` ↔ `PNG`) + Lazy Clipboard Transfers
-- [x] Pure-Rust Windows `CF_DIB` / `CF_DIBV5` ↔ `PNG` converter (`glide-backend::dib_png`) so Snipping Tool (`Win+Shift+S`), Paint, browsers, and Ubuntu Flameshot paste screenshots seamlessly both ways
-- [x] Lazy on-demand clipboard offers (`ClipboardOffer` / `ClipboardRequest`) for payloads > 256 KB so local large copies never waste LAN/Wi-Fi bandwidth
-- [x] Live Clipboard History in GUI (last 8 items with one-click re-send)
+### 3. Universal Image Clipboard & Privacy
+- [x] Pure-Rust Windows `CF_DIB` / `CF_DIBV5` ↔ `PNG` converter (`glide-backend::dib_png`) + Wayland/X11 image clipboard support
+- [x] Lazy on-demand clipboard offers (`ClipboardOffer` / `ClipboardRequest`) for payloads > 256 KB
+- [x] Live Clipboard History with one-click re-send, **Hide** privacy cover, and automatic password-manager secret exclusion (1Password, Bitwarden, KeePassXC)
 
-### 4. Dead-Corner Guards, Edge Dwell & Fullscreen App Lock
-- [x] Configurable corner dead-zone (24 px default) so clicking Windows' top-right `X` close button or bottom-right Show Desktop never accidentally jumps screens
-- [x] Configurable edge dwell delay (ms) alongside pixel push-through threshold
-- [x] Fullscreen game/app auto-lock on Windows + manual "Lock Cursor to Current Screen" (`Ctrl+Alt+L`, GUI button, Windows tray menu)
+### 4. Customizable & Disableable Default Shortcuts
+- [x] Live-rebindable and toggleable **Jump to a side** (`Ctrl+Alt+Arrow`), **Lock current screen** (`Ctrl+Alt+L`), and **Bring cursor home** (`ScrollLock`) in *Settings → Shortcuts*
+- [x] Lock-free `AtomicHotkeys` across Windows, X11, and Wayland with `AltGr`, `Win+L`, `Ctrl+Alt+Del`, and conflict protection + one-click **Reset defaults**
+- [x] Per-screen normalized cursor memory (`EnterAt` / `leave_remote_at`)
 
-### 5. Direct Keyboard Screen-Switching Hotkeys & Per-Screen Cursor Memory
-- [x] `Ctrl+Alt+Arrow` direct screen jumps (using Left Alt specifically so German `AltGr` never collides!)
-- [x] Per-screen normalized cursor memory (`EnterAt` / `leave_remote_at`) so hotkey jumps restore your cursor right where you left it
+### 5. Scale-Aware Pointer Feel, Linux Wayland & `/dev/uinput`
+- [x] Optional `auto_dpi_scale`, live `sensitivity`, `scroll_speed`, `invert_scroll`, Lock-key sync (`CapsLock`/`NumLock`), and per-client physical key remapping (`[[client.key_remap]]`)
+- [x] Native Linux Wayland backend (`xdg-desktop-portal` `InputCapture` + `RemoteDesktop` + pure-Rust `libei` / `reis`, persistent restore tokens, `wl-clipboard-rs` with XWayland fallback, and auto X11/Wayland detection)
+- [x] Pure-Rust Linux `/dev/uinput` virtual kernel HID backend (`--backend uinput` / GUI selector) with calibrated pointer sync & `REL_WHEEL_HI_RES` smooth scrolling
 
-### 6. Scale-Aware Pointer Feel, Scroll Tuning & Optional Linux `uinput` Native Mode
-- [x] Optional `auto_dpi_scale`, live `sensitivity`, `scroll_speed`, and `invert_scroll` (natural scrolling) controls
-- [x] Optional pure-Rust Linux `/dev/uinput` virtual kernel HID backend (`--backend uinput` / GUI selector) delivering 100% native `libinput` pointer acceleration & `REL_WHEEL_HI_RES` smooth scrolling, with clean fallback to XTest
+### 6. Live Cross-Edge File Drag-and-Drop
+- [x] Drag files straight across screen edges with live floating previews, lazy drag-only edge arming (zero click overhead), native Windows Shell / X11 XDND drop delivery, Wayland `Ctrl+V` handoff + cursor tooltip, SHA-256 verification, configurable max file size (up to 4 GB), and one-click Open/Reveal receive folder
+- [x] Terminal file transfer (`glide send`) and live session control IPC (`glide ctl status|lock|unlock|switch`)
 
-### 7. Lock-Key Sync (`CapsLock` / `NumLock`) & Per-Client Key Remapping
-- [x] Synchronize `CapsLock` and `NumLock` state on screen entry (`GetKeyState` on Windows, `get_keyboard_control` on X11)
-- [x] Declarative per-client physical key remapping (`[[client.key_remap]]` + live GUI editor with presets)
+### 7. Wi-Fi Anti-Spike & Resilience Hardening
+- [x] QUIC tuned for Wi-Fi: 45 ms keepalive, 2 ms max ACK delay (`ack_eliciting_threshold(1)`), GSO disabled, `2–4 KiB` datagram buffers, backpressure-aware datagram coalescing, `+100` control / `-100` chunked bulk stream priority, Linux `SO_PRIORITY = 6` (`AC_VO`), async SHA-256, and non-blocking LAN discovery
+- [x] Windows 10/11 EcoQoS opt-out (`SetProcessInformation`), non-blocking `wake_pipe()` for X11 clipboard/DnD, persistent `WaylandGeometryWatcher`, and atomic serialized `glide.toml` saves
+- [x] Sleep/wake, display hotplug, and Wi-Fi ↔ Ethernet roaming recovery (`WM_POWERBROADCAST` / `WM_DISPLAYCHANGE` / XRandR `ScreenChangeNotify` / Wayland output changes)
 
-### 10. Zero-Friction OS Integration & File Drop
-- [x] Windows: one-click login autostart (`HKCU\...\Run` Registry API), one-click Windows Firewall rule helper (UDP `24800`/`24801`), and one-click Elevated Scheduled Task helper (for UAC/Admin windows)
-- [x] Ubuntu `.deb`: `/usr/share/applications/glide.desktop`, crisp SVG icon, XDG autostart support, `systemd --user` units, and optional `/usr/share/doc/glide/99-glide-uinput.rules`
-- [x] Instant drag-and-drop File Transfer over QUIC bulk streams (SHA-256 verified, safe filename sanitization, saved to `Downloads/Glide/`)
+### 8. Installers, Channels & Passwordless Auto-Updates
+- [x] Per-user Windows WiX v5 `.msi` installer (`%LOCALAPPDATA%\Programs\Glide`, Start Menu shortcut, Apps & Features uninstaller, no admin/UAC prompt) + standalone `.exe`
+- [x] Ubuntu/Debian `.deb` package + standalone Linux binary + Windows/Linux autostart, Firewall, and Elevated Task helpers
+- [x] Branch & release channel split: `main` = **Stable** (default), `nightly` = **Nightly — Beta** (prerelease with confirmation warning modal)
+- [x] SHA-256 verified one-click **Update & Restart** on both Windows and Linux (passwordless Linux user-space install to `~/.local/bin/glide` with XDG `.desktop` override and autostart rewrite — zero `sudo` prompt)
 
 ---
 
-## Remaining Polish Steps (Next Up After Real-Hardware Test)
+## Remaining / Planned Horizons
 
-### 8. Bulletproof Sleep/Wake, Display Hotplug & Network Roaming Recovery
-- [ ] Subscribe to `WM_POWERBROADCAST` / `WM_DISPLAYCHANGE` / `WTSRegisterSessionNotification` on Windows and XRandR `ScreenChangeNotify` on X11
-- [ ] Instant recovery after laptop lid close/open, monitor plug/unplug, or Wi-Fi ↔ Ethernet roaming
-
-### 9. Interactive Scancode / AltGr Live Inspector & Deep Telemetry
+### Telemetry & Diagnostics Polish
 - [x] Live Ping/Pong RTT (ms) + sparkline in GUI
 - [ ] Jitter, UDP datagram drop counter, and effective mouse Hz meter
 - [ ] Interactive `glide doctor --keys` live raw scancode inspector
 
----
-
-## Deferred / Later Horizons (Explicitly Skipped For Now)
-
-### Linux Wayland Backend (`crates/glide-backend/src/linux_wayland/`)
-- [x] `xdg-desktop-portal` (`InputCapture` + `RemoteDesktop`) + pure-Rust `libei` (`reis`) support for GNOME 46+, KDE Plasma 6.1+, and Hyprland/wlroots portals (with automatic portal D-Bus fallback on older compositors and persistent restore tokens)
-- [x] Native Wayland clipboard bridge (`ext-data-control` / `wlr-data-control` via `wl-clipboard-rs`, with automatic XWayland fallback on GNOME < 49)
-- [x] Auto-detect X11 vs Wayland at runtime inside `glide-backend` + Wayland-compatible `/dev/uinput` backend
-
-### Upcoming Features
-- [ ] Cross-edge file drag-and-drop (drag a file off a screen edge straight onto another PC)
-- [ ] Windows installer (`Setup.exe` / `.msi` + optional `winget` package)
-- [ ] One-click / automatic in-app updates (after manual "Check for updates" in Settings)
+### Packaging Extras
+- [ ] Optional `winget` manifest for Windows
 
 ### macOS Backend (`crates/glide-backend/src/macos.rs`)
 - [ ] Capture: `CGEventTap` (`kCGHIDEventTap`) + `CGAssociateMouseAndMouseCursorPosition(false)` for raw unaccelerated deltas + `IOHIDManager` for extra keys/buttons
