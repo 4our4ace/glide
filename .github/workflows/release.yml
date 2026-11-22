@@ -7,9 +7,9 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: "Release tag to build and publish (e.g. v0.4.0)"
+        description: "Release tag to build and publish (e.g. v0.5.0)"
         required: true
-        default: "v0.4.0"
+        default: "v0.5.0"
 
 permissions:
   contents: read
@@ -140,12 +140,11 @@ jobs:
           One mouse and keyboard across your Windows 11 and Linux PCs — directly over your local network, with no account and no cloud.
 
           ### Highlights in ${TAG}
-          - **Per-user Windows \`.msi\` installer** — Clean install to \`%LOCALAPPDATA%\Programs\Glide\`, Start Menu shortcut, and Apps & Features uninstaller with no admin/UAC prompt required.
-          - **Verified in-app auto-updater (Stable & Nightly tracks)** — SHA-256 checksum-verified updates on Windows and Linux (including \`.msi\`, \`.deb\`, and standalone binaries), defaulting to Stable with a confirmation warning before opting into Nightly (Beta) builds.
-          - **Polished native UI** — Collapsible Saved servers list for one-click profile switching, crisp monochrome Settings icons, and experimental opt-in toggle for cross-edge file drag-and-drop.
-          - **Input & keyboard reliability** — Fixed \`Win+L\` lock-screen handling, local media/volume/brightness key pinning (keep media keys on the server PC), and Linux X11 fullscreen app/game auto-lock.
-          - **Clipboard & file transfers** — Automatic password-manager clipboard exclusion (Bitwarden, 1Password, KeePassXC, etc.), custom receive folder with one-click Open/Reveal actions, and configurable \`max_file_mb\` transfer limit.
-          - **Local CLI control & resilience** — Control a running session or send files from scripts/terminals with \`glide ctl\` and \`glide send\`, plus hardened sleep/wake, monitor hotplug, and LAN roaming recovery.
+          - **Customizable & disableable shortcuts** — Rebind or toggle off **Jump to a side**, **Lock current screen**, and **Bring cursor home** live in Settings with German \`AltGr\` and \`Win+L\` protection and one-click Reset defaults.
+          - **Ultra-low-latency Wi-Fi & OS anti-spike hardening** — 45ms QUIC keepalive, 2ms ACK delay, compact datagram buffers with backpressure & burst coalescing, stream priorities, Windows 10/11 EcoQoS opt-out, and non-blocking X11/Wayland/Windows hot paths.
+          - **Passwordless Linux auto-updates & per-user Windows \`.msi\`** — SHA-256 verified updates on both OSes with zero \`sudo\` or UAC prompts (\`~/.local/bin/glide\` + XDG launcher override on Linux; \`%LOCALAPPDATA%\Programs\Glide\` on Windows), defaulting to Stable with a confirmation warning before opting into Nightly (Beta) builds.
+          - **Cross-edge file drag-and-drop & clipboard upgrades** — Live floating drag previews and native Windows Shell / Linux X11 drops (plus \`Ctrl+V\` clipboard handoff on Wayland), automatic password-manager clipboard exclusion, custom receive folder with Open/Reveal actions, and configurable \`max_file_mb\`.
+          - **Polished native UI & keyboard reliability** — Collapsible Saved servers list, crisp monochrome icons across Settings/Clipboard/Input/Devices, \`Win+L\` lock-screen fix (no double-lock or stray Super tap on Linux), local media-key pinning, Linux X11 fullscreen auto-lock, \`glide ctl\` / \`glide send\` local IPC, and hardened sleep/wake & hotplug recovery.
 
           ### Downloads
           - **Windows 11 Installer (Recommended):** Download and double-click \`glide-windows-x86_64-installer.msi\` *(per-user install to \`%LOCALAPPDATA%\Programs\Glide\`, Start Menu shortcut, Apps & Features uninstaller, no admin/UAC prompt required)*.
