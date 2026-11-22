@@ -6,7 +6,7 @@ use super::widgets::{
     badge, button, card, card_rows, empty_box, kbd, password_field, section_head, segmented,
     setting_icon_badge, setting_row, slider_row, text_field, toggle, xs_button, BtnKind,
 };
-use super::{DeskDrag, DragKind, Role, Tab, Ui};
+use super::{DeskDrag, DragKind, Role, ShortcutSlot, Tab, Ui};
 use crate::updater::UpdateCheckState;
 use glide_backend::InputBackendKind;
 use glide_core::config::UpdateChannel;
@@ -372,7 +372,7 @@ fn sidebar(s: &Ui, p: Palette) -> El {
             .radius(6.0)
             .cursor(Cursor::Pointer)
             .focusable(true)
-            .on_press(move |s: &mut Ui| s.tab = tab)
+            .on_press(move |s: &mut Ui| s.set_tab(tab))
             .child(icon_fn(icon_color))
             .child(
                 text(label)
@@ -445,7 +445,7 @@ fn sidebar(s: &Ui, p: Palette) -> El {
             .press(p.accent.alpha(0.24))
             .cursor(Cursor::Pointer)
             .focusable(true)
-            .on_press(|s: &mut Ui| s.tab = Tab::Settings)
+            .on_press(|s: &mut Ui| s.set_tab(Tab::Settings))
             .child(el().size(6.0, 6.0).radius(3.0).fill(p.accent).a11y_hidden())
             .child(
                 text(banner_label)
@@ -2538,7 +2538,7 @@ fn clipboard_page(s: &Ui, p: Palette) -> El {
         "dnd-toggle-row",
         icons::drag_files_icon(p.text_2),
         "Drag files across edges",
-        Some("Experimental · drag past screen edges"),
+        Some("Pull files past a screen edge"),
         toggle(
             p,
             "dnd-toggle",
@@ -3308,51 +3308,100 @@ fn settings_page(s: &Ui, p: Palette) -> El {
         .child(left_inner);
 
     // Right: Shortcuts (+ Diagnostics when Advanced is enabled)
-    let plus = || text("+").font(ty::SUB).color(p.faint);
+    let hotkeys = s.config.server.parsed_hotkeys();
+    let jump_keycaps = hotkeys
+        .switch_mods
+        .map(|mods| {
+            let mut caps: Vec<String> = mods
+                .keycap_labels(s.is_windows)
+                .into_iter()
+                .map(String::from)
+                .collect();
+            caps.push("Arrow".to_owned());
+            caps
+        })
+        .unwrap_or_default();
+    let lock_keycaps = hotkeys
+        .lock
+        .map(|c| c.keycap_labels(s.is_windows))
+        .unwrap_or_default();
+    let home_keycaps = hotkeys
+        .escape
+        .map(|c| c.keycap_labels(s.is_windows))
+        .unwrap_or_default();
+
     let shortcuts_card = card_rows(
         p,
         "shortcuts-card",
         [
-            setting_row(
+            shortcut_row(
+                s,
                 p,
+                ShortcutSlot::Jump,
                 "sc-jump",
-                icons::swap_horizontal_icon(p.text_2),
-                "Jump to a side",
-                None,
-                row()
-                    .gap(3.0)
-                    .center_y()
-                    .child(kbd(p, "Ctrl"))
-                    .child(plus())
-                    .child(kbd(p, "Alt"))
-                    .child(plus())
-                    .child(kbd(p, "Arrow")),
+                "sc-jump-toggle",
+                icons::swap_horizontal_icon(if hotkeys.switch_mods.is_some() {
+                    p.text_2
+                } else {
+                    p.muted
+                }),
+                hotkeys.switch_mods.is_some(),
+                jump_keycaps,
             ),
-            setting_row(
+            shortcut_row(
+                s,
                 p,
+                ShortcutSlot::Lock,
                 "sc-lock",
-                icons::lock_setting_icon(p.text_2),
-                "Lock current screen",
-                None,
-                row()
-                    .gap(3.0)
-                    .center_y()
-                    .child(kbd(p, "Ctrl"))
-                    .child(plus())
-                    .child(kbd(p, "Alt"))
-                    .child(plus())
-                    .child(kbd(p, "L")),
+                "sc-lock-toggle",
+                icons::lock_setting_icon(if hotkeys.lock.is_some() {
+                    p.text_2
+                } else {
+                    p.muted
+                }),
+                hotkeys.lock.is_some(),
+                lock_keycaps,
             ),
-            setting_row(
+            shortcut_row(
+                s,
                 p,
+                ShortcutSlot::Home,
                 "sc-home",
-                icons::home_icon(p.text_2),
-                "Bring cursor home",
-                None,
-                kbd(p, "Scroll Lock"),
+                "sc-home-toggle",
+                icons::home_icon(if hotkeys.escape.is_some() {
+                    p.text_2
+                } else {
+                    p.muted
+                }),
+                hotkeys.escape.is_some(),
+                home_keycaps,
             ),
         ],
     );
+
+    let sc_head_right = if s.config.server.shortcuts_are_default() {
+        text("On the server").font(ty::SUB).color(p.faint)
+    } else {
+        row()
+            .key("sc-reset-btn")
+            .role("button")
+            .label_static("Reset defaults")
+            .h(22.0)
+            .px(7.0)
+            .center()
+            .radius(5.0)
+            .hover(p.hover)
+            .press(p.press)
+            .cursor(Cursor::Pointer)
+            .focusable(true)
+            .on_press(|s: &mut Ui| s.reset_shortcuts())
+            .child(
+                text("Reset defaults")
+                    .font(ty::SUB_MED)
+                    .color(p.accent_text)
+                    .a11y_hidden(),
+            )
+    };
 
     let mut right_col = col()
         .key("settings-right")
@@ -3366,12 +3415,7 @@ fn settings_page(s: &Ui, p: Palette) -> El {
             col()
                 .w_full()
                 .gap(7.0)
-                .child(section_head(
-                    p,
-                    "sc-head",
-                    "Shortcuts",
-                    Some(text("On the server").font(ty::SUB).color(p.faint)),
-                ))
+                .child(section_head(p, "sc-head", "Shortcuts", Some(sc_head_right)))
                 .child(shortcuts_card),
         );
 
@@ -3453,6 +3497,157 @@ fn settings_page(s: &Ui, p: Palette) -> El {
                 .child(right_col),
         )
         .child(version_foot)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn shortcut_row(
+    s: &Ui,
+    p: Palette,
+    slot: ShortcutSlot,
+    row_key: &'static str,
+    toggle_key: &'static str,
+    icon: El,
+    enabled: bool,
+    keycaps: Vec<String>,
+) -> El {
+    let title = slot.title();
+    let is_recording = s.shortcut_recorder.active == Some(slot);
+
+    let line1 = row()
+        .w_full()
+        .h(26.0)
+        .gap(9.0)
+        .center_y()
+        .child(setting_icon_badge(p, icon))
+        .child(
+            text(title)
+                .font(ty::LABEL)
+                .color(if enabled || is_recording {
+                    p.text
+                } else {
+                    p.muted
+                })
+                .grow(1.0)
+                .shrink()
+                .min_w(0.0)
+                .truncate(),
+        )
+        .child(toggle(p, toggle_key, title, enabled, move |s, tx| {
+            s.toggle_shortcut_slot(slot, tx);
+        }));
+
+    let plus = |col_c: Color| text("+").font(ty::SUB).color(col_c);
+
+    let (rec_left, rec_right): (El, Option<El>) = if is_recording {
+        let left = if !s.shortcut_recorder.held_mods.is_empty() {
+            let mut pills = row()
+                .grow(1.0)
+                .shrink()
+                .min_w(0.0)
+                .h(22.0)
+                .gap(3.0)
+                .center_y()
+                .clip_rounded(0.0);
+            for label in s.shortcut_recorder.held_mods.keycap_labels(s.is_windows) {
+                pills = pills.child(kbd(p, label)).child(plus(p.accent_text));
+            }
+            pills.child(text("…").font(ty::SUB_MED).color(p.accent_text))
+        } else {
+            let prompt = match slot {
+                ShortcutSlot::Jump => "Hold mod + Arrow…",
+                ShortcutSlot::Lock | ShortcutSlot::Home => "Press shortcut…",
+            };
+            text(prompt)
+                .font(ty::SUB_MED)
+                .color(p.accent_text)
+                .grow(1.0)
+                .shrink()
+                .min_w(0.0)
+                .truncate()
+        };
+        (left, Some(text("Esc").font(ty::SUB).color(p.accent_text)))
+    } else if enabled {
+        let show_change = keycaps.len() <= 4;
+        let mut pills = row()
+            .grow(1.0)
+            .shrink()
+            .min_w(0.0)
+            .h(22.0)
+            .gap(3.0)
+            .center_y()
+            .clip_rounded(0.0);
+        for (idx, label) in keycaps.iter().enumerate() {
+            if idx > 0 {
+                pills = pills.child(plus(p.faint));
+            }
+            pills = pills.child(kbd(p, label));
+        }
+        (
+            pills,
+            show_change.then(|| text("Change").font(ty::SUB).color(p.faint)),
+        )
+    } else {
+        (
+            text("Disabled — click to set")
+                .font(ty::SUB)
+                .color(p.muted)
+                .grow(1.0)
+                .shrink()
+                .min_w(0.0)
+                .truncate(),
+            None,
+        )
+    };
+
+    let rec_a11y = if is_recording {
+        format!("Recording shortcut for {title}")
+    } else if enabled {
+        format!("{title}: {}", keycaps.join("+"))
+    } else {
+        format!("{title}: Disabled")
+    };
+
+    let mut rec_box = row()
+        .key(slot.recorder_key())
+        .role("button")
+        .label(rec_a11y)
+        .focusable(true)
+        .cursor(Cursor::Pointer)
+        .h(26.0)
+        .w_full()
+        .px(8.0)
+        .gap(6.0)
+        .radius(6.0)
+        .center_y()
+        .justify_between()
+        .on_press(move |s: &mut Ui| s.start_recording_shortcut(slot))
+        .on_physical_input(move |s: &mut Ui, ev, tx| {
+            s.handle_shortcut_physical_input(slot, ev, tx)
+        })
+        .child(rec_left);
+
+    if let Some(right) = rec_right {
+        rec_box = rec_box.child(right);
+    }
+
+    rec_box = if is_recording {
+        rec_box.fill(p.accent_soft).border(1.5, p.accent)
+    } else {
+        rec_box
+            .fill(p.canvas)
+            .border(1.0, p.line)
+            .hover(p.hover)
+            .press(p.press)
+    };
+
+    col()
+        .key(row_key)
+        .w_full()
+        .px(11.0)
+        .py(8.0)
+        .gap(6.0)
+        .child(line1)
+        .child(row().w_full().pl(35.0).child(rec_box))
 }
 
 // ---------------------------------------------------------------------------

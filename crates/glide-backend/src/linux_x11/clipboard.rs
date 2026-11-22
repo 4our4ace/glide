@@ -4,12 +4,15 @@
 //! ICCCM `INCR` chunked transfers for large payloads, with SHA-256 anti-loop protection.
 
 use crate::clipboard_privacy::{has_sensitive_x11_target, PASSWORD_MANAGER_HINT_MIME};
+use crate::linux_x11::{poll_fd_and_wake, wake_pipe, WakeReceiver, WakeSender};
 use crate::{ClipboardBackend, ClipboardHandle};
 use anyhow::{Context, Result};
 use bytes::Bytes;
 use glide_net::sha256_bytes;
 use glide_proto::{ClipboardFormat, ClipboardPayload, MAX_CLIPBOARD_BYTES};
 use parking_lot::Mutex;
+use std::os::fd::AsRawFd;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::thread;
 use tokio::sync::mpsc;
@@ -17,9 +20,8 @@ use tracing::{debug, trace, warn};
 use x11rb::connection::Connection;
 use x11rb::protocol::xfixes::{ConnectionExt as XFixesExt, SelectionEventMask};
 use x11rb::protocol::xproto::{
-    Atom, AtomEnum, ClientMessageData, ClientMessageEvent, ConnectionExt as XProtoExt,
-    CreateWindowAux, EventMask, PropMode, Property, SelectionNotifyEvent, Window, WindowClass,
-    CLIENT_MESSAGE_EVENT, SELECTION_NOTIFY_EVENT,
+    Atom, AtomEnum, ConnectionExt as XProtoExt, CreateWindowAux, EventMask, PropMode, Property,
+    SelectionNotifyEvent, Window, WindowClass, SELECTION_NOTIFY_EVENT,
 };
 use x11rb::protocol::Event;
 use x11rb::rust_connection::RustConnection;
@@ -35,7 +37,6 @@ struct Atoms {
     password_manager_hint: Atom,
     incr: Atom,
     prop: Atom,
-    wake: Atom,
 }
 
 impl Atoms {
@@ -48,7 +49,6 @@ impl Atoms {
         let password_manager_hint = conn.intern_atom(false, PASSWORD_MANAGER_HINT_MIME.as_bytes())?;
         let incr = conn.intern_atom(false, b"INCR")?;
         let prop = conn.intern_atom(false, b"GLIDE_CLIP_DATA")?;
-        let wake = conn.intern_atom(false, b"GLIDE_CLIP_WAKE")?;
         Ok(Self {
             clipboard: clipboard.reply()?.atom,
             targets: targets.reply()?.atom,
@@ -59,7 +59,6 @@ impl Atoms {
             password_manager_hint: password_manager_hint.reply()?.atom,
             incr: incr.reply()?.atom,
             prop: prop.reply()?.atom,
-            wake: wake.reply()?.atom,
         })
     }
 }
@@ -67,12 +66,11 @@ impl Atoms {
 struct SharedClip {
     owned: Mutex<Option<ClipboardPayload>>,
     last_remote_hash: Mutex<Option<[u8; 32]>>,
+    claim_pending: AtomicBool,
 }
 
 struct X11ClipboardBackend {
-    conn: Arc<RustConnection>,
-    win: Window,
-    wake_atom: Atom,
+    wake: WakeSender,
     shared: Arc<SharedClip>,
 }
 
@@ -80,20 +78,8 @@ impl ClipboardBackend for X11ClipboardBackend {
     fn set(&self, payload: ClipboardPayload) -> Result<()> {
         *self.shared.last_remote_hash.lock() = Some(payload.sha256);
         *self.shared.owned.lock() = Some(payload);
-        let ev = ClientMessageEvent {
-            response_type: CLIENT_MESSAGE_EVENT,
-            format: 32,
-            sequence: 0,
-            window: self.win,
-            type_: self.wake_atom,
-            data: ClientMessageData::from([1u32, 0, 0, 0, 0]),
-        };
-        self.conn
-            .send_event(false, self.win, EventMask::NO_EVENT, ev)
-            .context("failed to wake X11 clipboard thread")?;
-        self.conn
-            .flush()
-            .context("failed to flush X11 clipboard wake")?;
+        self.shared.claim_pending.store(true, Ordering::Release);
+        self.wake.wake();
         Ok(())
     }
 }
@@ -101,7 +87,6 @@ impl ClipboardBackend for X11ClipboardBackend {
 pub fn start_x11_clipboard() -> Result<ClipboardHandle> {
     let (conn, screen_num) =
         RustConnection::connect(None).context("failed to connect to X11 display for clipboard")?;
-    let conn = Arc::new(conn);
     let root = conn.setup().roots[screen_num].root;
 
     conn.xfixes_query_version(5, 0)?
@@ -133,28 +118,26 @@ pub fn start_x11_clipboard() -> Result<ClipboardHandle> {
     )?;
     conn.flush()?;
 
+    let (wake_tx, wake_rx) = wake_pipe()?;
     let shared = Arc::new(SharedClip {
         owned: Mutex::new(None),
         last_remote_hash: Mutex::new(None),
+        claim_pending: AtomicBool::new(false),
     });
 
     let (tx, rx) = mpsc::unbounded_channel();
-    let wake_atom = atoms.wake;
 
-    let thread_conn = Arc::clone(&conn);
     let thread_shared = Arc::clone(&shared);
     thread::Builder::new()
         .name("glide-x11-clipboard".into())
         .spawn(move || {
-            run_clipboard_loop(thread_conn, win, atoms, thread_shared, tx);
+            run_clipboard_loop(conn, win, atoms, thread_shared, wake_rx, tx);
         })
         .context("failed to spawn glide-x11-clipboard thread")?;
 
     Ok(ClipboardHandle {
         backend: Box::new(X11ClipboardBackend {
-            conn,
-            win,
-            wake_atom,
+            wake: wake_tx,
             shared,
         }),
         local_changes: rx,
@@ -198,10 +181,11 @@ fn selection_notify_matches(state: &ReadState, time: u32, target: Atom) -> bool 
 }
 
 fn run_clipboard_loop(
-    conn: Arc<RustConnection>,
+    conn: RustConnection,
     win: Window,
     atoms: Atoms,
     shared: Arc<SharedClip>,
+    wake_rx: WakeReceiver,
     tx: mpsc::UnboundedSender<ClipboardPayload>,
 ) {
     let mut state = ReadState::Idle;
@@ -228,24 +212,29 @@ fn run_clipboard_loop(
         });
     };
 
-    loop {
-        let ev = match conn.wait_for_event() {
-            Ok(ev) => ev,
-            Err(e) => {
-                warn!(error = %e, "X11 clipboard connection closed");
-                break;
+    let claim_if_pending = || {
+        if shared.claim_pending.swap(false, Ordering::AcqRel) {
+            // Claim CLIPBOARD ownership so X11 apps paste our remote payload.
+            if let Err(e) = conn.set_selection_owner(win, atoms.clipboard, x11rb::CURRENT_TIME) {
+                warn!(error = %e, "Failed to claim X11 CLIPBOARD ownership");
             }
-        };
+            let _ = conn.flush();
+        }
+    };
 
-        match ev {
-            Event::ClientMessage(cm) if cm.type_ == atoms.wake => {
-                // Claim CLIPBOARD ownership so X11 apps paste our remote payload.
-                if let Err(e) = conn.set_selection_owner(win, atoms.clipboard, x11rb::CURRENT_TIME)
-                {
-                    warn!(error = %e, "Failed to claim X11 CLIPBOARD ownership");
+    'outer: loop {
+        loop {
+            claim_if_pending();
+            let ev = match conn.poll_for_event() {
+                Ok(Some(ev)) => ev,
+                Ok(None) => break,
+                Err(e) => {
+                    warn!(error = %e, "X11 clipboard connection closed");
+                    break 'outer;
                 }
-                let _ = conn.flush();
-            }
+            };
+
+            match ev {
             Event::XfixesSelectionNotify(sn) if sn.selection == atoms.clipboard => {
                 if sn.owner == win || sn.owner == x11rb::NONE {
                     state = ReadState::Idle;
@@ -447,8 +436,24 @@ fn run_clipboard_loop(
                 let _ = conn.flush();
             }
             _ => {}
+            }
+        }
+
+        if shared.claim_pending.load(Ordering::Acquire) {
+            continue;
+        }
+        let _ = conn.flush();
+        match poll_fd_and_wake(conn.stream().as_raw_fd(), &wake_rx, -1) {
+            Ok(st) if st.wake_closed || st.fd_error => break,
+            Ok(_) => {}
+            Err(e) => {
+                warn!(error = %e, "X11 clipboard poll failed");
+                break;
+            }
         }
     }
+    let _ = conn.destroy_window(win);
+    let _ = conn.flush();
 }
 
 fn choose_x11_clipboard_target(offered: &[Atom], atoms: &Atoms) -> Option<(Atom, ClipboardFormat)> {
@@ -481,7 +486,6 @@ mod tests {
             password_manager_hint: 7,
             incr: 8,
             prop: 9,
-            wake: 10,
         }
     }
 

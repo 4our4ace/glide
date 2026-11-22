@@ -836,10 +836,64 @@ where
             return Ok(UpdateInstallOutcome::InstalledRelaunch(current_exe));
         }
 
-        // System-wide install (e.g. /usr/bin/glide from .deb): download + verify the .deb into a
-        // private 0700 temp directory and install via `sudo` (authenticating as the current user,
-        // NOT root via Polkit/pkexec which fails on Debian and corporate laptops without a root
-        // password or local polkit admin group membership).
+        // Case 2: System-wide install (e.g. /usr/bin/glide from .deb) with a standalone Linux
+        // binary asset: install passwordlessly into `$XDG_BIN_HOME/glide` (default
+        // `~/.local/bin/glide`), shadow `/usr/share/applications/glide.desktop` via an XDG user
+        // `.desktop` override, and update existing autostart `Exec=` — ZERO sudo password needed!
+        // Subsequent updates will then run from `~/.local/bin/glide` and hit Case 1 in-place.
+        if let (Some(asset), Some(user_exe_path)) =
+            (update.binary_asset.as_ref(), linux_user_install_path())
+        {
+            let can_use_user_dir = user_exe_path.parent().is_some_and(|user_bin_dir| {
+                ensure_real_dir(user_bin_dir).is_ok()
+                    && is_dir_writable(user_bin_dir)
+                    && reject_if_symlink(&user_exe_path).is_ok()
+            });
+
+            if can_use_user_dir {
+                if let Some(user_bin_dir) = user_exe_path.parent() {
+                    let expected_sha = fetch_expected_sha256(
+                        &agent,
+                        checksums_url,
+                        &asset.name,
+                        current_version,
+                    )?;
+                    let staged =
+                        user_bin_dir.join(format!(".glide-update-{}.new", std::process::id()));
+                    download_verified_file(
+                        &agent,
+                        asset,
+                        &expected_sha,
+                        &staged,
+                        current_version,
+                        &mut on_progress,
+                    )?;
+
+                    on_installing();
+                    let desktop_path = linux_user_desktop_path();
+                    let autostart_path = linux_user_autostart_path();
+                    if let Err(e) = install_linux_user_staged_binary(
+                        &staged,
+                        &user_exe_path,
+                        desktop_path.as_deref(),
+                        autostart_path.as_deref(),
+                    ) {
+                        let _ = fs::remove_file(&staged);
+                        return Err(e);
+                    }
+
+                    info!(
+                        version = %update.version,
+                        exe = %user_exe_path.display(),
+                        "Installed verified Glide user-space update on Linux without sudo"
+                    );
+                    return Ok(UpdateInstallOutcome::InstalledRelaunch(user_exe_path));
+                }
+            }
+        }
+
+        // Case 3: Fallback for .deb-only releases or unwritable user bin directories — download
+        // and verify the .deb into a private 0700 temp directory and install via `sudo`.
         let deb_asset = update.deb_asset.as_ref().ok_or_else(|| {
             format!(
                 "{} is root-owned and release has no .deb package for automatic install",
@@ -1023,6 +1077,438 @@ pub fn cleanup_staged_dir(stage_dir: &Path) {
     if is_glide_stage {
         let _ = fs::remove_dir_all(stage_dir);
     }
+}
+
+#[cfg(target_os = "linux")]
+fn linux_env_abs_dir(var: &str) -> Option<PathBuf> {
+    std::env::var_os(var)
+        .filter(|v| !v.is_empty())
+        .map(PathBuf::from)
+        .filter(|p| p.is_absolute())
+}
+
+#[cfg(target_os = "linux")]
+fn linux_home_dir() -> Option<PathBuf> {
+    linux_env_abs_dir("HOME")
+}
+
+/// Resolves the standard XDG user executable path: `$XDG_BIN_HOME/glide` (if set and absolute),
+/// else `$HOME/.local/bin/glide`.
+#[cfg(target_os = "linux")]
+fn linux_user_install_path() -> Option<PathBuf> {
+    let bin_dir = linux_env_abs_dir("XDG_BIN_HOME")
+        .or_else(|| linux_home_dir().map(|h| h.join(".local").join("bin")))?;
+    Some(bin_dir.join("glide"))
+}
+
+/// Resolves the standard XDG user desktop entry override:
+/// `$XDG_DATA_HOME/applications/glide.desktop` (fallback `~/.local/share/applications/glide.desktop`).
+#[cfg(target_os = "linux")]
+fn linux_user_desktop_path() -> Option<PathBuf> {
+    let data_dir = linux_env_abs_dir("XDG_DATA_HOME")
+        .or_else(|| linux_home_dir().map(|h| h.join(".local").join("share")))?;
+    Some(data_dir.join("applications").join("glide.desktop"))
+}
+
+/// Resolves the standard XDG user autostart entry:
+/// `$XDG_CONFIG_HOME/autostart/glide.desktop` (fallback `~/.config/autostart/glide.desktop`).
+#[cfg(target_os = "linux")]
+fn linux_user_autostart_path() -> Option<PathBuf> {
+    let cfg_dir = linux_env_abs_dir("XDG_CONFIG_HOME")
+        .or_else(|| linux_home_dir().map(|h| h.join(".config")))?;
+    Some(cfg_dir.join("autostart").join("glide.desktop"))
+}
+
+/// Escapes a single argument token for a Freedesktop `.desktop` `Exec=` key.
+///
+/// Per the Desktop Entry Specification, `.desktop` string unescaping runs before `Exec=`
+/// argument unquoting, so quoted `\`, `"`, `$`, and `` ` `` are prefixed with `\\`, and
+/// literal `%` is doubled to `%%` to prevent field-code expansion.
+#[cfg(any(target_os = "linux", test))]
+fn escape_desktop_exec_arg(arg: &str) -> Result<String, String> {
+    if arg.is_empty() {
+        return Err("Desktop Exec argument must not be empty".into());
+    }
+    if arg.chars().any(|c| c.is_control()) {
+        return Err("Desktop Exec argument contains forbidden control characters".into());
+    }
+    let needs_quoting = arg.chars().any(|c| {
+        matches!(
+            c,
+            ' ' | '\t'
+                | '\n'
+                | '"'
+                | '\''
+                | '\\'
+                | '>'
+                | '<'
+                | '~'
+                | '|'
+                | '&'
+                | ';'
+                | '$'
+                | '*'
+                | '?'
+                | '#'
+                | '('
+                | ')'
+                | '`'
+        )
+    });
+
+    if !needs_quoting {
+        return Ok(arg.replace('%', "%%"));
+    }
+
+    let mut out = String::with_capacity(arg.len() + 8);
+    out.push('"');
+    for c in arg.chars() {
+        match c {
+            '\\' => out.push_str(r"\\\\"),
+            '"' => out.push_str(r#"\\""#),
+            '$' => out.push_str(r"\\$"),
+            '`' => out.push_str(r"\\`"),
+            '%' => out.push_str("%%"),
+            other => out.push(other),
+        }
+    }
+    out.push('"');
+    Ok(out)
+}
+
+/// Formats a Freedesktop `glide.desktop` launcher entry pointing at `exe_path`, matching
+/// `scripts/build-deb.sh` so `~/.local/share/applications/glide.desktop` shadows the system
+/// `/usr/share/applications/glide.desktop` entry seamlessly with the same Glide icon.
+#[cfg(any(target_os = "linux", test))]
+fn format_linux_desktop_entry(exe_path: &Path) -> Result<String, String> {
+    let exe_str = exe_path
+        .to_str()
+        .ok_or_else(|| "Install path is not valid UTF-8".to_string())?;
+    let quoted_exe = escape_desktop_exec_arg(exe_str)?;
+    Ok(format!(
+        "[Desktop Entry]\n\
+         Type=Application\n\
+         Version=1.0\n\
+         Name=Glide KVM\n\
+         GenericName=Software KVM\n\
+         Comment=Ultra-low-latency mouse, keyboard, clipboard, and file sharing over QUIC\n\
+         Exec={quoted_exe} gui\n\
+         Icon=glide\n\
+         StartupWMClass=Glide\n\
+         Terminal=false\n\
+         Categories=Utility;Network;\n\
+         StartupNotify=true\n"
+    ))
+}
+
+/// Splits a `.desktop` `Exec=` value into `(first_arg, remaining_args)` while respecting
+/// double-quoted executable paths and `.desktop` backslash escaping.
+#[cfg(any(target_os = "linux", test))]
+fn split_desktop_exec_first_arg(val: &str) -> (&str, &str) {
+    let s = val.trim_start_matches([' ', '\t']);
+    let bytes = s.as_bytes();
+    if bytes.is_empty() {
+        return ("", "");
+    }
+    if bytes[0] == b'"' {
+        let mut i = 1;
+        let mut consecutive_backslashes = 0usize;
+        while i < bytes.len() {
+            if bytes[i] == b'\\' {
+                consecutive_backslashes += 1;
+                i += 1;
+                continue;
+            }
+            if bytes[i] == b'"' && consecutive_backslashes % 4 == 0 {
+                let end = i + 1;
+                return (&s[..end], s[end..].trim_start_matches([' ', '\t']));
+            }
+            consecutive_backslashes = 0;
+            i += 1;
+        }
+        (s, "")
+    } else {
+        let mut i = 0;
+        while i < bytes.len() {
+            if bytes[i] == b'\\' {
+                i = (i + 2).min(bytes.len());
+                continue;
+            }
+            if bytes[i] == b' ' || bytes[i] == b'\t' {
+                return (&s[..i], s[i..].trim_start_matches([' ', '\t']));
+            }
+            i += 1;
+        }
+        (s, "")
+    }
+}
+
+/// Rewrites the `[Desktop Entry]` `Exec=` executable path in an existing autostart `.desktop`
+/// file to `new_exe`, preserving all existing CLI flags and non-`Exec` lines intact.
+#[cfg(any(target_os = "linux", test))]
+fn rewrite_autostart_exec(contents: &str, new_exe: &Path) -> Result<String, String> {
+    let exe_str = new_exe
+        .to_str()
+        .ok_or_else(|| "Install path is not valid UTF-8".to_string())?;
+    let quoted_exe = escape_desktop_exec_arg(exe_str)?;
+
+    let mut out = String::with_capacity(contents.len() + quoted_exe.len());
+    let mut in_desktop_entry = false;
+    let mut replaced = false;
+
+    for segment in contents.split_inclusive('\n') {
+        let (line_with_cr, has_nl) = match segment.strip_suffix('\n') {
+            Some(s) => (s, true),
+            None => (segment, false),
+        };
+        let (line, has_cr) = match line_with_cr.strip_suffix('\r') {
+            Some(s) => (s, true),
+            None => (line_with_cr, false),
+        };
+
+        let trimmed = line.trim();
+        if trimmed.starts_with('[') && trimmed.ends_with(']') {
+            in_desktop_entry = trimmed == "[Desktop Entry]";
+        }
+
+        if in_desktop_entry && !replaced {
+            if let Some((key, val)) = line.split_once('=') {
+                if key.trim() == "Exec" {
+                    let (_old_exe, rest) = split_desktop_exec_first_arg(val);
+                    out.push_str("Exec=");
+                    out.push_str(&quoted_exe);
+                    if !rest.is_empty() {
+                        out.push(' ');
+                        out.push_str(rest);
+                    }
+                    if has_cr {
+                        out.push('\r');
+                    }
+                    if has_nl {
+                        out.push('\n');
+                    }
+                    replaced = true;
+                    continue;
+                }
+            }
+        }
+
+        out.push_str(segment);
+    }
+
+    Ok(out)
+}
+
+#[cfg(target_os = "linux")]
+static ATOMIC_FILE_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+#[cfg(target_os = "linux")]
+fn ensure_real_dir(dir: &Path) -> Result<(), String> {
+    match fs::symlink_metadata(dir) {
+        Ok(meta) => {
+            if meta.file_type().is_symlink() {
+                return Err(format!(
+                    "Refusing to install into symlinked directory {}",
+                    dir.display()
+                ));
+            }
+            if !meta.is_dir() {
+                return Err(format!("{} exists and is not a directory", dir.display()));
+            }
+            Ok(())
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            fs::create_dir_all(dir)
+                .map_err(|e| format!("Failed creating directory {}: {e}", dir.display()))?;
+            let meta = fs::symlink_metadata(dir)
+                .map_err(|e| format!("Failed verifying directory {}: {e}", dir.display()))?;
+            if meta.file_type().is_symlink() || !meta.is_dir() {
+                return Err(format!(
+                    "Refusing to install into symlinked or non-directory {}",
+                    dir.display()
+                ));
+            }
+            Ok(())
+        }
+        Err(e) => Err(format!("Failed inspecting directory {}: {e}", dir.display())),
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn reject_if_symlink(path: &Path) -> Result<(), String> {
+    match fs::symlink_metadata(path) {
+        Ok(meta) => {
+            if meta.file_type().is_symlink() {
+                return Err(format!("Refusing to overwrite symlink {}", path.display()));
+            }
+            if !meta.is_file() {
+                return Err(format!("Refusing to overwrite non-file {}", path.display()));
+            }
+            Ok(())
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(format!("Failed inspecting {}: {e}", path.display())),
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn write_file_atomic_no_symlink(path: &Path, content: &str, mode: u32) -> Result<(), String> {
+    use std::os::unix::fs::OpenOptionsExt;
+
+    let parent = path
+        .parent()
+        .ok_or_else(|| format!("Path {} has no parent directory", path.display()))?;
+    ensure_real_dir(parent)?;
+    reject_if_symlink(path)?;
+
+    let fname = path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("glide");
+    let seq = ATOMIC_FILE_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let tmp = parent.join(format!(".{fname}.tmp.{}.{seq}", std::process::id()));
+
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(mode)
+        .open(&tmp)
+        .map_err(|e| format!("Failed creating temp file {}: {e}", tmp.display()))?;
+
+    let write_res = file
+        .write_all(content.as_bytes())
+        .and_then(|()| file.flush())
+        .and_then(|()| file.sync_all());
+    drop(file);
+    if let Err(e) = write_res {
+        let _ = fs::remove_file(&tmp);
+        return Err(format!("Failed writing {}: {e}", tmp.display()));
+    }
+
+    if let Err(e) = reject_if_symlink(path) {
+        let _ = fs::remove_file(&tmp);
+        return Err(e);
+    }
+
+    if let Err(e) = fs::rename(&tmp, path) {
+        let _ = fs::remove_file(&tmp);
+        return Err(format!(
+            "Failed atomically replacing {}: {e}",
+            path.display()
+        ));
+    }
+    Ok(())
+}
+
+/// Atomically installs a SHA-256 verified Linux binary into `user_exe_path` (`0755`), writes
+/// the XDG user `.desktop` override, and updates any existing regular autostart `.desktop` file.
+#[cfg(target_os = "linux")]
+fn install_linux_user_staged_binary(
+    staged_binary: &Path,
+    user_exe_path: &Path,
+    desktop_entry_path: Option<&Path>,
+    autostart_path: Option<&Path>,
+) -> Result<(), String> {
+    use std::os::unix::fs::PermissionsExt;
+
+    let bin_dir = user_exe_path
+        .parent()
+        .ok_or_else(|| "User install path has no parent directory".to_string())?;
+    ensure_real_dir(bin_dir)?;
+    reject_if_symlink(user_exe_path)?;
+
+    let staged_meta = fs::symlink_metadata(staged_binary).map_err(|e| {
+        format!(
+            "Failed inspecting staged binary {}: {e}",
+            staged_binary.display()
+        )
+    })?;
+    if staged_meta.file_type().is_symlink() || !staged_meta.is_file() {
+        return Err(format!(
+            "Refusing to install non-regular staged binary {}",
+            staged_binary.display()
+        ));
+    }
+
+    let desktop_content = if let Some(desktop_path) = desktop_entry_path {
+        if let Some(desktop_dir) = desktop_path.parent() {
+            ensure_real_dir(desktop_dir)?;
+        }
+        reject_if_symlink(desktop_path)?;
+        Some(format_linux_desktop_entry(user_exe_path)?)
+    } else {
+        None
+    };
+
+    fs::set_permissions(staged_binary, fs::Permissions::from_mode(0o755))
+        .map_err(|e| format!("Failed setting executable permission: {e}"))?;
+    reject_if_symlink(user_exe_path)?;
+    fs::rename(staged_binary, user_exe_path).map_err(|e| {
+        format!(
+            "Failed installing binary into {}: {e}",
+            user_exe_path.display()
+        )
+    })?;
+
+    if let (Some(desktop_path), Some(content)) = (desktop_entry_path, desktop_content) {
+        write_file_atomic_no_symlink(desktop_path, &content, 0o644)?;
+    }
+
+    if let Some(auto_path) = autostart_path {
+        match fs::symlink_metadata(auto_path) {
+            Ok(meta) if meta.file_type().is_file() => {
+                // `symlink_metadata().file_type().is_file()` is strictly false for symlinks.
+                if let Some(auto_dir) = auto_path.parent() {
+                    if let Err(e) = ensure_real_dir(auto_dir) {
+                        warn!(
+                            path = %auto_path.display(),
+                            error = %e,
+                            "Skipping autostart Exec= update due to unsafe directory"
+                        );
+                        return Ok(());
+                    }
+                }
+                match fs::read_to_string(auto_path) {
+                    Ok(existing) => match rewrite_autostart_exec(&existing, user_exe_path) {
+                        Ok(updated) if updated != existing => {
+                            if let Err(e) = write_file_atomic_no_symlink(auto_path, &updated, 0o644)
+                            {
+                                warn!(
+                                    path = %auto_path.display(),
+                                    error = %e,
+                                    "Failed updating autostart Exec= path after user-space update"
+                                );
+                            }
+                        }
+                        Ok(_) => {}
+                        Err(e) => {
+                            warn!(
+                                path = %auto_path.display(),
+                                error = %e,
+                                "Failed rewriting autostart Exec= line"
+                            );
+                        }
+                    },
+                    Err(e) => {
+                        warn!(
+                            path = %auto_path.display(),
+                            error = %e,
+                            "Failed reading existing autostart entry"
+                        );
+                    }
+                }
+            }
+            Ok(meta) if meta.file_type().is_symlink() => {
+                warn!(
+                    path = %auto_path.display(),
+                    "Refusing to modify symlinked autostart entry during update"
+                );
+            }
+            Ok(_) | Err(_) => {}
+        }
+    }
+
+    Ok(())
 }
 
 #[cfg(target_os = "linux")]
@@ -1642,5 +2128,232 @@ mod tests {
             lin_new.binary_asset.as_ref().map(|a| a.name.as_str()),
             Some(LINUX_BINARY_ASSET)
         );
+    }
+
+    #[test]
+    fn linux_desktop_entry_formats_and_quotes_exec_cleanly() {
+        let plain = format_linux_desktop_entry(Path::new("/home/alice/.local/bin/glide")).unwrap();
+        assert!(plain.starts_with("[Desktop Entry]\n"));
+        assert!(plain.contains("Name=Glide KVM\n"));
+        assert!(plain.contains("GenericName=Software KVM\n"));
+        assert!(plain.contains("Icon=glide\n"));
+        assert!(plain.contains("StartupWMClass=Glide\n"));
+        assert!(plain.contains("Terminal=false\n"));
+        assert!(plain.contains("Categories=Utility;Network;\n"));
+        assert!(plain.contains("StartupNotify=true\n"));
+        assert!(plain.contains("Exec=/home/alice/.local/bin/glide gui\n"));
+
+        let spaced = format_linux_desktop_entry(Path::new("/home/alice/My Apps/glide")).unwrap();
+        assert!(spaced.contains("Exec=\"/home/alice/My Apps/glide\" gui\n"));
+
+        let special =
+            format_linux_desktop_entry(Path::new(r#"/opt/a"b$c\d`e%f/glide"#)).unwrap();
+        assert!(special.contains(r#"Exec="/opt/a\\"b\\$c\\\\d\\`e%%f/glide" gui"#));
+
+        let percent = format_linux_desktop_entry(Path::new("/home/alice/100%/glide")).unwrap();
+        assert!(percent.contains("Exec=/home/alice/100%%/glide gui\n"));
+
+        assert!(format_linux_desktop_entry(Path::new("/tmp/bad\npath/glide")).is_err());
+        assert!(format_linux_desktop_entry(Path::new("/tmp/bad\rpath/glide")).is_err());
+        assert!(format_linux_desktop_entry(Path::new("/tmp/bad\0path/glide")).is_err());
+    }
+
+    #[test]
+    fn rewrite_autostart_exec_preserves_flags_and_updates_binary_path() {
+        let orig = "\
+[Desktop Entry]
+Type=Application
+Name=Glide KVM
+Comment=Ultra-low-latency software KVM
+Exec=/usr/bin/glide gui --minimized --auto-start client
+Icon=glide
+Terminal=false
+X-GNOME-Autostart-enabled=true
+";
+        let updated =
+            rewrite_autostart_exec(orig, Path::new("/home/alice/.local/bin/glide")).unwrap();
+        assert_eq!(
+            updated,
+            "\
+[Desktop Entry]
+Type=Application
+Name=Glide KVM
+Comment=Ultra-low-latency software KVM
+Exec=/home/alice/.local/bin/glide gui --minimized --auto-start client
+Icon=glide
+Terminal=false
+X-GNOME-Autostart-enabled=true
+"
+        );
+
+        // Quoted old executable path with spaces & escaped quotes -> preserves all flags!
+        let quoted_orig = "\
+[Desktop Entry]
+Name=Glide KVM
+Comment=Keep Exec=untouched in comments
+Exec=\"/home/alice/My \\\"Apps\\\"/glide\" gui --minimized --auto-start server
+X-GNOME-Autostart-enabled=true
+";
+        let quoted_updated =
+            rewrite_autostart_exec(quoted_orig, Path::new("/home/alice/New Bin/glide")).unwrap();
+        assert!(quoted_updated.contains("Comment=Keep Exec=untouched in comments\n"));
+        assert!(quoted_updated.contains(
+            "Exec=\"/home/alice/New Bin/glide\" gui --minimized --auto-start server\n"
+        ));
+
+        // Bare Exec= with no trailing CLI flags -> no trailing whitespace added.
+        let bare = "[Desktop Entry]\nExec=/usr/bin/glide\nIcon=glide\n";
+        let bare_updated =
+            rewrite_autostart_exec(bare, Path::new("/home/alice/.local/bin/glide")).unwrap();
+        assert_eq!(
+            bare_updated,
+            "[Desktop Entry]\nExec=/home/alice/.local/bin/glide\nIcon=glide\n"
+        );
+
+        // Double-escaped .desktop path (as generated by escape_desktop_exec_arg) splits cleanly.
+        let escaped_orig =
+            "[Desktop Entry]\nExec=\"/opt/a\\\\\"b/glide\" --minimized\nIcon=glide\n";
+        let escaped_updated =
+            rewrite_autostart_exec(escaped_orig, Path::new("/home/alice/.local/bin/glide"))
+                .unwrap();
+        assert_eq!(
+            escaped_updated,
+            "[Desktop Entry]\nExec=/home/alice/.local/bin/glide --minimized\nIcon=glide\n"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_user_install_stages_and_writes_desktop_override_atomically() {
+        use std::os::unix::fs::{symlink, PermissionsExt};
+
+        let unique = format!(
+            "glide-user-install-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        );
+        let root = std::env::temp_dir().join(unique);
+        let bin_dir = root.join("local").join("bin");
+        let user_exe = bin_dir.join("glide");
+        let desktop_path = root.join("share").join("applications").join("glide.desktop");
+        let autostart_dir = root.join("config").join("autostart");
+        let autostart_path = autostart_dir.join("glide.desktop");
+
+        fs::create_dir_all(&autostart_dir).unwrap();
+        fs::write(
+            &autostart_path,
+            "[Desktop Entry]\nType=Application\nName=Glide KVM\nExec=/usr/bin/glide gui --minimized --auto-start client\nIcon=glide\n",
+        )
+        .unwrap();
+
+        // 1. Fresh user-space install swaps binary, sets 0755, creates desktop override, and rewrites autostart.
+        fs::create_dir_all(&bin_dir).unwrap();
+        let staged1 = bin_dir.join(".glide-update-test1.new");
+        fs::write(&staged1, b"#!/bin/sh\necho v1\n").unwrap();
+        fs::set_permissions(&staged1, fs::Permissions::from_mode(0o600)).unwrap();
+
+        install_linux_user_staged_binary(
+            &staged1,
+            &user_exe,
+            Some(&desktop_path),
+            Some(&autostart_path),
+        )
+        .unwrap();
+
+        assert!(!staged1.exists(), "staged file should be atomically renamed");
+        assert_eq!(fs::read(&user_exe).unwrap(), b"#!/bin/sh\necho v1\n");
+        let mode = fs::metadata(&user_exe).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o755, "installed binary must be chmod 0755");
+
+        let desktop_body = fs::read_to_string(&desktop_path).unwrap();
+        assert!(desktop_body.contains(&format!("Exec={} gui\n", user_exe.display())));
+        assert!(desktop_body.contains("Icon=glide\n"));
+        assert!(desktop_body.contains("StartupWMClass=Glide\n"));
+
+        let auto_body = fs::read_to_string(&autostart_path).unwrap();
+        assert!(auto_body.contains(&format!(
+            "Exec={} gui --minimized --auto-start client\n",
+            user_exe.display()
+        )));
+        assert!(auto_body.contains("Name=Glide KVM\n"));
+
+        // 2. When autostart file does not exist, install must NOT create one.
+        let absent_autostart = root.join("config").join("autostart-missing").join("glide.desktop");
+        let staged2 = bin_dir.join(".glide-update-test2.new");
+        fs::write(&staged2, b"#!/bin/sh\necho v2\n").unwrap();
+        install_linux_user_staged_binary(
+            &staged2,
+            &user_exe,
+            Some(&desktop_path),
+            Some(&absent_autostart),
+        )
+        .unwrap();
+        assert_eq!(fs::read(&user_exe).unwrap(), b"#!/bin/sh\necho v2\n");
+        assert!(!absent_autostart.exists());
+
+        // 3. Symlink rejection: target binary symlink is rejected without modifying target.
+        let decoy_target = root.join("decoy-target");
+        fs::write(&decoy_target, b"untouched").unwrap();
+        let sym_bin_dir = root.join("sym-bin-case");
+        fs::create_dir_all(&sym_bin_dir).unwrap();
+        let sym_exe = sym_bin_dir.join("glide");
+        symlink(&decoy_target, &sym_exe).unwrap();
+        let staged3 = sym_bin_dir.join(".glide-update-test3.new");
+        fs::write(&staged3, b"new-bin").unwrap();
+        assert!(install_linux_user_staged_binary(&staged3, &sym_exe, None, None).is_err());
+        assert_eq!(fs::read(&decoy_target).unwrap(), b"untouched");
+
+        // 4. Symlink rejection: symlinked bin directory is rejected cleanly.
+        let real_target_dir = root.join("real-target-dir");
+        fs::create_dir_all(&real_target_dir).unwrap();
+        let sym_dir = root.join("symlinked-bin-dir");
+        symlink(&real_target_dir, &sym_dir).unwrap();
+        let staged4 = root.join(".glide-update-test4.new");
+        fs::write(&staged4, b"new-bin").unwrap();
+        assert!(
+            install_linux_user_staged_binary(&staged4, &sym_dir.join("glide"), None, None).is_err()
+        );
+        assert!(!real_target_dir.join("glide").exists());
+
+        // 5. Symlink rejection: symlinked desktop override file is rejected before swapping binary.
+        let sym_desktop = root.join("sym-apps").join("glide.desktop");
+        fs::create_dir_all(sym_desktop.parent().unwrap()).unwrap();
+        symlink(&decoy_target, &sym_desktop).unwrap();
+        let staged5 = bin_dir.join(".glide-update-test5.new");
+        fs::write(&staged5, b"should-not-swap").unwrap();
+        assert!(install_linux_user_staged_binary(
+            &staged5,
+            &user_exe,
+            Some(&sym_desktop),
+            None,
+        )
+        .is_err());
+        assert_eq!(fs::read(&decoy_target).unwrap(), b"untouched");
+        assert_eq!(
+            fs::read(&user_exe).unwrap(),
+            b"#!/bin/sh\necho v2\n",
+            "binary should not be swapped when desktop override is a symlink"
+        );
+
+        // 6. Symlinked autostart file is never overwritten.
+        let sym_auto = root.join("sym-auto").join("glide.desktop");
+        fs::create_dir_all(sym_auto.parent().unwrap()).unwrap();
+        symlink(&decoy_target, &sym_auto).unwrap();
+        let staged6 = bin_dir.join(".glide-update-test6.new");
+        fs::write(&staged6, b"#!/bin/sh\necho v3\n").unwrap();
+        install_linux_user_staged_binary(
+            &staged6,
+            &user_exe,
+            Some(&desktop_path),
+            Some(&sym_auto),
+        )
+        .unwrap();
+        assert_eq!(fs::read(&user_exe).unwrap(), b"#!/bin/sh\necho v3\n");
+        assert_eq!(fs::read(&decoy_target).unwrap(), b"untouched");
+
+        let _ = fs::remove_dir_all(&root);
     }
 }

@@ -6,15 +6,19 @@
 //! control to the local desktop.
 
 use crate::geometry::{DesktopGeometry, MonitorRect};
+use crate::hotkeys::{AtomicHotkeySuppressor, AtomicHotkeys, HotkeyAction, HotkeyMatch};
 use crate::linux_wayland::{
     call_portal_request, clear_input_capture_restore_token, close_portal_session,
     evdev_to_mouse_button, extract_object_path, load_input_capture_restore_token,
     next_portal_token, opt_str, save_input_capture_restore_token, INPUT_CAPTURE_IFACE, PORTAL_DEST,
     PORTAL_PATH,
 };
-use crate::{CaptureConfig, CaptureControl, CaptureEvent, CaptureHandle, RemoteMediaKeyTracker};
+use crate::{
+    CaptureConfig, CaptureControl, CaptureEvent, CaptureHandle, CaptureHotkeys,
+    RemoteMediaKeyTracker,
+};
 use anyhow::{anyhow, Context, Result};
-use glide_hid::HidUsage;
+use glide_hid::{HidUsage, ModifierMask};
 use glide_proto::{Edge, LockState};
 use parking_lot::Mutex;
 use reis::ei;
@@ -24,7 +28,7 @@ use std::collections::{HashMap, HashSet};
 use std::io;
 use std::os::fd::AsRawFd;
 use std::os::unix::net::UnixStream;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::mpsc;
@@ -208,7 +212,9 @@ struct SharedState {
     dead_corner_px: Mutex<i32>,
     locked: AtomicBool,
     in_remote: AtomicBool,
+    remote_gen: AtomicU64,
     pin_media_keys_local: AtomicBool,
+    hotkeys: AtomicHotkeys,
     activation_id: Mutex<Option<u32>>,
     last_local_norm: Mutex<(f32, f32)>,
     zone_set: Mutex<u32>,
@@ -249,13 +255,25 @@ impl CaptureControl for WaylandCaptureControl {
             .store(enabled, Ordering::Relaxed);
     }
 
+    fn set_hotkeys(&self, hotkeys: CaptureHotkeys) {
+        self.shared.hotkeys.store(hotkeys);
+    }
+
+    fn set_hotkeys_suspended(&self, suspended: bool) {
+        self.shared.hotkeys.set_suspended(suspended);
+    }
+
     fn enter_remote(&self) -> Result<()> {
-        self.shared.in_remote.store(true, Ordering::SeqCst);
+        if !self.shared.in_remote.swap(true, Ordering::SeqCst) {
+            self.shared.remote_gen.fetch_add(1, Ordering::AcqRel);
+        }
         Ok(())
     }
 
     fn leave_remote(&self, return_edge: Edge, normalized_pos: f32) -> Result<()> {
-        self.shared.in_remote.store(false, Ordering::SeqCst);
+        if self.shared.in_remote.swap(false, Ordering::SeqCst) {
+            self.shared.remote_gen.fetch_add(1, Ordering::AcqRel);
+        }
         let (x, y) = self
             .shared
             .geometry
@@ -269,7 +287,9 @@ impl CaptureControl for WaylandCaptureControl {
     }
 
     fn leave_remote_at(&self, norm_x: f32, norm_y: f32) -> Result<()> {
-        self.shared.in_remote.store(false, Ordering::SeqCst);
+        if self.shared.in_remote.swap(false, Ordering::SeqCst) {
+            self.shared.remote_gen.fetch_add(1, Ordering::AcqRel);
+        }
         let (x, y) = self
             .shared
             .geometry
@@ -508,7 +528,9 @@ fn start_wayland_capture_blocking(config: CaptureConfig) -> Result<CaptureHandle
         dead_corner_px: Mutex::new(config.dead_corner_px),
         locked: AtomicBool::new(false),
         in_remote: AtomicBool::new(false),
+        remote_gen: AtomicU64::new(0),
         pin_media_keys_local: AtomicBool::new(config.pin_media_keys_local),
+        hotkeys: AtomicHotkeys::new(config.hotkeys),
         activation_id: Mutex::new(None),
         last_local_norm: Mutex::new((0.5, 0.5)),
         zone_set: Mutex::new(zone_set),
@@ -596,7 +618,9 @@ fn start_wayland_capture_blocking(config: CaptureConfig) -> Result<CaptureHandle
 
                                 if let Some(edge) = edge_opt {
                                     let norm = normalize_barrier_hit(&geom, edge, cx, cy);
-                                    shared_sig.in_remote.store(true, Ordering::SeqCst);
+                                    if !shared_sig.in_remote.swap(true, Ordering::SeqCst) {
+                                        shared_sig.remote_gen.fetch_add(1, Ordering::AcqRel);
+                                    }
                                     let _ = ev_tx_sig.send(CaptureEvent::EdgeCrossed {
                                         edge,
                                         normalized_pos: norm,
@@ -607,6 +631,7 @@ fn start_wayland_capture_blocking(config: CaptureConfig) -> Result<CaptureHandle
                             }
                             "Deactivated" | "Disabled" => {
                                 if shared_sig.in_remote.swap(false, Ordering::SeqCst) {
+                                    shared_sig.remote_gen.fetch_add(1, Ordering::AcqRel);
                                     debug!(
                                         signal = %member,
                                         "Wayland InputCapture ended by compositor; releasing remote session"
@@ -706,16 +731,22 @@ fn start_wayland_capture_blocking(config: CaptureConfig) -> Result<CaptureHandle
         .spawn(move || {
             let mut converter = EiEventConverter::new(&ei_ctx, handshake_resp);
             let mut held_keys: HashSet<HidUsage> = HashSet::new();
+            let hotkey_suppressor = AtomicHotkeySuppressor::new();
             let mut media_tracker = RemoteMediaKeyTracker::new();
             let mut was_in_remote = false;
+            let mut last_remote_gen = shared_eis.remote_gen.load(Ordering::Acquire);
             let mut scroll_acc_x: f32 = 0.0;
             let mut scroll_acc_y: f32 = 0.0;
 
             let fd = ei_ctx.as_raw_fd();
             loop {
                 let in_remote_now = shared_eis.in_remote.load(Ordering::Acquire);
-                if was_in_remote && !in_remote_now {
+                let current_gen = shared_eis.remote_gen.load(Ordering::Acquire);
+                if last_remote_gen != current_gen || (was_in_remote && !in_remote_now) {
                     media_tracker.clear();
+                    held_keys.clear();
+                    hotkey_suppressor.clear();
+                    last_remote_gen = current_gen;
                 }
                 was_in_remote = in_remote_now;
 
@@ -744,6 +775,12 @@ fn start_wayland_capture_blocking(config: CaptureConfig) -> Result<CaptureHandle
                                     | DeviceCapability::Keyboard,
                             );
                             let _ = ei_ctx.flush();
+                        }
+                        EiEvent::DevicePaused(_) => {
+                            media_tracker.clear();
+                            held_keys.clear();
+                            hotkey_suppressor.clear();
+                            last_remote_gen = shared_eis.remote_gen.load(Ordering::Acquire);
                         }
                         EiEvent::PointerMotion(m) => {
                             if shared_eis.in_remote.load(Ordering::Relaxed)
@@ -804,67 +841,71 @@ fn start_wayland_capture_blocking(config: CaptureConfig) -> Result<CaptureHandle
                             }
                         }
                         EiEvent::KeyboardKey(k) => {
+                            let current_gen = shared_eis.remote_gen.load(Ordering::Acquire);
+                            if last_remote_gen != current_gen {
+                                media_tracker.clear();
+                                held_keys.clear();
+                                hotkey_suppressor.clear();
+                                last_remote_gen = current_gen;
+                            }
                             let pressed = k.state == ei::keyboard::KeyState::Press;
                             let Some(usage) = HidUsage::from_evdev(k.key as u16) else {
                                 continue;
                             };
+                            let mut prev_mask = ModifierMask::EMPTY;
+                            for &held in &held_keys {
+                                prev_mask.update(held, true);
+                            }
                             if pressed {
                                 held_keys.insert(usage);
                             } else {
                                 held_keys.remove(&usage);
                             }
 
-                            if pressed && usage == config.escape_key {
-                                shared_eis.in_remote.store(false, Ordering::SeqCst);
-                                media_tracker.clear();
-                                was_in_remote = false;
-                                if ev_tx.send(CaptureEvent::EscapeHotkey).is_err() {
-                                    return;
-                                }
-                                continue;
-                            }
-
-                            if config.enable_hotkeys && pressed {
-                                let ctrl = held_keys.contains(&HidUsage::CONTROL_LEFT)
-                                    || held_keys.contains(&HidUsage::CONTROL_RIGHT);
-                                let lalt = held_keys.contains(&HidUsage::ALT_LEFT);
-                                if ctrl && lalt {
-                                    let hotkey = match usage {
-                                        u if u == HidUsage::keyboard(0x50) => {
-                                            Some(CaptureEvent::HotkeySwitch {
-                                                direction: Edge::Left,
-                                            })
-                                        }
-                                        u if u == HidUsage::keyboard(0x4F) => {
-                                            Some(CaptureEvent::HotkeySwitch {
-                                                direction: Edge::Right,
-                                            })
-                                        }
-                                        u if u == HidUsage::keyboard(0x52) => {
-                                            Some(CaptureEvent::HotkeySwitch {
-                                                direction: Edge::Top,
-                                            })
-                                        }
-                                        u if u == HidUsage::keyboard(0x51) => {
-                                            Some(CaptureEvent::HotkeySwitch {
-                                                direction: Edge::Bottom,
-                                            })
-                                        }
-                                        u if u == HidUsage::keyboard(0x0F) => {
-                                            Some(CaptureEvent::HotkeyToggleLock)
-                                        }
-                                        _ => None,
-                                    };
-                                    if let Some(ev) = hotkey {
-                                        if ev_tx.send(ev).is_err() {
-                                            return;
-                                        }
-                                        continue;
-                                    }
-                                }
-                            }
-
                             let in_remote = shared_eis.in_remote.load(Ordering::Acquire);
+                            match hotkey_suppressor.evaluate(
+                                shared_eis.hotkeys.load(),
+                                in_remote,
+                                prev_mask,
+                                usage,
+                                pressed,
+                            ) {
+                                HotkeyMatch::Trigger(HotkeyAction::Escape) => {
+                                    shared_eis.in_remote.store(false, Ordering::SeqCst);
+                                    last_remote_gen = shared_eis
+                                        .remote_gen
+                                        .fetch_add(1, Ordering::AcqRel)
+                                        .wrapping_add(1);
+                                    media_tracker.clear();
+                                    held_keys.clear();
+                                    hotkey_suppressor.clear();
+                                    was_in_remote = false;
+                                    if ev_tx.send(CaptureEvent::EscapeHotkey).is_err() {
+                                        return;
+                                    }
+                                    continue;
+                                }
+                                HotkeyMatch::Trigger(HotkeyAction::Switch(direction)) => {
+                                    if ev_tx
+                                        .send(CaptureEvent::HotkeySwitch { direction })
+                                        .is_err()
+                                    {
+                                        return;
+                                    }
+                                    continue;
+                                }
+                                HotkeyMatch::Trigger(HotkeyAction::ToggleLock) => {
+                                    if ev_tx.send(CaptureEvent::HotkeyToggleLock).is_err() {
+                                        return;
+                                    }
+                                    continue;
+                                }
+                                HotkeyMatch::SuppressOnly => {
+                                    continue;
+                                }
+                                HotkeyMatch::PassThrough => {}
+                            }
+
                             if !in_remote {
                                 media_tracker.clear();
                             } else if media_tracker.should_forward(

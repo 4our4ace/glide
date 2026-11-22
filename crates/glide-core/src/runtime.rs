@@ -4,6 +4,7 @@
 use crate::config::KeyRemapRule;
 use bytes::Bytes;
 use glide_backend::geometry::DesktopGeometry;
+use glide_backend::CaptureHotkeys;
 use glide_proto::{ClipboardFormat, ClipboardPayload, Edge, OsKind};
 use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
@@ -98,7 +99,9 @@ pub enum RuntimeCommand {
         pin_media_keys_local: bool,
         clipboard: bool,
         drag_drop_files: bool,
+        hotkeys: CaptureHotkeys,
     },
+    SetHotkeysSuspended(bool),
     UpdateClientTuning {
         sensitivity: f32,
         scroll_speed: f32,
@@ -217,6 +220,31 @@ impl RuntimeState {
             if s.rtt_history.len() > 24 {
                 s.rtt_history.remove(0);
             }
+        });
+    }
+
+    /// Atomically updates RTT history (when `Some`) together with peer summaries, active target,
+    /// lock state, and status in a single write lock and broadcast notification.
+    pub fn record_rtt_and_peers(
+        &self,
+        rtt_ms: Option<f32>,
+        peers: Vec<PeerSummary>,
+        active_target: String,
+        locked: bool,
+        status: String,
+    ) {
+        self.update(|s| {
+            if let Some(ms) = rtt_ms {
+                s.rtt_ms = Some(ms);
+                s.rtt_history.push(ms);
+                if s.rtt_history.len() > 24 {
+                    s.rtt_history.remove(0);
+                }
+            }
+            s.peers = peers;
+            s.active_target = active_target;
+            s.locked = locked;
+            s.status = status;
         });
     }
 

@@ -3,7 +3,8 @@
 
 use crate::geometry::DesktopGeometry;
 use crate::{
-    CaptureControl, CaptureEvent, CaptureHandle, ClipboardBackend, ClipboardHandle, InputInjector,
+    CaptureControl, CaptureEvent, CaptureHandle, CaptureHotkeys, ClipboardBackend, ClipboardHandle,
+    InputInjector,
 };
 use anyhow::Result;
 use glide_hid::{HidUsage, MouseButton};
@@ -21,6 +22,8 @@ pub struct MockCaptureState {
     pub remote_mode: AtomicBool,
     pub locked: AtomicBool,
     pub pin_media_keys_local: AtomicBool,
+    pub hotkeys: Mutex<CaptureHotkeys>,
+    pub hotkeys_suspended: AtomicBool,
     pub enter_remote_calls: AtomicUsize,
     pub leave_remote_at_calls: AtomicUsize,
     pub last_leave: Mutex<Option<(Edge, f32)>>,
@@ -52,6 +55,16 @@ impl CaptureControl for MockCaptureControl {
         self.state
             .pin_media_keys_local
             .store(enabled, Ordering::SeqCst);
+    }
+
+    fn set_hotkeys(&self, hotkeys: CaptureHotkeys) {
+        *self.state.hotkeys.lock() = hotkeys;
+    }
+
+    fn set_hotkeys_suspended(&self, suspended: bool) {
+        self.state
+            .hotkeys_suspended
+            .store(suspended, Ordering::SeqCst);
     }
 
     fn enter_remote(&self) -> Result<()> {

@@ -20,25 +20,28 @@ use crate::dnd::{
 use crate::resilience::{HealthProbe, ReconnectBackoff, SleepDetector};
 use crate::runtime::{save_received_file, RuntimeCommand, RuntimeState};
 use anyhow::{anyhow, Context, Result};
+use bytes::Bytes;
 use glide_backend::dnd::{DndBackend, NoopDndBackend};
 use glide_backend::os_integration::resolve_receive_dir;
-use glide_backend::{ClipboardHandle, InputInjector};
+use glide_backend::{ClipboardBackend, ClipboardHandle, InputInjector};
 use glide_hid::MouseButton;
-use glide_net::discovery::{discover_servers, local_ipv4_addresses};
+use glide_net::discovery::{discover_servers, local_ipv4_addresses_async};
 use glide_net::tls::{normalize_fingerprint, TrustMode};
 use glide_net::{
     connect_client, recv_bulk_stream_with_atomic_limit, send_clipboard_on, send_file_on_with_limit,
-    sha256_bytes,
+    sha256_bytes_async, Connection,
 };
 use glide_proto::{
     BulkTransfer, ClipboardPayload, ControlMessage, DatagramMessage, FilePayload,
     LAZY_CLIPBOARD_THRESHOLD, PROTOCOL_VERSION,
 };
 use std::collections::HashMap;
+use std::future::Future;
 use std::net::{IpAddr, SocketAddr};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::task::{Context as TaskContext, Poll, Waker};
 use std::time::{Duration, Instant};
 use tokio::net::lookup_host;
 use tokio::sync::mpsc;
@@ -51,9 +54,67 @@ impl Drop for AbortOnDrop {
     }
 }
 
+struct NoopClipboardBackend;
+impl ClipboardBackend for NoopClipboardBackend {
+    fn set(&self, _payload: ClipboardPayload) -> Result<()> {
+        Ok(())
+    }
+}
+
+struct SharedClipboardBackend(Arc<dyn ClipboardBackend>);
+impl ClipboardBackend for SharedClipboardBackend {
+    fn set(&self, payload: ClipboardPayload) -> Result<()> {
+        self.0.set(payload)
+    }
+}
+
+/// Lifts `ClipboardHandle::backend` into an `Arc<dyn ClipboardBackend>` once so background
+/// clipboard-apply tasks can run `spawn_blocking` across reconnects while keeping `&mut Option<ClipboardHandle>`
+/// valid even if a session is cancelled externally.
+fn share_clipboard_backend(
+    clipboard: &mut Option<ClipboardHandle>,
+) -> Option<Arc<dyn ClipboardBackend>> {
+    let handle = clipboard.as_mut()?;
+    let orig = std::mem::replace(&mut handle.backend, Box::new(NoopClipboardBackend));
+    let shared: Arc<dyn ClipboardBackend> = Arc::from(orig);
+    handle.backend = Box::new(SharedClipboardBackend(Arc::clone(&shared)));
+    Some(shared)
+}
+
+/// Non-blockingly polls one already-buffered QUIC datagram using a noop waker so post-hiccup
+/// motion bursts can be drained and coalesced into a single `injector.move_relative()` call.
+fn try_read_datagram_now(conn: &Connection) -> Option<Result<Bytes>> {
+    let mut fut = std::pin::pin!(conn.read_datagram());
+    let mut cx = TaskContext::from_waker(Waker::noop());
+    match fut.as_mut().poll(&mut cx) {
+        Poll::Ready(Ok(b)) => Some(Ok(b)),
+        Poll::Ready(Err(e)) => Some(Err(anyhow!("datagram stream closed: {e}"))),
+        Poll::Pending => None,
+    }
+}
+
+fn accept_motion_seq(last_seq: &mut Option<u32>, seq: u32) -> bool {
+    if let Some(prev) = *last_seq {
+        let diff = seq.wrapping_sub(prev) as i32;
+        if diff < -32 {
+            return false;
+        }
+        if diff > 0 {
+            *last_seq = Some(seq);
+        }
+    } else {
+        *last_seq = Some(seq);
+    }
+    true
+}
+
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(4);
 const DNS_RESOLVE_TIMEOUT: Duration = Duration::from_secs(3);
 const ROAM_DISCOVERY_TIMEOUT: Duration = Duration::from_millis(900);
+const MAX_DATAGRAM_BURST_DRAIN: usize = 64;
+const DRAG_MOVE_MIN_INTERVAL: Duration = Duration::from_millis(16);
+const SLOW_INJECT_WARN_THRESHOLD: Duration = Duration::from_millis(15);
+const LAG_WARN_MIN_INTERVAL: Duration = Duration::from_secs(2);
 
 enum ResolveOutcome {
     Addr(SocketAddr),
@@ -308,11 +369,13 @@ pub async fn run_client_session_with_dnd(
     runtime: Option<&RuntimeState>,
     cmd_rx: Option<&mut mpsc::UnboundedReceiver<RuntimeCommand>>,
 ) -> Result<()> {
+    let shared_clip_backend = share_clipboard_backend(clipboard);
     run_client_session_tracked(
         config,
         server_addr,
         injector,
         clipboard,
+        shared_clip_backend,
         dnd,
         receive_dir,
         runtime,
@@ -330,6 +393,7 @@ async fn run_client_session_tracked(
     server_addr: SocketAddr,
     injector: &mut dyn InputInjector,
     clipboard: &mut Option<ClipboardHandle>,
+    shared_clip_backend: Option<Arc<dyn ClipboardBackend>>,
     dnd: Arc<dyn DndBackend>,
     receive_dir: Option<PathBuf>,
     runtime: Option<&RuntimeState>,
@@ -441,7 +505,7 @@ async fn run_client_session_tracked(
         }
     };
 
-    let mut last_local_ips = local_ipv4_addresses();
+    let mut last_local_ips = local_ipv4_addresses_async().await;
     let peer_fp = session
         .peer_fingerprint()
         .or_else(|| config.trusted_fingerprint.clone());
@@ -487,6 +551,8 @@ async fn run_client_session_tracked(
     let mut incoming_drag: Option<IncomingDragState> = None;
     let mut early_drag_files = EarlyDragBuffer::default();
     let mut client_lmb_down = false;
+    let mut last_drag_move_at: Option<Instant> = None;
+    let leave_gen = Arc::new(AtomicU64::new(0));
 
     let mut ping_interval = tokio::time::interval(Duration::from_millis(500));
     ping_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -498,10 +564,73 @@ async fn run_client_session_tracked(
     let mut sleep_detector = SleepDetector::default();
     let mut health_probe = HealthProbe::default();
     let mut last_ip_check = Instant::now();
+    let (ip_tx, mut ip_rx) = mpsc::unbounded_channel::<(u64, Vec<String>, bool)>();
+    let mut ip_check_gen: u64 = 0;
+    let mut ip_check_in_flight: usize = 0;
+
+    let mut last_lost_packets: u64 = 0;
+    let mut last_congestion_events: u64 = 0;
+    let mut last_lag_warn_at: Option<Instant> = None;
+    let mut last_slow_inject_warn: Option<Instant> = None;
+
+    // Dedicated serial clipboard-apply task so OS clipboard locks (e.g. OpenClipboard / PNG decode)
+    // stay strictly in order on Tokio's blocking pool without ever stalling read_datagram().
+    let (clip_apply_tx, _clip_apply_guard) = match shared_clip_backend {
+        Some(backend) => {
+            let (tx, mut rx) = mpsc::unbounded_channel::<ClipboardPayload>();
+            let guard = AbortOnDrop(tokio::spawn(async move {
+                while let Some(payload) = rx.recv().await {
+                    let b = Arc::clone(&backend);
+                    match tokio::task::spawn_blocking(move || b.set(payload)).await {
+                        Ok(Ok(())) => {}
+                        Ok(Err(e)) => warn!(error = %e, "Failed setting local clipboard"),
+                        Err(e) => warn!(error = %e, "Client clipboard apply task failed"),
+                    }
+                }
+            }));
+            (Some(tx), Some(guard))
+        }
+        None => (None, None),
+    };
 
     let conn = session.conn;
-    let mut ctrl_send = session.ctrl_send;
+
+    // Dedicated control stream reader task so `tokio::select!` never cancels a partially-read
+    // framed control message during 1000Hz `read_datagram()` traffic.
+    let (ctrl_in_tx, mut ctrl_in_rx) = mpsc::unbounded_channel::<Result<ControlMessage>>();
     let mut ctrl_recv = session.ctrl_recv;
+    let _ctrl_reader_guard = AbortOnDrop(tokio::spawn(async move {
+        loop {
+            match ctrl_recv.recv().await {
+                Ok(msg) => {
+                    if ctrl_in_tx.send(Ok(msg)).is_err() {
+                        break;
+                    }
+                }
+                Err(e) => {
+                    let _ = ctrl_in_tx.send(Err(e));
+                    break;
+                }
+            }
+        }
+    }));
+
+    // Dedicated control stream writer task so the client select! loop never stalls awaiting
+    // `ctrl_send.send().await` under QUIC flow-control pressure or bulk transfers.
+    let (ctrl_out_tx, mut ctrl_out_rx) = mpsc::unbounded_channel::<ControlMessage>();
+    let mut ctrl_send = session.ctrl_send;
+    let ctrl_writer_conn = conn.clone();
+    let _ctrl_writer_guard = AbortOnDrop(tokio::spawn(async move {
+        while let Some(msg) = ctrl_out_rx.recv().await {
+            if let Err(e) = ctrl_send.send(&msg).await {
+                debug!(error = %e, "Client control stream writer ended");
+                if ctrl_writer_conn.close_reason().is_none() {
+                    ctrl_writer_conn.close(1u32.into(), b"control send failed");
+                }
+                break;
+            }
+        }
+    }));
 
     // Receive unidirectional bulk streams (clipboard images / files / drag files) in a dedicated
     // task so `tokio::select!` branches never cancel an in-flight `read_exact` and silently drop
@@ -540,6 +669,24 @@ async fn run_client_session_tracked(
     }));
     let mut bulk_open = true;
 
+    let inject_scroll = |injector: &mut dyn InputInjector,
+                         invert_scroll: bool,
+                         scroll_speed: f32,
+                         dx_120: i16,
+                         dy_120: i16| {
+        let sign = if invert_scroll { -1.0 } else { 1.0 };
+        let mult = scroll_speed.clamp(0.1, 5.0) * sign;
+        let sdx = ((dx_120 as f32) * mult)
+            .round()
+            .clamp(i16::MIN as f32, i16::MAX as f32) as i16;
+        let sdy = ((dy_120 as f32) * mult)
+            .round()
+            .clamp(i16::MIN as f32, i16::MAX as f32) as i16;
+        if let Err(e) = injector.scroll(sdx, sdy) {
+            warn!(error = %e, "Failed injecting scroll");
+        }
+    };
+
     let session_result: Result<()> = loop {
         let dpi_mult = if config.auto_dpi_scale {
             (client_scale / server_scale).clamp(0.25, 4.0)
@@ -577,9 +724,15 @@ async fn run_client_session_tracked(
                         let _ = injector.show_cursor();
                     }
                     let fresh_geom = injector.desktop_geometry().ok();
-                    let fresh_ips = local_ipv4_addresses();
-                    last_local_ips = fresh_ips.clone();
                     last_ip_check = now;
+                    ip_check_gen = ip_check_gen.wrapping_add(1);
+                    ip_check_in_flight += 1;
+                    let gen = ip_check_gen;
+                    let tx = ip_tx.clone();
+                    tokio::spawn(async move {
+                        let ips = local_ipv4_addresses_async().await;
+                        let _ = tx.send((gen, ips, true));
+                    });
                     if let Some(ref g) = fresh_geom {
                         client_geom = g.clone();
                         client_scale = g.primary_scale();
@@ -589,32 +742,25 @@ async fn run_client_session_tracked(
                             if let Some(g) = fresh_geom {
                                 s.geometry = g;
                             }
-                            s.local_ips = fresh_ips;
                             s.active_target = server_name.clone();
                         });
                     }
                     let ts_us = health_probe.start_probe(now);
-                    if let Err(e) = ctrl_send.send(&ControlMessage::Ping { ts_us }).await {
-                        break Err(anyhow!("server unreachable after resume: {e}"));
+                    if ctrl_out_tx.send(ControlMessage::Ping { ts_us }).is_err() {
+                        break Err(anyhow!("server unreachable after resume: control writer closed"));
                     }
                 } else if now.saturating_duration_since(last_ip_check) >= Duration::from_secs(3) {
-                    // 3. Wi-Fi <-> Ethernet roaming detection
+                    // 3. Wi-Fi <-> Ethernet roaming detection (offloaded off select! loop)
                     last_ip_check = now;
-                    let fresh_ips = local_ipv4_addresses();
-                    if fresh_ips != last_local_ips {
-                        info!(
-                            old = ?last_local_ips,
-                            new = ?fresh_ips,
-                            "Client LAN interfaces changed; probing server health"
-                        );
-                        last_local_ips = fresh_ips.clone();
-                        if let Some(rt) = runtime {
-                            rt.update(|s| s.local_ips = fresh_ips);
-                        }
-                        let ts_us = health_probe.start_probe(now);
-                        if let Err(e) = ctrl_send.send(&ControlMessage::Ping { ts_us }).await {
-                            break Err(anyhow!("server unreachable after network change: {e}"));
-                        }
+                    if ip_check_in_flight == 0 {
+                        ip_check_gen = ip_check_gen.wrapping_add(1);
+                        ip_check_in_flight += 1;
+                        let gen = ip_check_gen;
+                        let tx = ip_tx.clone();
+                        tokio::spawn(async move {
+                            let ips = local_ipv4_addresses_async().await;
+                            let _ = tx.send((gen, ips, false));
+                        });
                     }
                 }
 
@@ -643,9 +789,60 @@ async fn run_client_session_tracked(
                     }
                 }
 
+                let rtt_ms = conn.rtt().as_secs_f32() * 1000.0;
+                let stats = conn.stats();
+                let lost_delta = stats.path.lost_packets.saturating_sub(last_lost_packets);
+                let cong_delta = stats
+                    .path
+                    .congestion_events
+                    .saturating_sub(last_congestion_events);
+                last_lost_packets = stats.path.lost_packets;
+                last_congestion_events = stats.path.congestion_events;
+                if (lost_delta > 0 || cong_delta > 0)
+                    && rtt_ms > 30.0
+                    && last_lag_warn_at
+                        .is_none_or(|t| now.saturating_duration_since(t) >= LAG_WARN_MIN_INTERVAL)
+                {
+                    last_lag_warn_at = Some(now);
+                    warn!(
+                        server = %server_name,
+                        rtt_ms = format_args!("{rtt_ms:.1}"),
+                        lost_packets_delta = lost_delta,
+                        congestion_events_delta = cong_delta,
+                        "Client QUIC lag spike detected (packet loss/congestion with RTT > 30ms)"
+                    );
+                }
+
                 if let Some(rt) = runtime {
-                    let rtt_ms = conn.rtt().as_secs_f32() * 1000.0;
                     rt.record_rtt(rtt_ms);
+                }
+            }
+
+            Some((gen, fresh_ips, from_wake)) = ip_rx.recv() => {
+                ip_check_in_flight = ip_check_in_flight.saturating_sub(1);
+                if gen != ip_check_gen {
+                    continue;
+                }
+                if fresh_ips != last_local_ips {
+                    if !from_wake {
+                        info!(
+                            old = ?last_local_ips,
+                            new = ?fresh_ips,
+                            "Client LAN interfaces changed; probing server health"
+                        );
+                    }
+                    last_local_ips = fresh_ips.clone();
+                    if let Some(rt) = runtime {
+                        rt.update(|s| s.local_ips = fresh_ips);
+                    }
+                    if !from_wake {
+                        let ts_us = health_probe.start_probe(Instant::now());
+                        if ctrl_out_tx.send(ControlMessage::Ping { ts_us }).is_err() {
+                            break Err(anyhow!(
+                                "server unreachable after network change: control writer closed"
+                            ));
+                        }
+                    }
                 }
             }
 
@@ -696,14 +893,15 @@ async fn run_client_session_tracked(
                             );
                         } else {
                             let byte_len = data.len();
-                            let payload = FilePayload {
-                                filename: filename.clone(),
-                                sha256: sha256_bytes(&data),
-                                data,
-                            };
                             let c = conn.clone();
                             let rt_opt = runtime.cloned();
                             tokio::spawn(async move {
+                                let sha256 = sha256_bytes_async(data.clone()).await;
+                                let payload = FilePayload {
+                                    filename: filename.clone(),
+                                    sha256,
+                                    data,
+                                };
                                 match send_file_on_with_limit(&c, &payload, limit).await {
                                     Ok(()) => {
                                         if let Some(rt) = rt_opt {
@@ -739,11 +937,9 @@ async fn run_client_session_tracked(
                         config.edge = edge;
                         return_edge = edge.opposite();
                         dnd.set_active_edges(&[return_edge], config.dead_corner_px);
-                        let _ = ctrl_send
-                            .send(&ControlMessage::SetEdge {
-                                edge_on_server: edge,
-                            })
-                            .await;
+                        let _ = ctrl_out_tx.send(ControlMessage::SetEdge {
+                            edge_on_server: edge,
+                        });
                         info!(?edge, "Client moved its own edge live");
                     }
                     RuntimeCommand::Shutdown => {
@@ -768,129 +964,225 @@ async fn run_client_session_tracked(
                 };
                 match msg {
                     DatagramMessage::MouseMove { seq, dx, dy } => {
-                        if let Some(prev) = last_seq {
-                            let diff = seq.wrapping_sub(prev) as i32;
-                            if diff < -32 {
-                                continue;
-                            }
-                            if diff > 0 {
-                                last_seq = Some(seq);
-                            }
-                        } else {
-                            last_seq = Some(seq);
+                        let mut sum_dx = 0.0f32;
+                        let mut sum_dy = 0.0f32;
+                        let mut has_move = false;
+                        if accept_motion_seq(&mut last_seq, seq) {
+                            sum_dx += dx;
+                            sum_dy += dy;
+                            has_move = true;
                         }
 
-                        let sdx = dx * eff_sens;
-                        let sdy = dy * eff_sens;
-                        match injector.move_relative(
-                            sdx,
-                            sdy,
-                            Some(return_edge),
-                            config.edge_threshold_px,
-                            config.dead_corner_px,
-                        ) {
-                            Ok(Some((edge, normalized_pos))) => {
-                                debug!(?edge, normalized_pos, "Cursor crossed return edge; handing focus back to server");
-                                // If dragging an uncommitted Server -> Client file back across the
-                                // return edge, cancel cleanly without saving or dropping.
-                                if let Some(inc) = incoming_drag.take() {
-                                    if !inc.drop_requested {
-                                        debug!(drag_id = inc.drag_id, "Cancelled uncommitted incoming drag on return-edge exit");
-                                        early_drag_files.remove_drag(inc.drag_id);
-                                        inc.cancel(Arc::clone(&dnd));
+                        // Drain up to 64 additional already-buffered datagrams non-blockingly so a
+                        // post-hiccup burst coalesces into a single `injector.move_relative()` call.
+                        let mut trailing_scroll: Option<(i16, i16)> = None;
+                        let mut dgram_err: Option<anyhow::Error> = None;
+                        for _ in 0..MAX_DATAGRAM_BURST_DRAIN {
+                            match try_read_datagram_now(&conn) {
+                                Some(Ok(extra_bytes)) => {
+                                    let Ok(extra_msg) = DatagramMessage::decode(&extra_bytes) else {
+                                        continue;
+                                    };
+                                    match extra_msg {
+                                        DatagramMessage::MouseMove { seq, dx, dy } => {
+                                            if accept_motion_seq(&mut last_seq, seq) {
+                                                sum_dx += dx;
+                                                sum_dy += dy;
+                                                has_move = true;
+                                            }
+                                        }
+                                        DatagramMessage::MouseScroll { dx_120, dy_120, .. } => {
+                                            trailing_scroll = Some((dx_120, dy_120));
+                                            break;
+                                        }
+                                    }
+                                }
+                                Some(Err(e)) => {
+                                    dgram_err = Some(e);
+                                    break;
+                                }
+                                None => break,
+                            }
+                        }
+
+                        if has_move {
+                            let sdx = sum_dx * eff_sens;
+                            let sdy = sum_dy * eff_sens;
+                            let inj_started = Instant::now();
+                            let move_res = injector.move_relative(
+                                sdx,
+                                sdy,
+                                Some(return_edge),
+                                config.edge_threshold_px,
+                                config.dead_corner_px,
+                            );
+                            let inj_elapsed = inj_started.elapsed();
+                            if inj_elapsed > SLOW_INJECT_WARN_THRESHOLD
+                                && last_slow_inject_warn.is_none_or(|t| {
+                                    inj_started.saturating_duration_since(t)
+                                        >= LAG_WARN_MIN_INTERVAL
+                                })
+                            {
+                                last_slow_inject_warn = Some(inj_started);
+                                warn!(
+                                    elapsed_ms = format_args!("{:.1}", inj_elapsed.as_secs_f32() * 1000.0),
+                                    dx = sdx,
+                                    dy = sdy,
+                                    "Client mouse injection stall detected (>15ms)"
+                                );
+                            }
+
+                            match move_res {
+                                Ok(Some((edge, normalized_pos))) => {
+                                    debug!(?edge, normalized_pos, "Cursor crossed return edge; handing focus back to server");
+                                    // If dragging an uncommitted Server -> Client file back across the
+                                    // return edge, cancel cleanly without saving or dropping.
+                                    if let Some(inc) = incoming_drag.take() {
+                                        if !inc.drop_requested {
+                                            debug!(drag_id = inc.drag_id, "Cancelled uncommitted incoming drag on return-edge exit");
+                                            early_drag_files.remove_drag(inc.drag_id);
+                                            inc.cancel(Arc::clone(&dnd));
+                                        } else {
+                                            incoming_drag = Some(inc);
+                                        }
+                                    }
+                                    last_drag_move_at = None;
+
+                                    // Check whether the user is dragging local files from this Client
+                                    // across the return edge back onto the Server!
+                                    let staged_paths = if config.drag_drop_files && client_lmb_down {
+                                        dnd.take_staged_files(edge)
                                     } else {
-                                        incoming_drag = Some(inc);
-                                    }
-                                }
+                                        None
+                                    };
+                                    let limit = max_file_bytes.load(Ordering::Relaxed);
+                                    focused = false;
+                                    client_lmb_down = false;
+                                    let expected_gen =
+                                        leave_gen.fetch_add(1, Ordering::AcqRel).wrapping_add(1);
 
-                                // Check whether the user is dragging local files from this Client
-                                // across the return edge back onto the Server!
-                                let staged_paths = if config.drag_drop_files && client_lmb_down {
-                                    dnd.take_staged_files(edge)
-                                } else {
-                                    None
-                                };
-                                let limit = max_file_bytes.load(Ordering::Relaxed);
-                                let drag_files = staged_paths
-                                    .as_deref()
-                                    .map(|paths| collect_local_drag_files(paths, limit))
-                                    .filter(|(infos, _)| !infos.is_empty());
-                                if drag_files.is_some() {
-                                    dnd.cancel_local_drag();
-                                } else {
-                                    dnd.set_drag_armed(false);
-                                }
-
-                                let (cx, cy) = injector.cursor_norm();
-                                focused = false;
-                                client_lmb_down = false;
-                                let _ = injector.release_all();
-                                let _ = injector.leave();
-                                if let Some(rt) = runtime {
-                                    rt.update(|s| s.active_target = server_name.clone());
-                                }
-                                if let Err(e) = ctrl_send
-                                    .send(&ControlMessage::Leave {
-                                        edge,
-                                        normalized_pos,
-                                        cursor_norm_x: cx,
-                                        cursor_norm_y: cy,
-                                    })
-                                    .await
-                                {
-                                    break Err(e);
-                                }
-
-                                if let Some((infos, send_list)) = drag_files {
-                                    let drag_id = next_drag_id();
-                                    if let Err(e) = ctrl_send
-                                        .send(&ControlMessage::DragStart {
-                                            drag_id,
-                                            files: infos,
+                                    if staged_paths.is_some() {
+                                        // Cancel local OS drag off Tokio's async worker before releasing
+                                        // virtual LMB so Explorer/Nautilus cancels instead of dropping locally.
+                                        let dnd_c = Arc::clone(&dnd);
+                                        let _ = tokio::task::spawn_blocking(move || {
+                                            dnd_c.cancel_local_drag();
                                         })
-                                        .await
-                                    {
-                                        break Err(e);
+                                        .await;
+                                    } else {
+                                        dnd.set_drag_armed(false);
                                     }
-                                    spawn_send_drag_files(
-                                        conn.clone(),
-                                        drag_id,
-                                        send_list,
-                                        limit,
-                                        runtime.cloned(),
-                                    );
+
+                                    let (cx, cy) = injector.cursor_norm();
+                                    let _ = injector.release_all();
+                                    let _ = injector.leave();
+                                    if let Some(rt) = runtime {
+                                        rt.update(|s| s.active_target = server_name.clone());
+                                    }
+                                    if ctrl_out_tx
+                                        .send(ControlMessage::Leave {
+                                            edge,
+                                            normalized_pos,
+                                            cursor_norm_x: cx,
+                                            cursor_norm_y: cy,
+                                        })
+                                        .is_err()
+                                    {
+                                        break Err(anyhow!("control writer closed during Leave"));
+                                    }
+
+                                    if let Some(paths) = staged_paths {
+                                        let conn_c = conn.clone();
+                                        let ctrl_tx_c = ctrl_out_tx.clone();
+                                        let rt_c = runtime.cloned();
+                                        let leave_gen_c = Arc::clone(&leave_gen);
+                                        tokio::spawn(async move {
+                                            let collected = tokio::task::spawn_blocking(move || {
+                                                collect_local_drag_files(&paths, limit)
+                                            })
+                                            .await
+                                            .ok();
+                                            let Some((infos, send_list)) =
+                                                collected.filter(|(i, _)| !i.is_empty())
+                                            else {
+                                                return;
+                                            };
+                                            if leave_gen_c.load(Ordering::Acquire) != expected_gen
+                                                || conn_c.close_reason().is_some()
+                                            {
+                                                debug!("Aborting stale client DragStart because focus returned or connection closed");
+                                                return;
+                                            }
+                                            let drag_id = next_drag_id();
+                                            if ctrl_tx_c
+                                                .send(ControlMessage::DragStart {
+                                                    drag_id,
+                                                    files: infos,
+                                                })
+                                                .is_err()
+                                            {
+                                                return;
+                                            }
+                                            spawn_send_drag_files(
+                                                conn_c, drag_id, send_list, limit, rt_c,
+                                            );
+                                        });
+                                    }
                                 }
-                            }
-                            Ok(None) => {
-                                if incoming_drag.is_some() {
-                                    let (nx, ny) = injector.cursor_norm();
-                                    let (px, py) = client_geom.denormalize_point(nx, ny);
-                                    dnd.on_incoming_drag_move(px, py);
+                                Ok(None) => {
+                                    if incoming_drag.is_some() {
+                                        let now = Instant::now();
+                                        if last_drag_move_at.is_none_or(|t| {
+                                            now.saturating_duration_since(t) >= DRAG_MOVE_MIN_INTERVAL
+                                        }) {
+                                            last_drag_move_at = Some(now);
+                                            let (nx, ny) = injector.cursor_norm();
+                                            let (px, py) = client_geom.denormalize_point(nx, ny);
+                                            dnd.on_incoming_drag_move(px, py);
+                                        }
+                                    }
                                 }
+                                Err(e) => warn!(error = %e, "Failed injecting relative mouse motion"),
                             }
-                            Err(e) => warn!(error = %e, "Failed injecting relative mouse motion"),
+                        }
+
+                        if focused {
+                            if let Some((dx_120, dy_120)) = trailing_scroll {
+                                inject_scroll(
+                                    injector,
+                                    config.invert_scroll,
+                                    config.scroll_speed,
+                                    dx_120,
+                                    dy_120,
+                                );
+                            }
+                        }
+                        if let Some(err) = dgram_err {
+                            break Err(err);
                         }
                     }
                     DatagramMessage::MouseScroll { dx_120, dy_120, .. } => {
-                        let sign = if config.invert_scroll { -1.0 } else { 1.0 };
-                        let mult = config.scroll_speed.clamp(0.1, 5.0) * sign;
-                        let sdx = ((dx_120 as f32) * mult).round().clamp(i16::MIN as f32, i16::MAX as f32) as i16;
-                        let sdy = ((dy_120 as f32) * mult).round().clamp(i16::MIN as f32, i16::MAX as f32) as i16;
-                        if let Err(e) = injector.scroll(sdx, sdy) {
-                            warn!(error = %e, "Failed injecting scroll");
-                        }
+                        inject_scroll(
+                            injector,
+                            config.invert_scroll,
+                            config.scroll_speed,
+                            dx_120,
+                            dy_120,
+                        );
                     }
                 }
             }
 
-            ctrl = ctrl_recv.recv() => {
+            ctrl = ctrl_in_rx.recv() => {
                 let msg = match ctrl {
-                    Ok(m) => m,
-                    Err(e) => break Err(e),
+                    Some(Ok(m)) => m,
+                    Some(Err(e)) => break Err(e),
+                    None => break Err(anyhow!("control stream closed")),
                 };
                 health_probe.mark_alive();
                 match msg {
                     ControlMessage::Enter { edge, normalized_pos, lock_state } => {
+                        leave_gen.fetch_add(1, Ordering::AcqRel);
                         focused = true;
                         last_seq = None;
                         client_lmb_down = false;
@@ -904,9 +1196,8 @@ async fn run_client_session_tracked(
                         // Fetch any lazily offered large clipboard item now that user entered this screen!
                         if config.clipboard {
                             if let Some(sha256) = pending_offer_hash.take() {
-                                let _ = ctrl_send
-                                    .send(&ControlMessage::ClipboardRequest { sha256 })
-                                    .await;
+                                let _ = ctrl_out_tx
+                                    .send(ControlMessage::ClipboardRequest { sha256 });
                             }
                         }
                         if let Some(rt) = runtime {
@@ -914,6 +1205,7 @@ async fn run_client_session_tracked(
                         }
                     }
                     ControlMessage::EnterAt { norm_x, norm_y, lock_state } => {
+                        leave_gen.fetch_add(1, Ordering::AcqRel);
                         focused = true;
                         last_seq = None;
                         client_lmb_down = false;
@@ -926,9 +1218,8 @@ async fn run_client_session_tracked(
                         }
                         if config.clipboard {
                             if let Some(sha256) = pending_offer_hash.take() {
-                                let _ = ctrl_send
-                                    .send(&ControlMessage::ClipboardRequest { sha256 })
-                                    .await;
+                                let _ = ctrl_out_tx
+                                    .send(ControlMessage::ClipboardRequest { sha256 });
                             }
                         }
                         if let Some(rt) = runtime {
@@ -939,8 +1230,10 @@ async fn run_client_session_tracked(
                         let _ = injector.release_all();
                     }
                     ControlMessage::Leave { .. } => {
+                        leave_gen.fetch_add(1, Ordering::AcqRel);
                         focused = false;
                         client_lmb_down = false;
+                        last_drag_move_at = None;
                         dnd.set_drag_armed(false);
                         if let Some(inc) = incoming_drag.take() {
                             if !inc.drop_requested {
@@ -959,6 +1252,7 @@ async fn run_client_session_tracked(
                     ControlMessage::DragStart { drag_id, files } => {
                         if config.drag_drop_files {
                             debug!(drag_id, count = files.len(), "Incoming cross-edge drag from server");
+                            last_drag_move_at = None;
                             if let Some(prev) = incoming_drag.take() {
                                 if !prev.drop_requested {
                                     prev.cancel(Arc::clone(&dnd));
@@ -984,6 +1278,7 @@ async fn run_client_session_tracked(
                     ControlMessage::DragDrop { drag_id } => {
                         if let Some(ref mut inc) = incoming_drag {
                             if inc.request_drop(drag_id) && inc.is_ready_to_commit() {
+                                last_drag_move_at = None;
                                 if let Some(done) = incoming_drag.take() {
                                     done.commit(
                                         receive_dir.clone(),
@@ -999,6 +1294,7 @@ async fn run_client_session_tracked(
                         early_drag_files.remove_drag(drag_id);
                         if incoming_drag.as_ref().is_some_and(|i| i.drag_id == drag_id) {
                             debug!(drag_id, "Cancelled incoming cross-edge drag from server");
+                            last_drag_move_at = None;
                             if let Some(inc) = incoming_drag.take() {
                                 inc.cancel(Arc::clone(&dnd));
                             }
@@ -1054,9 +1350,8 @@ async fn run_client_session_tracked(
                     ControlMessage::ClipboardOffer { sha256, .. } => {
                         if config.clipboard {
                             if focused {
-                                let _ = ctrl_send
-                                    .send(&ControlMessage::ClipboardRequest { sha256 })
-                                    .await;
+                                let _ = ctrl_out_tx
+                                    .send(ControlMessage::ClipboardRequest { sha256 });
                             } else {
                                 pending_offer_hash = Some(sha256);
                             }
@@ -1072,7 +1367,7 @@ async fn run_client_session_tracked(
                     }
                     ControlMessage::ModifierSync { .. } => {}
                     ControlMessage::Ping { ts_us } => {
-                        let _ = ctrl_send.send(&ControlMessage::Pong { ts_us }).await;
+                        let _ = ctrl_out_tx.send(ControlMessage::Pong { ts_us });
                     }
                     ControlMessage::Pong { .. } => {}
                     _ => {}
@@ -1087,11 +1382,9 @@ async fn run_client_session_tracked(
                             if let Some(rt) = runtime {
                                 rt.record_clipboard("received", &payload);
                             }
-                            if let Some(ref clip) = clipboard {
-                                debug!(format = ?payload.format, len = payload.data.len(), "Applying clipboard from server");
-                                if let Err(e) = clip.backend.set(payload) {
-                                    warn!(error = %e, "Failed setting local clipboard");
-                                }
+                            if let Some(ref tx) = clip_apply_tx {
+                                debug!(format = ?payload.format, len = payload.data.len(), "Queued server clipboard for serial background apply");
+                                let _ = tx.send(payload);
                             }
                         }
                     }
@@ -1138,6 +1431,7 @@ async fn run_client_session_tracked(
                             if let Some(ref mut inc) = incoming_drag {
                                 if inc.push_file(drag_file.drag_id, drag_file.file) {
                                     if inc.is_ready_to_commit() {
+                                        last_drag_move_at = None;
                                         if let Some(done) = incoming_drag.take() {
                                             done.commit(
                                                 receive_dir.clone(),
@@ -1185,13 +1479,11 @@ async fn run_client_session_tracked(
                                 local_clip_cache.clear();
                             }
                             local_clip_cache.insert(payload.sha256, payload.clone());
-                            let _ = ctrl_send
-                                .send(&ControlMessage::ClipboardOffer {
-                                    format: payload.format,
-                                    sha256: payload.sha256,
-                                    byte_len: payload.data.len() as u32,
-                                })
-                                .await;
+                            let _ = ctrl_out_tx.send(ControlMessage::ClipboardOffer {
+                                format: payload.format,
+                                sha256: payload.sha256,
+                                byte_len: payload.data.len() as u32,
+                            });
                         } else {
                             let c = conn.clone();
                             tokio::spawn(async move {
@@ -1216,6 +1508,10 @@ async fn run_client_session_tracked(
     } else if conn.close_reason().is_none() {
         conn.close(0u32.into(), b"client disconnected");
     }
+    drop(_clip_apply_guard);
+    drop(_ctrl_reader_guard);
+    drop(_ctrl_writer_guard);
+    drop(_bulk_guard);
     dnd.set_drag_armed(false);
     let _ = injector.release_all();
     let _ = injector.show_cursor();
@@ -1240,6 +1536,8 @@ async fn wait_reconnect_delay(
     watch_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     watch_tick.tick().await;
     let mut ticks_since_ip_check: u8 = 0;
+    let (ip_tx, mut ip_rx) = mpsc::unbounded_channel::<Vec<String>>();
+    let mut ip_check_in_flight = false;
 
     loop {
         tokio::select! {
@@ -1247,6 +1545,21 @@ async fn wait_reconnect_delay(
             cmd = recv_cmd_opt(cmd_rx) => {
                 if apply_pre_session_cmd(cmd, config) {
                     return WaitOutcome::Shutdown;
+                }
+            }
+            Some(fresh_ips) = ip_rx.recv() => {
+                ip_check_in_flight = false;
+                if fresh_ips != *last_local_ips {
+                    info!(
+                        old = ?last_local_ips,
+                        new = ?fresh_ips,
+                        "Client LAN interfaces changed during reconnect backoff; retrying immediately"
+                    );
+                    *last_local_ips = fresh_ips.clone();
+                    if let Some(rt) = runtime {
+                        rt.update(|s| s.local_ips = fresh_ips);
+                    }
+                    return WaitOutcome::FastRetry;
                 }
             }
             _ = watch_tick.tick() => {
@@ -1266,7 +1579,7 @@ async fn wait_reconnect_delay(
                         "Client detected wake/sleep jump during reconnect backoff; retrying immediately"
                     );
                     let fresh_geom = injector.desktop_geometry().ok();
-                    let fresh_ips = local_ipv4_addresses();
+                    let fresh_ips = local_ipv4_addresses_async().await;
                     *last_local_ips = fresh_ips.clone();
                     if let Some(rt) = runtime {
                         rt.update(|s| {
@@ -1287,18 +1600,12 @@ async fn wait_reconnect_delay(
 
                 if ticks_since_ip_check >= 3 {
                     ticks_since_ip_check = 0;
-                    let fresh_ips = local_ipv4_addresses();
-                    if fresh_ips != *last_local_ips {
-                        info!(
-                            old = ?last_local_ips,
-                            new = ?fresh_ips,
-                            "Client LAN interfaces changed during reconnect backoff; retrying immediately"
-                        );
-                        *last_local_ips = fresh_ips.clone();
-                        if let Some(rt) = runtime {
-                            rt.update(|s| s.local_ips = fresh_ips);
-                        }
-                        return WaitOutcome::FastRetry;
+                    if !ip_check_in_flight {
+                        ip_check_in_flight = true;
+                        let tx = ip_tx.clone();
+                        tokio::spawn(async move {
+                            let _ = tx.send(local_ipv4_addresses_async().await);
+                        });
                     }
                 }
             }
@@ -1340,7 +1647,8 @@ pub async fn run_client_with_backends_and_dnd(
     mut cmd_rx: Option<mpsc::UnboundedReceiver<RuntimeCommand>>,
 ) -> Result<()> {
     let geom = injector.desktop_geometry().unwrap_or_default();
-    let mut last_local_ips = local_ipv4_addresses();
+    let mut last_local_ips = local_ipv4_addresses_async().await;
+    let shared_clip_backend = share_clipboard_backend(clipboard);
 
     if let Some(ref rt) = runtime {
         rt.update(|s| {
@@ -1395,6 +1703,7 @@ pub async fn run_client_with_backends_and_dnd(
                     addr,
                     injector,
                     clipboard,
+                    shared_clip_backend.clone(),
                     Arc::clone(&dnd),
                     receive_dir.clone(),
                     runtime.as_ref(),
@@ -1511,7 +1820,7 @@ pub async fn run_client_with_backends_and_dnd(
 
         // Reset backoff immediately if the OS just woke or LAN IPs changed during connect/discover
         let os_resumed = injector.poll_system_resumed();
-        let fresh_ips = local_ipv4_addresses();
+        let fresh_ips = local_ipv4_addresses_async().await;
         let ips_changed = fresh_ips != last_local_ips;
         if os_resumed || ips_changed {
             last_local_ips = fresh_ips.clone();
@@ -1653,7 +1962,7 @@ mod tests {
         let resumed = Arc::clone(&injector.resumed_flag);
         let mut config = ClientConfig::default();
         let mut sleep_det = SleepDetector::default();
-        let mut ips = local_ipv4_addresses();
+        let mut ips = local_ipv4_addresses_async().await;
         let mut cmd_rx: Option<&mut mpsc::UnboundedReceiver<RuntimeCommand>> = None;
 
         tokio::spawn(async move {
@@ -1686,7 +1995,7 @@ mod tests {
         let (mut injector, _) = MockInjector::new(test_geom());
         let mut config = ClientConfig::default();
         let mut sleep_det = SleepDetector::default();
-        let mut ips = local_ipv4_addresses();
+        let mut ips = local_ipv4_addresses_async().await;
         let (tx, mut rx) = mpsc::unbounded_channel();
         let mut cmd_rx = Some(&mut rx);
 

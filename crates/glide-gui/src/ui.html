@@ -782,7 +782,7 @@
       </div>
       <button id="startStopBtn" class="primary">Start Server</button>
       <div class="side-actions">
-        <button id="lockBtn" class="sm ghost" title="Lock cursor to the current screen (Ctrl+Alt+L)">
+        <button id="lockBtn" class="sm ghost" title="Lock cursor to the current screen">
           <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="4.5" y="11" width="15" height="10" rx="2.5"/><path d="M8 11V7.5a4 4 0 0 1 8 0V11"/></svg>
           <span id="lockBtnText">Lock</span>
         </button>
@@ -1100,9 +1100,9 @@
           <div class="section">
             <div class="section-label">Shortcuts <span class="aside">On the server</span></div>
             <div class="group">
-              <div class="row shortcut"><span>Jump to a side</span><span class="keys"><span class="kbd">Ctrl</span>+<span class="kbd">Alt</span>+<span class="kbd">Arrow</span></span></div>
-              <div class="row shortcut"><span>Lock to current screen</span><span class="keys"><span class="kbd">Ctrl</span>+<span class="kbd">Alt</span>+<span class="kbd">L</span></span></div>
-              <div class="row shortcut"><span>Bring cursor home</span><span class="keys"><span class="kbd">Scroll Lock</span></span></div>
+              <div class="row shortcut"><span>Jump to a side</span><span class="keys" id="scJumpKeys"><span class="kbd">Ctrl</span>+<span class="kbd">Alt</span>+<span class="kbd">Arrow</span></span></div>
+              <div class="row shortcut"><span>Lock to current screen</span><span class="keys" id="scLockKeys"><span class="kbd">Ctrl</span>+<span class="kbd">Alt</span>+<span class="kbd">L</span></span></div>
+              <div class="row shortcut"><span>Bring cursor home</span><span class="keys" id="scHomeKeys"><span class="kbd">Scroll Lock</span></span></div>
             </div>
           </div>
           <div class="section grow">
@@ -1635,9 +1635,11 @@ function renderStatus(st) {
 
   $('lockBtn').classList.toggle('locked', !!st.locked);
   $('lockBtnText').textContent = st.locked ? 'Locked' : 'Lock';
+  const lockHint = currentLockShortcutLabel();
+  const lockSuffix = lockHint ? ` (${lockHint})` : '';
   $('lockBtn').title = st.locked
-    ? 'Cursor locked to this screen \u2014 click to unlock (Ctrl+Alt+L)'
-    : 'Lock cursor to the current screen (Ctrl+Alt+L)';
+    ? `Cursor locked to this screen \u2014 click to unlock${lockSuffix}`
+    : `Lock cursor to the current screen${lockSuffix}`;
 
   if (st.rtt_ms != null && state.running) {
     $('rttBox').style.display = 'flex';
@@ -1856,6 +1858,68 @@ function refreshRangeLabels() {
   RANGE_IDS.forEach(id => updateRangeFill($(id)));
 }
 
+function isDisabledShortcut(raw) {
+  const t = String(raw ?? '').trim().toLowerCase();
+  return t === '' || t === 'none' || t === 'off' || t === 'disabled';
+}
+
+function formatShortcutTokens(raw, appendArrow) {
+  if (isDisabledShortcut(raw)) return null;
+  const isWin = String(state.os || '').toLowerCase().includes('win');
+  const tokens = String(raw).split('+').map(s => s.trim()).filter(Boolean).map(tok => {
+    const lo = tok.toLowerCase();
+    if (lo === 'super' || lo === 'win' || lo === 'meta') return isWin ? 'Win' : 'Super';
+    if (lo === 'scrolllock') return 'Scroll Lock';
+    if (lo === 'printscreen') return 'PrtSc';
+    if (lo === 'escape') return 'Esc';
+    if (lo === 'delete') return 'Del';
+    return tok;
+  });
+  if (appendArrow) {
+    while (tokens.length && /^arrows?$/i.test(tokens[tokens.length - 1])) {
+      tokens.pop();
+    }
+    if (tokens.length) tokens.push('Arrow');
+  }
+  return tokens.length ? tokens : null;
+}
+
+function currentLockShortcutLabel() {
+  const srv = state.config && state.config.server;
+  if (!srv) return 'Ctrl+Alt+L';
+  const raw = srv.lock_shortcut != null ? srv.lock_shortcut : (srv.enable_hotkeys === false ? 'none' : 'Ctrl+Alt+L');
+  const tokens = formatShortcutTokens(raw, false);
+  return tokens ? tokens.join('+') : '';
+}
+
+function renderShortcutRow(elId, tokens) {
+  const el = $(elId);
+  if (!el) return;
+  if (!tokens) {
+    el.innerHTML = '<span class="aside">Disabled</span>';
+    return;
+  }
+  el.innerHTML = tokens.map(t => `<span class="kbd">${escapeHtml(t)}</span>`).join('+');
+}
+
+function renderShortcuts() {
+  const srv = state.config && state.config.server;
+  if (!srv) return;
+  const swRaw = srv.switch_shortcut != null ? srv.switch_shortcut : (srv.enable_hotkeys === false ? 'none' : 'Ctrl+Alt');
+  const lkRaw = srv.lock_shortcut != null ? srv.lock_shortcut : (srv.enable_hotkeys === false ? 'none' : 'Ctrl+Alt+L');
+  const escRaw = srv.escape_key != null ? srv.escape_key : 'ScrollLock';
+  renderShortcutRow('scJumpKeys', formatShortcutTokens(swRaw, true));
+  renderShortcutRow('scLockKeys', formatShortcutTokens(lkRaw, false));
+  renderShortcutRow('scHomeKeys', formatShortcutTokens(escRaw, false));
+  if (state.status) {
+    const lockHint = currentLockShortcutLabel();
+    const lockSuffix = lockHint ? ` (${lockHint})` : '';
+    $('lockBtn').title = state.status.locked
+      ? `Cursor locked to this screen \u2014 click to unlock${lockSuffix}`
+      : `Lock cursor to the current screen${lockSuffix}`;
+  }
+}
+
 function syncFormFromConfig() {
   const c = state.config;
   if (!c) return;
@@ -1879,6 +1943,7 @@ function syncFormFromConfig() {
   setTrustLabel(c.client.trusted_fingerprint);
 
   renderRemaps();
+  renderShortcuts();
   renderClientEdgePills();
   renderDeskLayout(true);
 }

@@ -7,8 +7,8 @@
 use crate::geometry::DesktopGeometry;
 use crate::linux_wayland::{
     call_portal_request, clear_restore_token, close_portal_session, extract_object_path,
-    load_restore_token, mouse_button_to_evdev, next_portal_token, opt_str, query_desktop_geometry,
-    save_restore_token, PORTAL_DEST, PORTAL_PATH, REMOTE_DESKTOP_IFACE,
+    load_restore_token, mouse_button_to_evdev, next_portal_token, opt_str, save_restore_token,
+    WaylandGeometryWatcher, PORTAL_DEST, PORTAL_PATH, REMOTE_DESKTOP_IFACE,
 };
 use crate::InputInjector;
 use anyhow::{anyhow, Context, Result};
@@ -320,12 +320,46 @@ impl Drop for EisSender {
     }
 }
 
+#[derive(Debug, PartialEq)]
 enum DbusCmd {
     Motion { dx: f64, dy: f64 },
+    /// Non-coalesced relative motion step used for two-step sweep-to-origin cursor warps.
+    WarpMotion { dx: f64, dy: f64 },
     Button { code: i32, pressed: bool },
     Key { code: i32, pressed: bool },
     ScrollDiscrete { axis: u32, steps: i32 },
     Close,
+}
+
+/// Receives the next [`DbusCmd`], coalescing any immediately queued consecutive
+/// `DbusCmd::Motion` messages into a single summed `(dx, dy)` while preserving exact
+/// FIFO ordering before any `WarpMotion`, `Button`, `Key`, `ScrollDiscrete`, or `Close`.
+fn recv_coalesced_dbus_cmd(
+    rx: &std::sync::mpsc::Receiver<DbusCmd>,
+    stashed: &mut Option<DbusCmd>,
+) -> Option<DbusCmd> {
+    let first = match stashed.take() {
+        Some(cmd) => cmd,
+        None => rx.recv().ok()?,
+    };
+    match first {
+        DbusCmd::Motion { mut dx, mut dy } => {
+            while let Ok(next) = rx.try_recv() {
+                match next {
+                    DbusCmd::Motion { dx: ndx, dy: ndy } => {
+                        dx += ndx;
+                        dy += ndy;
+                    }
+                    other => {
+                        *stashed = Some(other);
+                        break;
+                    }
+                }
+            }
+            Some(DbusCmd::Motion { dx, dy })
+        }
+        other => Some(other),
+    }
 }
 
 enum Transport {
@@ -333,11 +367,20 @@ enum Transport {
     DbusPortal,
 }
 
+type SetupResult = Result<(Transport, DesktopGeometry, Option<WaylandGeometryWatcher>)>;
+type InnerSetupResult = Result<(
+    DbusConnection,
+    OwnedObjectPath,
+    Transport,
+    DesktopGeometry,
+    Option<WaylandGeometryWatcher>,
+)>;
+
 pub struct WaylandInjector {
     dbus_tx: std::sync::mpsc::Sender<DbusCmd>,
     transport: Transport,
     geometry: DesktopGeometry,
-    last_geom_refresh: Instant,
+    geom_watcher: Option<WaylandGeometryWatcher>,
     est_x: f32,
     est_y: f32,
     scroll_rem_x: i32,
@@ -351,15 +394,14 @@ impl WaylandInjector {
     /// Opens an `org.freedesktop.portal.RemoteDesktop` session and connects to EIS when supported.
     pub fn connect() -> Result<Self> {
         let (cmd_tx, cmd_rx) = std::sync::mpsc::channel::<DbusCmd>();
-        let (ready_tx, ready_rx) =
-            std::sync::mpsc::sync_channel::<Result<(Transport, DesktopGeometry)>>(1);
+        let (ready_tx, ready_rx) = std::sync::mpsc::sync_channel::<SetupResult>(1);
 
         // Run all zbus::blocking portal setup, D-Bus Notify* fallback calls, and session teardown
         // on a dedicated non-Tokio OS thread so calling from inside Tokio never panics.
         std::thread::Builder::new()
             .name("glide-wl-rd-dbus".into())
             .spawn(move || {
-                let setup = (|| -> Result<(DbusConnection, OwnedObjectPath, Transport, DesktopGeometry)> {
+                let setup = (|| -> InnerSetupResult {
                     let conn = DbusConnection::session().context(
                         "failed to connect to session D-Bus for Wayland RemoteDesktop portal",
                     )?;
@@ -467,12 +509,23 @@ impl WaylandInjector {
                         }
                     };
 
-                    let geometry =
-                        query_desktop_geometry().unwrap_or_else(|_| DesktopGeometry::fallback());
-                    Ok((conn, session_path, transport, geometry))
+                    let (geom_watcher, geometry) = match WaylandGeometryWatcher::start() {
+                        Ok(watcher) => {
+                            let g = watcher.current();
+                            (Some(watcher), g)
+                        }
+                        Err(e) => {
+                            debug!(
+                                error = %e,
+                                "Wayland geometry observer unavailable; keeping fallback geometry"
+                            );
+                            (None, DesktopGeometry::fallback())
+                        }
+                    };
+                    Ok((conn, session_path, transport, geometry, geom_watcher))
                 })();
 
-                let (conn, session_path, transport, geometry) = match setup {
+                let (conn, session_path, transport, geometry, geom_watcher) = match setup {
                     Ok(v) => v,
                     Err(e) => {
                         let _ = ready_tx.send(Err(e));
@@ -480,15 +533,30 @@ impl WaylandInjector {
                     }
                 };
 
-                if ready_tx.send(Ok((transport, geometry))).is_err() {
+                if ready_tx
+                    .send(Ok((transport, geometry, geom_watcher)))
+                    .is_err()
+                {
                     close_portal_session(&conn, &session_path.as_ref());
                     return;
                 }
 
                 let proxy = Proxy::new(&conn, PORTAL_DEST, PORTAL_PATH, REMOTE_DESKTOP_IFACE).ok();
-                while let Ok(cmd) = cmd_rx.recv() {
+                let mut stashed: Option<DbusCmd> = None;
+                while let Some(cmd) = recv_coalesced_dbus_cmd(&cmd_rx, &mut stashed) {
                     match cmd {
                         DbusCmd::Motion { dx, dy } => {
+                            if dx != 0.0 || dy != 0.0 {
+                                if let Some(ref p) = proxy {
+                                    let opts: HashMap<&str, Value<'_>> = HashMap::new();
+                                    let _ = p.call_noreply(
+                                        "NotifyPointerMotion",
+                                        &(session_path.as_ref(), opts, dx, dy),
+                                    );
+                                }
+                            }
+                        }
+                        DbusCmd::WarpMotion { dx, dy } => {
                             if let Some(ref p) = proxy {
                                 let opts: HashMap<&str, Value<'_>> = HashMap::new();
                                 let _ = p.call_noreply(
@@ -532,7 +600,7 @@ impl WaylandInjector {
                 }
             })?;
 
-        let (transport, geometry) = ready_rx
+        let (transport, geometry, geom_watcher) = ready_rx
             .recv()
             .map_err(|_| anyhow!("Wayland RemoteDesktop setup thread exited unexpectedly"))??;
         let (cx, cy) = geometry.primary_center();
@@ -541,7 +609,7 @@ impl WaylandInjector {
             dbus_tx: cmd_tx,
             transport,
             geometry,
-            last_geom_refresh: Instant::now(),
+            geom_watcher,
             est_x: cx as f32,
             est_y: cy as f32,
             scroll_rem_x: 0,
@@ -553,12 +621,7 @@ impl WaylandInjector {
     }
 
     fn maybe_refresh_geometry(&mut self) {
-        if self.last_geom_refresh.elapsed() >= Duration::from_secs(5) {
-            if let Ok(g) = query_desktop_geometry() {
-                self.geometry = g;
-            }
-            self.last_geom_refresh = Instant::now();
-        }
+        let _ = self.poll_geometry_changed();
     }
 
     fn warp_to(&mut self, tx: i32, ty: i32) -> Result<()> {
@@ -573,14 +636,15 @@ impl WaylandInjector {
 
         if !warped_abs {
             // Compositor does not expose absolute pointer: sweep to top-left origin then move
-            // to the exact target offset relative to (min_x, min_y).
+            // to the exact target offset relative to (min_x, min_y). Use non-coalesced warp
+            // steps so the two motions never sum together in the D-Bus fallback queue.
             let span_x = (max_x - min_x).max(1) as f32;
             let span_y = (max_y - min_y).max(1) as f32;
-            self.emit_relative(-span_x * 1.5, -span_y * 1.5)?;
+            self.emit_warp_step(-span_x * 1.5, -span_y * 1.5)?;
             let off_x = (clamped_x - min_x) as f32;
             let off_y = (clamped_y - min_y) as f32;
             if off_x != 0.0 || off_y != 0.0 {
-                self.emit_relative(off_x, off_y)?;
+                self.emit_warp_step(off_x, off_y)?;
             }
         }
 
@@ -588,6 +652,22 @@ impl WaylandInjector {
         self.est_y = clamped_y as f32;
         self.edge_push_accum = 0.0;
         Ok(())
+    }
+
+    fn emit_warp_step(&self, dx: f32, dy: f32) -> Result<()> {
+        match &self.transport {
+            Transport::Eis(eis) => {
+                eis.motion_relative(dx, dy);
+                Ok(())
+            }
+            Transport::DbusPortal => {
+                let _ = self.dbus_tx.send(DbusCmd::WarpMotion {
+                    dx: dx as f64,
+                    dy: dy as f64,
+                });
+                Ok(())
+            }
+        }
     }
 
     fn emit_relative(&self, dx: f32, dy: f32) -> Result<()> {
@@ -645,33 +725,27 @@ impl InputInjector for WaylandInjector {
     }
 
     fn desktop_geometry(&mut self) -> Result<DesktopGeometry> {
-        self.last_geom_refresh = Instant::now();
-        if let Ok(g) = query_desktop_geometry() {
-            self.geometry = g;
+        if let Some(ref watcher) = self.geom_watcher {
+            let _ = watcher.poll_changed();
+            self.geometry = watcher.current();
         }
-        self.last_geom_refresh = Instant::now();
         Ok(self.geometry.clone())
     }
 
     fn poll_geometry_changed(&mut self) -> Option<DesktopGeometry> {
-        if self.last_geom_refresh.elapsed() < Duration::from_secs(3) {
-            return None;
-        }
-        self.last_geom_refresh = Instant::now();
-        if let Ok(new_geom) = query_desktop_geometry() {
-            if new_geom != self.geometry {
-                self.geometry = new_geom;
-                self.edge_push_accum = 0.0;
-                let (min_x, min_y, max_x, max_y) = self.geometry.bounds();
-                self.est_x = self.est_x.clamp(min_x as f32, (max_x - 1) as f32);
-                self.est_y = self.est_y.clamp(min_y as f32, (max_y - 1) as f32);
-                debug!(
-                    monitors = self.geometry.monitors.len(),
-                    primary_scale = self.geometry.primary_scale(),
-                    "WaylandInjector refreshed desktop geometry"
-                );
-                return Some(self.geometry.clone());
-            }
+        let new_geom = self.geom_watcher.as_ref()?.poll_changed()?;
+        if new_geom != self.geometry {
+            self.geometry = new_geom;
+            self.edge_push_accum = 0.0;
+            let (min_x, min_y, max_x, max_y) = self.geometry.bounds();
+            self.est_x = self.est_x.clamp(min_x as f32, (max_x - 1) as f32);
+            self.est_y = self.est_y.clamp(min_y as f32, (max_y - 1) as f32);
+            debug!(
+                monitors = self.geometry.monitors.len(),
+                primary_scale = self.geometry.primary_scale(),
+                "WaylandInjector refreshed desktop geometry"
+            );
+            return Some(self.geometry.clone());
         }
         None
     }
@@ -829,5 +903,77 @@ impl Drop for WaylandInjector {
     fn drop(&mut self) {
         let _ = self.release_all();
         let _ = self.dbus_tx.send(DbusCmd::Close);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn dbus_motion_coalesces_consecutive_deltas_and_preserves_ordering() {
+        let (tx, rx) = std::sync::mpsc::channel();
+        tx.send(DbusCmd::Motion { dx: 1.5, dy: -2.0 }).unwrap();
+        tx.send(DbusCmd::Motion { dx: 3.0, dy: 4.5 }).unwrap();
+        tx.send(DbusCmd::Motion { dx: -0.5, dy: 1.5 }).unwrap();
+        tx.send(DbusCmd::Button {
+            code: 0x110,
+            pressed: true,
+        })
+        .unwrap();
+        tx.send(DbusCmd::Motion { dx: 10.0, dy: 0.0 }).unwrap();
+        tx.send(DbusCmd::Motion { dx: 5.0, dy: -3.0 }).unwrap();
+        tx.send(DbusCmd::Key {
+            code: 30,
+            pressed: true,
+        })
+        .unwrap();
+        // Two-step sweep-to-origin warp must NOT coalesce!
+        tx.send(DbusCmd::WarpMotion {
+            dx: -2880.0,
+            dy: -1620.0,
+        })
+        .unwrap();
+        tx.send(DbusCmd::WarpMotion {
+            dx: 4.0,
+            dy: 540.0,
+        })
+        .unwrap();
+        tx.send(DbusCmd::ScrollDiscrete { axis: 0, steps: -1 })
+            .unwrap();
+        tx.send(DbusCmd::Close).unwrap();
+        drop(tx);
+
+        let mut stashed = None;
+        let mut out = Vec::new();
+        while let Some(cmd) = recv_coalesced_dbus_cmd(&rx, &mut stashed) {
+            out.push(cmd);
+        }
+
+        assert_eq!(
+            out,
+            vec![
+                DbusCmd::Motion { dx: 4.0, dy: 4.0 },
+                DbusCmd::Button {
+                    code: 0x110,
+                    pressed: true
+                },
+                DbusCmd::Motion { dx: 15.0, dy: -3.0 },
+                DbusCmd::Key {
+                    code: 30,
+                    pressed: true
+                },
+                DbusCmd::WarpMotion {
+                    dx: -2880.0,
+                    dy: -1620.0
+                },
+                DbusCmd::WarpMotion {
+                    dx: 4.0,
+                    dy: 540.0
+                },
+                DbusCmd::ScrollDiscrete { axis: 0, steps: -1 },
+                DbusCmd::Close,
+            ]
+        );
     }
 }

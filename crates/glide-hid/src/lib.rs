@@ -138,10 +138,24 @@ impl HidUsage {
     }
 
     // Well-known keys used across crates
+    pub const KEY_L: Self = Self::keyboard(0x0F);
     pub const ESCAPE: Self = Self::keyboard(0x29);
+    pub const BACKSPACE: Self = Self::keyboard(0x2A);
+    pub const PRINT_SCREEN: Self = Self::keyboard(0x46);
     pub const SCROLL_LOCK: Self = Self::keyboard(0x47);
     pub const PAUSE: Self = Self::keyboard(0x48);
+    pub const INSERT: Self = Self::keyboard(0x49);
+    pub const HOME: Self = Self::keyboard(0x4A);
+    pub const PAGE_UP: Self = Self::keyboard(0x4B);
+    pub const DELETE: Self = Self::keyboard(0x4C);
+    pub const END: Self = Self::keyboard(0x4D);
+    pub const PAGE_DOWN: Self = Self::keyboard(0x4E);
+    pub const ARROW_RIGHT: Self = Self::keyboard(0x4F);
+    pub const ARROW_LEFT: Self = Self::keyboard(0x50);
+    pub const ARROW_DOWN: Self = Self::keyboard(0x51);
+    pub const ARROW_UP: Self = Self::keyboard(0x52);
     pub const ISO_BACKSLASH: Self = Self::keyboard(0x64);
+    pub const CONTEXT_MENU: Self = Self::keyboard(0x65);
     pub const CONTROL_LEFT: Self = Self::keyboard(0xE0);
     pub const SHIFT_LEFT: Self = Self::keyboard(0xE1);
     pub const ALT_LEFT: Self = Self::keyboard(0xE2);
@@ -225,12 +239,72 @@ impl HidUsage {
         lookup_by_hid(self).and_then(|e| e.macos)
     }
 
-    /// Parse a key by case-insensitive canonical name (e.g. `"ScrollLock"`, `"AltRight"`).
+    /// Parse a key by case-insensitive canonical name or forgiving alias
+    /// (e.g. `"ScrollLock"`, `"Scroll Lock"`, `"L"`, `"Esc"`, `"AltGr"`, `"LWin"`).
     pub fn from_name(name: &str) -> Option<Self> {
         let trimmed = name.trim();
-        // Helpful common aliases
-        if trimmed.eq_ignore_ascii_case("AltGr") {
-            return Some(Self::ALT_RIGHT);
+        let bytes = trimmed.as_bytes();
+        if bytes.len() == 1 {
+            let b = bytes[0].to_ascii_uppercase();
+            if b.is_ascii_uppercase() {
+                return Some(Self::keyboard(0x04 + u16::from(b - b'A')));
+            }
+            if b.is_ascii_digit() {
+                return Some(if b == b'0' {
+                    Self::keyboard(0x27)
+                } else {
+                    Self::keyboard(0x1E + u16::from(b - b'1'))
+                });
+            }
+        }
+
+        // Forgiving common aliases (case-insensitive)
+        if trimmed.eq_ignore_ascii_case("Esc") {
+            return Some(Self::ESCAPE);
+        }
+        if trimmed.eq_ignore_ascii_case("Del") {
+            return Some(Self::DELETE);
+        }
+        if trimmed.eq_ignore_ascii_case("Ins") {
+            return Some(Self::INSERT);
+        }
+        if trimmed.eq_ignore_ascii_case("PgUp") {
+            return Some(Self::PAGE_UP);
+        }
+        if trimmed.eq_ignore_ascii_case("PgDn") {
+            return Some(Self::PAGE_DOWN);
+        }
+        if trimmed.eq_ignore_ascii_case("Scroll Lock") {
+            return Some(Self::SCROLL_LOCK);
+        }
+        if trimmed.eq_ignore_ascii_case("Print Screen") || trimmed.eq_ignore_ascii_case("PrtSc") {
+            return Some(Self::PRINT_SCREEN);
+        }
+        if trimmed.eq_ignore_ascii_case("Left") {
+            return Some(Self::ARROW_LEFT);
+        }
+        if trimmed.eq_ignore_ascii_case("Right") {
+            return Some(Self::ARROW_RIGHT);
+        }
+        if trimmed.eq_ignore_ascii_case("Up") {
+            return Some(Self::ARROW_UP);
+        }
+        if trimmed.eq_ignore_ascii_case("Down") {
+            return Some(Self::ARROW_DOWN);
+        }
+        if trimmed.eq_ignore_ascii_case("SuperLeft")
+            || trimmed.eq_ignore_ascii_case("WinLeft")
+            || trimmed.eq_ignore_ascii_case("LWin")
+            || trimmed.eq_ignore_ascii_case("LSuper")
+        {
+            return Some(Self::META_LEFT);
+        }
+        if trimmed.eq_ignore_ascii_case("SuperRight")
+            || trimmed.eq_ignore_ascii_case("WinRight")
+            || trimmed.eq_ignore_ascii_case("RWin")
+            || trimmed.eq_ignore_ascii_case("RSuper")
+        {
+            return Some(Self::META_RIGHT);
         }
         if trimmed.eq_ignore_ascii_case("CtrlLeft") || trimmed.eq_ignore_ascii_case("LCtrl") {
             return Some(Self::CONTROL_LEFT);
@@ -238,6 +312,19 @@ impl HidUsage {
         if trimmed.eq_ignore_ascii_case("CtrlRight") || trimmed.eq_ignore_ascii_case("RCtrl") {
             return Some(Self::CONTROL_RIGHT);
         }
+        if trimmed.eq_ignore_ascii_case("LAlt") {
+            return Some(Self::ALT_LEFT);
+        }
+        if trimmed.eq_ignore_ascii_case("RAlt") || trimmed.eq_ignore_ascii_case("AltGr") {
+            return Some(Self::ALT_RIGHT);
+        }
+        if trimmed.eq_ignore_ascii_case("LShift") {
+            return Some(Self::SHIFT_LEFT);
+        }
+        if trimmed.eq_ignore_ascii_case("RShift") {
+            return Some(Self::SHIFT_RIGHT);
+        }
+
         KEY_TABLE
             .iter()
             .find(|e| e.name.eq_ignore_ascii_case(trimmed))
@@ -248,6 +335,44 @@ impl HidUsage {
     #[inline]
     pub fn name(self) -> Option<&'static str> {
         lookup_by_hid(self).map(|e| e.name)
+    }
+
+    /// Clean, short UI keycap text suitable for displaying inside shortcut badges.
+    pub fn keycap_label(self) -> &'static str {
+        match self.canonicalize() {
+            Self::SCROLL_LOCK => "Scroll Lock",
+            Self::ESCAPE => "Esc",
+            Self::DELETE => "Del",
+            Self::BACKSPACE => "Backspace",
+            Self::PRINT_SCREEN => "PrtSc",
+            Self::PAGE_UP => "PgUp",
+            Self::PAGE_DOWN => "PgDn",
+            Self::ARROW_LEFT => "Left",
+            Self::ARROW_RIGHT => "Right",
+            Self::ARROW_UP => "Up",
+            Self::ARROW_DOWN => "Down",
+            Self::CONTROL_LEFT => "Left Ctrl",
+            Self::CONTROL_RIGHT => "Right Ctrl",
+            Self::SHIFT_LEFT => "Left Shift",
+            Self::SHIFT_RIGHT => "Right Shift",
+            Self::ALT_LEFT => "Left Alt",
+            Self::ALT_RIGHT => "Right Alt",
+            Self::META_LEFT => "Left Super",
+            Self::META_RIGHT => "Right Super",
+            other => {
+                if let Some(name) = other.name() {
+                    if let Some(letter) = name.strip_prefix("Key") {
+                        return letter;
+                    }
+                    if let Some(digit) = name.strip_prefix("Digit") {
+                        return digit;
+                    }
+                    name
+                } else {
+                    "Unknown"
+                }
+            }
+        }
     }
 
     /// Returns the bit in [`ModifierMask`] corresponding to this key, if it is a modifier.
@@ -263,6 +388,36 @@ impl HidUsage {
             x if x == Self::META_RIGHT.0 => ModifierMask::META_RIGHT,
             _ => 0,
         }
+    }
+
+    /// Returns `true` if this usage is one of the 8 physical USB HID modifier keys.
+    #[inline]
+    pub const fn is_modifier(self) -> bool {
+        self.modifier_bit() != 0
+    }
+
+    /// Returns `true` if this key may be bound standalone (without Ctrl/Alt/Super)
+    /// as a lock or escape shortcut (`F1..F24`, `ScrollLock`, `Pause`, `PrintScreen`,
+    /// `Insert`, `Home`, `End`, `PageUp`, `PageDown`, `ContextMenu`).
+    #[inline]
+    pub const fn is_standalone_shortcut_key(self) -> bool {
+        if self.page() != PAGE_KEYBOARD {
+            return false;
+        }
+        matches!(
+            self.id(),
+            0x3A..=0x45 // F1..=F12
+                | 0x46  // PrintScreen
+                | 0x47  // ScrollLock
+                | 0x48  // Pause
+                | 0x49  // Insert
+                | 0x4A  // Home
+                | 0x4B  // PageUp
+                | 0x4D  // End
+                | 0x4E  // PageDown
+                | 0x65  // ContextMenu
+                | 0x68..=0x73 // F13..=F24
+        )
     }
 }
 
@@ -535,5 +690,133 @@ mod tests {
         assert!(!HidUsage::ALT_RIGHT.is_media_key());
         assert!(!HidUsage::ISO_BACKSLASH.is_media_key());
         assert!(!HidUsage::from_name("KeyA").unwrap().is_media_key());
+    }
+
+    #[test]
+    fn from_name_forgiving_aliases_and_single_chars() {
+        for ch in 'A'..='Z' {
+            let single = ch.to_string();
+            let lower = ch.to_ascii_lowercase().to_string();
+            let canonical = format!("Key{ch}");
+            let expected = HidUsage::from_name(&canonical).unwrap();
+            assert_eq!(HidUsage::from_name(&single), Some(expected));
+            assert_eq!(HidUsage::from_name(&lower), Some(expected));
+            assert_eq!(HidUsage::from_name(&format!("  {single}  ")), Some(expected));
+        }
+        for d in '0'..='9' {
+            let single = d.to_string();
+            let canonical = format!("Digit{d}");
+            let expected = HidUsage::from_name(&canonical).unwrap();
+            assert_eq!(HidUsage::from_name(&single), Some(expected));
+        }
+
+        assert_eq!(HidUsage::from_name("L"), Some(HidUsage::KEY_L));
+        assert_eq!(HidUsage::from_name("esc"), Some(HidUsage::ESCAPE));
+        assert_eq!(HidUsage::from_name("Del"), Some(HidUsage::DELETE));
+        assert_eq!(HidUsage::from_name("Ins"), Some(HidUsage::INSERT));
+        assert_eq!(HidUsage::from_name("PgUp"), Some(HidUsage::PAGE_UP));
+        assert_eq!(HidUsage::from_name("PgDn"), Some(HidUsage::PAGE_DOWN));
+        assert_eq!(HidUsage::from_name("Scroll Lock"), Some(HidUsage::SCROLL_LOCK));
+        assert_eq!(HidUsage::from_name("Print Screen"), Some(HidUsage::PRINT_SCREEN));
+        assert_eq!(HidUsage::from_name("PrtSc"), Some(HidUsage::PRINT_SCREEN));
+        assert_eq!(HidUsage::from_name("Left"), Some(HidUsage::ARROW_LEFT));
+        assert_eq!(HidUsage::from_name("Right"), Some(HidUsage::ARROW_RIGHT));
+        assert_eq!(HidUsage::from_name("Up"), Some(HidUsage::ARROW_UP));
+        assert_eq!(HidUsage::from_name("Down"), Some(HidUsage::ARROW_DOWN));
+        assert_eq!(HidUsage::from_name("SuperLeft"), Some(HidUsage::META_LEFT));
+        assert_eq!(HidUsage::from_name("WinLeft"), Some(HidUsage::META_LEFT));
+        assert_eq!(HidUsage::from_name("LWin"), Some(HidUsage::META_LEFT));
+        assert_eq!(HidUsage::from_name("LSuper"), Some(HidUsage::META_LEFT));
+        assert_eq!(HidUsage::from_name("SuperRight"), Some(HidUsage::META_RIGHT));
+        assert_eq!(HidUsage::from_name("WinRight"), Some(HidUsage::META_RIGHT));
+        assert_eq!(HidUsage::from_name("RWin"), Some(HidUsage::META_RIGHT));
+        assert_eq!(HidUsage::from_name("RSuper"), Some(HidUsage::META_RIGHT));
+        assert_eq!(HidUsage::from_name("LAlt"), Some(HidUsage::ALT_LEFT));
+        assert_eq!(HidUsage::from_name("RAlt"), Some(HidUsage::ALT_RIGHT));
+        assert_eq!(HidUsage::from_name("AltGr"), Some(HidUsage::ALT_RIGHT));
+        assert_eq!(HidUsage::from_name("LShift"), Some(HidUsage::SHIFT_LEFT));
+        assert_eq!(HidUsage::from_name("RShift"), Some(HidUsage::SHIFT_RIGHT));
+        assert_eq!(HidUsage::from_name("LCtrl"), Some(HidUsage::CONTROL_LEFT));
+        assert_eq!(HidUsage::from_name("RCtrl"), Some(HidUsage::CONTROL_RIGHT));
+        assert_eq!(HidUsage::from_name("Backspace"), Some(HidUsage::BACKSPACE));
+        assert_eq!(HidUsage::from_name("NotAKey"), None);
+    }
+
+    #[test]
+    fn keycap_labels_are_clean_and_human_readable() {
+        assert_eq!(HidUsage::KEY_L.keycap_label(), "L");
+        assert_eq!(HidUsage::from_name("KeyA").unwrap().keycap_label(), "A");
+        assert_eq!(HidUsage::from_name("KeyZ").unwrap().keycap_label(), "Z");
+        assert_eq!(HidUsage::from_name("Digit0").unwrap().keycap_label(), "0");
+        assert_eq!(HidUsage::from_name("Digit9").unwrap().keycap_label(), "9");
+        assert_eq!(HidUsage::SCROLL_LOCK.keycap_label(), "Scroll Lock");
+        assert_eq!(HidUsage::ESCAPE.keycap_label(), "Esc");
+        assert_eq!(HidUsage::DELETE.keycap_label(), "Del");
+        assert_eq!(HidUsage::BACKSPACE.keycap_label(), "Backspace");
+        assert_eq!(HidUsage::PRINT_SCREEN.keycap_label(), "PrtSc");
+        assert_eq!(HidUsage::PAGE_UP.keycap_label(), "PgUp");
+        assert_eq!(HidUsage::PAGE_DOWN.keycap_label(), "PgDn");
+        assert_eq!(HidUsage::ARROW_LEFT.keycap_label(), "Left");
+        assert_eq!(HidUsage::ARROW_RIGHT.keycap_label(), "Right");
+        assert_eq!(HidUsage::ARROW_UP.keycap_label(), "Up");
+        assert_eq!(HidUsage::ARROW_DOWN.keycap_label(), "Down");
+        assert_eq!(HidUsage::CONTROL_LEFT.keycap_label(), "Left Ctrl");
+        assert_eq!(HidUsage::CONTROL_RIGHT.keycap_label(), "Right Ctrl");
+        assert_eq!(HidUsage::from_name("F1").unwrap().keycap_label(), "F1");
+        assert_eq!(HidUsage::from_name("F12").unwrap().keycap_label(), "F12");
+        assert_eq!(HidUsage::from_name("F24").unwrap().keycap_label(), "F24");
+        assert_eq!(HidUsage::PAUSE.keycap_label(), "Pause");
+        assert_eq!(HidUsage(0x00FF_00FF).keycap_label(), "Unknown");
+    }
+
+    #[test]
+    fn classifies_modifiers_and_standalone_shortcut_keys() {
+        for m in [
+            HidUsage::CONTROL_LEFT,
+            HidUsage::CONTROL_RIGHT,
+            HidUsage::SHIFT_LEFT,
+            HidUsage::SHIFT_RIGHT,
+            HidUsage::ALT_LEFT,
+            HidUsage::ALT_RIGHT,
+            HidUsage::META_LEFT,
+            HidUsage::META_RIGHT,
+        ] {
+            assert!(m.is_modifier());
+            assert!(!m.is_standalone_shortcut_key());
+        }
+
+        for n in 1..=24 {
+            let f = HidUsage::from_name(&format!("F{n}")).unwrap();
+            assert!(!f.is_modifier());
+            assert!(f.is_standalone_shortcut_key(), "F{n} should be standalone");
+        }
+        for k in [
+            HidUsage::SCROLL_LOCK,
+            HidUsage::PAUSE,
+            HidUsage::PRINT_SCREEN,
+            HidUsage::INSERT,
+            HidUsage::HOME,
+            HidUsage::END,
+            HidUsage::PAGE_UP,
+            HidUsage::PAGE_DOWN,
+            HidUsage::CONTEXT_MENU,
+        ] {
+            assert!(!k.is_modifier());
+            assert!(k.is_standalone_shortcut_key(), "{k} should be standalone");
+        }
+
+        // Ordinary typing / editing / media keys are NOT standalone shortcut keys
+        for k in [
+            HidUsage::KEY_L,
+            HidUsage::ESCAPE,
+            HidUsage::DELETE,
+            HidUsage::BACKSPACE,
+            HidUsage::ARROW_LEFT,
+            HidUsage::from_name("Space").unwrap(),
+            HidUsage::from_name("AudioVolumeUp").unwrap(),
+        ] {
+            assert!(!k.is_modifier());
+            assert!(!k.is_standalone_shortcut_key(), "{k} must not be standalone");
+        }
     }
 }

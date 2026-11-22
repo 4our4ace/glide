@@ -4,7 +4,7 @@
 use crate::runtime::{read_regular_file_bounded, save_received_file, RuntimeState};
 use glide_backend::dnd::DndBackend;
 use glide_backend::os_integration::resolve_receive_dir;
-use glide_net::{send_drag_file_on_with_limit, sha256_bytes, Connection};
+use glide_net::{send_drag_file_on_with_limit, sha256_bytes_async, Connection};
 use glide_proto::{sanitize_filename, DragFileInfo, DragFilePayload, FilePayload, MAX_DRAG_FILES};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -172,11 +172,12 @@ pub fn spawn_send_drag_files(
             };
 
             let byte_len = data.len();
+            let sha256 = sha256_bytes_async(data.clone()).await;
             let payload = DragFilePayload {
                 drag_id,
                 file: FilePayload {
                     filename: filename.clone(),
-                    sha256: sha256_bytes(&data),
+                    sha256,
                     data,
                 },
             };
