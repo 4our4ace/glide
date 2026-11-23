@@ -183,6 +183,10 @@ enum Command {
         #[arg(long)]
         forward_media_keys: bool,
 
+        /// Unfocus the active local window when pointer/keyboard focus leaves this machine
+        #[arg(long)]
+        unfocus_on_leave: bool,
+
         /// Mouse delta coalescing interval in microseconds (default: 1000 = 1000Hz; 0 = immediate)
         #[arg(long)]
         coalesce_us: Option<u64>,
@@ -249,6 +253,10 @@ enum Command {
         /// Disable bidirectional clipboard sync
         #[arg(long)]
         no_clipboard: bool,
+
+        /// Unfocus the active local window when pointer/keyboard focus leaves this machine
+        #[arg(long)]
+        unfocus_on_leave: bool,
     },
 
     /// Control a running Glide session via local IPC (`status`, `lock`, `unlock`, `toggle-lock`, `switch`)
@@ -450,6 +458,7 @@ async fn run_command(command: Command, config: Option<PathBuf>) -> Result<()> {
             edge_dwell_ms,
             no_fullscreen_lock,
             forward_media_keys,
+            unfocus_on_leave,
             coalesce_us,
         } => {
             let file_cfg = load_config(cli_config.as_ref())?;
@@ -484,6 +493,9 @@ async fn run_command(command: Command, config: Option<PathBuf>) -> Result<()> {
             }
             if forward_media_keys {
                 cfg.pin_media_keys_local = false;
+            }
+            if unfocus_on_leave {
+                cfg.unfocus_on_leave = true;
             }
             if let Some(cu) = coalesce_us {
                 cfg.motion_coalesce_us = cu;
@@ -529,6 +541,7 @@ async fn run_command(command: Command, config: Option<PathBuf>) -> Result<()> {
             dead_corner,
             backend,
             no_clipboard,
+            unfocus_on_leave,
         } => {
             let file_cfg = load_config(cli_config.as_ref())?;
             let mut cfg: ClientConfig = file_cfg.effective_client_config();
@@ -588,6 +601,9 @@ async fn run_command(command: Command, config: Option<PathBuf>) -> Result<()> {
             }
             if no_clipboard {
                 cfg.clipboard = false;
+            }
+            if unfocus_on_leave {
+                cfg.unfocus_on_leave = true;
             }
 
             let rt = RuntimeState::new();
@@ -1025,6 +1041,45 @@ mod tests {
             Some(Command::Update {
                 channel: Some(CliUpdateChannel::Nightly),
                 check: true
+            })
+        ));
+    }
+
+    #[test]
+    fn parses_unfocus_on_leave_flag_for_server_and_client() {
+        let srv_default = Cli::try_parse_from(["glide", "server"]).unwrap();
+        assert!(matches!(
+            srv_default.command,
+            Some(Command::Server {
+                unfocus_on_leave: false,
+                ..
+            })
+        ));
+
+        let srv_enabled = Cli::try_parse_from(["glide", "server", "--unfocus-on-leave"]).unwrap();
+        assert!(matches!(
+            srv_enabled.command,
+            Some(Command::Server {
+                unfocus_on_leave: true,
+                ..
+            })
+        ));
+
+        let cli_default = Cli::try_parse_from(["glide", "client"]).unwrap();
+        assert!(matches!(
+            cli_default.command,
+            Some(Command::Client {
+                unfocus_on_leave: false,
+                ..
+            })
+        ));
+
+        let cli_enabled = Cli::try_parse_from(["glide", "client", "--unfocus-on-leave"]).unwrap();
+        assert!(matches!(
+            cli_enabled.command,
+            Some(Command::Client {
+                unfocus_on_leave: true,
+                ..
             })
         ));
     }

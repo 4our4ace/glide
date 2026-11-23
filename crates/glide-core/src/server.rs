@@ -192,6 +192,7 @@ pub async fn run_server_with_dnd(
     dnd.set_enabled(config.drag_drop_files);
     capture_ctrl.set_drag_drop_files(config.drag_drop_files);
     capture_ctrl.set_dnd_probe(Arc::clone(&dnd));
+    capture_ctrl.set_unfocus_on_leave(config.unfocus_on_leave);
 
     // Dedicated serial clipboard applier so OS clipboard locks (e.g. OpenClipboard / DIB->PNG)
     // apply strictly in order on the blocking pool without ever stalling the capture select! loop.
@@ -828,6 +829,7 @@ pub async fn run_server_with_dnd(
                         locked: new_locked,
                         sync_lock_keys,
                         pin_media_keys_local,
+                        unfocus_on_leave,
                         clipboard: clip_enabled,
                         drag_drop_files,
                         hotkeys,
@@ -838,6 +840,7 @@ pub async fn run_server_with_dnd(
                         config.auto_lock_fullscreen = auto_lock_fullscreen;
                         config.sync_lock_keys = sync_lock_keys;
                         config.pin_media_keys_local = pin_media_keys_local;
+                        config.unfocus_on_leave = unfocus_on_leave;
                         config.clipboard = clip_enabled;
                         config.drag_drop_files = drag_drop_files;
                         config.set_switch_shortcut(hotkeys.switch_mods);
@@ -854,6 +857,7 @@ pub async fn run_server_with_dnd(
                         capture_ctrl.set_sync_lock_keys(sync_lock_keys);
                         capture_ctrl.set_drag_drop_files(drag_drop_files);
                         capture_ctrl.set_pin_media_keys_local(pin_media_keys_local);
+                        capture_ctrl.set_unfocus_on_leave(unfocus_on_leave);
                         capture_ctrl.set_hotkeys(hotkeys);
                         dnd.set_enabled(drag_drop_files);
                         if locked || !drag_drop_files {
@@ -2322,6 +2326,7 @@ pub async fn run_native_server_with_runtime(
         sync_lock_keys: config.sync_lock_keys,
         drag_drop_files: config.drag_drop_files,
         pin_media_keys_local: config.pin_media_keys_local,
+        unfocus_on_leave: config.unfocus_on_leave,
     })?;
 
     let clipboard = if config.clipboard {

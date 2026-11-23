@@ -1728,7 +1728,7 @@ fn input_server_cols(s: &Ui, p: Palette) -> El {
     let dead = s.config.server.dead_corner_px;
     let dwell = s.config.server.edge_dwell_ms;
 
-    let edge_rows = [
+    let mut edge_rows = vec![
         slider_row(
             p,
             "srv-thresh-row",
@@ -1826,6 +1826,26 @@ fn input_server_cols(s: &Ui, p: Palette) -> El {
             ),
         ),
     ];
+
+    if !matches!(s.os_kind, OsKind::LinuxWayland) {
+        edge_rows.push(setting_row(
+            p,
+            "srv-unfocus-row",
+            icons::unfocus_window_icon(p.text_2),
+            "Unfocus window on leave",
+            Some("Remove window focus when switching away"),
+            toggle(
+                p,
+                "srv-unfocus-toggle",
+                "Unfocus window on leave",
+                s.config.server.unfocus_on_leave,
+                |s, _| {
+                    s.config.server.unfocus_on_leave = !s.config.server.unfocus_on_leave;
+                    s.push_config();
+                },
+            ),
+        ));
+    }
 
     let left_col = col()
         .key("input-server-left")
@@ -2030,7 +2050,7 @@ fn input_client_cols(s: &Ui, p: Palette) -> El {
     let thresh = s.config.client.edge_threshold_px;
     let dead = s.config.client.dead_corner_px;
 
-    let return_rows = [
+    let mut return_rows = vec![
         slider_row(
             p,
             "cli-thresh-row",
@@ -2079,6 +2099,26 @@ fn input_client_cols(s: &Ui, p: Palette) -> El {
             ),
         ),
     ];
+
+    if !matches!(s.os_kind, OsKind::LinuxWayland) {
+        return_rows.push(setting_row(
+            p,
+            "cli-unfocus-row",
+            icons::unfocus_window_icon(p.text_2),
+            "Unfocus window on leave",
+            Some("Remove window focus when switching away"),
+            toggle(
+                p,
+                "cli-unfocus-toggle",
+                "Unfocus window on leave",
+                s.config.client.unfocus_on_leave,
+                |s, _| {
+                    s.config.client.unfocus_on_leave = !s.config.client.unfocus_on_leave;
+                    s.push_config();
+                },
+            ),
+        ));
+    }
 
     let left_col = col()
         .key("input-client-left")

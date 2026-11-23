@@ -21,7 +21,9 @@ use x11rb::connection::Connection;
 use x11rb::protocol::randr::{ConnectionExt as RandrExt, NotifyMask};
 use x11rb::protocol::xfixes::ConnectionExt as XFixesExt;
 use x11rb::protocol::xinput::ConnectionExt as XInputExt;
-use x11rb::protocol::xproto::Window;
+use x11rb::protocol::xproto::{
+    ConnectionExt as XProtoExt, CreateWindowAux, InputFocus, Window, WindowClass,
+};
 use x11rb::protocol::xtest::ConnectionExt as XTestExt;
 use x11rb::protocol::Event;
 use x11rb::rust_connection::RustConnection;
@@ -192,6 +194,90 @@ impl X11CursorHider {
                 }
                 Err(e) => tracing::warn!(error = %e, "XFixesShowCursor send failed"),
             }
+        }
+    }
+}
+
+/// Clears keyboard focus on X11 when focus leaves this machine.
+///
+/// Lazily creates and maps an offscreen 1×1 `InputOnly` `override_redirect` window
+/// (allocating zero X11 resources when unused) and directs `SetInputFocus` to it with
+/// `revert_to = PointerRoot` so WMs like KWin/Mutter do not immediately restore focus to
+/// another app window, while ensuring clean focus recovery if Glide exits while unfocused.
+#[derive(Default)]
+pub struct X11FocusClearer {
+    win: Option<Window>,
+}
+
+impl X11FocusClearer {
+    pub fn new() -> Self {
+        Self { win: None }
+    }
+
+    pub fn clear_focus(&mut self, conn: &RustConnection, root: Window) {
+        let target_win = match self.win {
+            Some(w) => w,
+            None => match conn.generate_id() {
+                Ok(w) => {
+                    let aux = CreateWindowAux::new().override_redirect(1);
+                    let created = conn
+                        .create_window(
+                            0,
+                            w,
+                            root,
+                            -10,
+                            -10,
+                            1,
+                            1,
+                            0,
+                            WindowClass::INPUT_ONLY,
+                            0,
+                            &aux,
+                        )
+                        .and_then(|c| {
+                            c.ignore_error();
+                            conn.map_window(w)
+                        });
+                    match created {
+                        Ok(map_cookie) => {
+                            map_cookie.ignore_error();
+                            self.win = Some(w);
+                            w
+                        }
+                        Err(e) => {
+                            tracing::debug!(
+                                error = %e,
+                                "Failed creating X11 focus sink window; falling back to root"
+                            );
+                            root
+                        }
+                    }
+                }
+                Err(e) => {
+                    tracing::debug!(
+                        error = %e,
+                        "Failed generating X11 window ID for focus sink; falling back to root"
+                    );
+                    root
+                }
+            },
+        };
+
+        match conn.set_input_focus(InputFocus::POINTER_ROOT, target_win, x11rb::CURRENT_TIME) {
+            Ok(cookie) => {
+                cookie.ignore_error();
+                let _ = conn.flush();
+            }
+            Err(e) => tracing::debug!(error = %e, "X11 SetInputFocus send failed"),
+        }
+    }
+
+    pub fn destroy(&mut self, conn: &RustConnection) {
+        if let Some(w) = self.win.take() {
+            if let Ok(cookie) = conn.destroy_window(w) {
+                cookie.ignore_error();
+            }
+            let _ = conn.flush();
         }
     }
 }
@@ -424,7 +510,6 @@ mod tests {
     use glide_hid::{HidUsage, MouseButton};
     use glide_net::sha256_bytes;
     use glide_proto::{ClipboardFormat, ClipboardPayload, Edge};
-    use x11rb::protocol::xproto::ConnectionExt as XProtoExt;
 
     #[test]
     #[ignore = "requires an active X11 DISPLAY (e.g. Xvfb :99)"]

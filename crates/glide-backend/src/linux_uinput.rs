@@ -13,7 +13,7 @@ use crate::linux_wayland::WaylandGeometryWatcher;
 use crate::linux_x11::inject::should_sync_x11_pointer;
 use crate::linux_x11::{
     poll_randr_event, query_desktop_geometry, subscribe_randr_events, unsubscribe_randr_events,
-    X11CursorHider,
+    X11CursorHider, X11FocusClearer,
 };
 use crate::InputInjector;
 use anyhow::{anyhow, Context, Result};
@@ -110,6 +110,7 @@ struct X11Helper {
     root: Window,
     randr_subscribed: bool,
     cursor_hider: X11CursorHider,
+    focus_clearer: X11FocusClearer,
 }
 
 pub struct UinputInjector {
@@ -130,6 +131,7 @@ pub struct UinputInjector {
     edge_push_accum: f32,
     pressed_keys: HashSet<u16>,
     pressed_buttons: HashSet<u16>,
+    unfocus_on_leave: bool,
 }
 
 impl UinputInjector {
@@ -216,6 +218,7 @@ impl UinputInjector {
                     root,
                     randr_subscribed,
                     cursor_hider,
+                    focus_clearer: X11FocusClearer::new(),
                 }),
                 None,
                 geometry,
@@ -247,6 +250,7 @@ impl UinputInjector {
             edge_push_accum: 0.0,
             pressed_keys: HashSet::new(),
             pressed_buttons: HashSet::new(),
+            unfocus_on_leave: false,
         })
     }
 
@@ -628,6 +632,9 @@ impl InputInjector for UinputInjector {
                 .conn
                 .warp_pointer(x11rb::NONE, x11.root, 0, 0, 0, 0, px as i16, py as i16);
             x11.cursor_hider.hide(&x11.conn, x11.root);
+            if self.unfocus_on_leave {
+                x11.focus_clearer.clear_focus(&x11.conn, x11.root);
+            }
             let _ = x11.conn.flush();
         } else {
             let _ = self.warp_to(px, py);
@@ -638,6 +645,10 @@ impl InputInjector for UinputInjector {
         self.edge_push_accum = 0.0;
         debug!(px, py, "UinputInjector left screen; cursor parked");
         Ok(())
+    }
+
+    fn set_unfocus_on_leave(&mut self, enabled: bool) {
+        self.unfocus_on_leave = enabled;
     }
 
     fn show_cursor(&mut self) -> Result<()> {
@@ -675,7 +686,8 @@ impl Drop for UinputInjector {
     fn drop(&mut self) {
         let _ = self.release_all();
         let _ = self.show_cursor();
-        if let Some(ref x11) = self.x11 {
+        if let Some(ref mut x11) = self.x11 {
+            x11.focus_clearer.destroy(&x11.conn);
             if x11.randr_subscribed {
                 unsubscribe_randr_events(&x11.conn, x11.root);
                 let _ = x11.conn.flush();

@@ -19,18 +19,25 @@ use anyhow::Result;
 use glide_proto::OsKind;
 use std::mem::size_of;
 use std::ptr;
-use windows_sys::Win32::Foundation::{BOOL, LPARAM, RECT};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
+use windows_sys::Win32::Foundation::{BOOL, HWND, LPARAM, RECT};
 use windows_sys::Win32::Graphics::Gdi::{
     EnumDisplayMonitors, GetMonitorInfoW, HDC, HMONITOR, MONITORINFO, MONITORINFOEXW,
 };
 use windows_sys::Win32::System::Threading::{
-    GetCurrentProcess, ProcessPowerThrottling, SetProcessInformation,
-    PROCESS_POWER_THROTTLING_CURRENT_VERSION, PROCESS_POWER_THROTTLING_EXECUTION_SPEED,
-    PROCESS_POWER_THROTTLING_IGNORE_TIMER_RESOLUTION, PROCESS_POWER_THROTTLING_STATE,
+    AttachThreadInput, GetCurrentProcess, GetCurrentThreadId, ProcessPowerThrottling,
+    SetProcessInformation, PROCESS_POWER_THROTTLING_CURRENT_VERSION,
+    PROCESS_POWER_THROTTLING_EXECUTION_SPEED, PROCESS_POWER_THROTTLING_IGNORE_TIMER_RESOLUTION,
+    PROCESS_POWER_THROTTLING_STATE,
 };
 use windows_sys::Win32::UI::HiDpi::{
     GetDpiForMonitor, SetProcessDpiAwarenessContext, DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2,
     MDT_EFFECTIVE_DPI,
+};
+use windows_sys::Win32::UI::WindowsAndMessaging::{
+    FindWindowW, GetClassNameW, GetForegroundWindow, GetShellWindow, GetWindowThreadProcessId,
+    IsHungAppWindow, PeekMessageW, SetForegroundWindow, MSG, PM_NOREMOVE,
 };
 
 /// Unique `dwExtraInfo` tag stamped onto events synthesized by Glide so our hooks
@@ -38,6 +45,101 @@ use windows_sys::Win32::UI::HiDpi::{
 pub(crate) const GLIDE_EXTRA_INFO: usize = 0x474C_4944;
 
 const MONITORINFOF_PRIMARY: u32 = 1;
+
+#[inline]
+pub(crate) fn eq_utf16_ascii(wide: &[u16], ascii: &str) -> bool {
+    wide.len() == ascii.len()
+        && wide
+            .iter()
+            .zip(ascii.bytes())
+            .all(|(&w, b)| w == u16::from(b))
+}
+
+/// Returns `true` if `hwnd` belongs to the Windows desktop shell or taskbar
+/// (`Progman`, `WorkerW`, `Shell_TrayWnd`, `Shell_SecondaryTrayWnd`).
+pub(crate) fn is_shell_window_class(hwnd: HWND) -> bool {
+    let mut class_buf = [0u16; 64];
+    let len = unsafe { GetClassNameW(hwnd, class_buf.as_mut_ptr(), class_buf.len() as i32) };
+    if len <= 0 {
+        return false;
+    }
+    let wide = &class_buf[..len as usize];
+    eq_utf16_ascii(wide, "Progman")
+        || eq_utf16_ascii(wide, "WorkerW")
+        || eq_utf16_ascii(wide, "Shell_TrayWnd")
+        || eq_utf16_ascii(wide, "Shell_SecondaryTrayWnd")
+}
+
+/// Dispatches foreground-window unfocusing off the calling thread when inside a Tokio runtime
+/// so low-level hooks and QUIC `Enter`/`Leave` sends never block.
+pub(crate) fn schedule_unfocus_foreground_window(gen_counter: Arc<AtomicU64>, expected_gen: u64) {
+    if let Ok(handle) = tokio::runtime::Handle::try_current() {
+        handle.spawn_blocking(move || {
+            unfocus_foreground_window_if_gen(&gen_counter, expected_gen);
+        });
+    } else {
+        unfocus_foreground_window_if_gen(&gen_counter, expected_gen);
+    }
+}
+
+fn unfocus_foreground_window_if_gen(gen_counter: &AtomicU64, expected_gen: u64) {
+    if gen_counter.load(Ordering::Acquire) != expected_gen {
+        return;
+    }
+
+    let fg = unsafe { GetForegroundWindow() };
+    if fg.is_null() {
+        return;
+    }
+
+    let mut shell_hwnd = unsafe { GetShellWindow() };
+    if shell_hwnd.is_null() {
+        let tray_class: Vec<u16> = "Shell_TrayWnd\0".encode_utf16().collect();
+        shell_hwnd = unsafe { FindWindowW(tray_class.as_ptr(), ptr::null()) };
+    }
+    if shell_hwnd.is_null() || fg == shell_hwnd || is_shell_window_class(fg) {
+        return;
+    }
+
+    if unsafe { IsHungAppWindow(fg) } != 0 {
+        tracing::debug!("Skipping unfocus_on_leave for hung foreground window");
+        return;
+    }
+
+    // Ensure the blocking thread has a Win32 message queue before calling AttachThreadInput.
+    let mut msg: MSG = unsafe { std::mem::zeroed() };
+    unsafe {
+        PeekMessageW(&mut msg, ptr::null_mut(), 0, 0, PM_NOREMOVE);
+    }
+
+    let cur_tid = unsafe { GetCurrentThreadId() };
+    let fg_tid = unsafe { GetWindowThreadProcessId(fg, ptr::null_mut()) };
+
+    if gen_counter.load(Ordering::Acquire) != expected_gen {
+        return;
+    }
+
+    let attached = fg_tid != 0
+        && fg_tid != cur_tid
+        && unsafe { AttachThreadInput(cur_tid, fg_tid, 1) } != 0;
+
+    let mut focused_shell = true;
+    if gen_counter.load(Ordering::Acquire) == expected_gen {
+        focused_shell = unsafe { SetForegroundWindow(shell_hwnd) } != 0;
+    }
+
+    if attached {
+        unsafe {
+            AttachThreadInput(cur_tid, fg_tid, 0);
+        }
+    }
+
+    if !focused_shell {
+        tracing::debug!(
+            "SetForegroundWindow(shell) returned 0 during unfocus_on_leave (e.g. UIPI elevated window)"
+        );
+    }
+}
 
 /// Enables Per-Monitor DPI Awareness V2 so Windows reports real physical coordinates
 /// across mixed-DPI multi-monitor setups (e.g. 100% + 125% + 150% + 200%).

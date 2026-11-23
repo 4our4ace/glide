@@ -11,6 +11,7 @@ use std::collections::HashSet;
 use std::mem::size_of;
 use std::ptr;
 use std::sync::atomic::{AtomicIsize, AtomicU64, Ordering};
+use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
 use tracing::{debug, trace};
@@ -162,6 +163,8 @@ pub struct WindowsInjector {
     edge_push_start: Option<Instant>,
     pressed_keys: HashSet<HidUsage>,
     pressed_buttons: HashSet<MouseButton>,
+    unfocus_on_leave: bool,
+    unfocus_gen: Arc<AtomicU64>,
 }
 
 impl WindowsInjector {
@@ -185,6 +188,8 @@ impl WindowsInjector {
             edge_push_start: None,
             pressed_keys: HashSet::new(),
             pressed_buttons: HashSet::new(),
+            unfocus_on_leave: false,
+            unfocus_gen: Arc::new(AtomicU64::new(0)),
         })
     }
 
@@ -262,6 +267,13 @@ impl InputInjector for WindowsInjector {
         OsKind::Windows
     }
 
+    fn set_unfocus_on_leave(&mut self, enabled: bool) {
+        self.unfocus_on_leave = enabled;
+        if !enabled {
+            self.unfocus_gen.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
     fn desktop_geometry(&mut self) -> Result<DesktopGeometry> {
         self.seen_display_gen = INJECTOR_DISPLAY_GEN.load(Ordering::Acquire);
         self.last_geom_refresh = Instant::now();
@@ -282,6 +294,7 @@ impl InputInjector for WindowsInjector {
         let gen = INJECTOR_SUSPEND_GEN.load(Ordering::Acquire);
         if gen != self.seen_suspend_gen {
             self.seen_suspend_gen = gen;
+            self.unfocus_gen.fetch_add(1, Ordering::SeqCst);
             let _ = self.release_all();
             return true;
         }
@@ -292,12 +305,14 @@ impl InputInjector for WindowsInjector {
         let gen = INJECTOR_RESUME_GEN.load(Ordering::Acquire);
         if gen != self.seen_resume_gen {
             self.seen_resume_gen = gen;
+            self.unfocus_gen.fetch_add(1, Ordering::SeqCst);
             return true;
         }
         false
     }
 
     fn enter(&mut self, edge: Edge, normalized_pos: f32) -> Result<()> {
+        self.unfocus_gen.fetch_add(1, Ordering::SeqCst);
         let _ = self.refresh_geometry_if_needed();
         let (x, y) = self.geometry.point_on_edge(edge, normalized_pos, 4);
         unsafe {
@@ -315,6 +330,7 @@ impl InputInjector for WindowsInjector {
     }
 
     fn enter_at(&mut self, norm_x: f32, norm_y: f32) -> Result<()> {
+        self.unfocus_gen.fetch_add(1, Ordering::SeqCst);
         let _ = self.refresh_geometry_if_needed();
         let (x, y) = self.geometry.denormalize_point(norm_x, norm_y);
         unsafe {
@@ -481,12 +497,25 @@ impl InputInjector for WindowsInjector {
         }
         self.edge_push_accum = 0.0;
         self.edge_push_start = None;
+        let gen = self
+            .unfocus_gen
+            .fetch_add(1, Ordering::SeqCst)
+            .wrapping_add(1);
+        if self.unfocus_on_leave {
+            super::schedule_unfocus_foreground_window(Arc::clone(&self.unfocus_gen), gen);
+        }
+        Ok(())
+    }
+
+    fn show_cursor(&mut self) -> Result<()> {
+        self.unfocus_gen.fetch_add(1, Ordering::SeqCst);
         Ok(())
     }
 }
 
 impl Drop for WindowsInjector {
     fn drop(&mut self) {
+        self.unfocus_gen.fetch_add(1, Ordering::SeqCst);
         let _ = self.release_all();
         let hwnd = self.watch_hwnd.swap(0, Ordering::SeqCst) as HWND;
         if !hwnd.is_null() {

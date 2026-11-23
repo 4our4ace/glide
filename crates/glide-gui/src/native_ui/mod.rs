@@ -2636,11 +2636,17 @@ const SCENES: &[(&str, SceneFn)] = &[
         s.theme = ThemePref::Light;
         s.tab = Tab::Input;
         s.role = Role::Server;
+        s.is_windows = true;
+        s.os_kind = OsKind::Windows;
+        s.os_label = "Windows";
     }),
     ("input-server-dark", |s| {
         s.theme = ThemePref::Dark;
         s.tab = Tab::Input;
         s.role = Role::Server;
+        s.is_windows = true;
+        s.os_kind = OsKind::Windows;
+        s.os_label = "Windows";
     }),
     ("input-client-light", |s| {
         s.theme = ThemePref::Light;
@@ -3106,6 +3112,7 @@ mod tests {
                     "fs-lock-row",
                     "srv-sync-lock-row",
                     "srv-pin-media-row",
+                    "srv-unfocus-row",
                 ],
             ),
             (
@@ -3119,6 +3126,7 @@ mod tests {
                     "cli-thresh-row",
                     "cli-corner-row",
                     "cli-sync-lock-row",
+                    "cli-unfocus-row",
                 ],
             ),
             ("server-live", &["row-addr", "row-port", "row-discovery"]),
@@ -3737,5 +3745,198 @@ mod tests {
         assert!(!rt.state.show_nightly_warning);
         assert_eq!(rt.state.config.update_channel, UpdateChannel::Stable);
         assert!(rt.find("nightly-warning-modal").is_none());
+    }
+
+    #[tokio::test]
+    async fn unfocus_on_leave_toggle_updates_config_and_hides_on_wayland() {
+        struct CleanupDir(PathBuf);
+        impl Drop for CleanupDir {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+
+        let dir = std::env::temp_dir().join(format!(
+            "glide-ui-unfocus-on-leave-test-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let _cleanup = CleanupDir(dir.clone());
+
+        let (quit_tx, _quit_rx) = tokio::sync::mpsc::unbounded_channel();
+        let ctrl = Arc::new(AppController::new(
+            dir.join("config.toml"),
+            "http://127.0.0.1:0".into(),
+            quit_tx,
+        ));
+
+        let (cmd_tx, mut cmd_rx) = tokio::sync::mpsc::unbounded_channel();
+        let dummy_task = tokio::spawn(async {});
+        *ctrl.engine.lock() = Some(crate::ActiveEngine {
+            task: dummy_task,
+            cmd_tx,
+        });
+
+        let vis = Arc::new(WindowVisibility::new(true));
+        let mut ui = Ui::new(ctrl, tokio::runtime::Handle::current(), vis);
+        ui.tab = Tab::Input;
+        ui.role = Role::Server;
+        ui.theme = ThemePref::Light;
+        ui.is_windows = true;
+        ui.os_kind = OsKind::Windows;
+        ui.os_label = "Windows";
+
+        assert!(!ui.config.server.unfocus_on_leave);
+        assert!(!ui.config.client.unfocus_on_leave);
+
+        let text_sys = rune::text::TextSystem::new(FONTS, ("Inter", "JetBrains Mono"));
+        let mut rt = rune::Runtime::with_text(
+            ui,
+            view,
+            (GUI_WIDTH as f32, GUI_HEIGHT as f32),
+            rune::Env::new(false, 1.0),
+            text_sys,
+        );
+        rt.frame(0.0);
+        rt.settle_all();
+        rt.frame(0.0);
+
+        let click_key = |rt: &mut rune::Runtime<Ui>, key: &str| {
+            let (x, y) = rt
+                .find(key)
+                .unwrap_or_else(|| panic!("element `{key}` should exist"));
+            rt.pointer_down(x, y);
+            rt.pointer_up(x, y);
+            rt.frame(0.0);
+            rt.settle_all();
+            rt.frame(0.0);
+        };
+
+        let assert_row_fits = |rt: &rune::Runtime<Ui>, key: &str| {
+            let info = rt
+                .elements()
+                .into_iter()
+                .find(|e| e.key.as_deref() == Some(key))
+                .unwrap_or_else(|| panic!("row `{key}` should render"));
+            assert!(
+                info.rect[2] > 180.0
+                    && info.rect[3] >= 36.0
+                    && info.rect[0] + info.rect[2] <= GUI_WIDTH as f32 + 1.0
+                    && info.rect[1] + info.rect[3] <= GUI_HEIGHT as f32 + 1.0,
+                "row `{key}` should fit cleanly inside 900x640, got {:?}",
+                info.rect
+            );
+        };
+
+        // 1. Server (non-Wayland): row renders within bounds and toggle flips false -> true -> false.
+        assert_row_fits(&rt, "srv-unfocus-row");
+
+        click_key(&mut rt, "srv-unfocus-toggle");
+        assert!(rt.state.config.server.unfocus_on_leave);
+        let mut saw_srv_true = false;
+        while let Ok(cmd) = cmd_rx.try_recv() {
+            if matches!(
+                cmd,
+                RuntimeCommand::UpdateServerTuning {
+                    unfocus_on_leave: true,
+                    ..
+                }
+            ) {
+                saw_srv_true = true;
+            }
+        }
+        assert!(
+            saw_srv_true,
+            "toggling srv-unfocus-toggle ON must emit UpdateServerTuning {{ unfocus_on_leave: true }}"
+        );
+
+        click_key(&mut rt, "srv-unfocus-toggle");
+        assert!(!rt.state.config.server.unfocus_on_leave);
+        let mut saw_srv_false = false;
+        while let Ok(cmd) = cmd_rx.try_recv() {
+            if matches!(
+                cmd,
+                RuntimeCommand::UpdateServerTuning {
+                    unfocus_on_leave: false,
+                    ..
+                }
+            ) {
+                saw_srv_false = true;
+            }
+        }
+        assert!(
+            saw_srv_false,
+            "toggling srv-unfocus-toggle OFF must emit UpdateServerTuning {{ unfocus_on_leave: false }}"
+        );
+
+        // 2. Client (Linux X11, with backend-row also visible): row fits within 900x640 and flips false -> true -> false.
+        rt.state.role = Role::Client;
+        rt.state.is_windows = false;
+        rt.state.os_kind = OsKind::LinuxX11;
+        rt.state.os_label = "Linux";
+        rt.invalidate();
+        rt.frame(0.0);
+        rt.settle_all();
+        rt.frame(0.0);
+
+        assert!(rt.find("backend-row").is_some());
+        assert_row_fits(&rt, "cli-unfocus-row");
+
+        click_key(&mut rt, "cli-unfocus-toggle");
+        assert!(rt.state.config.client.unfocus_on_leave);
+        let mut saw_cli_true = false;
+        while let Ok(cmd) = cmd_rx.try_recv() {
+            if matches!(
+                cmd,
+                RuntimeCommand::UpdateClientTuning {
+                    unfocus_on_leave: true,
+                    ..
+                }
+            ) {
+                saw_cli_true = true;
+            }
+        }
+        assert!(
+            saw_cli_true,
+            "toggling cli-unfocus-toggle ON must emit UpdateClientTuning {{ unfocus_on_leave: true }}"
+        );
+
+        click_key(&mut rt, "cli-unfocus-toggle");
+        assert!(!rt.state.config.client.unfocus_on_leave);
+        let mut saw_cli_false = false;
+        while let Ok(cmd) = cmd_rx.try_recv() {
+            if matches!(
+                cmd,
+                RuntimeCommand::UpdateClientTuning {
+                    unfocus_on_leave: false,
+                    ..
+                }
+            ) {
+                saw_cli_false = true;
+            }
+        }
+        assert!(
+            saw_cli_false,
+            "toggling cli-unfocus-toggle OFF must emit UpdateClientTuning {{ unfocus_on_leave: false }}"
+        );
+
+        // 3. Switching to LinuxWayland hides both cli-unfocus-row and srv-unfocus-row cleanly.
+        rt.state.os_kind = OsKind::LinuxWayland;
+        rt.state.os_label = "Linux (Wayland)";
+        rt.invalidate();
+        rt.frame(0.0);
+        rt.settle_all();
+        rt.frame(0.0);
+        assert!(rt.find("cli-unfocus-row").is_none());
+        assert!(rt.find("cli-unfocus-toggle").is_none());
+
+        rt.state.role = Role::Server;
+        rt.invalidate();
+        rt.frame(0.0);
+        rt.settle_all();
+        rt.frame(0.0);
+        assert!(rt.find("srv-unfocus-row").is_none());
+        assert!(rt.find("srv-unfocus-toggle").is_none());
     }
 }

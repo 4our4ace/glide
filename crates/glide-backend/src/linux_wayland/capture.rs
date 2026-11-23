@@ -220,6 +220,10 @@ struct SharedState {
     zone_set: Mutex<u32>,
 }
 
+/// Wayland server capture control handle.
+///
+/// Leaves [`CaptureControl::set_unfocus_on_leave`] as the default no-op because Wayland
+/// compositors prohibit cross-client window focus clearing.
 struct WaylandCaptureControl {
     shared: Arc<SharedState>,
     cmd_tx: std::sync::mpsc::Sender<ControlMsg>,

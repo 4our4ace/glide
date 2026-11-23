@@ -5,6 +5,7 @@ use crate::geometry::DesktopGeometry;
 use crate::hotkeys::{AtomicHotkeySuppressor, AtomicHotkeys, HotkeyAction, HotkeyMatch};
 use crate::linux_x11::{
     query_desktop_geometry, subscribe_randr_events, unsubscribe_randr_events, X11CursorHider,
+    X11FocusClearer,
 };
 use crate::{
     edge_bit, AtomicEdgeMask, AtomicNormPoint, CaptureConfig, CaptureControl, CaptureEvent,
@@ -55,6 +56,7 @@ struct SharedState {
     drag_drop_files: AtomicBool,
     auto_lock_fullscreen: AtomicBool,
     pin_media_keys_local: AtomicBool,
+    unfocus_on_leave: AtomicBool,
     hotkeys: AtomicHotkeys,
     edge_threshold_px: AtomicI32,
     dead_corner_px: AtomicI32,
@@ -123,6 +125,12 @@ impl CaptureControl for X11CaptureControl {
     fn set_pin_media_keys_local(&self, enabled: bool) {
         self.shared
             .pin_media_keys_local
+            .store(enabled, Ordering::Relaxed);
+    }
+
+    fn set_unfocus_on_leave(&self, enabled: bool) {
+        self.shared
+            .unfocus_on_leave
             .store(enabled, Ordering::Relaxed);
     }
 
@@ -389,6 +397,7 @@ pub fn start_x11_capture(config: CaptureConfig) -> Result<CaptureHandle> {
         drag_drop_files: AtomicBool::new(config.drag_drop_files),
         auto_lock_fullscreen: AtomicBool::new(config.auto_lock_fullscreen),
         pin_media_keys_local: AtomicBool::new(config.pin_media_keys_local),
+        unfocus_on_leave: AtomicBool::new(config.unfocus_on_leave),
         hotkeys: AtomicHotkeys::new(config.hotkeys),
         edge_threshold_px: AtomicI32::new(config.edge_threshold_px.max(1)),
         dead_corner_px: AtomicI32::new(config.dead_corner_px.max(0)),
@@ -489,6 +498,7 @@ fn run_capture_loop(
     let mut grabbed = false;
     let mut kbd_grabbed = false;
     let mut cursor_hider = X11CursorHider::init(&conn);
+    let mut focus_clearer = X11FocusClearer::new();
     // This thread is the sole writer of `shared.geometry`, so keeping a local copy
     // avoids cloning DesktopGeometry on every mouse event.
     let mut local_geom = shared.geometry.read().clone();
@@ -511,7 +521,8 @@ fn run_capture_loop(
                    geom: &DesktopGeometry,
                    grabbed: &mut bool,
                    kbd_grabbed: &mut bool,
-                   cursor_hider: &mut X11CursorHider| {
+                   cursor_hider: &mut X11CursorHider,
+                   focus_clearer: &mut X11FocusClearer| {
         if !*grabbed {
             let pointer_mask = CoreEventMask::BUTTON_PRESS
                 | CoreEventMask::BUTTON_RELEASE
@@ -541,6 +552,11 @@ fn run_capture_loop(
             let (cx, cy) = geom.primary_center();
             let _ = conn.warp_pointer(x11rb::NONE, root, 0, 0, 0, 0, cx as i16, cy as i16);
             cursor_hider.hide(conn, root);
+            // Clear focus BEFORE grab_keyboard_sync so the active window receives a genuine
+            // FocusOut(NotifyNormal) before keyboard grab freezes focus delivery.
+            if shared.unfocus_on_leave.load(Ordering::Relaxed) {
+                focus_clearer.clear_focus(conn, root);
+            }
             *grabbed = true;
         }
         grab_keyboard_sync(conn, ctrl_win, kbd_grabbed);
@@ -671,6 +687,7 @@ fn run_capture_loop(
                             &mut grabbed,
                             &mut kbd_grabbed,
                             &mut cursor_hider,
+                            &mut focus_clearer,
                         );
                     }
                     CMD_LEAVE_REMOTE => {
@@ -731,6 +748,7 @@ fn run_capture_loop(
                             &mut grabbed,
                             &mut kbd_grabbed,
                             &mut cursor_hider,
+                            &mut focus_clearer,
                         );
                     }
                     let _ = tx.send(CaptureEvent::MouseDelta { dx, dy });
@@ -876,6 +894,7 @@ fn run_capture_loop(
                                 &mut grabbed,
                                 &mut kbd_grabbed,
                                 &mut cursor_hider,
+                                &mut focus_clearer,
                             );
                         }
                         let _ = tx.send(CaptureEvent::EdgeCrossed {
@@ -1107,6 +1126,7 @@ fn run_capture_loop(
         let _ = conn.ungrab_pointer(x11rb::CURRENT_TIME);
     }
     cursor_hider.show(&conn, root);
+    focus_clearer.destroy(&conn);
     let _ = xinput::xi_select_events(&*conn, root, &[]);
     unsubscribe_randr_events(&conn, root);
     let _ = conn.flush();

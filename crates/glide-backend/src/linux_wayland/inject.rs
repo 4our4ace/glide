@@ -376,6 +376,10 @@ type InnerSetupResult = Result<(
     Option<WaylandGeometryWatcher>,
 )>;
 
+/// Wayland client input injector backed by `org.freedesktop.portal.RemoteDesktop` / EIS.
+///
+/// Leaves [`InputInjector::set_unfocus_on_leave`] as the default no-op because Wayland
+/// compositors prohibit cross-client window focus clearing.
 pub struct WaylandInjector {
     dbus_tx: std::sync::mpsc::Sender<DbusCmd>,
     transport: Transport,

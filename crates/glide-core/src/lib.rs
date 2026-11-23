@@ -1349,6 +1349,7 @@ mod tests {
                 locked: false,
                 sync_lock_keys: true,
                 pin_media_keys_local: true,
+                unfocus_on_leave: false,
                 clipboard: true,
                 drag_drop_files: false,
                 hotkeys: glide_backend::CaptureHotkeys::default(),
@@ -1748,6 +1749,7 @@ mod tests {
                 locked: false,
                 sync_lock_keys: true,
                 pin_media_keys_local: true,
+                unfocus_on_leave: false,
                 clipboard: false,
                 drag_drop_files: true,
                 hotkeys: custom_hotkeys,
@@ -1774,6 +1776,7 @@ mod tests {
                 locked: false,
                 sync_lock_keys: true,
                 pin_media_keys_local: true,
+                unfocus_on_leave: false,
                 clipboard: false,
                 drag_drop_files: true,
                 hotkeys: CaptureHotkeys::disabled(),
@@ -2257,5 +2260,458 @@ mod tests {
         cli_task.abort();
         srv_task.abort();
         let _ = std::fs::remove_dir_all(&root_tmp);
+    }
+
+    #[tokio::test]
+    async fn server_unfocus_on_leave_triggers_only_when_enabled_live_reloads_and_skips_remote_to_remote(
+    ) {
+        use crate::runtime::RuntimeCommand;
+
+        let identity = ServerIdentity::generate_ephemeral().unwrap();
+        let fp = identity.fingerprint.clone();
+        let endpoint =
+            GlideServerEndpoint::bind("127.0.0.1:0".parse().unwrap(), &identity).unwrap();
+        let addr = endpoint.local_addr();
+
+        let geom = single_monitor_geom("UnfocusSrv");
+        let (capture_handle, cap_tx, cap_state) = create_mock_capture(geom.clone());
+        let (mut right_inj, _right_log) = MockInjector::new(geom.clone());
+        let (mut left_inj, _left_log) = MockInjector::new(geom);
+        let srv_rt = RuntimeState::new();
+        let (srv_cmd_tx, srv_cmd_rx) = tokio::sync::mpsc::unbounded_channel();
+
+        let srv_cfg = ServerConfig {
+            name: "unfocus-srv".into(),
+            discovery: false,
+            clipboard: false,
+            motion_coalesce_us: 0,
+            unfocus_on_leave: false,
+            ..Default::default()
+        };
+        let mut right_cfg = ClientConfig {
+            name: "unfocus-right".into(),
+            server: Some(addr.to_string()),
+            edge: Edge::Right,
+            trusted_fingerprint: Some(fp.clone()),
+            clipboard: false,
+            ..Default::default()
+        };
+        let mut left_cfg = ClientConfig {
+            name: "unfocus-left".into(),
+            server: Some(addr.to_string()),
+            edge: Edge::Left,
+            trusted_fingerprint: Some(fp),
+            clipboard: false,
+            ..Default::default()
+        };
+
+        let srv_rt_c = srv_rt.clone();
+        let srv_task = tokio::spawn(async move {
+            let _ = run_server_with_backends(
+                srv_cfg,
+                endpoint,
+                capture_handle,
+                None,
+                "windows",
+                Some(srv_rt_c),
+                Some(srv_cmd_rx),
+            )
+            .await;
+        });
+        let right_task = tokio::spawn(async move {
+            let mut opt_clip = None;
+            let _ =
+                run_client_session(&mut right_cfg, addr, &mut right_inj, &mut opt_clip, None, None)
+                    .await;
+        });
+        let left_task = tokio::spawn(async move {
+            let mut opt_clip = None;
+            let _ =
+                run_client_session(&mut left_cfg, addr, &mut left_inj, &mut opt_clip, None, None)
+                    .await;
+        });
+
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+        while srv_rt.snapshot().peers.len() < 2 {
+            assert!(tokio::time::Instant::now() < deadline);
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(!cap_state.unfocus_on_leave());
+        assert_eq!(cap_state.unfocus_count(), 0);
+
+        // 1. Disabled by default: Local -> Right must NOT unfocus
+        srv_cmd_tx
+            .send(RuntimeCommand::SwitchTarget(Some(Edge::Right)))
+            .unwrap();
+        for _ in 0..40 {
+            if cap_state.remote_mode.load(Ordering::SeqCst)
+                && srv_rt.snapshot().active_target == "unfocus-right"
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(cap_state.remote_mode.load(Ordering::SeqCst));
+        assert_eq!(cap_state.unfocus_count(), 0);
+
+        srv_cmd_tx.send(RuntimeCommand::ReturnLocal).unwrap();
+        for _ in 0..40 {
+            if !cap_state.remote_mode.load(Ordering::SeqCst) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(!cap_state.remote_mode.load(Ordering::SeqCst));
+
+        // 2. Live-enable via UpdateServerTuning
+        srv_cmd_tx
+            .send(RuntimeCommand::UpdateServerTuning {
+                edge_threshold_px: 4,
+                dead_corner_px: 24,
+                edge_dwell_ms: 0,
+                auto_lock_fullscreen: true,
+                locked: false,
+                sync_lock_keys: true,
+                pin_media_keys_local: true,
+                unfocus_on_leave: true,
+                clipboard: false,
+                drag_drop_files: true,
+                hotkeys: glide_backend::CaptureHotkeys::default(),
+            })
+            .unwrap();
+        for _ in 0..40 {
+            if cap_state.unfocus_on_leave() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(cap_state.unfocus_on_leave());
+
+        // 3. Local -> Right triggers unfocus once
+        srv_cmd_tx
+            .send(RuntimeCommand::SwitchTarget(Some(Edge::Right)))
+            .unwrap();
+        for _ in 0..40 {
+            if cap_state.remote_mode.load(Ordering::SeqCst)
+                && srv_rt.snapshot().active_target == "unfocus-right"
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(cap_state.unfocus_count(), 1);
+
+        // 4. Remote Right -> Remote Left must NOT trigger unfocus again
+        srv_cmd_tx
+            .send(RuntimeCommand::SwitchTarget(Some(Edge::Left)))
+            .unwrap();
+        for _ in 0..40 {
+            if srv_rt.snapshot().active_target == "unfocus-left" {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(srv_rt.snapshot().active_target, "unfocus-left");
+        assert_eq!(
+            cap_state.unfocus_count(),
+            1,
+            "remote -> remote switch must not trigger server unfocus again"
+        );
+
+        // 5. Return Local, then Local -> Left via EdgeCrossed triggers unfocus a second time
+        srv_cmd_tx.send(RuntimeCommand::ReturnLocal).unwrap();
+        for _ in 0..40 {
+            if !cap_state.remote_mode.load(Ordering::SeqCst) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        cap_tx
+            .send(CaptureEvent::EdgeCrossed {
+                edge: Edge::Left,
+                normalized_pos: 0.5,
+            })
+            .unwrap();
+        for _ in 0..40 {
+            if cap_state.remote_mode.load(Ordering::SeqCst)
+                && srv_rt.snapshot().active_target == "unfocus-left"
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(cap_state.unfocus_count(), 2);
+
+        // 6. Live-disable via UpdateServerTuning stops unfocusing on subsequent leaves
+        srv_cmd_tx.send(RuntimeCommand::ReturnLocal).unwrap();
+        for _ in 0..40 {
+            if !cap_state.remote_mode.load(Ordering::SeqCst) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        srv_cmd_tx
+            .send(RuntimeCommand::UpdateServerTuning {
+                edge_threshold_px: 4,
+                dead_corner_px: 24,
+                edge_dwell_ms: 0,
+                auto_lock_fullscreen: true,
+                locked: false,
+                sync_lock_keys: true,
+                pin_media_keys_local: true,
+                unfocus_on_leave: false,
+                clipboard: false,
+                drag_drop_files: true,
+                hotkeys: glide_backend::CaptureHotkeys::default(),
+            })
+            .unwrap();
+        for _ in 0..40 {
+            if !cap_state.unfocus_on_leave() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        srv_cmd_tx
+            .send(RuntimeCommand::SwitchTarget(Some(Edge::Right)))
+            .unwrap();
+        for _ in 0..40 {
+            if cap_state.remote_mode.load(Ordering::SeqCst)
+                && srv_rt.snapshot().active_target == "unfocus-right"
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(
+            cap_state.unfocus_count(),
+            2,
+            "disabling unfocus_on_leave live must prevent subsequent unfocus calls"
+        );
+
+        right_task.abort();
+        left_task.abort();
+        srv_task.abort();
+    }
+
+    #[tokio::test]
+    async fn client_unfocus_on_leave_triggers_only_when_enabled_and_live_reloads() {
+        use crate::runtime::RuntimeCommand;
+        use std::sync::Arc;
+
+        let identity = ServerIdentity::generate_ephemeral().unwrap();
+        let fp = identity.fingerprint.clone();
+        let endpoint =
+            GlideServerEndpoint::bind("127.0.0.1:0".parse().unwrap(), &identity).unwrap();
+        let addr = endpoint.local_addr();
+
+        let geom = single_monitor_geom("UnfocusCli");
+        let (capture_handle, cap_tx, cap_state) = create_mock_capture(geom.clone());
+        let (mut injector, inj_log) = MockInjector::new(geom);
+        let cli_unfocus_flag = Arc::clone(&injector.unfocus_on_leave_flag);
+        let cli_rt = RuntimeState::new();
+        let (srv_cmd_tx, srv_cmd_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (cli_cmd_tx, mut cli_cmd_rx) = tokio::sync::mpsc::unbounded_channel();
+
+        let srv_cfg = ServerConfig {
+            name: "unfocus-cli-srv".into(),
+            discovery: false,
+            clipboard: false,
+            motion_coalesce_us: 0,
+            unfocus_on_leave: true,
+            ..Default::default()
+        };
+        let mut cli_cfg = ClientConfig {
+            name: "unfocus-cli".into(),
+            server: Some(addr.to_string()),
+            edge: Edge::Right,
+            trusted_fingerprint: Some(fp),
+            clipboard: false,
+            unfocus_on_leave: true,
+            ..Default::default()
+        };
+
+        let srv_task = tokio::spawn(async move {
+            let _ = run_server_with_backends(
+                srv_cfg,
+                endpoint,
+                capture_handle,
+                None,
+                "linux-x11",
+                None,
+                Some(srv_cmd_rx),
+            )
+            .await;
+        });
+        let cli_rt_c = cli_rt.clone();
+        let cli_task = tokio::spawn(async move {
+            let mut opt_clip = None;
+            let _ = run_client_session(
+                &mut cli_cfg,
+                addr,
+                &mut injector,
+                &mut opt_clip,
+                Some(&cli_rt_c),
+                Some(&mut cli_cmd_rx),
+            )
+            .await;
+        });
+
+        for _ in 0..40 {
+            if *cap_state.active_edges.lock() == vec![Edge::Right]
+                && cli_rt.snapshot().status.starts_with("Connected")
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert_eq!(*cap_state.active_edges.lock(), vec![Edge::Right]);
+        assert!(
+            cap_state.unfocus_on_leave(),
+            "server startup must propagate initial unfocus_on_leave = true"
+        );
+        assert!(
+            cli_unfocus_flag.load(Ordering::SeqCst),
+            "client startup must propagate initial unfocus_on_leave = true"
+        );
+
+        let count_action = |pred: fn(&InjectedAction) -> bool| -> usize {
+            inj_log.lock().iter().filter(|a| pred(a)).count()
+        };
+
+        // 1. Initial unfocus_on_leave = true -> server-initiated Leave triggers UnfocusWindow
+        srv_cmd_tx
+            .send(RuntimeCommand::SwitchTarget(Some(Edge::Right)))
+            .unwrap();
+        for _ in 0..40 {
+            if count_action(|a| matches!(a, InjectedAction::EnterAt(_, _))) == 1 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(
+            count_action(|a| matches!(a, InjectedAction::EnterAt(_, _))),
+            1
+        );
+
+        srv_cmd_tx.send(RuntimeCommand::ReturnLocal).unwrap();
+        for _ in 0..40 {
+            if count_action(|a| matches!(a, InjectedAction::UnfocusWindow)) == 1
+                && cli_rt.snapshot().active_target == "unfocus-cli-srv"
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(
+            count_action(|a| matches!(a, InjectedAction::UnfocusWindow)),
+            1
+        );
+
+        // 2. Live-disable via UpdateClientTuning -> Leave must NOT trigger UnfocusWindow
+        cli_cmd_tx
+            .send(RuntimeCommand::UpdateClientTuning {
+                sensitivity: 1.0,
+                scroll_speed: 1.0,
+                invert_scroll: false,
+                auto_dpi_scale: false,
+                edge_threshold_px: 4,
+                dead_corner_px: 24,
+                sync_lock_keys: true,
+                unfocus_on_leave: false,
+                clipboard: false,
+                drag_drop_files: true,
+                key_remap: Vec::new(),
+            })
+            .unwrap();
+        for _ in 0..40 {
+            if !cli_unfocus_flag.load(Ordering::SeqCst) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(!cli_unfocus_flag.load(Ordering::SeqCst));
+
+        let releases_before = count_action(|a| matches!(a, InjectedAction::ReleaseAll));
+        srv_cmd_tx
+            .send(RuntimeCommand::SwitchTarget(Some(Edge::Right)))
+            .unwrap();
+        for _ in 0..40 {
+            if count_action(|a| matches!(a, InjectedAction::EnterAt(_, _))) == 2 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        srv_cmd_tx.send(RuntimeCommand::ReturnLocal).unwrap();
+        for _ in 0..40 {
+            if count_action(|a| matches!(a, InjectedAction::ReleaseAll)) > releases_before
+                && cli_rt.snapshot().active_target == "unfocus-cli-srv"
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(
+            count_action(|a| matches!(a, InjectedAction::UnfocusWindow)),
+            1,
+            "disabled unfocus_on_leave must not unfocus on Leave"
+        );
+
+        // 3. Live-enable via UpdateClientTuning -> edge-return leave() triggers UnfocusWindow
+        cli_cmd_tx
+            .send(RuntimeCommand::UpdateClientTuning {
+                sensitivity: 1.0,
+                scroll_speed: 1.0,
+                invert_scroll: false,
+                auto_dpi_scale: false,
+                edge_threshold_px: 4,
+                dead_corner_px: 24,
+                sync_lock_keys: true,
+                unfocus_on_leave: true,
+                clipboard: false,
+                drag_drop_files: true,
+                key_remap: Vec::new(),
+            })
+            .unwrap();
+        for _ in 0..40 {
+            if cli_unfocus_flag.load(Ordering::SeqCst) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(cli_unfocus_flag.load(Ordering::SeqCst));
+
+        cap_tx
+            .send(CaptureEvent::EdgeCrossed {
+                edge: Edge::Right,
+                normalized_pos: 0.5,
+            })
+            .unwrap();
+        for _ in 0..40 {
+            if count_action(|a| matches!(a, InjectedAction::Enter(Edge::Left, _))) == 1 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        // Push left past client's Left return edge -> triggers client edge-return leave()!
+        cap_tx
+            .send(CaptureEvent::MouseDelta { dx: -60.0, dy: 0.0 })
+            .unwrap();
+        for _ in 0..40 {
+            if !cap_state.remote_mode.load(Ordering::SeqCst)
+                && count_action(|a| matches!(a, InjectedAction::UnfocusWindow)) == 2
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(!cap_state.remote_mode.load(Ordering::SeqCst));
+        assert_eq!(
+            count_action(|a| matches!(a, InjectedAction::UnfocusWindow)),
+            2,
+            "re-enabled unfocus_on_leave must trigger UnfocusWindow on edge-return leave()"
+        );
+
+        cli_task.abort();
+        srv_task.abort();
     }
 }

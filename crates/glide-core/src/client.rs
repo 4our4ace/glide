@@ -144,7 +144,11 @@ async fn recv_cmd_opt(
 
 /// Applies non-fatal runtime commands received while disconnected/connecting and returns
 /// `true` if the client should shut down immediately.
-fn apply_pre_session_cmd(cmd: Option<RuntimeCommand>, config: &mut ClientConfig) -> bool {
+fn apply_pre_session_cmd(
+    cmd: Option<RuntimeCommand>,
+    config: &mut ClientConfig,
+    injector: Option<&mut dyn InputInjector>,
+) -> bool {
     match cmd {
         None | Some(RuntimeCommand::Shutdown) => true,
         Some(RuntimeCommand::UpdateClientTuning {
@@ -155,6 +159,7 @@ fn apply_pre_session_cmd(cmd: Option<RuntimeCommand>, config: &mut ClientConfig)
             edge_threshold_px,
             dead_corner_px,
             sync_lock_keys,
+            unfocus_on_leave,
             clipboard,
             drag_drop_files,
             key_remap,
@@ -166,9 +171,13 @@ fn apply_pre_session_cmd(cmd: Option<RuntimeCommand>, config: &mut ClientConfig)
             config.edge_threshold_px = edge_threshold_px;
             config.dead_corner_px = dead_corner_px;
             config.sync_lock_keys = sync_lock_keys;
+            config.unfocus_on_leave = unfocus_on_leave;
             config.clipboard = clipboard;
             config.drag_drop_files = drag_drop_files;
             config.key_remap = key_remap;
+            if let Some(inj) = injector {
+                inj.set_unfocus_on_leave(unfocus_on_leave);
+            }
             false
         }
         Some(RuntimeCommand::UpdateMaxFileBytes(limit)) => {
@@ -241,7 +250,7 @@ async fn discover_roamed_server_by_fingerprint(
     loop {
         tokio::select! {
             cmd = recv_cmd_opt(cmd_rx) => {
-                if apply_pre_session_cmd(cmd, config) {
+                if apply_pre_session_cmd(cmd, config, None) {
                     return RoamLookup::Shutdown;
                 }
             }
@@ -272,7 +281,7 @@ async fn resolve_server_addr(
         loop {
             tokio::select! {
                 cmd = recv_cmd_opt(cmd_rx) => {
-                    if apply_pre_session_cmd(cmd, config) {
+                    if apply_pre_session_cmd(cmd, config, None) {
                         return Ok(ResolveOutcome::Shutdown);
                     }
                 }
@@ -300,7 +309,7 @@ async fn resolve_server_addr(
         loop {
             tokio::select! {
                 cmd = recv_cmd_opt(cmd_rx) => {
-                    if apply_pre_session_cmd(cmd, config) {
+                    if apply_pre_session_cmd(cmd, config, None) {
                         return Ok(ResolveOutcome::Shutdown);
                     }
                 }
@@ -399,6 +408,7 @@ async fn run_client_session_tracked(
     runtime: Option<&RuntimeState>,
     mut cmd_rx: Option<&mut mpsc::UnboundedReceiver<RuntimeCommand>>,
 ) -> (bool, Result<()>) {
+    injector.set_unfocus_on_leave(config.unfocus_on_leave);
     let trust = build_trust_mode(config);
     let mut session = {
         let connect_fut = tokio::time::timeout(CONNECT_TIMEOUT, connect_client(server_addr, trust));
@@ -406,7 +416,7 @@ async fn run_client_session_tracked(
         loop {
             tokio::select! {
                 cmd = recv_cmd_opt(&mut cmd_rx) => {
-                    if apply_pre_session_cmd(cmd, config) {
+                    if apply_pre_session_cmd(cmd, config, Some(&mut *injector)) {
                         return (false, Ok(()));
                     }
                 }
@@ -449,7 +459,7 @@ async fn run_client_session_tracked(
         loop {
             tokio::select! {
                 cmd = recv_cmd_opt(&mut cmd_rx) => {
-                    if apply_pre_session_cmd(cmd, config) {
+                    if apply_pre_session_cmd(cmd, config, Some(&mut *injector)) {
                         session.conn.close(0u32.into(), b"client shutdown");
                         return (false, Ok(()));
                     }
@@ -864,6 +874,7 @@ async fn run_client_session_tracked(
                         edge_threshold_px,
                         dead_corner_px,
                         sync_lock_keys,
+                        unfocus_on_leave,
                         clipboard: clip_enabled,
                         drag_drop_files,
                         key_remap,
@@ -875,10 +886,12 @@ async fn run_client_session_tracked(
                         config.edge_threshold_px = edge_threshold_px;
                         config.dead_corner_px = dead_corner_px;
                         config.sync_lock_keys = sync_lock_keys;
+                        config.unfocus_on_leave = unfocus_on_leave;
                         config.clipboard = clip_enabled;
                         config.drag_drop_files = drag_drop_files;
                         key_remaps = compile_key_remaps(&key_remap);
                         config.key_remap = key_remap;
+                        injector.set_unfocus_on_leave(unfocus_on_leave);
                         dnd.set_enabled(drag_drop_files);
                         dnd.set_active_edges(&[return_edge], dead_corner_px);
                     }
@@ -1543,7 +1556,7 @@ async fn wait_reconnect_delay(
         tokio::select! {
             _ = &mut sleep_fut => return WaitOutcome::Retry,
             cmd = recv_cmd_opt(cmd_rx) => {
-                if apply_pre_session_cmd(cmd, config) {
+                if apply_pre_session_cmd(cmd, config, Some(&mut *injector)) {
                     return WaitOutcome::Shutdown;
                 }
             }
@@ -1646,6 +1659,7 @@ pub async fn run_client_with_backends_and_dnd(
     runtime: Option<RuntimeState>,
     mut cmd_rx: Option<mpsc::UnboundedReceiver<RuntimeCommand>>,
 ) -> Result<()> {
+    injector.set_unfocus_on_leave(config.unfocus_on_leave);
     let geom = injector.desktop_geometry().unwrap_or_default();
     let mut last_local_ips = local_ipv4_addresses_async().await;
     let shared_clip_backend = share_clipboard_backend(clipboard);

@@ -148,6 +148,8 @@ pub struct CaptureConfig {
     pub drag_drop_files: bool,
     /// Keep USB Consumer Control media/volume keys on the local server PC instead of forwarding to clients.
     pub pin_media_keys_local: bool,
+    /// Unfocus the active local window when pointer/keyboard focus leaves this machine.
+    pub unfocus_on_leave: bool,
 }
 
 impl Default for CaptureConfig {
@@ -161,6 +163,7 @@ impl Default for CaptureConfig {
             sync_lock_keys: true,
             drag_drop_files: true,
             pin_media_keys_local: true,
+            unfocus_on_leave: false,
         }
     }
 }
@@ -394,6 +397,8 @@ pub trait CaptureControl: Send + Sync {
     fn set_dnd_probe(&self, _dnd: Arc<dyn dnd::DndBackend>) {}
     /// Updates whether USB Consumer Control media/volume keys remain pinned to the local server OS.
     fn set_pin_media_keys_local(&self, _enabled: bool) {}
+    /// Updates whether the active local window should be unfocused when focus leaves to a remote client.
+    fn set_unfocus_on_leave(&self, _enabled: bool) {}
     /// Hot-updates global capture shortcuts (screen switch, cursor lock, escape) without restarting capture.
     fn set_hotkeys(&self, _hotkeys: CaptureHotkeys) {}
     /// Temporarily suspends/resumes global shortcut interception (e.g. while recording a shortcut in UI).
@@ -465,6 +470,9 @@ pub trait InputInjector: Send {
     fn leave(&mut self) -> Result<()> {
         Ok(())
     }
+
+    /// Updates whether the active local window should be unfocused when focus leaves this client.
+    fn set_unfocus_on_leave(&mut self, _enabled: bool) {}
 
     /// Ensures the local cursor is visible again (called on disconnect or shutdown).
     fn show_cursor(&mut self) -> Result<()> {
@@ -748,8 +756,9 @@ mod tests {
             assert!(should_forward_key_in_remote(key, false));
         }
 
-        // Default CaptureConfig pins media keys locally.
+        // Default CaptureConfig pins media keys locally and keeps unfocus_on_leave disabled.
         assert!(CaptureConfig::default().pin_media_keys_local);
+        assert!(!CaptureConfig::default().unfocus_on_leave);
     }
 
     #[test]

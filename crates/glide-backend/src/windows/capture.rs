@@ -48,16 +48,16 @@ use windows_sys::Win32::UI::Input::{
     RIM_TYPEMOUSE,
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::{
-    CallNextHookEx, CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW,
-    GetClassNameW, GetCursorPos, GetForegroundWindow, GetMessageW, GetWindowRect, PostMessageW,
-    RegisterClassW, SetCursorPos, SetWindowsHookExW, TranslateMessage, UnhookWindowsHookEx, HHOOK,
-    KBDLLHOOKSTRUCT, LLKHF_EXTENDED, MSG, MSLLHOOKSTRUCT, PBT_APMRESUMEAUTOMATIC,
-    PBT_APMRESUMECRITICAL, PBT_APMRESUMESUSPEND, PBT_APMSUSPEND, WH_KEYBOARD_LL, WH_MOUSE_LL,
-    WM_APP, WM_DISPLAYCHANGE, WM_DPICHANGED, WM_INPUT, WM_KEYDOWN, WM_KEYUP, WM_LBUTTONDOWN,
-    WM_LBUTTONUP, WM_MBUTTONDOWN, WM_MBUTTONUP, WM_MOUSEHWHEEL, WM_MOUSEMOVE, WM_MOUSEWHEEL,
-    WM_POWERBROADCAST, WM_QUIT, WM_RBUTTONDOWN, WM_RBUTTONUP, WM_SYSKEYDOWN, WM_SYSKEYUP,
-    WM_WTSSESSION_CHANGE, WM_XBUTTONDOWN, WM_XBUTTONUP, WNDCLASSW, WS_EX_NOACTIVATE,
-    WS_EX_TOOLWINDOW, WS_OVERLAPPED, WTS_SESSION_LOCK, WTS_SESSION_UNLOCK, XBUTTON1, XBUTTON2,
+    CallNextHookEx, CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GetCursorPos,
+    GetForegroundWindow, GetMessageW, GetWindowRect, PostMessageW, RegisterClassW, SetCursorPos,
+    SetWindowsHookExW, TranslateMessage, UnhookWindowsHookEx, HHOOK, KBDLLHOOKSTRUCT,
+    LLKHF_EXTENDED, MSG, MSLLHOOKSTRUCT, PBT_APMRESUMEAUTOMATIC, PBT_APMRESUMECRITICAL,
+    PBT_APMRESUMESUSPEND, PBT_APMSUSPEND, WH_KEYBOARD_LL, WH_MOUSE_LL, WM_APP, WM_DISPLAYCHANGE,
+    WM_DPICHANGED, WM_INPUT, WM_KEYDOWN, WM_KEYUP, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MBUTTONDOWN,
+    WM_MBUTTONUP, WM_MOUSEHWHEEL, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_POWERBROADCAST, WM_QUIT,
+    WM_RBUTTONDOWN, WM_RBUTTONUP, WM_SYSKEYDOWN, WM_SYSKEYUP, WM_WTSSESSION_CHANGE, WM_XBUTTONDOWN,
+    WM_XBUTTONUP, WNDCLASSW, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_OVERLAPPED, WTS_SESSION_LOCK,
+    WTS_SESSION_UNLOCK, XBUTTON1, XBUTTON2,
 };
 
 const WM_APP_ENTER_REMOTE: u32 = WM_APP + 1;
@@ -108,6 +108,8 @@ struct HookState {
     lmb_fullscreen_checked: AtomicBool,
     drag_strip_armed: AtomicBool,
     pin_media_keys_local: AtomicBool,
+    unfocus_on_leave: AtomicBool,
+    unfocus_gen: Arc<AtomicU64>,
     forwarded_media_keys: Mutex<RemoteMediaKeyTracker>,
     pending_meta: WindowsPendingMeta,
     hotkeys: AtomicHotkeys,
@@ -200,6 +202,7 @@ impl HookState {
     /// immediately release any held keys — guaranteeing the user is never locked out of
     /// their Windows lock screen or wake prompt.
     fn release_to_local_on_suspend(&self, reason: &str) {
+        self.unfocus_gen.fetch_add(1, Ordering::SeqCst);
         let was_remote = self.remote_mode.swap(false, Ordering::SeqCst);
         self.pending_meta.clear();
         self.hotkey_suppressor.clear();
@@ -227,6 +230,7 @@ impl HookState {
     /// Ensures clean local state after wake or session unlock, queues an off-thread display
     /// geometry refresh (monitors often change while asleep), and emits a debounced `SystemResumed`.
     fn handle_resume_or_unlock(&self, reason: &str) {
+        self.unfocus_gen.fetch_add(1, Ordering::SeqCst);
         let was_remote = self.remote_mode.swap(false, Ordering::SeqCst);
         self.pending_meta.clear();
         self.hotkey_suppressor.clear();
@@ -295,6 +299,7 @@ struct WindowsCaptureControl {
 impl Drop for WindowsCaptureControl {
     fn drop(&mut self) {
         // Always restore cursor & stop hook loop + geometry helper cleanly on shutdown
+        self.state.unfocus_gen.fetch_add(1, Ordering::SeqCst);
         let was_remote = self.state.remote_mode.swap(false, Ordering::SeqCst);
         self.state.pending_meta.clear();
         self.state.hotkey_suppressor.clear();
@@ -381,6 +386,15 @@ impl CaptureControl for WindowsCaptureControl {
             .store(enabled, Ordering::Relaxed);
     }
 
+    fn set_unfocus_on_leave(&self, enabled: bool) {
+        self.state
+            .unfocus_on_leave
+            .store(enabled, Ordering::Relaxed);
+        if !enabled {
+            self.state.unfocus_gen.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
     fn set_hotkeys(&self, hotkeys: CaptureHotkeys) {
         self.state.hotkeys.store(hotkeys);
     }
@@ -409,10 +423,19 @@ impl CaptureControl for WindowsCaptureControl {
             let (px, py) = self.state.geometry.read().primary_park_corner();
             self.state.park_cursor_at(px, py);
         }
+        let gen = self
+            .state
+            .unfocus_gen
+            .fetch_add(1, Ordering::SeqCst)
+            .wrapping_add(1);
+        if self.state.unfocus_on_leave.load(Ordering::Relaxed) {
+            super::schedule_unfocus_foreground_window(Arc::clone(&self.state.unfocus_gen), gen);
+        }
         Ok(())
     }
 
     fn leave_remote(&self, return_edge: Edge, normalized_pos: f32) -> Result<()> {
+        self.state.unfocus_gen.fetch_add(1, Ordering::SeqCst);
         let (x, y, nx, ny) = {
             let geom = self.state.geometry.read();
             let (x, y) = geom.point_on_edge(return_edge, normalized_pos, 6);
@@ -455,6 +478,7 @@ impl CaptureControl for WindowsCaptureControl {
     }
 
     fn leave_remote_at(&self, norm_x: f32, norm_y: f32) -> Result<()> {
+        self.state.unfocus_gen.fetch_add(1, Ordering::SeqCst);
         let (x, y) = self
             .state
             .geometry
@@ -542,33 +566,12 @@ fn translate_ll_key(vk_code: u32, scan_code: u32, flags: u32) -> Option<HidUsage
     HidUsage::from_win_scan(win_scan)
 }
 
-#[inline]
-fn eq_utf16_ascii(wide: &[u16], ascii: &str) -> bool {
-    wide.len() == ascii.len()
-        && wide
-            .iter()
-            .zip(ascii.bytes())
-            .all(|(&w, b)| w == u16::from(b))
-}
-
 /// Checks whether the active foreground window covers an entire monitor (e.g. fullscreen game/VM),
 /// excluding Windows desktop shell windows (`Progman`, `WorkerW`, `Shell_TrayWnd`).
 fn is_foreground_fullscreen(geom: &DesktopGeometry) -> bool {
     let hwnd = unsafe { GetForegroundWindow() };
-    if hwnd.is_null() {
+    if hwnd.is_null() || super::is_shell_window_class(hwnd) {
         return false;
-    }
-    let mut class_buf = [0u16; 64];
-    let len = unsafe { GetClassNameW(hwnd, class_buf.as_mut_ptr(), class_buf.len() as i32) };
-    if len > 0 {
-        let wide = &class_buf[..len as usize];
-        if eq_utf16_ascii(wide, "Progman")
-            || eq_utf16_ascii(wide, "WorkerW")
-            || eq_utf16_ascii(wide, "Shell_TrayWnd")
-            || eq_utf16_ascii(wide, "Shell_SecondaryTrayWnd")
-        {
-            return false;
-        }
     }
 
     let mut rect: RECT = unsafe { std::mem::zeroed() };
@@ -649,6 +652,7 @@ unsafe extern "system" fn keyboard_ll_proc(code: i32, wparam: WPARAM, lparam: LP
                             state.pending_meta.clear();
                             match action {
                                 HotkeyAction::Escape => {
+                                    state.unfocus_gen.fetch_add(1, Ordering::SeqCst);
                                     state.remote_mode.store(false, Ordering::SeqCst);
                                     state.cursor_parked.store(false, Ordering::Release);
                                     state.forwarded_media_keys.lock().clear();
@@ -1365,6 +1369,8 @@ pub fn start_windows_capture(config: CaptureConfig) -> Result<CaptureHandle> {
         lmb_fullscreen_checked: AtomicBool::new(false),
         drag_strip_armed: AtomicBool::new(false),
         pin_media_keys_local: AtomicBool::new(config.pin_media_keys_local),
+        unfocus_on_leave: AtomicBool::new(config.unfocus_on_leave),
+        unfocus_gen: Arc::new(AtomicU64::new(0)),
         forwarded_media_keys: Mutex::new(RemoteMediaKeyTracker::new()),
         pending_meta: WindowsPendingMeta::new(),
         hotkeys: AtomicHotkeys::new(config.hotkeys),

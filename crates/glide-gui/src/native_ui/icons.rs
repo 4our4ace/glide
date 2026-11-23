@@ -315,6 +315,12 @@ static VOLUME: Icon = Icon {
     body: r#"<path d="M2.2 6.2H4.5L7.6 3.5V12.5L4.5 9.8H2.2V6.2Z" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linejoin="round"/><path d="M10.2 5.9A3.0 3.0 0 0 1 10.2 10.1M12.5 3.9A5.6 5.6 0 0 1 12.5 12.1" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/>"#,
 };
 
+static UNFOCUS_WINDOW: Icon = Icon {
+    name: "setting-unfocus-window",
+    view: 16.0,
+    body: r#"<path d="M7.6 3.4H3.6A1.4 1.4 0 0 0 2.2 4.8V12.0A1.4 1.4 0 0 0 3.6 13.4H11.2A1.4 1.4 0 0 0 12.6 12.0V8.4M2.2 6.4H6.2M8.8 7.2L13.6 2.4M10.4 2.4H13.6V5.6" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/>"#,
+};
+
 static MOUSE: Icon = Icon {
     name: "setting-mouse",
     view: 16.0,
@@ -629,6 +635,10 @@ pub fn keyboard_icon(color: Color) -> El {
 
 pub fn volume_icon(color: Color) -> El {
     setting_glyph(&VOLUME, color)
+}
+
+pub fn unfocus_window_icon(color: Color) -> El {
+    setting_glyph(&UNFOCUS_WINDOW, color)
 }
 
 pub fn mouse_icon(color: Color) -> El {

@@ -949,6 +949,10 @@
                 <div class="row-text"><div class="row-label">Sync Caps &amp; Num Lock</div><div class="row-desc">Keyboard lights stay consistent</div></div>
                 <label class="switch"><input type="checkbox" id="syncLockToggle" checked><span class="slider"></span></label>
               </div>
+              <div class="row" id="unfocusOnLeaveField">
+                <div class="row-text"><div class="row-label">Unfocus window on leave</div><div class="row-desc">Remove window focus when switching away</div></div>
+                <label class="switch"><input type="checkbox" id="unfocusOnLeaveToggle"><span class="slider"></span></label>
+              </div>
             </div>
           </div>
         </div>
@@ -1287,6 +1291,11 @@ function setRole(role) {
     : 'Starts minimized as Client';
   if (!state.running) {
     $('startStopBtn').textContent = role === 'server' ? 'Start Server' : 'Connect';
+  }
+  if (state.config) {
+    $('unfocusOnLeaveToggle').checked = !!(
+      role === 'client' ? state.config.client?.unfocus_on_leave : state.config.server?.unfocus_on_leave
+    );
   }
   updateLayoutHint();
   renderDeskLayout(true);
@@ -1934,6 +1943,9 @@ function syncFormFromConfig() {
   $('dwellSlider').value = c.server.edge_dwell_ms;
   $('fullscreenLockToggle').checked = !!c.server.auto_lock_fullscreen;
   $('syncLockToggle').checked = !!c.server.sync_lock_keys;
+  $('unfocusOnLeaveToggle').checked = !!(
+    state.role === 'client' ? c.client?.unfocus_on_leave : c.server?.unfocus_on_leave
+  );
   $('clipToggle').checked = !!c.server.clipboard;
   refreshRangeLabels();
 
@@ -1975,6 +1987,11 @@ async function pushConfig() {
   c.server.auto_lock_fullscreen = $('fullscreenLockToggle').checked;
   c.server.sync_lock_keys = $('syncLockToggle').checked;
   c.client.sync_lock_keys = $('syncLockToggle').checked;
+  if (state.role === 'client') {
+    if (c.client) c.client.unfocus_on_leave = $('unfocusOnLeaveToggle').checked;
+  } else if (c.server) {
+    c.server.unfocus_on_leave = $('unfocusOnLeaveToggle').checked;
+  }
   c.server.clipboard = $('clipToggle').checked;
   c.client.clipboard = $('clipToggle').checked;
 
@@ -1996,7 +2013,7 @@ RANGE_IDS.forEach(id => {
 
 [
   'autoDpiToggle', 'invertScrollToggle', 'inputBackendSelect',
-  'fullscreenLockToggle', 'syncLockToggle', 'clipToggle',
+  'fullscreenLockToggle', 'syncLockToggle', 'unfocusOnLeaveToggle', 'clipToggle',
   'discoveryToggle', 'manualServerInput'
 ].forEach(id => { $(id).onchange = () => pushConfig(); });
 
@@ -2251,6 +2268,10 @@ async function init() {
   }
 
   const isWin = state.os.toLowerCase().includes('win');
+  const isWayland = state.os.toLowerCase().includes('wayland');
+  if (isWayland) {
+    $('unfocusOnLeaveField').style.display = 'none';
+  }
   if (isWin) {
     $('linuxBackendField').style.display = 'none';
     $('winOnlyBadge').style.display = 'none';

@@ -22,6 +22,8 @@ pub struct MockCaptureState {
     pub remote_mode: AtomicBool,
     pub locked: AtomicBool,
     pub pin_media_keys_local: AtomicBool,
+    pub unfocus_on_leave: AtomicBool,
+    pub unfocus_count: AtomicUsize,
     pub hotkeys: Mutex<CaptureHotkeys>,
     pub hotkeys_suspended: AtomicBool,
     pub enter_remote_calls: AtomicUsize,
@@ -31,8 +33,28 @@ pub struct MockCaptureState {
     pub lock_state: Mutex<LockState>,
 }
 
+impl MockCaptureState {
+    pub fn unfocus_count(&self) -> usize {
+        self.unfocus_count.load(Ordering::SeqCst)
+    }
+
+    pub fn unfocus_on_leave(&self) -> bool {
+        self.unfocus_on_leave.load(Ordering::SeqCst)
+    }
+}
+
 pub struct MockCaptureControl {
     pub state: Arc<MockCaptureState>,
+}
+
+impl MockCaptureControl {
+    pub fn unfocus_count(&self) -> usize {
+        self.state.unfocus_count()
+    }
+
+    pub fn unfocus_on_leave(&self) -> bool {
+        self.state.unfocus_on_leave()
+    }
 }
 
 impl CaptureControl for MockCaptureControl {
@@ -57,6 +79,12 @@ impl CaptureControl for MockCaptureControl {
             .store(enabled, Ordering::SeqCst);
     }
 
+    fn set_unfocus_on_leave(&self, enabled: bool) {
+        self.state
+            .unfocus_on_leave
+            .store(enabled, Ordering::SeqCst);
+    }
+
     fn set_hotkeys(&self, hotkeys: CaptureHotkeys) {
         *self.state.hotkeys.lock() = hotkeys;
     }
@@ -70,6 +98,9 @@ impl CaptureControl for MockCaptureControl {
     fn enter_remote(&self) -> Result<()> {
         self.state.enter_remote_calls.fetch_add(1, Ordering::SeqCst);
         self.state.remote_mode.store(true, Ordering::SeqCst);
+        if self.state.unfocus_on_leave.load(Ordering::SeqCst) {
+            self.state.unfocus_count.fetch_add(1, Ordering::SeqCst);
+        }
         Ok(())
     }
 
@@ -136,6 +167,7 @@ pub enum InjectedAction {
     Button(MouseButton, bool),
     Key(HidUsage, bool),
     ReleaseAll,
+    UnfocusWindow,
 }
 
 #[derive(Debug)]
@@ -144,6 +176,9 @@ pub struct MockInjector {
     pub pending_geometry: Arc<Mutex<Option<DesktopGeometry>>>,
     pub suspended_flag: Arc<AtomicBool>,
     pub resumed_flag: Arc<AtomicBool>,
+    pub unfocus_on_leave_flag: Arc<AtomicBool>,
+    pub unfocus_on_leave: bool,
+    pub unfocus_calls: usize,
     pub cursor_x: f32,
     pub cursor_y: f32,
     pub pressed_keys: HashSet<HidUsage>,
@@ -161,6 +196,9 @@ impl MockInjector {
             pending_geometry: Arc::new(Mutex::new(None)),
             suspended_flag: Arc::new(AtomicBool::new(false)),
             resumed_flag: Arc::new(AtomicBool::new(false)),
+            unfocus_on_leave_flag: Arc::new(AtomicBool::new(false)),
+            unfocus_on_leave: false,
+            unfocus_calls: 0,
             cursor_x: cx as f32,
             cursor_y: cy as f32,
             pressed_keys: HashSet::new(),
@@ -170,11 +208,24 @@ impl MockInjector {
         };
         (me, log)
     }
+
+    pub fn unfocus_on_leave(&self) -> bool {
+        self.unfocus_on_leave
+    }
+
+    pub fn unfocus_calls(&self) -> usize {
+        self.unfocus_calls
+    }
 }
 
 impl InputInjector for MockInjector {
     fn os_kind(&self) -> OsKind {
         OsKind::LinuxX11
+    }
+
+    fn set_unfocus_on_leave(&mut self, enabled: bool) {
+        self.unfocus_on_leave = enabled;
+        self.unfocus_on_leave_flag.store(enabled, Ordering::SeqCst);
     }
 
     fn desktop_geometry(&mut self) -> Result<DesktopGeometry> {
@@ -320,6 +371,15 @@ impl InputInjector for MockInjector {
             log.push(InjectedAction::Button(b, false));
         }
         log.push(InjectedAction::ReleaseAll);
+        Ok(())
+    }
+
+    fn leave(&mut self) -> Result<()> {
+        self.edge_push_accum = 0.0;
+        if self.unfocus_on_leave {
+            self.unfocus_calls += 1;
+            self.log.lock().push(InjectedAction::UnfocusWindow);
+        }
         Ok(())
     }
 }

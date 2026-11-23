@@ -3,7 +3,7 @@
 use crate::geometry::DesktopGeometry;
 use crate::linux_x11::{
     poll_randr_event, query_desktop_geometry, subscribe_randr_events, unsubscribe_randr_events,
-    X11CursorHider,
+    X11CursorHider, X11FocusClearer,
 };
 use crate::InputInjector;
 use anyhow::{Context, Result};
@@ -28,6 +28,8 @@ pub struct X11Injector {
     randr_subscribed: bool,
     last_geom_refresh: Instant,
     cursor_hider: X11CursorHider,
+    focus_clearer: X11FocusClearer,
+    unfocus_on_leave: bool,
     parked_pos: (i32, i32),
     // Sub-pixel motion remainder accumulator so fractional deltas never get dropped.
     rem_x: f32,
@@ -77,6 +79,8 @@ impl X11Injector {
             randr_subscribed,
             last_geom_refresh: now,
             cursor_hider,
+            focus_clearer: X11FocusClearer::new(),
+            unfocus_on_leave: false,
             parked_pos: (cx, cy),
             rem_x: 0.0,
             rem_y: 0.0,
@@ -470,6 +474,9 @@ impl InputInjector for X11Injector {
             .conn
             .warp_pointer(x11rb::NONE, self.root, 0, 0, 0, 0, px as i16, py as i16);
         self.cursor_hider.hide(&self.conn, self.root);
+        if self.unfocus_on_leave {
+            self.focus_clearer.clear_focus(&self.conn, self.root);
+        }
         let _ = self.conn.flush();
         self.parked_pos = (px, py);
         self.est_x = px as f32;
@@ -478,6 +485,10 @@ impl InputInjector for X11Injector {
         self.edge_push_start = None;
         debug!(px, py, "X11Injector left screen; cursor hidden & parked");
         Ok(())
+    }
+
+    fn set_unfocus_on_leave(&mut self, enabled: bool) {
+        self.unfocus_on_leave = enabled;
     }
 
     fn show_cursor(&mut self) -> Result<()> {
@@ -509,6 +520,7 @@ impl Drop for X11Injector {
     fn drop(&mut self) {
         let _ = self.release_all();
         let _ = self.show_cursor();
+        self.focus_clearer.destroy(&self.conn);
         if self.randr_subscribed {
             unsubscribe_randr_events(&self.conn, self.root);
             let _ = self.conn.flush();
