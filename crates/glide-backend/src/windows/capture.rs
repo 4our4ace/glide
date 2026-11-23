@@ -338,8 +338,8 @@ struct WindowsCaptureControl {
 
 impl Drop for WindowsCaptureControl {
     fn drop(&mut self) {
-        // Always restore cursor & stop hook loop + geometry helper cleanly on shutdown
-        self.state.focus_state.discard();
+        // Always restore cursor & stop hook loop + geometry/focus helpers cleanly on shutdown
+        self.state.focus_state.shutdown();
         let was_remote = self.state.remote_mode.swap(false, Ordering::SeqCst);
         self.state.pending_meta.clear();
         self.state.hotkey_suppressor.clear();

@@ -527,7 +527,7 @@ impl InputInjector for WindowsInjector {
 
 impl Drop for WindowsInjector {
     fn drop(&mut self) {
-        self.focus_state.discard();
+        self.focus_state.shutdown();
         let _ = self.release_all();
         let hwnd = self.watch_hwnd.swap(0, Ordering::SeqCst) as HWND;
         if !hwnd.is_null() {
