@@ -45,8 +45,8 @@ use anyhow::Result;
 use geometry::DesktopGeometry;
 use glide_hid::{HidUsage, ModifierMask, MouseButton};
 use glide_proto::{ClipboardPayload, Edge, LockState, OsKind};
-use std::sync::atomic::{AtomicU8, Ordering};
 use serde::{Deserialize, Serialize};
+use std::sync::atomic::{AtomicU64, AtomicU8, Ordering};
 use std::sync::Arc;
 use tokio::sync::mpsc;
 
@@ -347,6 +347,80 @@ impl WindowsPendingMeta {
     }
 }
 
+/// Lock-free 256-bit key-state bitset (`[AtomicU64; 4]`) safe to mutate directly inside
+/// low-level OS keyboard hooks (zero mutexes, zero heap allocations).
+#[derive(Debug, Default)]
+pub struct AtomicKeyBitset([AtomicU64; 4]);
+
+impl AtomicKeyBitset {
+    pub const fn new() -> Self {
+        Self([
+            AtomicU64::new(0),
+            AtomicU64::new(0),
+            AtomicU64::new(0),
+            AtomicU64::new(0),
+        ])
+    }
+
+    /// Sets bit `idx` and returns `true` if it was already set before this call.
+    #[inline]
+    pub fn insert(&self, idx: u8) -> bool {
+        let word = (idx >> 6) as usize;
+        let mask = 1u64 << (idx & 63);
+        (self.0[word].fetch_or(mask, Ordering::AcqRel) & mask) != 0
+    }
+
+    /// Clears bit `idx` and returns `true` if it was set before this call.
+    #[inline]
+    pub fn remove(&self, idx: u8) -> bool {
+        let word = (idx >> 6) as usize;
+        let mask = 1u64 << (idx & 63);
+        (self.0[word].fetch_and(!mask, Ordering::AcqRel) & mask) != 0
+    }
+
+    /// Returns `true` if bit `idx` is currently set.
+    #[inline]
+    pub fn contains(&self, idx: u8) -> bool {
+        let word = (idx >> 6) as usize;
+        let mask = 1u64 << (idx & 63);
+        (self.0[word].load(Ordering::Acquire) & mask) != 0
+    }
+
+    /// Clears all 256 bits.
+    #[inline]
+    pub fn clear(&self) {
+        for w in &self.0 {
+            w.store(0, Ordering::Release);
+        }
+    }
+
+    /// Records a remote `PAGE_KEYBOARD` key transition and returns `true` if it should be
+    /// forwarded to the active remote client.
+    ///
+    /// - Suppresses duplicate `pressed == true` typematic repeats on modifier keys (`Ctrl`,
+    ///   `Shift`, `Alt`, `Meta`/`Super`) so remote X11 `XTest` / `XKB` never receives modifier
+    ///   repeat storms while a modifier is held on Windows.
+    /// - Suppresses unpaired `pressed == false` releases for keys whose press was never sent
+    ///   to the remote client (e.g. a modifier held locally while crossing the screen edge or
+    ///   pressing `Ctrl+Alt+Arrow`).
+    /// - Preserves auto-repeat for regular non-modifier keys and passes non-keyboard usages
+    ///   (Consumer/Media keys) through unchanged.
+    #[inline]
+    pub fn should_forward_remote_key(&self, usage: HidUsage, pressed: bool) -> bool {
+        let canon = usage.canonicalize();
+        if canon.page() != HidUsage::PAGE_KEYBOARD || canon.id() >= 256 {
+            return true;
+        }
+        let idx = canon.id() as u8;
+        if pressed {
+            let already_down = self.insert(idx);
+            !(already_down && canon.modifier_bit() != 0)
+        } else {
+            self.remove(idx)
+        }
+    }
+}
+
 /// Low-latency input events emitted by the server's OS capture thread.
 #[derive(Debug, Clone)]
 pub enum CaptureEvent {
@@ -420,6 +494,9 @@ pub trait CaptureControl: Send + Sync {
     fn set_hotkeys_suspended(&self, _suspended: bool) {}
     /// Enters remote mode: suppresses/grabs local input and parks/hides cursor cleanly.
     fn enter_remote(&self) -> Result<()>;
+    /// Resets tracked remote key-down state when switching active remote targets without
+    /// leaving remote mode (or finalizing a cross-edge file drag handoff).
+    fn reset_remote_keys(&self) {}
     /// Leaves remote mode: releases grab and warps cursor to `return_edge` at `normalized_pos`.
     fn leave_remote(&self, return_edge: Edge, normalized_pos: f32) -> Result<()>;
     /// Leaves remote mode via hotkey: restores cursor to saved normalized desktop coordinates.
@@ -1126,5 +1203,50 @@ mod tests {
             assert!(pending.is_empty());
             assert_eq!(pending.take_pending(), [None, None]);
         }
+    }
+
+    #[test]
+    fn atomic_key_bitset_deduplicates_modifiers_and_pairs_releases() {
+        let bits = AtomicKeyBitset::new();
+
+        // Low-level bitset boundary coverage across all 4 u64 words (0, 63, 64, 127, 128, 162, 255)
+        for idx in [0u8, 63, 64, 127, 128, 0xA2, 0xA4, 255] {
+            assert!(!bits.contains(idx));
+            assert!(!bits.insert(idx));
+            assert!(bits.contains(idx));
+            assert!(bits.insert(idx));
+            assert!(bits.remove(idx));
+            assert!(!bits.contains(idx));
+            assert!(!bits.remove(idx));
+        }
+
+        // Unpaired remote modifier release (e.g. Ctrl held locally before crossing edge) is dropped
+        assert!(!bits.should_forward_remote_key(HidUsage::CONTROL_LEFT, false));
+
+        // Fresh Ctrl press forwards once; typematic repeats are suppressed; matching release forwards once
+        assert!(bits.should_forward_remote_key(HidUsage::CONTROL_LEFT, true));
+        assert!(!bits.should_forward_remote_key(HidUsage::CONTROL_LEFT, true));
+        assert!(!bits.should_forward_remote_key(HidUsage::CONTROL_LEFT, true));
+        assert!(bits.should_forward_remote_key(HidUsage::CONTROL_LEFT, false));
+        assert!(!bits.should_forward_remote_key(HidUsage::CONTROL_LEFT, false));
+
+        // Regular non-modifier keys preserve typematic repeat, while unpaired release is still blocked
+        let key_c = HidUsage::keyboard(0x06);
+        assert!(!bits.should_forward_remote_key(key_c, false));
+        assert!(bits.should_forward_remote_key(key_c, true));
+        assert!(bits.should_forward_remote_key(key_c, true));
+        assert!(bits.should_forward_remote_key(key_c, false));
+        assert!(!bits.should_forward_remote_key(key_c, false));
+
+        // Consumer/media usages pass through unchanged
+        let vol_up = HidUsage::consumer(0x00E9);
+        assert!(bits.should_forward_remote_key(vol_up, true));
+        assert!(bits.should_forward_remote_key(vol_up, false));
+
+        // clear() resets all active remote keys
+        assert!(bits.should_forward_remote_key(HidUsage::ALT_LEFT, true));
+        bits.clear();
+        assert!(!bits.should_forward_remote_key(HidUsage::ALT_LEFT, false));
+        assert!(bits.should_forward_remote_key(HidUsage::ALT_LEFT, true));
     }
 }

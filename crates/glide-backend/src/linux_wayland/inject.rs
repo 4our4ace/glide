@@ -877,11 +877,19 @@ impl InputInjector for WaylandInjector {
         };
         let code = evdev as u32;
         if pressed {
+            if usage.modifier_bit() != 0 && self.pressed_keys.contains(&code) {
+                return Ok(());
+            }
+        } else if !self.pressed_keys.contains(&code) {
+            return Ok(());
+        }
+        self.emit_evdev_key(code, pressed)?;
+        if pressed {
             self.pressed_keys.insert(code);
         } else {
             self.pressed_keys.remove(&code);
         }
-        self.emit_evdev_key(code, pressed)
+        Ok(())
     }
 
     fn release_all(&mut self) -> Result<()> {

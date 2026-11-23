@@ -720,6 +720,7 @@ pub async fn run_server_with_dnd(
                     pending_dy = 0.0;
                     coalesce_armed = false;
                     last_motion_sent = None;
+                    capture_ctrl.reset_remote_keys();
                     let _ = capture_ctrl.enter_remote();
                     let _ = peer.ctrl_tx.send(ControlMessage::Enter {
                         edge: ready.edge.opposite(),
@@ -972,6 +973,8 @@ pub async fn run_server_with_dnd(
                                 // overwrite the saved local cursor position (e.g. Windows last_local_norm).
                                 if !was_remote {
                                     let _ = capture_ctrl.enter_remote();
+                                } else {
+                                    capture_ctrl.reset_remote_keys();
                                 }
                                 let (nx, ny) = peer.last_cursor_norm;
                                 let _ = peer.ctrl_tx.send(ControlMessage::EnterAt {
@@ -1265,6 +1268,7 @@ pub async fn run_server_with_dnd(
                                                 cursor_norm_y: 0.5,
                                             });
                                         }
+                                        capture_ctrl.reset_remote_keys();
                                     }
                                 }
 

@@ -582,6 +582,11 @@ mod tests {
         }
 
         // Client B must be entered and must NOT have received Client A's stale coalesced (99, 77) move!
+        assert_eq!(
+            cap_state.reset_remote_keys_calls.load(Ordering::SeqCst),
+            1,
+            "direct peer-to-peer switch must reset capture remote_keys_down"
+        );
         {
             let lb = log_b.lock();
             assert!(lb.iter().any(|a| matches!(a, InjectedAction::EnterAt(_, _))));

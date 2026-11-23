@@ -478,15 +478,23 @@ impl InputInjector for WindowsInjector {
     }
 
     fn key(&mut self, usage: HidUsage, pressed: bool) -> Result<()> {
-        let Some(scan) = usage.to_win_scan() else {
+        let canon = usage.canonicalize();
+        let Some(scan) = canon.to_win_scan() else {
             trace!(?usage, "Unmapped HID usage for Windows");
             return Ok(());
         };
+        if pressed {
+            if canon.modifier_bit() != 0 && self.pressed_keys.contains(&canon) {
+                return Ok(());
+            }
+        } else if !self.pressed_keys.contains(&canon) {
+            return Ok(());
+        }
         self.send_key_scan(scan.code, scan.extended, pressed);
         if pressed {
-            self.pressed_keys.insert(usage);
+            self.pressed_keys.insert(canon);
         } else {
-            self.pressed_keys.remove(&usage);
+            self.pressed_keys.remove(&canon);
         }
         Ok(())
     }

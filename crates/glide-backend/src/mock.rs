@@ -31,6 +31,7 @@ pub struct MockCaptureState {
     pub hotkeys: Mutex<CaptureHotkeys>,
     pub hotkeys_suspended: AtomicBool,
     pub enter_remote_calls: AtomicUsize,
+    pub reset_remote_keys_calls: AtomicUsize,
     pub leave_remote_at_calls: AtomicUsize,
     pub last_leave: Mutex<Option<(Edge, f32)>>,
     pub last_leave_at: Mutex<Option<(f32, f32)>>,
@@ -54,6 +55,7 @@ impl Default for MockCaptureState {
             hotkeys: Mutex::new(CaptureHotkeys::default()),
             hotkeys_suspended: AtomicBool::new(false),
             enter_remote_calls: AtomicUsize::new(0),
+            reset_remote_keys_calls: AtomicUsize::new(0),
             leave_remote_at_calls: AtomicUsize::new(0),
             last_leave: Mutex::new(None),
             last_leave_at: Mutex::new(None),
@@ -178,6 +180,12 @@ impl CaptureControl for MockCaptureControl {
             self.state.has_saved_focus.store(false, Ordering::SeqCst);
         }
         Ok(())
+    }
+
+    fn reset_remote_keys(&self) {
+        self.state
+            .reset_remote_keys_calls
+            .fetch_add(1, Ordering::SeqCst);
     }
 
     fn leave_remote(&self, return_edge: Edge, normalized_pos: f32) -> Result<()> {

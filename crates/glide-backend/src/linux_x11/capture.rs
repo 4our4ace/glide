@@ -8,8 +8,8 @@ use crate::linux_x11::{
     X11FocusClearer,
 };
 use crate::{
-    edge_bit, AtomicEdgeMask, AtomicNormPoint, CaptureConfig, CaptureControl, CaptureEvent,
-    CaptureHandle, CaptureHotkeys, RemoteMediaKeyTracker, ALL_EDGES,
+    edge_bit, AtomicEdgeMask, AtomicKeyBitset, AtomicNormPoint, CaptureConfig, CaptureControl,
+    CaptureEvent, CaptureHandle, CaptureHotkeys, RemoteMediaKeyTracker, ALL_EDGES,
 };
 use anyhow::{Context, Result};
 use glide_hid::{HidUsage, ModifierMask, MouseButton};
@@ -53,6 +53,7 @@ struct SharedState {
     active_edges: AtomicEdgeMask,
     geometry: RwLock<DesktopGeometry>,
     remote_mode: AtomicBool,
+    remote_keys_down: AtomicKeyBitset,
     locked: AtomicBool,
     drag_drop_files: AtomicBool,
     auto_lock_fullscreen: AtomicBool,
@@ -163,19 +164,28 @@ impl CaptureControl for X11CaptureControl {
     }
 
     fn enter_remote(&self) -> Result<()> {
+        if !self.shared.remote_mode.load(Ordering::Acquire) {
+            self.shared.remote_keys_down.clear();
+        }
         self.shared.remote_mode.store(true, Ordering::SeqCst);
         self.send_cmd(CMD_ENTER_REMOTE)
+    }
+
+    fn reset_remote_keys(&self) {
+        self.shared.remote_keys_down.clear();
     }
 
     fn leave_remote(&self, return_edge: Edge, normalized_pos: f32) -> Result<()> {
         *self.shared.pending_leave.lock() = Some(LeaveTarget::Edge(return_edge, normalized_pos));
         self.shared.remote_mode.store(false, Ordering::SeqCst);
+        self.shared.remote_keys_down.clear();
         self.send_cmd(CMD_LEAVE_REMOTE)
     }
 
     fn leave_remote_at(&self, norm_x: f32, norm_y: f32) -> Result<()> {
         *self.shared.pending_leave.lock() = Some(LeaveTarget::Point(norm_x, norm_y));
         self.shared.remote_mode.store(false, Ordering::SeqCst);
+        self.shared.remote_keys_down.clear();
         self.send_cmd(CMD_LEAVE_REMOTE)
     }
 
@@ -480,6 +490,7 @@ pub fn start_x11_capture(config: CaptureConfig) -> Result<CaptureHandle> {
         active_edges: AtomicEdgeMask::empty(),
         geometry: RwLock::new(geometry),
         remote_mode: AtomicBool::new(false),
+        remote_keys_down: AtomicKeyBitset::new(),
         locked: AtomicBool::new(false),
         drag_drop_files: AtomicBool::new(config.drag_drop_files),
         auto_lock_fullscreen: AtomicBool::new(config.auto_lock_fullscreen),
@@ -697,6 +708,9 @@ fn run_capture_loop(
             *grabbed = false;
         }
         media_tracker.clear();
+        if !shared.remote_mode.load(Ordering::Acquire) {
+            shared.remote_keys_down.clear();
+        }
         if let Some(t) = target {
             let (x, y) = match t {
                 LeaveTarget::Edge(edge, norm) => geom.point_on_edge(edge, norm, 6),
@@ -1053,6 +1067,7 @@ fn run_capture_loop(
                         {
                             continue;
                         }
+                        shared.remote_keys_down.clear();
                         shared.remote_mode.store(true, Ordering::SeqCst);
                         let _ = tx.send(CaptureEvent::EdgeCrossed {
                             edge,
@@ -1226,10 +1241,15 @@ fn run_capture_loop(
                         if !kbd_grabbed {
                             grab_keyboard_sync(&conn, ctrl_win, &mut kbd_grabbed);
                         }
-                        let _ = tx.send(CaptureEvent::Key {
-                            usage,
-                            pressed: true,
-                        });
+                        if shared
+                            .remote_keys_down
+                            .should_forward_remote_key(usage, true)
+                        {
+                            let _ = tx.send(CaptureEvent::Key {
+                                usage,
+                                pressed: true,
+                            });
+                        }
                     }
                 }
             }
@@ -1268,10 +1288,15 @@ fn run_capture_loop(
                 ) {
                     continue;
                 }
-                let _ = tx.send(CaptureEvent::Key {
-                    usage,
-                    pressed: false,
-                });
+                if shared
+                    .remote_keys_down
+                    .should_forward_remote_key(usage, false)
+                {
+                    let _ = tx.send(CaptureEvent::Key {
+                        usage,
+                        pressed: false,
+                    });
+                }
             }
             _ => {}
         }

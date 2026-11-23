@@ -14,7 +14,7 @@ use crate::linux_wayland::{
     PORTAL_PATH,
 };
 use crate::{
-    CaptureConfig, CaptureControl, CaptureEvent, CaptureHandle, CaptureHotkeys,
+    AtomicKeyBitset, CaptureConfig, CaptureControl, CaptureEvent, CaptureHandle, CaptureHotkeys,
     RemoteMediaKeyTracker,
 };
 use anyhow::{anyhow, Context, Result};
@@ -213,6 +213,7 @@ struct SharedState {
     locked: AtomicBool,
     in_remote: AtomicBool,
     remote_gen: AtomicU64,
+    remote_keys_down: AtomicKeyBitset,
     pin_media_keys_local: AtomicBool,
     hotkeys: AtomicHotkeys,
     activation_id: Mutex<Option<u32>>,
@@ -268,16 +269,24 @@ impl CaptureControl for WaylandCaptureControl {
     }
 
     fn enter_remote(&self) -> Result<()> {
+        if !self.shared.in_remote.load(Ordering::Acquire) {
+            self.shared.remote_keys_down.clear();
+        }
         if !self.shared.in_remote.swap(true, Ordering::SeqCst) {
             self.shared.remote_gen.fetch_add(1, Ordering::AcqRel);
         }
         Ok(())
     }
 
+    fn reset_remote_keys(&self) {
+        self.shared.remote_keys_down.clear();
+    }
+
     fn leave_remote(&self, return_edge: Edge, normalized_pos: f32) -> Result<()> {
         if self.shared.in_remote.swap(false, Ordering::SeqCst) {
             self.shared.remote_gen.fetch_add(1, Ordering::AcqRel);
         }
+        self.shared.remote_keys_down.clear();
         let (x, y) = self
             .shared
             .geometry
@@ -294,6 +303,7 @@ impl CaptureControl for WaylandCaptureControl {
         if self.shared.in_remote.swap(false, Ordering::SeqCst) {
             self.shared.remote_gen.fetch_add(1, Ordering::AcqRel);
         }
+        self.shared.remote_keys_down.clear();
         let (x, y) = self
             .shared
             .geometry
@@ -533,6 +543,7 @@ fn start_wayland_capture_blocking(config: CaptureConfig) -> Result<CaptureHandle
         locked: AtomicBool::new(false),
         in_remote: AtomicBool::new(false),
         remote_gen: AtomicU64::new(0),
+        remote_keys_down: AtomicKeyBitset::new(),
         pin_media_keys_local: AtomicBool::new(config.pin_media_keys_local),
         hotkeys: AtomicHotkeys::new(config.hotkeys),
         activation_id: Mutex::new(None),
@@ -622,6 +633,9 @@ fn start_wayland_capture_blocking(config: CaptureConfig) -> Result<CaptureHandle
 
                                 if let Some(edge) = edge_opt {
                                     let norm = normalize_barrier_hit(&geom, edge, cx, cy);
+                                    if !shared_sig.in_remote.load(Ordering::Acquire) {
+                                        shared_sig.remote_keys_down.clear();
+                                    }
                                     if !shared_sig.in_remote.swap(true, Ordering::SeqCst) {
                                         shared_sig.remote_gen.fetch_add(1, Ordering::AcqRel);
                                     }
@@ -636,6 +650,7 @@ fn start_wayland_capture_blocking(config: CaptureConfig) -> Result<CaptureHandle
                             "Deactivated" | "Disabled" => {
                                 if shared_sig.in_remote.swap(false, Ordering::SeqCst) {
                                     shared_sig.remote_gen.fetch_add(1, Ordering::AcqRel);
+                                    shared_sig.remote_keys_down.clear();
                                     debug!(
                                         signal = %member,
                                         "Wayland InputCapture ended by compositor; releasing remote session"
@@ -748,6 +763,7 @@ fn start_wayland_capture_blocking(config: CaptureConfig) -> Result<CaptureHandle
                 let current_gen = shared_eis.remote_gen.load(Ordering::Acquire);
                 if last_remote_gen != current_gen || (was_in_remote && !in_remote_now) {
                     media_tracker.clear();
+                    shared_eis.remote_keys_down.clear();
                     held_keys.clear();
                     hotkey_suppressor.clear();
                     last_remote_gen = current_gen;
@@ -782,6 +798,7 @@ fn start_wayland_capture_blocking(config: CaptureConfig) -> Result<CaptureHandle
                         }
                         EiEvent::DevicePaused(_) => {
                             media_tracker.clear();
+                            shared_eis.remote_keys_down.clear();
                             held_keys.clear();
                             hotkey_suppressor.clear();
                             last_remote_gen = shared_eis.remote_gen.load(Ordering::Acquire);
@@ -848,6 +865,7 @@ fn start_wayland_capture_blocking(config: CaptureConfig) -> Result<CaptureHandle
                             let current_gen = shared_eis.remote_gen.load(Ordering::Acquire);
                             if last_remote_gen != current_gen {
                                 media_tracker.clear();
+                                shared_eis.remote_keys_down.clear();
                                 held_keys.clear();
                                 hotkey_suppressor.clear();
                                 last_remote_gen = current_gen;
@@ -881,6 +899,7 @@ fn start_wayland_capture_blocking(config: CaptureConfig) -> Result<CaptureHandle
                                         .fetch_add(1, Ordering::AcqRel)
                                         .wrapping_add(1);
                                     media_tracker.clear();
+                                    shared_eis.remote_keys_down.clear();
                                     held_keys.clear();
                                     hotkey_suppressor.clear();
                                     was_in_remote = false;
@@ -912,13 +931,17 @@ fn start_wayland_capture_blocking(config: CaptureConfig) -> Result<CaptureHandle
 
                             if !in_remote {
                                 media_tracker.clear();
+                                shared_eis.remote_keys_down.clear();
                             } else if media_tracker.should_forward(
                                 usage,
                                 pressed,
                                 shared_eis.pin_media_keys_local.load(Ordering::Relaxed),
-                            ) && ev_tx
-                                .send(CaptureEvent::Key { usage, pressed })
-                                .is_err()
+                            ) && shared_eis
+                                .remote_keys_down
+                                .should_forward_remote_key(usage, pressed)
+                                && ev_tx
+                                    .send(CaptureEvent::Key { usage, pressed })
+                                    .is_err()
                             {
                                 return;
                             }

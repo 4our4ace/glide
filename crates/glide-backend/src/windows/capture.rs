@@ -16,8 +16,8 @@ use crate::windows::{
 };
 use crate::{
     edge_bit, is_windows_consumer_or_media_vk, is_windows_workstation_lock_chord, AtomicEdgeMask,
-    AtomicNormPoint, CaptureConfig, CaptureControl, CaptureEvent, CaptureHandle, CaptureHotkeys,
-    RemoteMediaKeyTracker, WindowsPendingMeta, ALL_EDGES,
+    AtomicKeyBitset, AtomicNormPoint, CaptureConfig, CaptureControl, CaptureEvent, CaptureHandle,
+    CaptureHotkeys, RemoteMediaKeyTracker, WindowsPendingMeta, ALL_EDGES,
 };
 use anyhow::{anyhow, Context, Result};
 use glide_hid::{is_windows_fake_altgr_lctrl, HidUsage, ModifierMask, MouseButton, WinScan};
@@ -45,7 +45,9 @@ use windows_sys::Win32::System::Threading::{
     PROCESS_NAME_WIN32, PROCESS_QUERY_LIMITED_INFORMATION, THREAD_PRIORITY_HIGHEST,
 };
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
-    GetAsyncKeyState, GetKeyState, VK_CAPITAL, VK_LBUTTON,
+    GetAsyncKeyState, GetKeyState, SendInput, INPUT, INPUT_0, INPUT_KEYBOARD, KEYBDINPUT,
+    KEYEVENTF_EXTENDEDKEY, KEYEVENTF_KEYUP, VK_CAPITAL, VK_LBUTTON, VK_LCONTROL, VK_LMENU,
+    VK_LSHIFT, VK_LWIN, VK_RCONTROL, VK_RMENU, VK_RSHIFT, VK_RWIN,
 };
 use windows_sys::Win32::UI::Input::{
     GetRawInputData, GetRegisteredRawInputDevices, RegisterRawInputDevices, HRAWINPUT,
@@ -72,11 +74,28 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
 const WM_APP_ENTER_REMOTE: u32 = WM_APP + 1;
 const WM_APP_LEAVE_REMOTE: u32 = WM_APP + 2;
 const WM_APP_ENSURE_RAW_INPUT: u32 = WM_APP + 3;
+const WM_APP_RELEASE_LOCAL_MODS: u32 = WM_APP + 4;
 
 const VK_PAUSE_CODE: u32 = 0x13;
 const VK_SNAPSHOT_CODE: u32 = 0x2C;
 const VK_NUMLOCK_CODE: u32 = 0x90;
-const VK_RSHIFT_CODE: u32 = 0xA1;
+
+/// Modifier keys proactively released to local Windows when transitioning `local -> remote`
+/// so keys held across `Ctrl+Alt+Arrow`, `AltGr`, or `Ctrl+C` + edge-crossing never remain
+/// stuck down in Windows' async key-state table.
+///
+/// Ordered `Alt -> Shift -> Ctrl` so `Alt` always releases while `Ctrl` is still held,
+/// preventing bare-Alt menu-bar activation. `Win` keys are intentionally omitted from
+/// synthetic `SendInput` release and instead rely on physical `WM_KEYUP` passthrough
+/// (via `local_keys_down` / `GetAsyncKeyState`) so Glide itself never synthesizes a Win key-up.
+const LOCAL_MODIFIER_RELEASES: [(u16, u16, bool); 6] = [
+    (VK_LMENU, 0x38, false),
+    (VK_RMENU, 0x38, true),
+    (VK_LSHIFT, 0x2A, false),
+    (VK_RSHIFT, 0x36, false),
+    (VK_LCONTROL, 0x1D, false),
+    (VK_RCONTROL, 0x1D, true),
+];
 
 /// Minimum squared movement (4 px = Win32 `SM_CXDRAG`) from `WM_LBUTTONDOWN` origin before arming DnD edge strips.
 const DRAG_ARM_MIN_MOVE_SQ: i64 = 16;
@@ -152,6 +171,12 @@ struct HookState {
     focus_state: Arc<WindowsFocusState>,
     forwarded_media_keys: Mutex<RemoteMediaKeyTracker>,
     pending_meta: WindowsPendingMeta,
+    /// Tracks every `vkCode` (0..255) whose `WM_KEYDOWN` passed through to local Windows so
+    /// its matching `WM_KEYUP` is never swallowed after flipping into remote mode.
+    local_keys_down: AtomicKeyBitset,
+    /// Tracks `PAGE_KEYBOARD` usages currently held on the active remote client so modifier
+    /// typematic repeats and unpaired releases from local keys are never sent over QUIC.
+    remote_keys_down: AtomicKeyBitset,
     hotkeys: AtomicHotkeys,
     hotkey_suppressor: AtomicHotkeySuppressor,
     edge_threshold_px: AtomicI32,
@@ -178,10 +203,75 @@ impl HookState {
 
     fn flush_pending_meta(&self) {
         for usage in self.pending_meta.take_pending().into_iter().flatten() {
-            let _ = self.tx.send(CaptureEvent::Key {
-                usage,
-                pressed: true,
-            });
+            if self.remote_keys_down.should_forward_remote_key(usage, true) {
+                let _ = self.tx.send(CaptureEvent::Key {
+                    usage,
+                    pressed: true,
+                });
+            }
+        }
+    }
+
+    fn has_local_modifier_down(&self) -> bool {
+        LOCAL_MODIFIER_RELEASES.iter().any(|&(vk, _, _)| {
+            self.local_keys_down.contains(vk as u8)
+                || (unsafe { GetAsyncKeyState(vk as i32) } as u16 & 0x8000) != 0
+        })
+    }
+
+    fn request_release_local_modifiers(&self) {
+        if !self.has_local_modifier_down() {
+            return;
+        }
+        let hwnd = self.capture_hwnd.load(Ordering::Acquire) as HWND;
+        if !hwnd.is_null() {
+            unsafe {
+                PostMessageW(hwnd, WM_APP_RELEASE_LOCAL_MODS, 0, 0);
+            }
+        }
+    }
+
+    /// Synthesizes `KEYEVENTF_KEYUP` (tagged with `GLIDE_EXTRA_INFO`) for any local modifier
+    /// currently held in `local_keys_down` or Windows' async key-state table (catching modifiers
+    /// pressed inside elevated/UIPI windows before leaving local mode).
+    /// Must be called on the message-loop thread (never inside `WH_MOUSE_LL`/`WH_KEYBOARD_LL`).
+    fn release_local_modifiers_to_os(&self) {
+        let mut inputs: [INPUT; LOCAL_MODIFIER_RELEASES.len()] = unsafe { std::mem::zeroed() };
+        let mut vks = [0u8; LOCAL_MODIFIER_RELEASES.len()];
+        let mut count = 0usize;
+        for &(vk, scan, extended) in &LOCAL_MODIFIER_RELEASES {
+            let was_tracked = self.local_keys_down.remove(vk as u8);
+            let os_down = (unsafe { GetAsyncKeyState(vk as i32) } as u16 & 0x8000) != 0;
+            if was_tracked || os_down {
+                let mut flags = KEYEVENTF_KEYUP;
+                if extended {
+                    flags |= KEYEVENTF_EXTENDEDKEY;
+                }
+                inputs[count] = INPUT {
+                    r#type: INPUT_KEYBOARD,
+                    Anonymous: INPUT_0 {
+                        ki: KEYBDINPUT {
+                            wVk: vk,
+                            wScan: scan,
+                            dwFlags: flags,
+                            time: 0,
+                            dwExtraInfo: GLIDE_EXTRA_INFO,
+                        },
+                    },
+                };
+                vks[count] = vk as u8;
+                count += 1;
+            }
+        }
+        if count > 0 {
+            let sent =
+                unsafe { SendInput(count as u32, inputs.as_ptr(), size_of::<INPUT>() as i32) }
+                    as usize;
+            // If UIPI blocked SendInput (e.g. an elevated foreground window had not unfocused yet),
+            // restore unsent VKs into `local_keys_down` so physical WM_KEYUP still passes through.
+            for &vk in &vks[sent.min(count)..count] {
+                self.local_keys_down.insert(vk);
+            }
         }
     }
 
@@ -245,6 +335,8 @@ impl HookState {
         self.focus_state.discard();
         let was_remote = self.remote_mode.swap(false, Ordering::SeqCst);
         self.pending_meta.clear();
+        self.local_keys_down.clear();
+        self.remote_keys_down.clear();
         self.hotkey_suppressor.clear();
         self.cursor_parked.store(false, Ordering::Release);
         self.lmb_down.store(false, Ordering::SeqCst);
@@ -273,6 +365,8 @@ impl HookState {
         self.focus_state.discard();
         let was_remote = self.remote_mode.swap(false, Ordering::SeqCst);
         self.pending_meta.clear();
+        self.local_keys_down.clear();
+        self.remote_keys_down.clear();
         self.hotkey_suppressor.clear();
         self.cursor_parked.store(false, Ordering::Release);
         self.lmb_down.store(false, Ordering::SeqCst);
@@ -342,6 +436,8 @@ impl Drop for WindowsCaptureControl {
         self.state.focus_state.shutdown();
         let was_remote = self.state.remote_mode.swap(false, Ordering::SeqCst);
         self.state.pending_meta.clear();
+        self.state.local_keys_down.clear();
+        self.state.remote_keys_down.clear();
         self.state.hotkey_suppressor.clear();
         self.state.cursor_parked.store(false, Ordering::Release);
         if was_remote {
@@ -460,6 +556,9 @@ impl CaptureControl for WindowsCaptureControl {
         // WM_APP_ENTER_REMOTE would overwrite last_local_norm with the parked position.
         // For file drag-out crossings, cursor parking was intentionally deferred until after
         // `cancel_local_drag()` cancelled Explorer's modal DoDragDrop at the edge strip.
+        if !self.state.remote_mode.load(Ordering::Acquire) {
+            self.state.remote_keys_down.clear();
+        }
         let was_remote = self.state.remote_mode.swap(true, Ordering::SeqCst);
         if !was_remote {
             self.state.cursor_parked.store(true, Ordering::Release);
@@ -479,6 +578,11 @@ impl CaptureControl for WindowsCaptureControl {
             self.state.focus_state.discard();
         }
         Ok(())
+    }
+
+    fn reset_remote_keys(&self) {
+        self.state.pending_meta.clear();
+        self.state.remote_keys_down.clear();
     }
 
     fn leave_remote(&self, return_edge: Edge, normalized_pos: f32) -> Result<()> {
@@ -511,8 +615,10 @@ impl CaptureControl for WindowsCaptureControl {
             Some(LeaveTarget::Edge(return_edge, normalized_pos))
         };
         self.state.remote_mode.store(false, Ordering::SeqCst);
-        // Clear pending_meta AFTER remote_mode=false to close the micro-window during SetCursorPos.
+        // Clear pending_meta and remote_keys_down AFTER remote_mode=false to close the
+        // micro-window during SetCursorPos.
         self.state.pending_meta.clear();
+        self.state.remote_keys_down.clear();
         self.state.forwarded_media_keys.lock().clear();
         let hwnd = self.hwnd.load(Ordering::Acquire) as HWND;
         if !hwnd.is_null() {
@@ -551,6 +657,7 @@ impl CaptureControl for WindowsCaptureControl {
         };
         self.state.remote_mode.store(false, Ordering::SeqCst);
         self.state.pending_meta.clear();
+        self.state.remote_keys_down.clear();
         self.state.forwarded_media_keys.lock().clear();
         let hwnd = self.hwnd.load(Ordering::Acquire) as HWND;
         if !hwnd.is_null() {
@@ -596,6 +703,22 @@ fn translate_ll_key(vk_code: u32, scan_code: u32, flags: u32) -> Option<HidUsage
         _ => {}
     }
 
+    // Handle all 8 physical modifier VKs explicitly so keyboard drivers or virtual inputs
+    // that emit scanCode == 0 or unexpected LLKHF_EXTENDED flags never drop Ctrl/Shift/Alt/Win.
+    if let Ok(vk) = u16::try_from(vk_code) {
+        match vk {
+            VK_LSHIFT => return Some(HidUsage::SHIFT_LEFT),
+            VK_RSHIFT => return Some(HidUsage::SHIFT_RIGHT),
+            VK_LCONTROL => return Some(HidUsage::CONTROL_LEFT),
+            VK_RCONTROL => return Some(HidUsage::CONTROL_RIGHT),
+            VK_LMENU => return Some(HidUsage::ALT_LEFT),
+            VK_RMENU => return Some(HidUsage::ALT_RIGHT),
+            VK_LWIN => return Some(HidUsage::META_LEFT),
+            VK_RWIN => return Some(HidUsage::META_RIGHT),
+            _ => {}
+        }
+    }
+
     let win_scan = match vk_code {
         VK_PAUSE_CODE => WinScan {
             code: 0x45,
@@ -604,10 +727,6 @@ fn translate_ll_key(vk_code: u32, scan_code: u32, flags: u32) -> Option<HidUsage
         VK_NUMLOCK_CODE => WinScan {
             code: 0x45,
             extended: true,
-        },
-        VK_RSHIFT_CODE => WinScan {
-            code: 0x36,
-            extended: false,
         },
         VK_SNAPSHOT_CODE => WinScan {
             code: 0x37,
@@ -758,6 +877,182 @@ fn is_foreground_fullscreen_locked(state: &HookState, geom: &DesktopGeometry) ->
         })
 }
 
+const MODIFIER_VK_BITS: [(u16, u8); 8] = [
+    (VK_LCONTROL, ModifierMask::CONTROL_LEFT),
+    (VK_RCONTROL, ModifierMask::CONTROL_RIGHT),
+    (VK_LSHIFT, ModifierMask::SHIFT_LEFT),
+    (VK_RSHIFT, ModifierMask::SHIFT_RIGHT),
+    (VK_LMENU, ModifierMask::ALT_LEFT),
+    (VK_RMENU, ModifierMask::ALT_RIGHT),
+    (VK_LWIN, ModifierMask::META_LEFT),
+    (VK_RWIN, ModifierMask::META_RIGHT),
+];
+
+#[inline]
+fn is_windows_modifier_vk(vk_code: u32) -> bool {
+    u16::try_from(vk_code).is_ok_and(|vk| {
+        matches!(
+            vk,
+            VK_LCONTROL
+                | VK_RCONTROL
+                | VK_LSHIFT
+                | VK_RSHIFT
+                | VK_LMENU
+                | VK_RMENU
+                | VK_LWIN
+                | VK_RWIN
+        )
+    })
+}
+
+/// Self-heals phantom modifier bits left in `state.mods` / `state.local_keys_down` when a
+/// Secure Desktop transition (UAC prompt, `Ctrl+Alt+Del`) prevented `WH_KEYBOARD_LL` from
+/// observing the physical `WM_KEYUP`.
+///
+/// Only prunes bits that are ALSO tracked in `local_keys_down`, so physical modifiers still
+/// held after returning from remote mode (whose local OS state was either suppressed in remote
+/// mode or already released via `release_local_modifiers_to_os`) remain intact for repeated
+/// `Ctrl+Alt+Arrow` / `Ctrl+Alt+L` shortcuts.
+fn prune_phantom_local_mods(
+    mut mask: ModifierMask,
+    ignore_bit: u8,
+    local_keys_down: &AtomicKeyBitset,
+) -> ModifierMask {
+    if mask == ModifierMask::EMPTY {
+        return mask;
+    }
+    for &(vk, bit) in &MODIFIER_VK_BITS {
+        if bit != ignore_bit
+            && mask.contains(bit)
+            && local_keys_down.contains(vk as u8)
+            && (unsafe { GetAsyncKeyState(vk as i32) } as u16 & 0x8000) == 0
+        {
+            mask.0 &= !bit;
+            local_keys_down.remove(vk as u8);
+        }
+    }
+    mask
+}
+
+/// Evaluates whether a `WH_KEYBOARD_LL` key transition should be suppressed locally (`true`) or
+/// passed through to Windows (`false`), forwarding deduplicated transitions to the active remote
+/// client when in remote mode.
+fn eval_keyboard_ll_suppress(
+    state: &HookState,
+    kb: &KBDLLHOOKSTRUCT,
+    remote: bool,
+    pressed: bool,
+) -> bool {
+    // CRITICAL FOR GERMAN / EU KEYBOARDS:
+    // Swallow Windows' synthetic fake VK_LCONTROL (scanCode == 0x21D) before AltGr!
+    if is_windows_fake_altgr_lctrl(kb.vkCode, kb.scanCode) {
+        return remote;
+    }
+
+    let Some(usage) = translate_ll_key(kb.vkCode, kb.scanCode, kb.flags) else {
+        if remote
+            && state.pin_media_keys_local.load(Ordering::Relaxed)
+            && is_windows_consumer_or_media_vk(kb.vkCode, kb.scanCode, kb.flags)
+        {
+            return false;
+        }
+        trace!(
+            vk = kb.vkCode,
+            scan = kb.scanCode,
+            flags = kb.flags,
+            "Unmapped Win key"
+        );
+        return remote;
+    };
+
+    // Track modifiers atomically for local hotkey chords & bare-Meta deferral
+    let mut prev_mask = ModifierMask(state.mods.load(Ordering::Relaxed));
+    if !remote {
+        prev_mask =
+            prune_phantom_local_mods(prev_mask, usage.modifier_bit(), &state.local_keys_down);
+    }
+    let mut mask = prev_mask;
+    mask.update(usage, pressed);
+    state.mods.store(mask.0, Ordering::Relaxed);
+
+    // Windows' kernel (win32k) intercepts physical Win+L below WH_KEYBOARD_LL
+    // and unconditionally locks the local Windows server regardless of hook
+    // suppression. Never forward `L` (or any deferred bare Meta) to the remote
+    // client on Win+L so we neither lock both machines nor leak a lone Super
+    // tap that opens GNOME/KDE Activities.
+    if remote && is_windows_workstation_lock_chord(mask, kb.vkCode, pressed) {
+        state.release_to_local_on_suspend("Win+L");
+        return true;
+    }
+
+    match state
+        .hotkey_suppressor
+        .evaluate(state.hotkeys.load(), remote, prev_mask, usage, pressed)
+    {
+        HotkeyMatch::Trigger(action) => {
+            // Clear any deferred bare Meta so a custom `Super+...` shortcut
+            // never leaks a lone `Super` press to Linux clients.
+            state.pending_meta.clear();
+            match action {
+                HotkeyAction::Escape => {
+                    state.focus_state.bump_gen_only();
+                    state.remote_mode.store(false, Ordering::SeqCst);
+                    state.remote_keys_down.clear();
+                    state.cursor_parked.store(false, Ordering::Release);
+                    state.forwarded_media_keys.lock().clear();
+                    let _ = state.tx.send(CaptureEvent::EscapeHotkey);
+                }
+                HotkeyAction::Switch(direction) => {
+                    let _ = state.tx.send(CaptureEvent::HotkeySwitch { direction });
+                }
+                HotkeyAction::ToggleLock => {
+                    let _ = state.tx.send(CaptureEvent::HotkeyToggleLock);
+                }
+            }
+            return true;
+        }
+        HotkeyMatch::SuppressOnly => {
+            return true;
+        }
+        HotkeyMatch::PassThrough => {}
+    }
+
+    if remote {
+        if usage.is_media_key()
+            && !state.forwarded_media_keys.lock().should_forward(
+                usage,
+                pressed,
+                state.pin_media_keys_local.load(Ordering::Relaxed),
+            )
+        {
+            return false;
+        }
+        if state
+            .pending_meta
+            .try_defer(prev_mask, mask, usage, pressed)
+        {
+            return true;
+        }
+        state.flush_pending_meta();
+        if state
+            .remote_keys_down
+            .should_forward_remote_key(usage, pressed)
+        {
+            let _ = state.tx.send(CaptureEvent::Key { usage, pressed });
+        }
+        // Keep the physical keyboard's CapsLock / NumLock LED and Windows'
+        // toggle state in sync with the client when lock-key sync is enabled.
+        if state.sync_lock_keys.load(Ordering::Relaxed)
+            && (kb.vkCode == VK_CAPITAL as u32 || kb.vkCode == VK_NUMLOCK_CODE)
+        {
+            return false;
+        }
+        return true;
+    }
+
+    false
+}
+
 unsafe extern "system" fn keyboard_ll_proc(code: i32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
     if code >= 0 && lparam != 0 {
         let kb = unsafe { &*(lparam as *const KBDLLHOOKSTRUCT) };
@@ -771,110 +1066,34 @@ unsafe extern "system" fn keyboard_ll_proc(code: i32, wparam: WPARAM, lparam: LP
             if let Some(pressed) = pressed {
                 let suppress = with_hook_state(|state| {
                     let remote = state.remote_mode.load(Ordering::Acquire);
-
-                    // CRITICAL FOR GERMAN / EU KEYBOARDS:
-                    // Swallow Windows' synthetic fake VK_LCONTROL (scanCode == 0x21D) before AltGr!
-                    if is_windows_fake_altgr_lctrl(kb.vkCode, kb.scanCode) {
-                        return remote;
-                    }
-
-                    let Some(usage) = translate_ll_key(kb.vkCode, kb.scanCode, kb.flags) else {
-                        if remote
-                            && state.pin_media_keys_local.load(Ordering::Relaxed)
-                            && is_windows_consumer_or_media_vk(kb.vkCode, kb.scanCode, kb.flags)
-                        {
-                            return false;
-                        }
-                        trace!(
-                            vk = kb.vkCode,
-                            scan = kb.scanCode,
-                            flags = kb.flags,
-                            "Unmapped Win key"
-                        );
-                        return remote;
+                    let vk_byte = u8::try_from(kb.vkCode).ok();
+                    let was_local = if !pressed {
+                        vk_byte.is_some_and(|vk| state.local_keys_down.remove(vk))
+                    } else {
+                        false
                     };
 
-                    // Track modifiers atomically for local hotkey chords & bare-Meta deferral
-                    let prev_mask = ModifierMask(state.mods.load(Ordering::Relaxed));
-                    let mut mask = prev_mask;
-                    mask.update(usage, pressed);
-                    state.mods.store(mask.0, Ordering::Relaxed);
+                    let mut suppress = eval_keyboard_ll_suppress(state, kb, remote, pressed);
 
-                    // Windows' kernel (win32k) intercepts physical Win+L below WH_KEYBOARD_LL
-                    // and unconditionally locks the local Windows server regardless of hook
-                    // suppression. Never forward `L` (or any deferred bare Meta) to the remote
-                    // client on Win+L so we neither lock both machines nor leak a lone Super
-                    // tap that opens GNOME/KDE Activities.
-                    if remote && is_windows_workstation_lock_chord(mask, kb.vkCode, pressed) {
-                        state.release_to_local_on_suspend("Win+L");
-                        return true;
-                    }
-
-                    match state.hotkey_suppressor.evaluate(
-                        state.hotkeys.load(),
-                        remote,
-                        prev_mask,
-                        usage,
-                        pressed,
-                    ) {
-                        HotkeyMatch::Trigger(action) => {
-                            // Clear any deferred bare Meta so a custom `Super+...` shortcut
-                            // never leaks a lone `Super` press to Linux clients.
-                            state.pending_meta.clear();
-                            match action {
-                                HotkeyAction::Escape => {
-                                    state.focus_state.bump_gen_only();
-                                    state.remote_mode.store(false, Ordering::SeqCst);
-                                    state.cursor_parked.store(false, Ordering::Release);
-                                    state.forwarded_media_keys.lock().clear();
-                                    let _ = state.tx.send(CaptureEvent::EscapeHotkey);
-                                }
-                                HotkeyAction::Switch(direction) => {
-                                    let _ = state
-                                        .tx
-                                        .send(CaptureEvent::HotkeySwitch { direction });
-                                }
-                                HotkeyAction::ToggleLock => {
-                                    let _ = state.tx.send(CaptureEvent::HotkeyToggleLock);
-                                }
+                    // Guarantee every WM_KEYDOWN that passed through to local Windows (or was
+                    // pressed inside an elevated/UIPI window hidden from WH_KEYBOARD_LL) gets a
+                    // matching WM_KEYUP so Windows' async key-state table can never latch a stuck
+                    // Ctrl/Alt/Shift/Win.
+                    if pressed {
+                        if !suppress {
+                            if let Some(vk) = vk_byte {
+                                state.local_keys_down.insert(vk);
                             }
-                            return true;
                         }
-                        HotkeyMatch::SuppressOnly => {
-                            return true;
-                        }
-                        HotkeyMatch::PassThrough => {}
+                    } else if was_local
+                        || (suppress
+                            && is_windows_modifier_vk(kb.vkCode)
+                            && (unsafe { GetAsyncKeyState(kb.vkCode as i32) } as u16 & 0x8000) != 0)
+                    {
+                        suppress = false;
                     }
 
-                    if remote {
-                        if usage.is_media_key()
-                            && !state.forwarded_media_keys.lock().should_forward(
-                                usage,
-                                pressed,
-                                state.pin_media_keys_local.load(Ordering::Relaxed),
-                            )
-                        {
-                            return false;
-                        }
-                        if state
-                            .pending_meta
-                            .try_defer(prev_mask, mask, usage, pressed)
-                        {
-                            return true;
-                        }
-                        state.flush_pending_meta();
-                        let _ = state.tx.send(CaptureEvent::Key { usage, pressed });
-                        // Keep the physical keyboard's CapsLock / NumLock LED and Windows'
-                        // toggle state in sync with the client when lock-key sync is enabled.
-                        if state.sync_lock_keys.load(Ordering::Relaxed)
-                            && (kb.vkCode == VK_CAPITAL as u32 || kb.vkCode == VK_NUMLOCK_CODE)
-                        {
-                            return false;
-                        }
-                        return true;
-                    }
-
-                    false
+                    suppress
                 })
                 .unwrap_or(false);
 
@@ -1277,6 +1496,7 @@ fn process_local_edge_motion(state: &HookState, dx: f32, dy: f32, pt: POINT) -> 
             let (px, py) = geom.primary_park_corner();
             drop(geom);
             state.pending_meta.clear();
+            state.remote_keys_down.clear();
             state.drag_strip_armed.store(false, Ordering::SeqCst);
             if dragging_staged_files {
                 // Keep the cursor right at the edge strip while `server.rs` runs
@@ -1291,6 +1511,7 @@ fn process_local_edge_motion(state: &HookState, dx: f32, dy: f32, pt: POINT) -> 
                 state.remote_mode.store(true, Ordering::SeqCst);
                 state.park_cursor_at(px, py);
             }
+            state.request_release_local_modifiers();
             let _ = state.tx.send(CaptureEvent::EdgeCrossed {
                 edge,
                 normalized_pos: norm,
@@ -1444,6 +1665,7 @@ unsafe extern "system" fn capture_wnd_proc(
                 if !state.remote_mode.load(Ordering::Acquire) {
                     return;
                 }
+                state.release_local_modifiers_to_os();
                 // Save current local cursor before hiding/parking (for hotkey return memory)
                 let mut pt = POINT { x: 0, y: 0 };
                 let (px, py) = {
@@ -1458,8 +1680,19 @@ unsafe extern "system" fn capture_wnd_proc(
             });
             0
         }
+        WM_APP_RELEASE_LOCAL_MODS => {
+            with_hook_state(|state| {
+                if state.remote_mode.load(Ordering::Acquire) {
+                    state.release_local_modifiers_to_os();
+                }
+            });
+            0
+        }
         WM_APP_LEAVE_REMOTE => {
             with_hook_state(|state| {
+                if !state.remote_mode.load(Ordering::Acquire) {
+                    state.remote_keys_down.clear();
+                }
                 if let Some(target) = state.pending_leave.lock().take() {
                     let (x, y) = {
                         let geom = state.geometry.read();
@@ -1548,6 +1781,8 @@ pub fn start_windows_capture(config: CaptureConfig) -> Result<CaptureHandle> {
         focus_state: Arc::new(WindowsFocusState::new()),
         forwarded_media_keys: Mutex::new(RemoteMediaKeyTracker::new()),
         pending_meta: WindowsPendingMeta::new(),
+        local_keys_down: AtomicKeyBitset::new(),
+        remote_keys_down: AtomicKeyBitset::new(),
         hotkeys: AtomicHotkeys::new(config.hotkeys),
         hotkey_suppressor: AtomicHotkeySuppressor::new(),
         tx,
@@ -1740,4 +1975,64 @@ fn init_capture_window_and_hooks() -> Result<(HWND, HHOOK, HHOOK, bool)> {
     }
 
     Ok((hwnd, kb_hook, ms_hook, wts_registered))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn translate_ll_key_maps_all_modifier_vks_even_without_scancode() {
+        let cases = [
+            (VK_LSHIFT, HidUsage::SHIFT_LEFT),
+            (VK_RSHIFT, HidUsage::SHIFT_RIGHT),
+            (VK_LCONTROL, HidUsage::CONTROL_LEFT),
+            (VK_RCONTROL, HidUsage::CONTROL_RIGHT),
+            (VK_LMENU, HidUsage::ALT_LEFT),
+            (VK_RMENU, HidUsage::ALT_RIGHT),
+            (VK_LWIN, HidUsage::META_LEFT),
+            (VK_RWIN, HidUsage::META_RIGHT),
+        ];
+        for (vk, expected) in cases {
+            assert_eq!(translate_ll_key(u32::from(vk), 0, 0), Some(expected));
+            assert_eq!(
+                translate_ll_key(u32::from(vk), 0, LLKHF_EXTENDED),
+                Some(expected)
+            );
+        }
+        // Out-of-range upper bits must not alias onto VK_LCONTROL via u16 truncation.
+        assert_ne!(
+            translate_ll_key(0x0001_0000 | u32::from(VK_LCONTROL), 0, 0),
+            Some(HidUsage::CONTROL_LEFT)
+        );
+    }
+
+    #[test]
+    fn local_modifier_releases_order_alt_before_ctrl_and_omit_win() {
+        let vks: Vec<u16> = LOCAL_MODIFIER_RELEASES
+            .iter()
+            .map(|&(vk, _, _)| vk)
+            .collect();
+        assert!(!vks.contains(&VK_LWIN));
+        assert!(!vks.contains(&VK_RWIN));
+        let pos = |vk: u16| vks.iter().position(|&v| v == vk).unwrap();
+        assert!(pos(VK_LMENU) < pos(VK_LCONTROL));
+        assert!(pos(VK_RMENU) < pos(VK_LCONTROL));
+        assert!(pos(VK_LMENU) < pos(VK_RCONTROL));
+        assert!(pos(VK_RMENU) < pos(VK_RCONTROL));
+    }
+
+    #[test]
+    fn modifier_vk_bits_cover_all_eight_modifier_bits() {
+        let mut combined = 0u8;
+        for &(vk, bit) in &MODIFIER_VK_BITS {
+            assert!(is_windows_modifier_vk(u32::from(vk)));
+            assert_ne!(bit, 0);
+            assert_eq!(combined & bit, 0);
+            combined |= bit;
+        }
+        assert_eq!(combined, 0xFF);
+        assert!(!is_windows_modifier_vk(0x41));
+        assert!(!is_windows_modifier_vk(0x0001_0000 | u32::from(VK_LCONTROL)));
+    }
 }

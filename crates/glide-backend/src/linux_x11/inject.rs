@@ -431,6 +431,17 @@ impl InputInjector for X11Injector {
             trace!(?usage, "Unmapped HID usage for X11");
             return Ok(());
         };
+        // Never inject duplicate XTest KeyPress repeats for an already-held modifier
+        // (Windows sends 33ms WM_KEYDOWN repeats while Ctrl/Alt/Shift/Win is held, which
+        // can desync Xorg XTest/XKB modifier state), and never inject unpaired KeyReleases
+        // for keys Glide never pressed.
+        if pressed {
+            if usage.modifier_bit() != 0 && self.pressed_keys.contains(&kc) {
+                return Ok(());
+            }
+        } else if !self.pressed_keys.contains(&kc) {
+            return Ok(());
+        }
         let event_type = if pressed {
             KEY_PRESS_EVENT
         } else {

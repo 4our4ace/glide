@@ -612,6 +612,13 @@ impl InputInjector for UinputInjector {
             trace!(?usage, "Unmapped HID usage for uinput");
             return Ok(());
         };
+        if pressed {
+            if usage.modifier_bit() != 0 && self.pressed_keys.contains(&code) {
+                return Ok(());
+            }
+        } else if !self.pressed_keys.contains(&code) {
+            return Ok(());
+        }
         self.emit_events(&[(EV_KEY, code, i32::from(pressed))])?;
         if pressed {
             self.pressed_keys.insert(code);
