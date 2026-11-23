@@ -22,7 +22,8 @@ use x11rb::protocol::randr::{ConnectionExt as RandrExt, NotifyMask};
 use x11rb::protocol::xfixes::ConnectionExt as XFixesExt;
 use x11rb::protocol::xinput::ConnectionExt as XInputExt;
 use x11rb::protocol::xproto::{
-    ConnectionExt as XProtoExt, CreateWindowAux, InputFocus, MapState, Window, WindowClass,
+    Atom, AtomEnum, ClientMessageData, ClientMessageEvent, ConnectionExt as XProtoExt,
+    CreateWindowAux, EventMask, InputFocus, MapState, Window, WindowClass, CLIENT_MESSAGE_EVENT,
 };
 use x11rb::protocol::xtest::ConnectionExt as XTestExt;
 use x11rb::protocol::Event;
@@ -198,50 +199,137 @@ impl X11CursorHider {
     }
 }
 
+#[derive(Clone, Copy)]
+enum SavedX11Focus {
+    /// Managed top-level window read from EWMH `_NET_ACTIVE_WINDOW` on `root`.
+    Ewmh(Window),
+    /// Direct X11 focus window read from `GetInputFocus` (fallback on non-EWMH WMs).
+    Raw(Window),
+}
+
 /// Clears keyboard focus on X11 when focus leaves this machine and optionally restores focus to
 /// the previously active window when control returns.
 ///
-/// Lazily creates and maps an offscreen 1×1 `InputOnly` `override_redirect` window
-/// (allocating zero X11 resources when unused) and directs `SetInputFocus` to it with
-/// `revert_to = PointerRoot` so WMs like KWin/Mutter do not immediately restore focus to
-/// another app window, while ensuring clean focus recovery if Glide exits while unfocused.
+/// Lazily creates an offscreen 1×1 `InputOnly` `override_redirect` window (allocating zero X11
+/// resources when unused), maps it only while unfocused, and directs `SetInputFocus` to it with
+/// `revert_to = PointerRoot` so WMs like KWin/Mutter do not immediately jump focus to another app.
+/// Unmapping the sink window on restore or discard ensures keyboard focus is never trapped on the
+/// invisible window if the saved app closed, the session disconnected, or the toggle was disabled.
 #[derive(Default)]
 pub struct X11FocusClearer {
     win: Option<Window>,
-    saved_focus: Option<Window>,
+    mapped: bool,
+    saved_focus: Option<SavedX11Focus>,
+    /// Cached `_NET_ACTIVE_WINDOW` atom (`None` = not yet queried, `Some(NONE)` = unavailable).
+    net_active_atom: Option<Atom>,
 }
 
 impl X11FocusClearer {
     pub fn new() -> Self {
         Self {
             win: None,
+            mapped: false,
             saved_focus: None,
+            net_active_atom: None,
         }
     }
 
-    pub fn clear_saved(&mut self) {
+    fn resolve_net_active_atom(&mut self, conn: &RustConnection) -> Option<Atom> {
+        let atom = match self.net_active_atom {
+            Some(a) => a,
+            None => {
+                let interned = conn
+                    .intern_atom(false, b"_NET_ACTIVE_WINDOW")
+                    .ok()
+                    .and_then(|c| c.reply().ok())
+                    .map(|r| r.atom)
+                    .unwrap_or(x11rb::NONE);
+                self.net_active_atom = Some(interned);
+                interned
+            }
+        };
+        (atom != x11rb::NONE).then_some(atom)
+    }
+
+    fn query_ewmh_active_window(&mut self, conn: &RustConnection, root: Window) -> Option<Window> {
+        let atom = self.resolve_net_active_atom(conn)?;
+        let reply = conn
+            .get_property(false, root, atom, AtomEnum::WINDOW, 0, 1)
+            .ok()?
+            .reply()
+            .ok()?;
+        if reply.format != 32 || reply.value.len() < 4 {
+            return None;
+        }
+        let win = u32::from_ne_bytes([
+            reply.value[0],
+            reply.value[1],
+            reply.value[2],
+            reply.value[3],
+        ]);
+        if win == x11rb::NONE || win == root || Some(win) == self.win {
+            return None;
+        }
+        Some(win)
+    }
+
+    fn unmap_sink(&mut self, conn: &RustConnection) {
+        if !self.mapped {
+            return;
+        }
+        self.mapped = false;
+        if let Some(w) = self.win {
+            // Because SetInputFocus used revert_to = PointerRoot, unmapping releases focus
+            // cleanly ONLY if `w` still owns it, without disturbing any window the user focused.
+            if let Ok(cookie) = conn.unmap_window(w) {
+                cookie.ignore_error();
+            }
+            let _ = conn.flush();
+        }
+    }
+
+    /// Discards any saved window and unmaps the focus-sink window so keyboard focus is never
+    /// stranded on the invisible window after disconnect, suspend/resume, or toggle-off.
+    pub fn discard(&mut self, conn: &RustConnection) {
         self.saved_focus = None;
+        self.unmap_sink(conn);
     }
 
     pub fn clear_focus(&mut self, conn: &RustConnection, root: Window) {
         let pointer_root = u32::from(u8::from(InputFocus::POINTER_ROOT));
         match conn.get_input_focus().ok().and_then(|c| c.reply().ok()) {
+            Some(reply) if Some(reply.focus) == self.win => {
+                // Focus is already on our sink (e.g. duplicate Leave or remote-to-remote switch);
+                // preserve any previously saved window.
+            }
             Some(reply)
                 if reply.focus != x11rb::NONE
                     && reply.focus != pointer_root
-                    && reply.focus != root
-                    && Some(reply.focus) != self.win =>
+                    && reply.focus != root =>
             {
-                self.saved_focus = Some(reply.focus);
+                // Prefer the managed top-level EWMH _NET_ACTIVE_WINDOW over a raw child
+                // focus-proxy or transient override_redirect popup when available.
+                if let Some(ewmh_win) = self.query_ewmh_active_window(conn, root) {
+                    self.saved_focus = Some(SavedX11Focus::Ewmh(ewmh_win));
+                } else {
+                    self.saved_focus = Some(SavedX11Focus::Raw(reply.focus));
+                }
             }
-            Some(reply) if Some(reply.focus) == self.win => {}
             _ => {
                 self.saved_focus = None;
             }
         }
 
         let target_win = match self.win {
-            Some(w) => w,
+            Some(w) => {
+                if !self.mapped {
+                    if let Ok(cookie) = conn.map_window(w) {
+                        cookie.ignore_error();
+                        self.mapped = true;
+                    }
+                }
+                w
+            }
             None => match conn.generate_id() {
                 Ok(w) => {
                     let aux = CreateWindowAux::new().override_redirect(1);
@@ -267,6 +355,7 @@ impl X11FocusClearer {
                         Ok(map_cookie) => {
                             map_cookie.ignore_error();
                             self.win = Some(w);
+                            self.mapped = true;
                             w
                         }
                         Err(e) => {
@@ -298,12 +387,16 @@ impl X11FocusClearer {
     }
 
     pub fn restore_focus(&mut self, conn: &RustConnection, root: Window) {
-        let Some(saved) = self.saved_focus.take() else {
+        let saved = self.saved_focus.take();
+
+        let Some(saved) = saved else {
+            self.unmap_sink(conn);
             return;
         };
 
         let pointer_root = u32::from(u8::from(InputFocus::POINTER_ROOT));
         let Some(cur) = conn.get_input_focus().ok().and_then(|c| c.reply().ok()) else {
+            self.unmap_sink(conn);
             return;
         };
         let focus_still_cleared = Some(cur.focus) == self.win
@@ -311,31 +404,66 @@ impl X11FocusClearer {
             || cur.focus == pointer_root
             || cur.focus == root;
         if !focus_still_cleared {
+            self.unmap_sink(conn);
             return;
         }
 
+        let target_win = match saved {
+            SavedX11Focus::Ewmh(w) | SavedX11Focus::Raw(w) => w,
+        };
         let Some(attrs) = conn
-            .get_window_attributes(saved)
+            .get_window_attributes(target_win)
             .ok()
             .and_then(|c| c.reply().ok())
         else {
+            self.unmap_sink(conn);
             return;
         };
         if attrs.map_state != MapState::VIEWABLE {
+            self.unmap_sink(conn);
             return;
         }
 
-        match conn.set_input_focus(InputFocus::PARENT, saved, x11rb::CURRENT_TIME) {
-            Ok(cookie) => {
-                cookie.ignore_error();
-                let _ = conn.flush();
-            }
+        // Restore X11 input focus directly (using POINTER_ROOT so it never falls back to root)
+        // so WMs that kept `active_client == target_win` across our override_redirect sink still
+        // restore keyboard focus immediately.
+        match conn.set_input_focus(InputFocus::POINTER_ROOT, target_win, x11rb::CURRENT_TIME) {
+            Ok(cookie) => cookie.ignore_error(),
             Err(e) => tracing::debug!(error = %e, "X11 restore SetInputFocus send failed"),
         }
+
+        // Also send EWMH `_NET_ACTIVE_WINDOW` (source indication 2 = pager) for managed windows
+        // so Mutter/KWin/Xfwm4/Openbox refresh decorations and deliver `WM_TAKE_FOCUS` to
+        // ICCCM Globally Active clients (e.g. JetBrains/Java/Qt/Wine).
+        if let SavedX11Focus::Ewmh(w) = saved {
+            if let Some(atom) = self.resolve_net_active_atom(conn) {
+                let ev = ClientMessageEvent {
+                    response_type: CLIENT_MESSAGE_EVENT,
+                    format: 32,
+                    sequence: 0,
+                    window: w,
+                    type_: atom,
+                    data: ClientMessageData::from([2u32, x11rb::CURRENT_TIME, 0, 0, 0]),
+                };
+                if let Ok(cookie) = conn.send_event(
+                    false,
+                    root,
+                    EventMask::SUBSTRUCTURE_REDIRECT | EventMask::SUBSTRUCTURE_NOTIFY,
+                    ev,
+                ) {
+                    cookie.ignore_error();
+                }
+            }
+        }
+
+        // Unmap the sink AFTER moving focus off it so it stays clean and never intercepts input.
+        self.unmap_sink(conn);
+        let _ = conn.flush();
     }
 
     pub fn destroy(&mut self, conn: &RustConnection) {
         self.saved_focus = None;
+        self.mapped = false;
         if let Some(w) = self.win.take() {
             if let Ok(cookie) = conn.destroy_window(w) {
                 cookie.ignore_error();

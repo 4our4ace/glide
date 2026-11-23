@@ -188,7 +188,7 @@ impl InputInjector for X11Injector {
         if self.unfocus_on_leave {
             self.focus_clearer.restore_focus(&self.conn, self.root);
         } else {
-            self.focus_clearer.clear_saved();
+            self.focus_clearer.discard(&self.conn);
         }
         self.conn.flush().context("X11 flush failed")?;
 
@@ -215,7 +215,7 @@ impl InputInjector for X11Injector {
         if self.unfocus_on_leave {
             self.focus_clearer.restore_focus(&self.conn, self.root);
         } else {
-            self.focus_clearer.clear_saved();
+            self.focus_clearer.discard(&self.conn);
         }
         self.conn.flush().context("X11 flush failed")?;
 
@@ -487,7 +487,7 @@ impl InputInjector for X11Injector {
         if self.unfocus_on_leave {
             self.focus_clearer.clear_focus(&self.conn, self.root);
         } else {
-            self.focus_clearer.clear_saved();
+            self.focus_clearer.discard(&self.conn);
         }
         let _ = self.conn.flush();
         self.parked_pos = (px, py);
@@ -502,16 +502,16 @@ impl InputInjector for X11Injector {
     fn set_unfocus_on_leave(&mut self, enabled: bool) {
         self.unfocus_on_leave = enabled;
         if !enabled {
-            self.focus_clearer.clear_saved();
+            self.focus_clearer.discard(&self.conn);
         }
     }
 
     fn discard_saved_focus(&mut self) {
-        self.focus_clearer.clear_saved();
+        self.focus_clearer.discard(&self.conn);
     }
 
     fn show_cursor(&mut self) -> Result<()> {
-        self.focus_clearer.clear_saved();
+        self.focus_clearer.discard(&self.conn);
         self.cursor_hider.show(&self.conn, self.root);
         let _ = self.conn.flush();
         Ok(())
@@ -528,6 +528,7 @@ impl InputInjector for X11Injector {
         if let Ok((x, y)) = self.sync_pointer() {
             let (px, py) = self.parked_pos;
             if (x - px).abs() > 4 || (y - py).abs() > 4 {
+                self.focus_clearer.discard(&self.conn);
                 self.cursor_hider.show(&self.conn, self.root);
                 let _ = self.conn.flush();
                 debug!(x, y, "Local pointer moved while hidden; cursor revealed");

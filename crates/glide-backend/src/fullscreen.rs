@@ -32,6 +32,7 @@ fn is_video_player_exact(s: &str) -> bool {
             | "mpc-be"
             | "mpc-be64"
             | "potplayer"
+            | "potplayer64"
             | "potplayermini"
             | "potplayermini64"
             | "kodi"
@@ -47,6 +48,7 @@ fn is_video_player_exact(s: &str) -> bool {
             | "microsoft.media.player"
             | "video.ui"
             | "zunevideo"
+            | "appletv"
             | "netflix"
             | "primevideo"
             | "disneyplus"
@@ -56,7 +58,7 @@ fn is_video_player_exact(s: &str) -> bool {
             | "showtime"
             | "haruna"
             | "clapper"
-            | "dragon"
+            | "dragonplayer"
             | "parole"
             | "bomi"
             | "hypnotix"
@@ -102,7 +104,6 @@ fn is_browser_exact(s: &str) -> bool {
             | "firefox"
             | "firefox-esr"
             | "firefox-developer-edition"
-            | "navigator"
             | "brave"
             | "brave-browser"
             | "vivaldi"
@@ -151,6 +152,7 @@ fn is_unambiguous_video_player_segment(seg: &str) -> bool {
             | "mpc-be"
             | "mpc-be64"
             | "potplayer"
+            | "potplayer64"
             | "potplayermini"
             | "potplayermini64"
             | "kodi"
@@ -311,10 +313,12 @@ mod tests {
             "mpvnet.exe",
             "mpc-hc64.exe",
             "MPC-BE64.EXE",
+            "PotPlayer64.exe",
             "PotPlayerMini64.exe",
             "Microsoft.Media.Player.exe",
             "Video.UI.exe",
             "ZuneVideo.exe",
+            "AppleTV.exe",
             "wmplayer.exe",
             "kodi.exe",
             "PlexMediaPlayer.exe",
@@ -470,6 +474,8 @@ mod tests {
             "VALORANT-Win64-Shipping.exe",
             "eldenring.exe",
             "Cyberpunk2077.exe",
+            "Dragon.exe",
+            "Navigator.exe",
             "UnrealEngine.exe",
             "UnityPlayer.exe",
             "steam.exe",

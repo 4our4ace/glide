@@ -390,7 +390,7 @@ impl UinputInjector {
             if self.unfocus_on_leave {
                 x11.focus_clearer.restore_focus(&x11.conn, x11.root);
             } else {
-                x11.focus_clearer.clear_saved();
+                x11.focus_clearer.discard(&x11.conn);
             }
             let _ = x11.conn.flush();
         }
@@ -650,7 +650,7 @@ impl InputInjector for UinputInjector {
             if self.unfocus_on_leave {
                 x11.focus_clearer.clear_focus(&x11.conn, x11.root);
             } else {
-                x11.focus_clearer.clear_saved();
+                x11.focus_clearer.discard(&x11.conn);
             }
             let _ = x11.conn.flush();
         } else {
@@ -668,20 +668,20 @@ impl InputInjector for UinputInjector {
         self.unfocus_on_leave = enabled;
         if !enabled {
             if let Some(ref mut x11) = self.x11 {
-                x11.focus_clearer.clear_saved();
+                x11.focus_clearer.discard(&x11.conn);
             }
         }
     }
 
     fn discard_saved_focus(&mut self) {
         if let Some(ref mut x11) = self.x11 {
-            x11.focus_clearer.clear_saved();
+            x11.focus_clearer.discard(&x11.conn);
         }
     }
 
     fn show_cursor(&mut self) -> Result<()> {
         if let Some(ref mut x11) = self.x11 {
-            x11.focus_clearer.clear_saved();
+            x11.focus_clearer.discard(&x11.conn);
             x11.cursor_hider.show(&x11.conn, x11.root);
             let _ = x11.conn.flush();
         }
@@ -702,6 +702,7 @@ impl InputInjector for UinputInjector {
             let (px, py) = self.parked_pos;
             if (x - px).abs() > 4 || (y - py).abs() > 4 {
                 if let Some(ref mut x11) = self.x11 {
+                    x11.focus_clearer.discard(&x11.conn);
                     x11.cursor_hider.show(&x11.conn, x11.root);
                     let _ = x11.conn.flush();
                 }

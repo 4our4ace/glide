@@ -328,7 +328,8 @@ impl InputInjector for WindowsInjector {
         self.edge_push_accum = 0.0;
         self.edge_push_start = None;
         if self.unfocus_on_leave {
-            self.focus_state.schedule_restore();
+            self.focus_state
+                .schedule_restore_and_wait(Duration::from_millis(25));
         } else {
             self.focus_state.discard();
         }
@@ -350,7 +351,8 @@ impl InputInjector for WindowsInjector {
         self.edge_push_accum = 0.0;
         self.edge_push_start = None;
         if self.unfocus_on_leave {
-            self.focus_state.schedule_restore();
+            self.focus_state
+                .schedule_restore_and_wait(Duration::from_millis(25));
         } else {
             self.focus_state.discard();
         }

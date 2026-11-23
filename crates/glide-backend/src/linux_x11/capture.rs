@@ -33,6 +33,7 @@ use x11rb::rust_connection::RustConnection;
 
 const CMD_ENTER_REMOTE: u32 = 1;
 const CMD_LEAVE_REMOTE: u32 = 2;
+const CMD_DISCARD_FOCUS: u32 = 3;
 
 #[derive(Debug, Clone, Copy, Default)]
 struct EwmhFullscreenAtoms {
@@ -59,6 +60,7 @@ struct SharedState {
     pin_media_keys_local: AtomicBool,
     unfocus_on_leave: AtomicBool,
     focus_discard_gen: AtomicU64,
+    focus_sink_active: AtomicBool,
     hotkeys: AtomicHotkeys,
     edge_threshold_px: AtomicI32,
     dead_corner_px: AtomicI32,
@@ -141,12 +143,15 @@ impl CaptureControl for X11CaptureControl {
             .unfocus_on_leave
             .store(enabled, Ordering::Relaxed);
         if !enabled {
-            self.shared.focus_discard_gen.fetch_add(1, Ordering::SeqCst);
+            self.discard_saved_focus();
         }
     }
 
     fn discard_saved_focus(&self) {
         self.shared.focus_discard_gen.fetch_add(1, Ordering::SeqCst);
+        if self.shared.focus_sink_active.load(Ordering::SeqCst) {
+            let _ = self.send_cmd(CMD_DISCARD_FOCUS);
+        }
     }
 
     fn set_hotkeys(&self, hotkeys: CaptureHotkeys) {
@@ -482,6 +487,7 @@ pub fn start_x11_capture(config: CaptureConfig) -> Result<CaptureHandle> {
         pin_media_keys_local: AtomicBool::new(config.pin_media_keys_local),
         unfocus_on_leave: AtomicBool::new(config.unfocus_on_leave),
         focus_discard_gen: AtomicU64::new(0),
+        focus_sink_active: AtomicBool::new(false),
         hotkeys: AtomicHotkeys::new(config.hotkeys),
         edge_threshold_px: AtomicI32::new(config.edge_threshold_px.max(1)),
         dead_corner_px: AtomicI32::new(config.dead_corner_px.max(0)),
@@ -608,14 +614,21 @@ fn run_capture_loop(
                    kbd_grabbed: &mut bool,
                    cursor_hider: &mut X11CursorHider,
                    focus_clearer: &mut X11FocusClearer,
-                   grab_discard_gen: &mut u64| {
+                   grab_discard_gen: &mut u64,
+                   retry_on_busy: bool|
+     -> bool {
         if !*grabbed {
             let pointer_mask = CoreEventMask::BUTTON_PRESS
                 | CoreEventMask::BUTTON_RELEASE
                 | CoreEventMask::POINTER_MOTION;
-            // Retry briefly if an X11 XDND source (e.g. Nautilus) is still releasing its pointer
-            // grab after our synthetic Escape cancellation.
-            for attempt in 0..6 {
+            // On explicit CMD_ENTER_REMOTE (hotkey jump or post-XDND handoff), retry briefly
+            // while an X11 XDND source (e.g. Nautilus) finishes releasing its pointer grab.
+            // On routine edge crossings (`retry_on_busy == false`), make a single instant attempt
+            // and abort cleanly if another client (e.g. a fullscreen pointer-grabbing browser game
+            // or VM) already holds the pointer grab.
+            let max_attempts = if retry_on_busy { 6 } else { 1 };
+            let mut last_status = None;
+            for attempt in 0..max_attempts {
                 let status = conn
                     .grab_pointer(
                         false,
@@ -630,10 +643,18 @@ fn run_capture_loop(
                     .ok()
                     .and_then(|c| c.reply().ok())
                     .map(|r| r.status);
-                if status == Some(GrabStatus::SUCCESS) || attempt == 5 {
+                last_status = status;
+                if status == Some(GrabStatus::SUCCESS) || attempt + 1 == max_attempts {
                     break;
                 }
                 thread::sleep(Duration::from_millis(10));
+            }
+            if !retry_on_busy && last_status != Some(GrabStatus::SUCCESS) {
+                debug!(
+                    status = ?last_status,
+                    "X11 edge crossing skipped: pointer already grabbed by active window"
+                );
+                return false;
             }
             let (cx, cy) = geom.primary_center();
             let _ = conn.warp_pointer(x11rb::NONE, root, 0, 0, 0, 0, cx as i16, cy as i16);
@@ -641,16 +662,19 @@ fn run_capture_loop(
             // Clear focus BEFORE grab_keyboard_sync so the active window receives a genuine
             // FocusOut(NotifyNormal) before keyboard grab freezes focus delivery.
             if shared.unfocus_on_leave.load(Ordering::Relaxed) {
-                *grab_discard_gen = shared.focus_discard_gen.load(Ordering::Acquire);
+                shared.focus_sink_active.store(true, Ordering::SeqCst);
+                *grab_discard_gen = shared.focus_discard_gen.load(Ordering::SeqCst);
                 focus_clearer.clear_focus(conn, root);
             } else {
-                focus_clearer.clear_saved();
+                focus_clearer.discard(conn);
+                shared.focus_sink_active.store(false, Ordering::Release);
             }
             *grabbed = true;
         }
         grab_keyboard_sync(conn, ctrl_win, kbd_grabbed);
         let _ = conn.flush();
         debug!("X11Capture grabbed pointer & sync keyboard (remote mode)");
+        true
     };
 
     let do_ungrab = |conn: &RustConnection,
@@ -686,8 +710,9 @@ fn run_capture_loop(
         {
             focus_clearer.restore_focus(conn, root);
         } else {
-            focus_clearer.clear_saved();
+            focus_clearer.discard(conn);
         }
+        shared.focus_sink_active.store(false, Ordering::Release);
         let _ = conn.flush();
         debug!("X11Capture ungrabbed pointer & keyboard (local mode)");
     };
@@ -777,9 +802,12 @@ fn run_capture_loop(
                 let cmd = cm.data.as_data32()[0];
                 match cmd {
                     CMD_ENTER_REMOTE => {
+                        if !shared.remote_mode.load(Ordering::Acquire) {
+                            continue;
+                        }
                         last_ptr = None;
                         raw_travel = 0.0;
-                        do_grab(
+                        let _ = do_grab(
                             &conn,
                             &local_geom,
                             &mut grabbed,
@@ -787,6 +815,7 @@ fn run_capture_loop(
                             &mut cursor_hider,
                             &mut focus_clearer,
                             &mut grab_discard_gen,
+                            true,
                         );
                     }
                     CMD_LEAVE_REMOTE => {
@@ -807,6 +836,15 @@ fn run_capture_loop(
                             grab_discard_gen,
                             leave,
                         );
+                    }
+                    CMD_DISCARD_FOCUS
+                        if !grabbed
+                            || !shared.unfocus_on_leave.load(Ordering::Relaxed)
+                            || shared.focus_discard_gen.load(Ordering::Acquire)
+                                != grab_discard_gen =>
+                    {
+                        focus_clearer.discard(&conn);
+                        shared.focus_sink_active.store(false, Ordering::Release);
                     }
                     _ => {}
                 }
@@ -843,7 +881,7 @@ fn run_capture_loop(
                 }
                 if shared.remote_mode.load(Ordering::Acquire) {
                     if !grabbed {
-                        do_grab(
+                        let _ = do_grab(
                             &conn,
                             &local_geom,
                             &mut grabbed,
@@ -851,6 +889,7 @@ fn run_capture_loop(
                             &mut cursor_hider,
                             &mut focus_clearer,
                             &mut grab_discard_gen,
+                            false,
                         );
                     }
                     let _ = tx.send(CaptureEvent::MouseDelta { dx, dy });
@@ -998,11 +1037,10 @@ fn run_capture_loop(
                         last_ptr = None;
                         raw_travel = 0.0;
                         drag_strip_armed = false;
-                        shared.remote_mode.store(true, Ordering::SeqCst);
                         // Note: defer do_grab until CMD_ENTER_REMOTE when LMB is down so server.rs
                         // can cancel an X11 XDND source grab cleanly before we grab the pointer!
-                        if !(lmb_down && dnd_enabled) {
-                            do_grab(
+                        if !(lmb_down && dnd_enabled)
+                            && !do_grab(
                                 &conn,
                                 &local_geom,
                                 &mut grabbed,
@@ -1010,8 +1048,12 @@ fn run_capture_loop(
                                 &mut cursor_hider,
                                 &mut focus_clearer,
                                 &mut grab_discard_gen,
-                            );
+                                false,
+                            )
+                        {
+                            continue;
                         }
+                        shared.remote_mode.store(true, Ordering::SeqCst);
                         let _ = tx.send(CaptureEvent::EdgeCrossed {
                             edge,
                             normalized_pos,

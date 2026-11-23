@@ -17,11 +17,12 @@ use crate::geometry::{DesktopGeometry, MonitorRect};
 use crate::DoctorReport;
 use anyhow::Result;
 use glide_proto::OsKind;
-use parking_lot::Mutex;
+use parking_lot::{Condvar, Mutex};
 use std::mem::size_of;
 use std::ptr;
 use std::sync::atomic::{AtomicBool, AtomicIsize, AtomicU64, Ordering};
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 use windows_sys::Win32::Foundation::{BOOL, HWND, LPARAM, LRESULT, RECT, WPARAM};
 use windows_sys::Win32::Graphics::Gdi::{
     EnumDisplayMonitors, GetMonitorInfoW, HDC, HMONITOR, MONITORINFO, MONITORINFOEXW,
@@ -84,7 +85,7 @@ pub(crate) fn is_shell_window_class(hwnd: HWND) -> bool {
         || eq_utf16_ascii(wide, "Shell_SecondaryTrayWnd")
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum FocusOp {
     Unfocus { g: u64, epoch: u64 },
     Restore { g: u64, epoch: u64 },
@@ -106,7 +107,11 @@ struct FocusCore {
     cleared_through_gen: AtomicU64,
     sink_hwnd: AtomicIsize,
     shutdown: AtomicBool,
+    worker_failed: AtomicBool,
     pending: Mutex<Option<FocusOp>>,
+    /// Highest generation whose worker handling has finished, allowing Windows client
+    /// `Enter`/`EnterAt` to wait briefly so immediate post-jump keystrokes do not hit the sink.
+    completed_gen: (Mutex<u64>, Condvar),
 }
 
 struct FocusWorkerState {
@@ -149,7 +154,9 @@ impl WindowsFocusState {
                 cleared_through_gen: AtomicU64::new(0),
                 sink_hwnd: AtomicIsize::new(0),
                 shutdown: AtomicBool::new(false),
+                worker_failed: AtomicBool::new(false),
                 pending: Mutex::new(None),
+                completed_gen: (Mutex::new(0), Condvar::new()),
             }),
             worker_started: AtomicBool::new(false),
             spawn_lock: Mutex::new(()),
@@ -157,14 +164,18 @@ impl WindowsFocusState {
     }
 
     fn ensure_worker_started(&self) -> bool {
-        if self.core.shutdown.load(Ordering::Acquire) {
+        if self.core.shutdown.load(Ordering::Acquire)
+            || self.core.worker_failed.load(Ordering::Acquire)
+        {
             return false;
         }
         if self.worker_started.load(Ordering::Acquire) {
             return true;
         }
         let _guard = self.spawn_lock.lock();
-        if self.core.shutdown.load(Ordering::Acquire) {
+        if self.core.shutdown.load(Ordering::Acquire)
+            || self.core.worker_failed.load(Ordering::Acquire)
+        {
             return false;
         }
         if self.worker_started.load(Ordering::Acquire) {
@@ -209,7 +220,9 @@ impl WindowsFocusState {
     /// Dispatches foreground-window unfocusing to the lazily-spawned `"glide-win-focus"`
     /// thread so low-level hooks and QUIC `Enter`/`Leave` sends never block.
     pub(crate) fn schedule_unfocus(&self) {
-        if self.core.shutdown.load(Ordering::Acquire) {
+        if self.core.shutdown.load(Ordering::Acquire)
+            || self.core.worker_failed.load(Ordering::Acquire)
+        {
             return;
         }
         let epoch = self.core.discard_epoch.load(Ordering::Acquire);
@@ -232,19 +245,18 @@ impl WindowsFocusState {
         }
     }
 
-    /// Dispatches restoration of the previously unfocused foreground window to the
-    /// `"glide-win-focus"` thread. Returns immediately with zero syscalls when nothing
-    /// was unfocused.
-    pub(crate) fn schedule_restore(&self) {
+    fn schedule_restore_inner(&self) -> Option<u64> {
         let g = self.core.gen.fetch_add(1, Ordering::SeqCst).wrapping_add(1);
         let last_unfocus = self.core.last_unfocus_gen.load(Ordering::Acquire);
         if last_unfocus == 0
             || last_unfocus <= self.core.cleared_through_gen.load(Ordering::Acquire)
         {
-            return;
+            return None;
         }
-        if self.core.shutdown.load(Ordering::Acquire) {
-            return;
+        if self.core.shutdown.load(Ordering::Acquire)
+            || self.core.worker_failed.load(Ordering::Acquire)
+        {
+            return None;
         }
         let epoch = self.core.discard_epoch.load(Ordering::Acquire);
         enqueue_pending(&self.core, FocusOp::Restore { g, epoch });
@@ -252,6 +264,34 @@ impl WindowsFocusState {
         if !hwnd.is_null() {
             unsafe {
                 PostMessageW(hwnd, WM_APP_FOCUS_PROCESS, 0, 0);
+            }
+        }
+        Some(g)
+    }
+
+    /// Dispatches restoration of the previously unfocused foreground window to the
+    /// `"glide-win-focus"` thread. Returns immediately with zero syscalls when nothing
+    /// was unfocused.
+    pub(crate) fn schedule_restore(&self) {
+        let _ = self.schedule_restore_inner();
+    }
+
+    /// Dispatches restoration and waits up to `max_wait` for the worker to hand foreground
+    /// back to the saved window before returning (used on Windows client `Enter`/`EnterAt`
+    /// so immediate post-jump keystrokes never land in the hidden sink window).
+    pub(crate) fn schedule_restore_and_wait(&self, max_wait: Duration) {
+        let Some(target_gen) = self.schedule_restore_inner() else {
+            return;
+        };
+        let deadline = Instant::now() + max_wait;
+        let (lock, cvar) = &self.core.completed_gen;
+        let mut done = lock.lock();
+        while *done < target_gen
+            && !self.core.shutdown.load(Ordering::Acquire)
+            && !self.core.worker_failed.load(Ordering::Acquire)
+        {
+            if cvar.wait_until(&mut done, deadline).timed_out() {
+                break;
             }
         }
     }
@@ -269,6 +309,9 @@ impl WindowsFocusState {
                 PostMessageW(hwnd, WM_APP_FOCUS_SHUTDOWN, 0, 0);
             }
         }
+        let (lock, cvar) = &self.core.completed_gen;
+        let _done = lock.lock();
+        cvar.notify_all();
     }
 }
 
@@ -282,6 +325,15 @@ fn enqueue_pending(core: &FocusCore, op: FocusOp) {
     let mut slot = core.pending.lock();
     if slot.is_none_or(|prev| op.generation() > prev.generation()) {
         *slot = Some(op);
+    }
+}
+
+fn mark_completed(core: &FocusCore, g: u64) {
+    let (lock, cvar) = &core.completed_gen;
+    let mut done = lock.lock();
+    if g > *done {
+        *done = g;
+        cvar.notify_all();
     }
 }
 
@@ -325,12 +377,13 @@ fn create_focus_sink_window() -> Option<HWND> {
     // Off-screen 1x1 borderless popup excluded from Taskbar, Alt+Tab, Win+Tab, and Virtual
     // Desktops (WS_EX_TOOLWINDOW), with layered alpha=1/255 (never cloaked/unfocusable,
     // visually invisible, and intentionally without WS_EX_NOACTIVATE or WS_EX_TOPMOST).
+    // Null title avoids screen readers / UI Automation announcing an internal class name.
     // Starts hidden (no WS_VISIBLE) until unfocus_on_leave activates it.
     let hwnd = unsafe {
         CreateWindowExW(
             WS_EX_TOOLWINDOW | WS_EX_LAYERED,
             class_name.as_ptr(),
-            class_name.as_ptr(),
+            ptr::null(),
             WS_POPUP,
             -16_000,
             -16_000,
@@ -355,9 +408,11 @@ fn create_focus_sink_window() -> Option<HWND> {
 
 fn focus_worker_loop(core: Arc<FocusCore>) {
     let Some(sink_hwnd) = create_focus_sink_window() else {
+        core.worker_failed.store(true, Ordering::Release);
         *core.pending.lock() = None;
         let g = core.gen.load(Ordering::Acquire);
         core.cleared_through_gen.fetch_max(g, Ordering::AcqRel);
+        mark_completed(&core, u64::MAX);
         return;
     };
 
@@ -372,6 +427,7 @@ fn focus_worker_loop(core: Arc<FocusCore>) {
         // Drain any op queued while this thread was lazily starting up.
         if let Some(op) = core.pending.lock().take() {
             handle_focus_op(&core, sink_hwnd, &mut state, op);
+            mark_completed(&core, op.generation());
         }
 
         let mut msg: MSG = unsafe { std::mem::zeroed() };
@@ -383,6 +439,7 @@ fn focus_worker_loop(core: Arc<FocusCore>) {
                     WM_APP_FOCUS_PROCESS => {
                         if let Some(op) = core.pending.lock().take() {
                             handle_focus_op(&core, sink_hwnd, &mut state, op);
+                            mark_completed(&core, op.generation());
                         }
                         continue;
                     }
@@ -404,6 +461,7 @@ fn focus_worker_loop(core: Arc<FocusCore>) {
     }
 
     core.sink_hwnd.store(0, Ordering::SeqCst);
+    mark_completed(&core, u64::MAX);
     unsafe {
         ShowWindow(sink_hwnd, SW_HIDE);
         DestroyWindow(sink_hwnd);
@@ -454,7 +512,7 @@ fn send_noop_mouse_input(flags: u32) {
 
 /// Moves Windows foreground to Glide's invisible `sink_hwnd` using a 3-tier Windows 11
 /// escalation path, verifying `GetForegroundWindow() == sink_hwnd` after each tier.
-fn take_foreground_with_sink(sink_hwnd: HWND, prev_fg: HWND) -> bool {
+fn take_foreground_with_sink(sink_hwnd: HWND) -> bool {
     // Tier 1 (Microsoft PowerToys Command Palette Windows 11 foreground unlock):
     // A zero-flag, zero-delta mouse INPUT tagged with GLIDE_EXTRA_INFO marks this process
     // as the last input source in Win32k (lifting ForegroundLockTimeout) without moving the
@@ -469,11 +527,13 @@ fn take_foreground_with_sink(sink_hwnd: HWND, prev_fg: HWND) -> bool {
     }
 
     // Tier 2: Pair a zero-delta MOUSEEVENTF_MOVE with AttachThreadInput + SetActiveWindow
-    // from sink_hwnd's own owning thread.
+    // from sink_hwnd's own owning thread, re-querying GetForegroundWindow() fresh in case
+    // foreground changed or closed during Tier 1.
     send_noop_mouse_input(MOUSEEVENTF_MOVE);
     let cur_tid = unsafe { GetCurrentThreadId() };
-    let fg_tid = if !prev_fg.is_null() && unsafe { IsHungAppWindow(prev_fg) } == 0 {
-        unsafe { GetWindowThreadProcessId(prev_fg, ptr::null_mut()) }
+    let cur_fg = unsafe { GetForegroundWindow() };
+    let fg_tid = if !cur_fg.is_null() && unsafe { IsHungAppWindow(cur_fg) } == 0 {
+        unsafe { GetWindowThreadProcessId(cur_fg, ptr::null_mut()) }
     } else {
         0
     };
@@ -507,8 +567,7 @@ fn handle_unfocus(
     g: u64,
     epoch: u64,
 ) {
-    if core.gen.load(Ordering::Acquire) != g || core.discard_epoch.load(Ordering::Acquire) != epoch
-    {
+    if core.gen.load(Ordering::SeqCst) != g || core.discard_epoch.load(Ordering::SeqCst) != epoch {
         return;
     }
 
@@ -548,13 +607,12 @@ fn handle_unfocus(
         return;
     }
 
-    if core.gen.load(Ordering::Acquire) != g || core.discard_epoch.load(Ordering::Acquire) != epoch
-    {
+    if core.gen.load(Ordering::SeqCst) != g || core.discard_epoch.load(Ordering::SeqCst) != epoch {
         return;
     }
 
-    let took_focus = take_foreground_with_sink(sink_hwnd, fg);
-    if took_focus && core.discard_epoch.load(Ordering::Acquire) == epoch {
+    let took_focus = take_foreground_with_sink(sink_hwnd);
+    if took_focus && core.discard_epoch.load(Ordering::SeqCst) == epoch {
         // Save even if `gen` moved (e.g. a queued Restore arrived mid-call) so that
         // Restore immediately gives foreground back to `fg` and hides `sink_hwnd`.
         state.sink_epoch = Some(epoch);
@@ -618,20 +676,28 @@ fn handle_restore(
         return;
     }
 
-    let taken = state.saved.take();
-    state.sink_epoch = None;
-    core.cleared_through_gen.fetch_max(g, Ordering::AcqRel);
-
     let cur_fg = unsafe { GetForegroundWindow() };
     let sink_holds_focus = cur_fg == sink_hwnd || cur_fg.is_null();
 
-    let target = taken
+    // Validate the candidate target BEFORE mutating `state` so that if a rapid
+    // `schedule_unfocus()` bumps `gen` (same `discard_epoch`) while inspecting the window,
+    // we leave `state.saved`, `state.sink_epoch`, and the visible `sink_hwnd` untouched.
+    let target = state
+        .saved
         .filter(|&(saved_epoch, _)| sink_holds_focus && saved_epoch == epoch)
-        .and_then(|(_, raw_target)| resolve_restorable_target(raw_target))
-        .filter(|_| {
-            core.gen.load(Ordering::Acquire) == g
-                && core.discard_epoch.load(Ordering::Acquire) == epoch
-        });
+        .and_then(|(_, raw_target)| resolve_restorable_target(raw_target));
+
+    if core.discard_epoch.load(Ordering::Acquire) != epoch {
+        handle_focus_discard(core, sink_hwnd, state);
+        return;
+    }
+    if core.gen.load(Ordering::Acquire) != g {
+        return;
+    }
+
+    state.saved = None;
+    state.sink_epoch = None;
+    core.cleared_through_gen.fetch_max(g, Ordering::AcqRel);
 
     if let Some(target) = target {
         // Because sink_hwnd currently owns foreground, SetForegroundWindow(target)
@@ -639,12 +705,16 @@ fn handle_restore(
         unsafe {
             let _ = SetForegroundWindow(target);
         }
-        if unsafe { GetForegroundWindow() } != target {
-            // UWP / ApplicationFrameWindow fallback (PowerToys #50455).
+        let after = unsafe { GetForegroundWindow() };
+        if after == sink_hwnd || after.is_null() {
+            // UWP / ApplicationFrameWindow fallback (PowerToys #50455): only escalate if
+            // foreground is still stuck on our sink (don't fight an app that handed focus
+            // to its own owned child/dialog window).
             unsafe {
                 SwitchToThisWindow(target, 1);
             }
-            if unsafe { GetForegroundWindow() } != target {
+            let after_fallback = unsafe { GetForegroundWindow() };
+            if after_fallback == sink_hwnd || after_fallback.is_null() {
                 tracing::debug!("Unable to restore saved foreground window after unfocus_on_leave");
             }
         }
@@ -781,4 +851,66 @@ pub fn run_doctor() -> Result<DoctorReport> {
         geometry,
         notes,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn enqueue_pending_keeps_highest_generation() {
+        let state = WindowsFocusState::new();
+        enqueue_pending(&state.core, FocusOp::Unfocus { g: 5, epoch: 1 });
+        // Out-of-order older generation must not overwrite newer op.
+        enqueue_pending(&state.core, FocusOp::Restore { g: 3, epoch: 1 });
+        assert_eq!(
+            *state.core.pending.lock(),
+            Some(FocusOp::Unfocus { g: 5, epoch: 1 })
+        );
+        // Newer generation replaces older op.
+        enqueue_pending(&state.core, FocusOp::Restore { g: 6, epoch: 1 });
+        assert_eq!(
+            *state.core.pending.lock(),
+            Some(FocusOp::Restore { g: 6, epoch: 1 })
+        );
+    }
+
+    #[test]
+    fn mark_completed_is_monotonic() {
+        let state = WindowsFocusState::new();
+        mark_completed(&state.core, 4);
+        mark_completed(&state.core, 2);
+        assert_eq!(*state.core.completed_gen.0.lock(), 4);
+        mark_completed(&state.core, 9);
+        assert_eq!(*state.core.completed_gen.0.lock(), 9);
+    }
+
+    #[test]
+    fn focus_state_fast_paths_and_shutdown_do_not_spawn_worker() {
+        let state = WindowsFocusState::new();
+        state.schedule_restore();
+        state.schedule_restore_and_wait(Duration::from_millis(5));
+        state.bump_gen_only();
+        state.discard();
+        assert!(!state.worker_started.load(Ordering::Acquire));
+
+        // After shutdown, schedule_unfocus must remain a no-op and never spawn.
+        state.shutdown();
+        state.shutdown();
+        state.schedule_unfocus();
+        state.schedule_restore_and_wait(Duration::from_millis(5));
+        assert!(!state.worker_started.load(Ordering::Acquire));
+        assert!(state.core.pending.lock().is_none());
+    }
+
+    #[test]
+    fn worker_failed_latch_short_circuits_future_ops() {
+        let state = WindowsFocusState::new();
+        state.core.worker_failed.store(true, Ordering::Release);
+        state.schedule_unfocus();
+        state.schedule_restore_and_wait(Duration::from_millis(5));
+        assert!(!state.worker_started.load(Ordering::Acquire));
+        assert!(state.core.pending.lock().is_none());
+        assert_eq!(state.core.last_unfocus_gen.load(Ordering::Acquire), 0);
+    }
 }
