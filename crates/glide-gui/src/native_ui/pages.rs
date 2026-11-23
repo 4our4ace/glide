@@ -1791,6 +1791,30 @@ fn input_server_cols(s: &Ui, p: Palette) -> El {
                 },
             ),
         ),
+    ];
+
+    if s.config.server.auto_lock_fullscreen {
+        edge_rows.push(setting_row(
+            p,
+            "fs-allow-video-row",
+            icons::fullscreen_video_icon(p.text_2),
+            "Allow fullscreen videos",
+            Some("Don’t pause in video players & browsers"),
+            toggle(
+                p,
+                "fs-allow-video-toggle",
+                "Allow fullscreen videos",
+                s.config.server.allow_fullscreen_videos,
+                |s, _| {
+                    s.config.server.allow_fullscreen_videos =
+                        !s.config.server.allow_fullscreen_videos;
+                    s.push_config();
+                },
+            ),
+        ));
+    }
+
+    edge_rows.extend([
         setting_row(
             p,
             "srv-sync-lock-row",
@@ -1825,7 +1849,7 @@ fn input_server_cols(s: &Ui, p: Palette) -> El {
                 },
             ),
         ),
-    ];
+    ]);
 
     if !matches!(s.os_kind, OsKind::LinuxWayland) {
         edge_rows.push(setting_row(
@@ -1833,7 +1857,7 @@ fn input_server_cols(s: &Ui, p: Palette) -> El {
             "srv-unfocus-row",
             icons::unfocus_window_icon(p.text_2),
             "Unfocus window on leave",
-            Some("Remove window focus when switching away"),
+            Some("Clear focus away and restore on return"),
             toggle(
                 p,
                 "srv-unfocus-toggle",
@@ -2106,7 +2130,7 @@ fn input_client_cols(s: &Ui, p: Palette) -> El {
             "cli-unfocus-row",
             icons::unfocus_window_icon(p.text_2),
             "Unfocus window on leave",
-            Some("Remove window focus when switching away"),
+            Some("Clear focus away and restore on return"),
             toggle(
                 p,
                 "cli-unfocus-toggle",

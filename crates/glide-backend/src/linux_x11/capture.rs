@@ -55,8 +55,10 @@ struct SharedState {
     locked: AtomicBool,
     drag_drop_files: AtomicBool,
     auto_lock_fullscreen: AtomicBool,
+    allow_fullscreen_videos: AtomicBool,
     pin_media_keys_local: AtomicBool,
     unfocus_on_leave: AtomicBool,
+    focus_discard_gen: AtomicU64,
     hotkeys: AtomicHotkeys,
     edge_threshold_px: AtomicI32,
     dead_corner_px: AtomicI32,
@@ -118,6 +120,12 @@ impl CaptureControl for X11CaptureControl {
         self.shared.locked.store(locked, Ordering::Relaxed);
     }
 
+    fn set_allow_fullscreen_videos(&self, enabled: bool) {
+        self.shared
+            .allow_fullscreen_videos
+            .store(enabled, Ordering::Relaxed);
+    }
+
     fn set_drag_drop_files(&self, enabled: bool) {
         self.shared.drag_drop_files.store(enabled, Ordering::Relaxed);
     }
@@ -132,6 +140,13 @@ impl CaptureControl for X11CaptureControl {
         self.shared
             .unfocus_on_leave
             .store(enabled, Ordering::Relaxed);
+        if !enabled {
+            self.shared.focus_discard_gen.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    fn discard_saved_focus(&self) {
+        self.shared.focus_discard_gen.fetch_add(1, Ordering::SeqCst);
     }
 
     fn set_hotkeys(&self, hotkeys: CaptureHotkeys) {
@@ -235,20 +250,28 @@ const FULLSCREEN_CACHE_TTL: Duration = Duration::from_millis(75);
 
 /// Caches `_NET_WM_STATE_FULLSCREEN` queries for 75 ms so edge-panning or edge-dwelling
 /// does not flood the X11 server with thousands of synchronous round-trips per second.
+/// Keyed by `allow_fullscreen_videos` so toggling the setting in the GUI takes effect immediately.
 #[derive(Debug, Default)]
 struct FullscreenCache {
-    cached: Option<(Instant, bool)>,
+    cached: Option<(Instant, bool, bool)>,
 }
 
 impl FullscreenCache {
-    fn check_with<F: FnOnce() -> bool>(&mut self, now: Instant, query: F) -> bool {
-        if let Some((at, value)) = self.cached {
-            if now.saturating_duration_since(at) < FULLSCREEN_CACHE_TTL {
+    fn check_with<F: FnOnce() -> bool>(
+        &mut self,
+        now: Instant,
+        allow_fullscreen_videos: bool,
+        query: F,
+    ) -> bool {
+        if let Some((at, cached_allow, value)) = self.cached {
+            if cached_allow == allow_fullscreen_videos
+                && now.saturating_duration_since(at) < FULLSCREEN_CACHE_TTL
+            {
                 return value;
             }
         }
         let value = query();
-        self.cached = Some((now, value));
+        self.cached = Some((now, allow_fullscreen_videos, value));
         value
     }
 }
@@ -269,14 +292,27 @@ fn reply_contains_atom(reply: &GetPropertyReply, needle: u32) -> bool {
     needle != x11rb::NONE && reply.value32().is_some_and(|mut it| it.any(|a| a == needle))
 }
 
-/// Checks whether the currently active X11 window advertises `_NET_WM_STATE_FULLSCREEN`.
+/// Parses null-separated X11 `WM_CLASS` (`instance\0class\0`) bytes into non-empty UTF-8 tokens.
+fn parse_wm_class_tokens(bytes: &[u8]) -> Vec<&str> {
+    bytes
+        .split(|&b| b == 0)
+        .filter(|seg| !seg.is_empty())
+        .filter_map(|seg| std::str::from_utf8(seg).ok())
+        .collect()
+}
+
+/// Checks whether the currently active X11 window advertises `_NET_WM_STATE_FULLSCREEN` and
+/// should pause edge switching.
 ///
 /// Gracefully returns `false` on window managers that do not support EWMH or when the active
-/// window is the root/desktop window.
+/// window is the root/desktop window. When `allow_fullscreen_videos` is `true`, pipelines a
+/// `WM_CLASS` query in the same roundtrip and allows crossing past fullscreen video players
+/// and browsers while keeping games, VMs, and other fullscreen apps locked.
 fn is_active_window_fullscreen(
     conn: &RustConnection,
     root: Window,
     atoms: EwmhFullscreenAtoms,
+    allow_fullscreen_videos: bool,
 ) -> bool {
     if atoms.net_active_window == x11rb::NONE
         || atoms.net_wm_state == x11rb::NONE
@@ -297,32 +333,78 @@ fn is_active_window_fullscreen(
         return false;
     };
 
-    if atoms.net_wm_window_type != x11rb::NONE && atoms.net_wm_window_type_desktop != x11rb::NONE {
-        if let Ok(type_cookie) = conn.get_property(
+    // Pipeline _NET_WM_WINDOW_TYPE, _NET_WM_STATE, and (when enabled) WM_CLASS in one roundtrip.
+    let type_cookie = if atoms.net_wm_window_type != x11rb::NONE
+        && atoms.net_wm_window_type_desktop != x11rb::NONE
+    {
+        conn.get_property(
             false,
             active_win,
             atoms.net_wm_window_type,
             AtomEnum::ATOM,
             0,
             16,
-        ) {
-            if let Ok(type_reply) = type_cookie.reply() {
-                if reply_contains_atom(&type_reply, atoms.net_wm_window_type_desktop) {
+        )
+        .ok()
+    } else {
+        None
+    };
+
+    let state_cookie = conn
+        .get_property(false, active_win, atoms.net_wm_state, AtomEnum::ATOM, 0, 32)
+        .ok();
+
+    let class_cookie = if allow_fullscreen_videos {
+        conn.get_property(
+            false,
+            active_win,
+            AtomEnum::WM_CLASS,
+            AtomEnum::STRING,
+            0,
+            64,
+        )
+        .ok()
+    } else {
+        None
+    };
+
+    if let Some(cookie) = type_cookie {
+        if let Ok(type_reply) = cookie.reply() {
+            if reply_contains_atom(&type_reply, atoms.net_wm_window_type_desktop) {
+                return false;
+            }
+        }
+    }
+
+    let Some(state_cookie) = state_cookie else {
+        return false;
+    };
+    let Ok(state_reply) = state_cookie.reply() else {
+        return false;
+    };
+    if !reply_contains_atom(&state_reply, atoms.net_wm_state_fullscreen) {
+        return false;
+    }
+
+    if !allow_fullscreen_videos {
+        return true;
+    }
+
+    if let Some(class_cookie) = class_cookie {
+        if let Ok(class_reply) = class_cookie.reply() {
+            if class_reply.format == 8 {
+                let tokens = parse_wm_class_tokens(&class_reply.value);
+                if matches!(
+                    crate::classify_fullscreen_identifiers(tokens),
+                    crate::FullscreenAppKind::VideoPlayer | crate::FullscreenAppKind::Browser
+                ) {
                     return false;
                 }
             }
         }
     }
 
-    let Ok(state_cookie) =
-        conn.get_property(false, active_win, atoms.net_wm_state, AtomEnum::ATOM, 0, 32)
-    else {
-        return false;
-    };
-    let Ok(state_reply) = state_cookie.reply() else {
-        return false;
-    };
-    reply_contains_atom(&state_reply, atoms.net_wm_state_fullscreen)
+    true
 }
 
 /// Starts the X11 server input capture loop on a dedicated OS thread.
@@ -396,8 +478,10 @@ pub fn start_x11_capture(config: CaptureConfig) -> Result<CaptureHandle> {
         locked: AtomicBool::new(false),
         drag_drop_files: AtomicBool::new(config.drag_drop_files),
         auto_lock_fullscreen: AtomicBool::new(config.auto_lock_fullscreen),
+        allow_fullscreen_videos: AtomicBool::new(config.allow_fullscreen_videos),
         pin_media_keys_local: AtomicBool::new(config.pin_media_keys_local),
         unfocus_on_leave: AtomicBool::new(config.unfocus_on_leave),
+        focus_discard_gen: AtomicU64::new(0),
         hotkeys: AtomicHotkeys::new(config.hotkeys),
         edge_threshold_px: AtomicI32::new(config.edge_threshold_px.max(1)),
         dead_corner_px: AtomicI32::new(config.dead_corner_px.max(0)),
@@ -499,6 +583,7 @@ fn run_capture_loop(
     let mut kbd_grabbed = false;
     let mut cursor_hider = X11CursorHider::init(&conn);
     let mut focus_clearer = X11FocusClearer::new();
+    let mut grab_discard_gen: u64 = 0;
     // This thread is the sole writer of `shared.geometry`, so keeping a local copy
     // avoids cloning DesktopGeometry on every mouse event.
     let mut local_geom = shared.geometry.read().clone();
@@ -522,7 +607,8 @@ fn run_capture_loop(
                    grabbed: &mut bool,
                    kbd_grabbed: &mut bool,
                    cursor_hider: &mut X11CursorHider,
-                   focus_clearer: &mut X11FocusClearer| {
+                   focus_clearer: &mut X11FocusClearer,
+                   grab_discard_gen: &mut u64| {
         if !*grabbed {
             let pointer_mask = CoreEventMask::BUTTON_PRESS
                 | CoreEventMask::BUTTON_RELEASE
@@ -555,7 +641,10 @@ fn run_capture_loop(
             // Clear focus BEFORE grab_keyboard_sync so the active window receives a genuine
             // FocusOut(NotifyNormal) before keyboard grab freezes focus delivery.
             if shared.unfocus_on_leave.load(Ordering::Relaxed) {
+                *grab_discard_gen = shared.focus_discard_gen.load(Ordering::Acquire);
                 focus_clearer.clear_focus(conn, root);
+            } else {
+                focus_clearer.clear_saved();
             }
             *grabbed = true;
         }
@@ -570,6 +659,8 @@ fn run_capture_loop(
                      kbd_grabbed: &mut bool,
                      media_tracker: &mut RemoteMediaKeyTracker,
                      cursor_hider: &mut X11CursorHider,
+                     focus_clearer: &mut X11FocusClearer,
+                     grab_discard_gen: u64,
                      target: Option<LeaveTarget>| {
         if *kbd_grabbed {
             // Always thaw any frozen synchronous keyboard grab before ungrabbing!
@@ -590,6 +681,13 @@ fn run_capture_loop(
             let _ = conn.warp_pointer(x11rb::NONE, root, 0, 0, 0, 0, x as i16, y as i16);
         }
         cursor_hider.show(conn, root);
+        if shared.unfocus_on_leave.load(Ordering::Relaxed)
+            && shared.focus_discard_gen.load(Ordering::Acquire) == grab_discard_gen
+        {
+            focus_clearer.restore_focus(conn, root);
+        } else {
+            focus_clearer.clear_saved();
+        }
         let _ = conn.flush();
         debug!("X11Capture ungrabbed pointer & keyboard (local mode)");
     };
@@ -688,6 +786,7 @@ fn run_capture_loop(
                             &mut kbd_grabbed,
                             &mut cursor_hider,
                             &mut focus_clearer,
+                            &mut grab_discard_gen,
                         );
                     }
                     CMD_LEAVE_REMOTE => {
@@ -704,6 +803,8 @@ fn run_capture_loop(
                             &mut kbd_grabbed,
                             &mut media_tracker,
                             &mut cursor_hider,
+                            &mut focus_clearer,
+                            grab_discard_gen,
                             leave,
                         );
                     }
@@ -749,6 +850,7 @@ fn run_capture_loop(
                             &mut kbd_grabbed,
                             &mut cursor_hider,
                             &mut focus_clearer,
+                            &mut grab_discard_gen,
                         );
                     }
                     let _ = tx.send(CaptureEvent::MouseDelta { dx, dy });
@@ -845,18 +947,30 @@ fn run_capture_loop(
                             if let Some(norm) =
                                 local_geom.hit_outer_edge_guarded(edge, px, py, 2, dead_corner)
                             {
-                                // Only query EWMH _NET_WM_STATE_FULLSCREEN when the cursor actually
-                                // touches an active outer edge, cached for 75 ms to avoid spamming
-                                // X11 round-trips while panning or dwelling along a border.
-                                if shared.auto_lock_fullscreen.load(Ordering::Relaxed)
-                                    && fullscreen_cache.check_with(Instant::now(), || {
-                                        is_active_window_fullscreen(&conn, root, ewmh_atoms)
-                                    })
-                                {
-                                    edge_push_edge = None;
-                                    edge_push_accum = 0.0;
-                                    edge_dwell_start = None;
-                                    break;
+                                // Only query EWMH _NET_WM_STATE_FULLSCREEN (+ WM_CLASS when allowing
+                                // fullscreen videos) when the cursor actually touches an active outer
+                                // edge, cached for 75 ms to avoid spamming X11 round-trips while
+                                // panning or dwelling along a border.
+                                if shared.auto_lock_fullscreen.load(Ordering::Relaxed) {
+                                    let allow_videos =
+                                        shared.allow_fullscreen_videos.load(Ordering::Relaxed);
+                                    if fullscreen_cache.check_with(
+                                        Instant::now(),
+                                        allow_videos,
+                                        || {
+                                            is_active_window_fullscreen(
+                                                &conn,
+                                                root,
+                                                ewmh_atoms,
+                                                allow_videos,
+                                            )
+                                        },
+                                    ) {
+                                        edge_push_edge = None;
+                                        edge_push_accum = 0.0;
+                                        edge_dwell_start = None;
+                                        break;
+                                    }
                                 }
                                 if edge_push_edge == Some(edge) {
                                     edge_push_accum += outward;
@@ -895,6 +1009,7 @@ fn run_capture_loop(
                                 &mut kbd_grabbed,
                                 &mut cursor_hider,
                                 &mut focus_clearer,
+                                &mut grab_discard_gen,
                             );
                         }
                         let _ = tx.send(CaptureEvent::EdgeCrossed {
@@ -1033,6 +1148,8 @@ fn run_capture_loop(
                             &mut kbd_grabbed,
                             &mut media_tracker,
                             &mut cursor_hider,
+                            &mut focus_clearer,
+                            grab_discard_gen,
                             None,
                         );
                         let _ = tx.send(CaptureEvent::EscapeHotkey);
@@ -1222,30 +1339,81 @@ mod tests {
     }
 
     #[test]
-    fn fullscreen_cache_reuses_result_within_ttl_and_refreshes_after() {
+    fn fullscreen_cache_reuses_result_within_ttl_invalidates_on_mode_change_and_refreshes_after() {
         let mut cache = FullscreenCache::default();
         let t0 = Instant::now();
         let mut calls = 0usize;
 
-        assert!(cache.check_with(t0, || {
+        assert!(cache.check_with(t0, true, || {
             calls += 1;
             true
         }));
         assert_eq!(calls, 1);
 
-        // Within 75 ms TTL, cached result is returned without invoking the X11 query
-        assert!(cache.check_with(t0 + Duration::from_millis(50), || {
+        // Within 75 ms TTL with same allow_fullscreen_videos, cached result is reused
+        assert!(cache.check_with(t0 + Duration::from_millis(50), true, || {
             calls += 1;
             false
         }));
         assert_eq!(calls, 1);
 
-        // At/after 75 ms TTL, query runs again and updates cached value
-        assert!(!cache.check_with(t0 + FULLSCREEN_CACHE_TTL, || {
+        // Toggling allow_fullscreen_videos invalidates the cache immediately within TTL
+        assert!(!cache.check_with(t0 + Duration::from_millis(55), false, || {
             calls += 1;
             false
         }));
         assert_eq!(calls, 2);
+
+        // Same toggled flag within 75 ms of the refresh reuses cached value
+        assert!(!cache.check_with(t0 + Duration::from_millis(90), false, || {
+            calls += 1;
+            true
+        }));
+        assert_eq!(calls, 2);
+
+        // At/after 75 ms TTL from the last refresh, query runs again and updates cached value
+        assert!(cache.check_with(
+            t0 + Duration::from_millis(55) + FULLSCREEN_CACHE_TTL,
+            false,
+            || {
+                calls += 1;
+                true
+            }
+        ));
+        assert_eq!(calls, 3);
+    }
+
+    #[test]
+    fn parses_x11_wm_class_tokens_and_classifies_video_browsers_vs_games() {
+        assert_eq!(
+            parse_wm_class_tokens(b"Navigator\0firefox\0"),
+            vec!["Navigator", "firefox"]
+        );
+        assert_eq!(
+            parse_wm_class_tokens(b"crx_agimnkijcaahngcdmfeangaknmldooml\0Google-chrome\0"),
+            vec!["crx_agimnkijcaahngcdmfeangaknmldooml", "Google-chrome"]
+        );
+        assert_eq!(parse_wm_class_tokens(b""), Vec::<&str>::new());
+        assert_eq!(parse_wm_class_tokens(b"\0\0vlc\0"), vec!["vlc"]);
+        // Invalid UTF-8 in one segment still preserves valid UTF-8 class token
+        assert_eq!(parse_wm_class_tokens(b"\xFF\xFE\0mpv\0"), vec!["mpv"]);
+
+        assert_eq!(
+            crate::classify_fullscreen_identifiers(parse_wm_class_tokens(b"gl\0mpv\0")),
+            crate::FullscreenAppKind::VideoPlayer
+        );
+        assert_eq!(
+            crate::classify_fullscreen_identifiers(parse_wm_class_tokens(
+                b"crx_agimnkijcaahngcdmfeangaknmldooml\0Google-chrome\0"
+            )),
+            crate::FullscreenAppKind::Browser
+        );
+        assert_eq!(
+            crate::classify_fullscreen_identifiers(parse_wm_class_tokens(
+                b"steam_app_730\0steam_app_730\0"
+            )),
+            crate::FullscreenAppKind::Other
+        );
     }
 
     #[test]

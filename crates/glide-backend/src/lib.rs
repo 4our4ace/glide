@@ -7,12 +7,17 @@
 pub mod clipboard_privacy;
 pub mod dib_png;
 pub mod dnd;
+pub mod fullscreen;
 pub mod geometry;
 pub mod hotkeys;
 pub mod icon;
 pub mod mock;
 pub mod os_integration;
 
+pub use fullscreen::{
+    classify_fullscreen_app, classify_fullscreen_identifiers, is_cursor_rect_confined,
+    FullscreenAppKind,
+};
 pub use hotkeys::{CaptureHotkeys, HotkeyChord, HotkeyMods};
 
 /// User actions emitted by the native OS system tray (Windows 11 & Linux StatusNotifierItem).
@@ -142,6 +147,9 @@ pub struct CaptureConfig {
     pub edge_dwell_ms: u64,
     /// Pause edge switching while an exclusive fullscreen app/game has focus on the server.
     pub auto_lock_fullscreen: bool,
+    /// Allow edge switching past fullscreen video players and non-pointer-locked fullscreen browsers
+    /// while `auto_lock_fullscreen` is enabled (games and VMs stay locked).
+    pub allow_fullscreen_videos: bool,
     /// Keep the server's local CapsLock / NumLock state & keyboard LEDs in sync while controlling a client.
     pub sync_lock_keys: bool,
     /// Enable cross-edge file drag-and-drop detection along active outer edges.
@@ -160,6 +168,7 @@ impl Default for CaptureConfig {
             dead_corner_px: 24,
             edge_dwell_ms: 0,
             auto_lock_fullscreen: true,
+            allow_fullscreen_videos: true,
             sync_lock_keys: true,
             drag_drop_files: true,
             pin_media_keys_local: true,
@@ -388,6 +397,9 @@ pub trait CaptureControl: Send + Sync {
         auto_lock_fullscreen: bool,
         locked: bool,
     );
+    /// Updates whether fullscreen video players and non-pointer-locked fullscreen browsers are
+    /// exempt from `auto_lock_fullscreen`.
+    fn set_allow_fullscreen_videos(&self, _enabled: bool) {}
     /// Updates whether CapsLock / NumLock keys should also toggle local OS state & LEDs in remote mode.
     fn set_sync_lock_keys(&self, _enabled: bool) {}
     /// Updates whether cross-edge file drag-and-drop assistance is enabled.
@@ -399,6 +411,9 @@ pub trait CaptureControl: Send + Sync {
     fn set_pin_media_keys_local(&self, _enabled: bool) {}
     /// Updates whether the active local window should be unfocused when focus leaves to a remote client.
     fn set_unfocus_on_leave(&self, _enabled: bool) {}
+    /// Discards any saved previously-focused local window so a subsequent `leave_remote*` does not
+    /// restore focus to it (used on suspend, wake, peer disconnect, and shutdown).
+    fn discard_saved_focus(&self) {}
     /// Hot-updates global capture shortcuts (screen switch, cursor lock, escape) without restarting capture.
     fn set_hotkeys(&self, _hotkeys: CaptureHotkeys) {}
     /// Temporarily suspends/resumes global shortcut interception (e.g. while recording a shortcut in UI).
@@ -473,6 +488,10 @@ pub trait InputInjector: Send {
 
     /// Updates whether the active local window should be unfocused when focus leaves this client.
     fn set_unfocus_on_leave(&mut self, _enabled: bool) {}
+
+    /// Discards any saved previously-focused local window so a subsequent `enter*` does not
+    /// restore focus to it (used on suspend, wake, disconnect, and shutdown).
+    fn discard_saved_focus(&mut self) {}
 
     /// Ensures the local cursor is visible again (called on disconnect or shutdown).
     fn show_cursor(&mut self) -> Result<()> {
@@ -756,8 +775,9 @@ mod tests {
             assert!(should_forward_key_in_remote(key, false));
         }
 
-        // Default CaptureConfig pins media keys locally and keeps unfocus_on_leave disabled.
+        // Default CaptureConfig pins media keys locally, allows fullscreen videos, and keeps unfocus_on_leave disabled.
         assert!(CaptureConfig::default().pin_media_keys_local);
+        assert!(CaptureConfig::default().allow_fullscreen_videos);
         assert!(!CaptureConfig::default().unfocus_on_leave);
     }
 

@@ -303,6 +303,7 @@ impl AppController {
             dead_corner_px: s.dead_corner_px,
             edge_dwell_ms: s.edge_dwell_ms,
             auto_lock_fullscreen: s.auto_lock_fullscreen,
+            allow_fullscreen_videos: s.allow_fullscreen_videos,
             locked,
             sync_lock_keys: s.sync_lock_keys,
             pin_media_keys_local: s.pin_media_keys_local,

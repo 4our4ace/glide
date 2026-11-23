@@ -945,12 +945,16 @@
                 <div class="row-text"><div class="row-label">Pause in fullscreen apps</div><div class="row-desc">Games keep the cursor</div></div>
                 <label class="switch"><input type="checkbox" id="fullscreenLockToggle" checked><span class="slider"></span></label>
               </div>
+              <div class="row" id="allowFullscreenVideosField">
+                <div class="row-text"><div class="row-label">Allow fullscreen videos</div><div class="row-desc">Don&rsquo;t pause in video players &amp; browsers</div></div>
+                <label class="switch"><input type="checkbox" id="allowFullscreenVideosToggle" checked><span class="slider"></span></label>
+              </div>
               <div class="row">
                 <div class="row-text"><div class="row-label">Sync Caps &amp; Num Lock</div><div class="row-desc">Keyboard lights stay consistent</div></div>
                 <label class="switch"><input type="checkbox" id="syncLockToggle" checked><span class="slider"></span></label>
               </div>
               <div class="row" id="unfocusOnLeaveField">
-                <div class="row-text"><div class="row-label">Unfocus window on leave</div><div class="row-desc">Remove window focus when switching away</div></div>
+                <div class="row-text"><div class="row-label">Unfocus window on leave</div><div class="row-desc">Clear focus away and restore on return</div></div>
                 <label class="switch"><input type="checkbox" id="unfocusOnLeaveToggle"><span class="slider"></span></label>
               </div>
             </div>
@@ -1929,6 +1933,10 @@ function renderShortcuts() {
   }
 }
 
+function updateAllowFullscreenVideosVisibility() {
+  $('allowFullscreenVideosField').style.display = $('fullscreenLockToggle').checked ? '' : 'none';
+}
+
 function syncFormFromConfig() {
   const c = state.config;
   if (!c) return;
@@ -1942,6 +1950,8 @@ function syncFormFromConfig() {
   $('deadCornerSlider').value = c.server.dead_corner_px;
   $('dwellSlider').value = c.server.edge_dwell_ms;
   $('fullscreenLockToggle').checked = !!c.server.auto_lock_fullscreen;
+  $('allowFullscreenVideosToggle').checked = c.server?.allow_fullscreen_videos !== false;
+  updateAllowFullscreenVideosVisibility();
   $('syncLockToggle').checked = !!c.server.sync_lock_keys;
   $('unfocusOnLeaveToggle').checked = !!(
     state.role === 'client' ? c.client?.unfocus_on_leave : c.server?.unfocus_on_leave
@@ -1985,6 +1995,7 @@ async function pushConfig() {
   c.client.dead_corner_px = dead;
   c.server.edge_dwell_ms = dwell;
   c.server.auto_lock_fullscreen = $('fullscreenLockToggle').checked;
+  if (c.server) c.server.allow_fullscreen_videos = $('allowFullscreenVideosToggle').checked;
   c.server.sync_lock_keys = $('syncLockToggle').checked;
   c.client.sync_lock_keys = $('syncLockToggle').checked;
   if (state.role === 'client') {
@@ -2013,10 +2024,14 @@ RANGE_IDS.forEach(id => {
 
 [
   'autoDpiToggle', 'invertScrollToggle', 'inputBackendSelect',
-  'fullscreenLockToggle', 'syncLockToggle', 'unfocusOnLeaveToggle', 'clipToggle',
+  'allowFullscreenVideosToggle', 'syncLockToggle', 'unfocusOnLeaveToggle', 'clipToggle',
   'discoveryToggle', 'manualServerInput'
 ].forEach(id => { $(id).onchange = () => pushConfig(); });
 
+$('fullscreenLockToggle').onchange = () => {
+  updateAllowFullscreenVideosVisibility();
+  pushConfig();
+};
 $('serverPortInput').onchange = () => { renderLocalIps(state.localIps); pushConfig(); };
 
 // Start / Stop / Lock / Quit

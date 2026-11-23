@@ -384,6 +384,17 @@ impl UinputInjector {
             num_lock: (reply.led_mask & 2) != 0,
         })
     }
+
+    fn restore_x11_focus(&mut self) {
+        if let Some(ref mut x11) = self.x11 {
+            if self.unfocus_on_leave {
+                x11.focus_clearer.restore_focus(&x11.conn, x11.root);
+            } else {
+                x11.focus_clearer.clear_saved();
+            }
+            let _ = x11.conn.flush();
+        }
+    }
 }
 
 impl InputInjector for UinputInjector {
@@ -411,13 +422,17 @@ impl InputInjector for UinputInjector {
     fn enter(&mut self, edge: Edge, normalized_pos: f32) -> Result<()> {
         self.maybe_refresh_geometry();
         let (x, y) = self.geometry.point_on_edge(edge, normalized_pos, 4);
-        self.warp_to(x, y)
+        self.warp_to(x, y)?;
+        self.restore_x11_focus();
+        Ok(())
     }
 
     fn enter_at(&mut self, norm_x: f32, norm_y: f32) -> Result<()> {
         self.maybe_refresh_geometry();
         let (x, y) = self.geometry.denormalize_point(norm_x, norm_y);
-        self.warp_to(x, y)
+        self.warp_to(x, y)?;
+        self.restore_x11_focus();
+        Ok(())
     }
 
     fn cursor_norm(&mut self) -> (f32, f32) {
@@ -634,6 +649,8 @@ impl InputInjector for UinputInjector {
             x11.cursor_hider.hide(&x11.conn, x11.root);
             if self.unfocus_on_leave {
                 x11.focus_clearer.clear_focus(&x11.conn, x11.root);
+            } else {
+                x11.focus_clearer.clear_saved();
             }
             let _ = x11.conn.flush();
         } else {
@@ -649,10 +666,22 @@ impl InputInjector for UinputInjector {
 
     fn set_unfocus_on_leave(&mut self, enabled: bool) {
         self.unfocus_on_leave = enabled;
+        if !enabled {
+            if let Some(ref mut x11) = self.x11 {
+                x11.focus_clearer.clear_saved();
+            }
+        }
+    }
+
+    fn discard_saved_focus(&mut self) {
+        if let Some(ref mut x11) = self.x11 {
+            x11.focus_clearer.clear_saved();
+        }
     }
 
     fn show_cursor(&mut self) -> Result<()> {
         if let Some(ref mut x11) = self.x11 {
+            x11.focus_clearer.clear_saved();
             x11.cursor_hider.show(&x11.conn, x11.root);
             let _ = x11.conn.flush();
         }

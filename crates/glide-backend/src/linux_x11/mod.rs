@@ -22,7 +22,7 @@ use x11rb::protocol::randr::{ConnectionExt as RandrExt, NotifyMask};
 use x11rb::protocol::xfixes::ConnectionExt as XFixesExt;
 use x11rb::protocol::xinput::ConnectionExt as XInputExt;
 use x11rb::protocol::xproto::{
-    ConnectionExt as XProtoExt, CreateWindowAux, InputFocus, Window, WindowClass,
+    ConnectionExt as XProtoExt, CreateWindowAux, InputFocus, MapState, Window, WindowClass,
 };
 use x11rb::protocol::xtest::ConnectionExt as XTestExt;
 use x11rb::protocol::Event;
@@ -198,7 +198,8 @@ impl X11CursorHider {
     }
 }
 
-/// Clears keyboard focus on X11 when focus leaves this machine.
+/// Clears keyboard focus on X11 when focus leaves this machine and optionally restores focus to
+/// the previously active window when control returns.
 ///
 /// Lazily creates and maps an offscreen 1×1 `InputOnly` `override_redirect` window
 /// (allocating zero X11 resources when unused) and directs `SetInputFocus` to it with
@@ -207,14 +208,38 @@ impl X11CursorHider {
 #[derive(Default)]
 pub struct X11FocusClearer {
     win: Option<Window>,
+    saved_focus: Option<Window>,
 }
 
 impl X11FocusClearer {
     pub fn new() -> Self {
-        Self { win: None }
+        Self {
+            win: None,
+            saved_focus: None,
+        }
+    }
+
+    pub fn clear_saved(&mut self) {
+        self.saved_focus = None;
     }
 
     pub fn clear_focus(&mut self, conn: &RustConnection, root: Window) {
+        let pointer_root = u32::from(u8::from(InputFocus::POINTER_ROOT));
+        match conn.get_input_focus().ok().and_then(|c| c.reply().ok()) {
+            Some(reply)
+                if reply.focus != x11rb::NONE
+                    && reply.focus != pointer_root
+                    && reply.focus != root
+                    && Some(reply.focus) != self.win =>
+            {
+                self.saved_focus = Some(reply.focus);
+            }
+            Some(reply) if Some(reply.focus) == self.win => {}
+            _ => {
+                self.saved_focus = None;
+            }
+        }
+
         let target_win = match self.win {
             Some(w) => w,
             None => match conn.generate_id() {
@@ -272,7 +297,45 @@ impl X11FocusClearer {
         }
     }
 
+    pub fn restore_focus(&mut self, conn: &RustConnection, root: Window) {
+        let Some(saved) = self.saved_focus.take() else {
+            return;
+        };
+
+        let pointer_root = u32::from(u8::from(InputFocus::POINTER_ROOT));
+        let Some(cur) = conn.get_input_focus().ok().and_then(|c| c.reply().ok()) else {
+            return;
+        };
+        let focus_still_cleared = Some(cur.focus) == self.win
+            || cur.focus == x11rb::NONE
+            || cur.focus == pointer_root
+            || cur.focus == root;
+        if !focus_still_cleared {
+            return;
+        }
+
+        let Some(attrs) = conn
+            .get_window_attributes(saved)
+            .ok()
+            .and_then(|c| c.reply().ok())
+        else {
+            return;
+        };
+        if attrs.map_state != MapState::VIEWABLE {
+            return;
+        }
+
+        match conn.set_input_focus(InputFocus::PARENT, saved, x11rb::CURRENT_TIME) {
+            Ok(cookie) => {
+                cookie.ignore_error();
+                let _ = conn.flush();
+            }
+            Err(e) => tracing::debug!(error = %e, "X11 restore SetInputFocus send failed"),
+        }
+    }
+
     pub fn destroy(&mut self, conn: &RustConnection) {
+        self.saved_focus = None;
         if let Some(w) = self.win.take() {
             if let Ok(cookie) = conn.destroy_window(w) {
                 cookie.ignore_error();

@@ -7,10 +7,12 @@
 //! - CapsLock / NumLock state synchronization
 
 use crate::dnd::DndBackend;
+use crate::fullscreen::{classify_fullscreen_app, is_cursor_rect_confined, FullscreenAppKind};
 use crate::geometry::DesktopGeometry;
 use crate::hotkeys::{AtomicHotkeySuppressor, AtomicHotkeys, HotkeyAction, HotkeyMatch};
 use crate::windows::{
-    init_dpi_awareness, init_windows_realtime_qos, query_desktop_geometry, GLIDE_EXTRA_INFO,
+    init_dpi_awareness, init_windows_realtime_qos, query_desktop_geometry, WindowsFocusState,
+    GLIDE_EXTRA_INFO,
 };
 use crate::{
     edge_bit, is_windows_consumer_or_media_vk, is_windows_workstation_lock_chord, AtomicEdgeMask,
@@ -31,13 +33,16 @@ use std::thread;
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
 use tracing::{debug, info, trace, warn};
-use windows_sys::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
+use windows_sys::Win32::Foundation::{
+    CloseHandle, HANDLE, HWND, LPARAM, LRESULT, POINT, RECT, S_OK, WPARAM,
+};
 use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows_sys::Win32::System::RemoteDesktop::{
     WTSRegisterSessionNotification, WTSUnRegisterSessionNotification, NOTIFY_FOR_THIS_SESSION,
 };
 use windows_sys::Win32::System::Threading::{
-    GetCurrentThread, SetThreadPriority, THREAD_PRIORITY_HIGHEST,
+    GetCurrentThread, OpenProcess, QueryFullProcessImageNameW, SetThreadPriority,
+    PROCESS_NAME_WIN32, PROCESS_QUERY_LIMITED_INFORMATION, THREAD_PRIORITY_HIGHEST,
 };
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
     GetAsyncKeyState, GetKeyState, VK_CAPITAL, VK_LBUTTON,
@@ -47,16 +52,20 @@ use windows_sys::Win32::UI::Input::{
     MOUSE_MOVE_ABSOLUTE, RAWINPUT, RAWINPUTDEVICE, RAWINPUTHEADER, RIDEV_INPUTSINK, RID_INPUT,
     RIM_TYPEMOUSE,
 };
+use windows_sys::Win32::UI::Shell::{
+    SHQueryUserNotificationState, QUERY_USER_NOTIFICATION_STATE, QUNS_RUNNING_D3D_FULL_SCREEN,
+};
 use windows_sys::Win32::UI::WindowsAndMessaging::{
-    CallNextHookEx, CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GetCursorPos,
-    GetForegroundWindow, GetMessageW, GetWindowRect, PostMessageW, RegisterClassW, SetCursorPos,
-    SetWindowsHookExW, TranslateMessage, UnhookWindowsHookEx, HHOOK, KBDLLHOOKSTRUCT,
-    LLKHF_EXTENDED, MSG, MSLLHOOKSTRUCT, PBT_APMRESUMEAUTOMATIC, PBT_APMRESUMECRITICAL,
-    PBT_APMRESUMESUSPEND, PBT_APMSUSPEND, WH_KEYBOARD_LL, WH_MOUSE_LL, WM_APP, WM_DISPLAYCHANGE,
-    WM_DPICHANGED, WM_INPUT, WM_KEYDOWN, WM_KEYUP, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MBUTTONDOWN,
-    WM_MBUTTONUP, WM_MOUSEHWHEEL, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_POWERBROADCAST, WM_QUIT,
-    WM_RBUTTONDOWN, WM_RBUTTONUP, WM_SYSKEYDOWN, WM_SYSKEYUP, WM_WTSSESSION_CHANGE, WM_XBUTTONDOWN,
-    WM_XBUTTONUP, WNDCLASSW, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_OVERLAPPED, WTS_SESSION_LOCK,
+    CallNextHookEx, CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW,
+    FindWindowExW, GetClipCursor, GetCursorPos, GetForegroundWindow, GetMessageW, GetWindowRect,
+    GetWindowThreadProcessId, PostMessageW, RegisterClassW, SetCursorPos, SetWindowsHookExW,
+    TranslateMessage, UnhookWindowsHookEx, HHOOK, KBDLLHOOKSTRUCT, LLKHF_EXTENDED, MSG,
+    MSLLHOOKSTRUCT, PBT_APMRESUMEAUTOMATIC, PBT_APMRESUMECRITICAL, PBT_APMRESUMESUSPEND,
+    PBT_APMSUSPEND, WH_KEYBOARD_LL, WH_MOUSE_LL, WM_APP, WM_DISPLAYCHANGE, WM_DPICHANGED, WM_INPUT,
+    WM_KEYDOWN, WM_KEYUP, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MBUTTONDOWN, WM_MBUTTONUP,
+    WM_MOUSEHWHEEL, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_POWERBROADCAST, WM_QUIT, WM_RBUTTONDOWN,
+    WM_RBUTTONUP, WM_SYSKEYDOWN, WM_SYSKEYUP, WM_WTSSESSION_CHANGE, WM_XBUTTONDOWN, WM_XBUTTONUP,
+    WNDCLASSW, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_OVERLAPPED, WTS_SESSION_LOCK,
     WTS_SESSION_UNLOCK, XBUTTON1, XBUTTON2,
 };
 
@@ -75,6 +84,35 @@ const DRAG_ARM_MIN_MOVE_SQ: i64 = 16;
 const DRAG_ARM_EDGE_DIST_PX: i32 = 160;
 /// Hysteresis distance (px) beyond which a retreating drag disarms the edge strip.
 const DRAG_DISARM_EDGE_DIST_PX: i32 = 220;
+/// Short cache TTL for foreground fullscreen + executable/pointer-lock inspection while pushing an edge.
+const FULLSCREEN_CACHE_TTL: Duration = Duration::from_millis(75);
+
+#[derive(Debug, Default)]
+struct WinFullscreenCache {
+    cached: Option<(Instant, isize, bool, bool)>,
+}
+
+impl WinFullscreenCache {
+    fn check_with<F: FnOnce() -> bool>(
+        &mut self,
+        now: Instant,
+        hwnd_raw: isize,
+        allow_fullscreen_videos: bool,
+        query: F,
+    ) -> bool {
+        if let Some((at, cached_hwnd, cached_allow, value)) = self.cached {
+            if cached_hwnd == hwnd_raw
+                && cached_allow == allow_fullscreen_videos
+                && now.saturating_duration_since(at) < FULLSCREEN_CACHE_TTL
+            {
+                return value;
+            }
+        }
+        let value = query();
+        self.cached = Some((now, hwnd_raw, allow_fullscreen_videos, value));
+        value
+    }
+}
 
 enum LeaveTarget {
     Edge(Edge, f32),
@@ -97,6 +135,8 @@ struct HookState {
     cursor_parked: AtomicBool,
     locked: AtomicBool,
     auto_lock_fullscreen: AtomicBool,
+    allow_fullscreen_videos: AtomicBool,
+    fullscreen_cache: Mutex<WinFullscreenCache>,
     sync_lock_keys: AtomicBool,
     drag_drop_files: AtomicBool,
     dnd_probe: OnceLock<Arc<dyn DndBackend>>,
@@ -109,7 +149,7 @@ struct HookState {
     drag_strip_armed: AtomicBool,
     pin_media_keys_local: AtomicBool,
     unfocus_on_leave: AtomicBool,
-    unfocus_gen: Arc<AtomicU64>,
+    focus_state: Arc<WindowsFocusState>,
     forwarded_media_keys: Mutex<RemoteMediaKeyTracker>,
     pending_meta: WindowsPendingMeta,
     hotkeys: AtomicHotkeys,
@@ -202,7 +242,7 @@ impl HookState {
     /// immediately release any held keys — guaranteeing the user is never locked out of
     /// their Windows lock screen or wake prompt.
     fn release_to_local_on_suspend(&self, reason: &str) {
-        self.unfocus_gen.fetch_add(1, Ordering::SeqCst);
+        self.focus_state.discard();
         let was_remote = self.remote_mode.swap(false, Ordering::SeqCst);
         self.pending_meta.clear();
         self.hotkey_suppressor.clear();
@@ -230,7 +270,7 @@ impl HookState {
     /// Ensures clean local state after wake or session unlock, queues an off-thread display
     /// geometry refresh (monitors often change while asleep), and emits a debounced `SystemResumed`.
     fn handle_resume_or_unlock(&self, reason: &str) {
-        self.unfocus_gen.fetch_add(1, Ordering::SeqCst);
+        self.focus_state.discard();
         let was_remote = self.remote_mode.swap(false, Ordering::SeqCst);
         self.pending_meta.clear();
         self.hotkey_suppressor.clear();
@@ -299,7 +339,7 @@ struct WindowsCaptureControl {
 impl Drop for WindowsCaptureControl {
     fn drop(&mut self) {
         // Always restore cursor & stop hook loop + geometry helper cleanly on shutdown
-        self.state.unfocus_gen.fetch_add(1, Ordering::SeqCst);
+        self.state.focus_state.discard();
         let was_remote = self.state.remote_mode.swap(false, Ordering::SeqCst);
         self.state.pending_meta.clear();
         self.state.hotkey_suppressor.clear();
@@ -365,6 +405,12 @@ impl CaptureControl for WindowsCaptureControl {
         self.state.locked.store(locked, Ordering::Relaxed);
     }
 
+    fn set_allow_fullscreen_videos(&self, enabled: bool) {
+        self.state
+            .allow_fullscreen_videos
+            .store(enabled, Ordering::Relaxed);
+    }
+
     fn set_sync_lock_keys(&self, enabled: bool) {
         self.state.sync_lock_keys.store(enabled, Ordering::Relaxed);
     }
@@ -391,8 +437,12 @@ impl CaptureControl for WindowsCaptureControl {
             .unfocus_on_leave
             .store(enabled, Ordering::Relaxed);
         if !enabled {
-            self.state.unfocus_gen.fetch_add(1, Ordering::SeqCst);
+            self.state.focus_state.discard();
         }
+    }
+
+    fn discard_saved_focus(&self) {
+        self.state.focus_state.discard();
     }
 
     fn set_hotkeys(&self, hotkeys: CaptureHotkeys) {
@@ -423,19 +473,15 @@ impl CaptureControl for WindowsCaptureControl {
             let (px, py) = self.state.geometry.read().primary_park_corner();
             self.state.park_cursor_at(px, py);
         }
-        let gen = self
-            .state
-            .unfocus_gen
-            .fetch_add(1, Ordering::SeqCst)
-            .wrapping_add(1);
         if self.state.unfocus_on_leave.load(Ordering::Relaxed) {
-            super::schedule_unfocus_foreground_window(Arc::clone(&self.state.unfocus_gen), gen);
+            self.state.focus_state.schedule_unfocus();
+        } else {
+            self.state.focus_state.discard();
         }
         Ok(())
     }
 
     fn leave_remote(&self, return_edge: Edge, normalized_pos: f32) -> Result<()> {
-        self.state.unfocus_gen.fetch_add(1, Ordering::SeqCst);
         let (x, y, nx, ny) = {
             let geom = self.state.geometry.read();
             let (x, y) = geom.point_on_edge(return_edge, normalized_pos, 6);
@@ -474,11 +520,15 @@ impl CaptureControl for WindowsCaptureControl {
                 PostMessageW(hwnd, WM_APP_LEAVE_REMOTE, 0, 0);
             }
         }
+        if self.state.unfocus_on_leave.load(Ordering::Relaxed) {
+            self.state.focus_state.schedule_restore();
+        } else {
+            self.state.focus_state.discard();
+        }
         Ok(())
     }
 
     fn leave_remote_at(&self, norm_x: f32, norm_y: f32) -> Result<()> {
-        self.state.unfocus_gen.fetch_add(1, Ordering::SeqCst);
         let (x, y) = self
             .state
             .geometry
@@ -507,6 +557,11 @@ impl CaptureControl for WindowsCaptureControl {
             unsafe {
                 PostMessageW(hwnd, WM_APP_LEAVE_REMOTE, 0, 0);
             }
+        }
+        if self.state.unfocus_on_leave.load(Ordering::Relaxed) {
+            self.state.focus_state.schedule_restore();
+        } else {
+            self.state.focus_state.discard();
         }
         Ok(())
     }
@@ -566,11 +621,75 @@ fn translate_ll_key(vk_code: u32, scan_code: u32, flags: u32) -> Option<HidUsage
     HidUsage::from_win_scan(win_scan)
 }
 
-/// Checks whether the active foreground window covers an entire monitor (e.g. fullscreen game/VM),
-/// excluding Windows desktop shell windows (`Progman`, `WorkerW`, `Shell_TrayWnd`).
-fn is_foreground_fullscreen(geom: &DesktopGeometry) -> bool {
-    let hwnd = unsafe { GetForegroundWindow() };
-    if hwnd.is_null() || super::is_shell_window_class(hwnd) {
+/// Queries the executable basename (e.g. `"vlc.exe"`, `"Microsoft.Media.Player.exe"`) for `pid`.
+fn query_process_exe_name(pid: u32) -> Option<String> {
+    if pid == 0 {
+        return None;
+    }
+    let handle: HANDLE = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) };
+    if handle.is_null() {
+        return None;
+    }
+    let mut buf = [0u16; 1024];
+    let mut len = buf.len() as u32;
+    let ok = unsafe {
+        QueryFullProcessImageNameW(handle, PROCESS_NAME_WIN32, buf.as_mut_ptr(), &mut len)
+    };
+    unsafe {
+        CloseHandle(handle);
+    }
+    if ok == 0 || len == 0 || (len as usize) > buf.len() {
+        return None;
+    }
+    let path = String::from_utf16_lossy(&buf[..len as usize]);
+    let file_name = path.rsplit(['\\', '/']).next().unwrap_or(&path);
+    if file_name.is_empty() {
+        None
+    } else {
+        Some(file_name.to_string())
+    }
+}
+
+/// Resolves the foreground window's executable basename, unwrapping UWP `ApplicationFrameHost.exe`
+/// windows to their hosted `Windows.UI.Core.CoreWindow` app process (e.g. Windows 11 Media Player,
+/// Movies & TV, Netflix/Prime Store apps).
+fn foreground_exe_name(hwnd: HWND) -> Option<String> {
+    let mut pid: u32 = 0;
+    unsafe {
+        GetWindowThreadProcessId(hwnd, &mut pid);
+    }
+    let name = query_process_exe_name(pid)?;
+    if name.eq_ignore_ascii_case("applicationframehost.exe")
+        || name.eq_ignore_ascii_case("applicationframehost")
+    {
+        let core_class: Vec<u16> = "Windows.UI.Core.CoreWindow\0".encode_utf16().collect();
+        let mut child =
+            unsafe { FindWindowExW(hwnd, ptr::null_mut(), core_class.as_ptr(), ptr::null()) };
+        for _ in 0..16 {
+            if child.is_null() {
+                break;
+            }
+            let mut child_pid: u32 = 0;
+            unsafe {
+                GetWindowThreadProcessId(child, &mut child_pid);
+            }
+            if child_pid != 0 && child_pid != pid {
+                if let Some(child_name) = query_process_exe_name(child_pid) {
+                    return Some(child_name);
+                }
+            }
+            child = unsafe { FindWindowExW(hwnd, child, core_class.as_ptr(), ptr::null()) };
+        }
+    }
+    Some(name)
+}
+
+fn eval_foreground_fullscreen_locked(
+    hwnd: HWND,
+    geom: &DesktopGeometry,
+    allow_fullscreen_videos: bool,
+) -> bool {
+    if super::is_shell_window_class(hwnd) {
         return false;
     }
 
@@ -579,12 +698,64 @@ fn is_foreground_fullscreen(geom: &DesktopGeometry) -> bool {
         return false;
     }
 
-    geom.monitors.iter().any(|m| {
+    let Some(matched_monitor) = geom.monitors.iter().find(|m| {
         rect.left <= m.left()
             && rect.top <= m.top()
             && rect.right >= m.right()
             && rect.bottom >= m.bottom()
-    })
+    }) else {
+        return false;
+    };
+
+    if !allow_fullscreen_videos {
+        return true;
+    }
+
+    let Some(exe_name) = foreground_exe_name(hwnd) else {
+        // Elevated or anti-cheat protected process (OpenProcess denied): fail closed and lock.
+        return true;
+    };
+
+    match classify_fullscreen_app(&exe_name) {
+        FullscreenAppKind::VideoPlayer => false,
+        FullscreenAppKind::Browser => {
+            let mut clip: RECT = unsafe { std::mem::zeroed() };
+            if unsafe { GetClipCursor(&mut clip) } != 0
+                && is_cursor_rect_confined(
+                    (clip.left, clip.top, clip.right, clip.bottom),
+                    matched_monitor,
+                    geom,
+                )
+            {
+                return true;
+            }
+            let mut quns: QUERY_USER_NOTIFICATION_STATE = 0;
+            if unsafe { SHQueryUserNotificationState(&mut quns) } == S_OK
+                && quns == QUNS_RUNNING_D3D_FULL_SCREEN
+            {
+                return true;
+            }
+            false
+        }
+        FullscreenAppKind::Other => true,
+    }
+}
+
+/// Checks whether the active foreground window should auto-lock cursor switching on an outer edge,
+/// excluding Windows desktop shell windows (`Progman`, `WorkerW`, `Shell_TrayWnd`) and (when
+/// `allow_fullscreen_videos` is enabled) video players and non-pointer-locked fullscreen browsers.
+fn is_foreground_fullscreen_locked(state: &HookState, geom: &DesktopGeometry) -> bool {
+    let hwnd = unsafe { GetForegroundWindow() };
+    if hwnd.is_null() {
+        return false;
+    }
+    let allow_videos = state.allow_fullscreen_videos.load(Ordering::Relaxed);
+    state
+        .fullscreen_cache
+        .lock()
+        .check_with(Instant::now(), hwnd as isize, allow_videos, || {
+            eval_foreground_fullscreen_locked(hwnd, geom, allow_videos)
+        })
 }
 
 unsafe extern "system" fn keyboard_ll_proc(code: i32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
@@ -652,7 +823,7 @@ unsafe extern "system" fn keyboard_ll_proc(code: i32, wparam: WPARAM, lparam: LP
                             state.pending_meta.clear();
                             match action {
                                 HotkeyAction::Escape => {
-                                    state.unfocus_gen.fetch_add(1, Ordering::SeqCst);
+                                    state.focus_state.bump_gen_only();
                                     state.remote_mode.store(false, Ordering::SeqCst);
                                     state.cursor_parked.store(false, Ordering::Release);
                                     state.forwarded_media_keys.lock().clear();
@@ -1004,7 +1175,7 @@ fn process_local_edge_motion(state: &HookState, dx: f32, dy: f32, pt: POINT) -> 
                     let fs_blocked = if state.auto_lock_fullscreen.load(Ordering::Relaxed)
                         && !state.lmb_fullscreen_checked.swap(true, Ordering::Relaxed)
                     {
-                        let fs = is_foreground_fullscreen(&geom);
+                        let fs = is_foreground_fullscreen_locked(state, &geom);
                         if fs {
                             state.lmb_block_drag_arm.store(true, Ordering::Relaxed);
                         }
@@ -1050,7 +1221,9 @@ fn process_local_edge_motion(state: &HookState, dx: f32, dy: f32, pt: POINT) -> 
     if let Some((edge, norm, outward)) = hit {
         // Only query foreground fullscreen status when the cursor actually pushes an active edge,
         // avoiding 1000Hz GetForegroundWindow/GetClassNameW/GetWindowRect syscalls mid-screen.
-        if state.auto_lock_fullscreen.load(Ordering::Relaxed) && is_foreground_fullscreen(&geom) {
+        if state.auto_lock_fullscreen.load(Ordering::Relaxed)
+            && is_foreground_fullscreen_locked(state, &geom)
+        {
             // Suppress strip re-arming for the remainder of this LMB hold so 1000Hz motion
             // cannot ping-pong `drag_strip_armed` false -> true -> false against a fullscreen app.
             if lmb_down {
@@ -1358,6 +1531,8 @@ pub fn start_windows_capture(config: CaptureConfig) -> Result<CaptureHandle> {
         dead_corner_px: AtomicI32::new(config.dead_corner_px.max(0)),
         edge_dwell_ms: AtomicU64::new(config.edge_dwell_ms),
         auto_lock_fullscreen: AtomicBool::new(config.auto_lock_fullscreen),
+        allow_fullscreen_videos: AtomicBool::new(config.allow_fullscreen_videos),
+        fullscreen_cache: Mutex::new(WinFullscreenCache::default()),
         sync_lock_keys: AtomicBool::new(config.sync_lock_keys),
         drag_drop_files: AtomicBool::new(config.drag_drop_files),
         dnd_probe: OnceLock::new(),
@@ -1370,7 +1545,7 @@ pub fn start_windows_capture(config: CaptureConfig) -> Result<CaptureHandle> {
         drag_strip_armed: AtomicBool::new(false),
         pin_media_keys_local: AtomicBool::new(config.pin_media_keys_local),
         unfocus_on_leave: AtomicBool::new(config.unfocus_on_leave),
-        unfocus_gen: Arc::new(AtomicU64::new(0)),
+        focus_state: Arc::new(WindowsFocusState::new()),
         forwarded_media_keys: Mutex::new(RemoteMediaKeyTracker::new()),
         pending_meta: WindowsPendingMeta::new(),
         hotkeys: AtomicHotkeys::new(config.hotkeys),

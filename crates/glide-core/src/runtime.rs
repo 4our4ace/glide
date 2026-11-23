@@ -94,6 +94,7 @@ pub enum RuntimeCommand {
         dead_corner_px: i32,
         edge_dwell_ms: u64,
         auto_lock_fullscreen: bool,
+        allow_fullscreen_videos: bool,
         locked: bool,
         sync_lock_keys: bool,
         pin_media_keys_local: bool,

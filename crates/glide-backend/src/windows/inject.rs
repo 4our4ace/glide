@@ -2,7 +2,9 @@
 //! cursor memory restoration, dead-corner guards, and CapsLock/NumLock sync.
 
 use crate::geometry::DesktopGeometry;
-use crate::windows::{init_dpi_awareness, query_desktop_geometry, GLIDE_EXTRA_INFO};
+use crate::windows::{
+    init_dpi_awareness, query_desktop_geometry, WindowsFocusState, GLIDE_EXTRA_INFO,
+};
 use crate::InputInjector;
 use anyhow::Result;
 use glide_hid::{HidUsage, MouseButton};
@@ -164,7 +166,7 @@ pub struct WindowsInjector {
     pressed_keys: HashSet<HidUsage>,
     pressed_buttons: HashSet<MouseButton>,
     unfocus_on_leave: bool,
-    unfocus_gen: Arc<AtomicU64>,
+    focus_state: Arc<WindowsFocusState>,
 }
 
 impl WindowsInjector {
@@ -189,7 +191,7 @@ impl WindowsInjector {
             pressed_keys: HashSet::new(),
             pressed_buttons: HashSet::new(),
             unfocus_on_leave: false,
-            unfocus_gen: Arc::new(AtomicU64::new(0)),
+            focus_state: Arc::new(WindowsFocusState::new()),
         })
     }
 
@@ -270,8 +272,12 @@ impl InputInjector for WindowsInjector {
     fn set_unfocus_on_leave(&mut self, enabled: bool) {
         self.unfocus_on_leave = enabled;
         if !enabled {
-            self.unfocus_gen.fetch_add(1, Ordering::SeqCst);
+            self.focus_state.discard();
         }
+    }
+
+    fn discard_saved_focus(&mut self) {
+        self.focus_state.discard();
     }
 
     fn desktop_geometry(&mut self) -> Result<DesktopGeometry> {
@@ -294,7 +300,7 @@ impl InputInjector for WindowsInjector {
         let gen = INJECTOR_SUSPEND_GEN.load(Ordering::Acquire);
         if gen != self.seen_suspend_gen {
             self.seen_suspend_gen = gen;
-            self.unfocus_gen.fetch_add(1, Ordering::SeqCst);
+            self.focus_state.discard();
             let _ = self.release_all();
             return true;
         }
@@ -305,14 +311,13 @@ impl InputInjector for WindowsInjector {
         let gen = INJECTOR_RESUME_GEN.load(Ordering::Acquire);
         if gen != self.seen_resume_gen {
             self.seen_resume_gen = gen;
-            self.unfocus_gen.fetch_add(1, Ordering::SeqCst);
+            self.focus_state.discard();
             return true;
         }
         false
     }
 
     fn enter(&mut self, edge: Edge, normalized_pos: f32) -> Result<()> {
-        self.unfocus_gen.fetch_add(1, Ordering::SeqCst);
         let _ = self.refresh_geometry_if_needed();
         let (x, y) = self.geometry.point_on_edge(edge, normalized_pos, 4);
         unsafe {
@@ -322,6 +327,11 @@ impl InputInjector for WindowsInjector {
         self.rem_y = 0.0;
         self.edge_push_accum = 0.0;
         self.edge_push_start = None;
+        if self.unfocus_on_leave {
+            self.focus_state.schedule_restore();
+        } else {
+            self.focus_state.discard();
+        }
         debug!(
             ?edge,
             normalized_pos, x, y, "WindowsInjector entered screen"
@@ -330,7 +340,6 @@ impl InputInjector for WindowsInjector {
     }
 
     fn enter_at(&mut self, norm_x: f32, norm_y: f32) -> Result<()> {
-        self.unfocus_gen.fetch_add(1, Ordering::SeqCst);
         let _ = self.refresh_geometry_if_needed();
         let (x, y) = self.geometry.denormalize_point(norm_x, norm_y);
         unsafe {
@@ -340,6 +349,11 @@ impl InputInjector for WindowsInjector {
         self.rem_y = 0.0;
         self.edge_push_accum = 0.0;
         self.edge_push_start = None;
+        if self.unfocus_on_leave {
+            self.focus_state.schedule_restore();
+        } else {
+            self.focus_state.discard();
+        }
         Ok(())
     }
 
@@ -497,25 +511,23 @@ impl InputInjector for WindowsInjector {
         }
         self.edge_push_accum = 0.0;
         self.edge_push_start = None;
-        let gen = self
-            .unfocus_gen
-            .fetch_add(1, Ordering::SeqCst)
-            .wrapping_add(1);
         if self.unfocus_on_leave {
-            super::schedule_unfocus_foreground_window(Arc::clone(&self.unfocus_gen), gen);
+            self.focus_state.schedule_unfocus();
+        } else {
+            self.focus_state.discard();
         }
         Ok(())
     }
 
     fn show_cursor(&mut self) -> Result<()> {
-        self.unfocus_gen.fetch_add(1, Ordering::SeqCst);
+        self.focus_state.discard();
         Ok(())
     }
 }
 
 impl Drop for WindowsInjector {
     fn drop(&mut self) {
-        self.unfocus_gen.fetch_add(1, Ordering::SeqCst);
+        self.focus_state.discard();
         let _ = self.release_all();
         let hwnd = self.watch_hwnd.swap(0, Ordering::SeqCst) as HWND;
         if !hwnd.is_null() {

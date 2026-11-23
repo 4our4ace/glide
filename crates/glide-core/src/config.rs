@@ -264,6 +264,10 @@ pub struct ServerConfig {
     pub edge_dwell_ms: u64,
     /// Automatically pause edge switching while a fullscreen game/app is active.
     pub auto_lock_fullscreen: bool,
+    /// Allow crossing screen edges past fullscreen video players and non-pointer-locked
+    /// fullscreen browsers while `auto_lock_fullscreen` is enabled (games and VMs stay locked).
+    #[serde(default = "default_true")]
+    pub allow_fullscreen_videos: bool,
     /// Legacy master switch for `<Mods>+Arrow` screen switching and cursor lock toggle when
     /// `switch_shortcut` / `lock_shortcut` are unset (`None`).
     pub enable_hotkeys: bool,
@@ -311,6 +315,7 @@ impl Default for ServerConfig {
             dead_corner_px: 24,
             edge_dwell_ms: 0,
             auto_lock_fullscreen: true,
+            allow_fullscreen_videos: true,
             enable_hotkeys: true,
             switch_shortcut: None,
             lock_shortcut: None,
@@ -973,6 +978,30 @@ mod tests {
         let raw = toml::to_string_pretty(&cfg).unwrap();
         let parsed: GlideConfigFile = toml::from_str(&raw).unwrap();
         assert!(!parsed.server.pin_media_keys_local);
+    }
+
+    #[test]
+    fn allow_fullscreen_videos_defaults_true_and_roundtrips() {
+        assert!(ServerConfig::default().allow_fullscreen_videos);
+
+        // Existing configs omitting allow_fullscreen_videos default to true
+        let legacy: GlideConfigFile = toml::from_str(
+            r#"
+            [server]
+            auto_lock_fullscreen = true
+            "#,
+        )
+        .unwrap();
+        assert!(legacy.server.allow_fullscreen_videos);
+        assert!(legacy.effective_server_config().allow_fullscreen_videos);
+
+        let mut cfg = GlideConfigFile::default();
+        cfg.server.allow_fullscreen_videos = false;
+        let raw = toml::to_string_pretty(&cfg).unwrap();
+        assert!(raw.contains("allow_fullscreen_videos = false"));
+        let parsed: GlideConfigFile = toml::from_str(&raw).unwrap();
+        assert!(!parsed.server.allow_fullscreen_videos);
+        assert!(!parsed.effective_server_config().allow_fullscreen_videos);
     }
 
     #[test]

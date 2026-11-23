@@ -712,6 +712,7 @@ async fn run_client_session_tracked(
                 // 1. OS suspend / lock safety: release any held keys and restore local cursor
                 if injector.poll_system_suspended() {
                     focused = false;
+                    injector.discard_saved_focus();
                     let _ = injector.release_all();
                     let _ = injector.show_cursor();
                     if let Some(rt) = runtime {
@@ -728,6 +729,7 @@ async fn run_client_session_tracked(
                         ?sleep_jump,
                         "Client detected wake/sleep jump; refreshing geometry & LAN IPs and probing server"
                     );
+                    injector.discard_saved_focus();
                     if focused {
                         focused = false;
                         let _ = injector.release_all();
@@ -1526,6 +1528,7 @@ async fn run_client_session_tracked(
     drop(_ctrl_writer_guard);
     drop(_bulk_guard);
     dnd.set_drag_armed(false);
+    injector.discard_saved_focus();
     let _ = injector.release_all();
     let _ = injector.show_cursor();
     (true, session_result)
@@ -1577,6 +1580,7 @@ async fn wait_reconnect_delay(
             }
             _ = watch_tick.tick() => {
                 if injector.poll_system_suspended() {
+                    injector.discard_saved_focus();
                     let _ = injector.release_all();
                     let _ = injector.show_cursor();
                 }
@@ -1591,6 +1595,7 @@ async fn wait_reconnect_delay(
                         ?sleep_jump,
                         "Client detected wake/sleep jump during reconnect backoff; retrying immediately"
                     );
+                    injector.discard_saved_focus();
                     let fresh_geom = injector.desktop_geometry().ok();
                     let fresh_ips = local_ipv4_addresses_async().await;
                     *last_local_ips = fresh_ips.clone();
@@ -1751,6 +1756,7 @@ pub async fn run_client_with_backends_and_dnd(
                                 s.last_error = Some(e.to_string());
                             });
                         }
+                        injector.discard_saved_focus();
                         let _ = injector.release_all();
                         let _ = injector.show_cursor();
 
@@ -1834,6 +1840,9 @@ pub async fn run_client_with_backends_and_dnd(
 
         // Reset backoff immediately if the OS just woke or LAN IPs changed during connect/discover
         let os_resumed = injector.poll_system_resumed();
+        if os_resumed {
+            injector.discard_saved_focus();
+        }
         let fresh_ips = local_ipv4_addresses_async().await;
         let ips_changed = fresh_ips != last_local_ips;
         if os_resumed || ips_changed {
@@ -1869,6 +1878,7 @@ pub async fn run_client_with_backends_and_dnd(
         }
     }
 
+    injector.discard_saved_focus();
     let _ = injector.release_all();
     let _ = injector.show_cursor();
     if let Some(ref rt) = runtime {

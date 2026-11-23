@@ -1346,6 +1346,7 @@ mod tests {
                 dead_corner_px: 24,
                 edge_dwell_ms: 0,
                 auto_lock_fullscreen: true,
+                allow_fullscreen_videos: true,
                 locked: false,
                 sync_lock_keys: true,
                 pin_media_keys_local: true,
@@ -1728,7 +1729,12 @@ mod tests {
             .await
         });
 
-        // 1. Live UpdateServerTuning updates MockCaptureState.hotkeys immediately
+        assert!(
+            cap_state.allow_fullscreen_videos(),
+            "allow_fullscreen_videos must default to true on server startup"
+        );
+
+        // 1. Live UpdateServerTuning updates MockCaptureState.hotkeys and allow_fullscreen_videos immediately
         let custom_hotkeys = CaptureHotkeys {
             switch_mods: Some(HotkeyMods::CTRL | HotkeyMods::SHIFT),
             lock: Some(HotkeyChord::new(
@@ -1746,6 +1752,7 @@ mod tests {
                 dead_corner_px: 24,
                 edge_dwell_ms: 0,
                 auto_lock_fullscreen: true,
+                allow_fullscreen_videos: false,
                 locked: false,
                 sync_lock_keys: true,
                 pin_media_keys_local: true,
@@ -1758,21 +1765,25 @@ mod tests {
 
         let mut updated = false;
         for _ in 0..30 {
-            if *cap_state.hotkeys.lock() == custom_hotkeys {
+            if *cap_state.hotkeys.lock() == custom_hotkeys && !cap_state.allow_fullscreen_videos() {
                 updated = true;
                 break;
             }
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
-        assert!(updated, "UpdateServerTuning must hot-reload CaptureHotkeys");
+        assert!(
+            updated,
+            "UpdateServerTuning must hot-reload CaptureHotkeys and allow_fullscreen_videos"
+        );
 
-        // 2. Disabling all shortcuts via UpdateServerTuning propagates cleanly
+        // 2. Disabling all shortcuts and re-enabling allow_fullscreen_videos propagates cleanly
         srv_cmd_tx
             .send(RuntimeCommand::UpdateServerTuning {
                 edge_threshold_px: 4,
                 dead_corner_px: 24,
                 edge_dwell_ms: 0,
                 auto_lock_fullscreen: true,
+                allow_fullscreen_videos: true,
                 locked: false,
                 sync_lock_keys: true,
                 pin_media_keys_local: true,
@@ -1784,7 +1795,9 @@ mod tests {
             .unwrap();
         let mut disabled = false;
         for _ in 0..30 {
-            if *cap_state.hotkeys.lock() == CaptureHotkeys::disabled() {
+            if *cap_state.hotkeys.lock() == CaptureHotkeys::disabled()
+                && cap_state.allow_fullscreen_videos()
+            {
                 disabled = true;
                 break;
             }
@@ -1792,7 +1805,7 @@ mod tests {
         }
         assert!(
             disabled,
-            "UpdateServerTuning must support disabling all shortcuts live"
+            "UpdateServerTuning must support disabling all shortcuts and toggling allow_fullscreen_videos live"
         );
 
         // 3. SetHotkeysSuspended toggles hotkeys_suspended on and off live
@@ -2279,6 +2292,7 @@ mod tests {
         let (mut left_inj, _left_log) = MockInjector::new(geom);
         let srv_rt = RuntimeState::new();
         let (srv_cmd_tx, srv_cmd_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (right_cmd_tx, mut right_cmd_rx) = tokio::sync::mpsc::unbounded_channel();
 
         let srv_cfg = ServerConfig {
             name: "unfocus-srv".into(),
@@ -2320,9 +2334,15 @@ mod tests {
         });
         let right_task = tokio::spawn(async move {
             let mut opt_clip = None;
-            let _ =
-                run_client_session(&mut right_cfg, addr, &mut right_inj, &mut opt_clip, None, None)
-                    .await;
+            let _ = run_client_session(
+                &mut right_cfg,
+                addr,
+                &mut right_inj,
+                &mut opt_clip,
+                None,
+                Some(&mut right_cmd_rx),
+            )
+            .await;
         });
         let left_task = tokio::spawn(async move {
             let mut opt_clip = None;
@@ -2338,8 +2358,9 @@ mod tests {
         }
         assert!(!cap_state.unfocus_on_leave());
         assert_eq!(cap_state.unfocus_count(), 0);
+        assert_eq!(cap_state.refocus_count(), 0);
 
-        // 1. Disabled by default: Local -> Right must NOT unfocus
+        // 1. Disabled by default: Local -> Right -> Local must neither unfocus nor refocus
         srv_cmd_tx
             .send(RuntimeCommand::SwitchTarget(Some(Edge::Right)))
             .unwrap();
@@ -2362,6 +2383,7 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
         assert!(!cap_state.remote_mode.load(Ordering::SeqCst));
+        assert_eq!(cap_state.refocus_count(), 0);
 
         // 2. Live-enable via UpdateServerTuning
         srv_cmd_tx
@@ -2370,6 +2392,7 @@ mod tests {
                 dead_corner_px: 24,
                 edge_dwell_ms: 0,
                 auto_lock_fullscreen: true,
+                allow_fullscreen_videos: true,
                 locked: false,
                 sync_lock_keys: true,
                 pin_media_keys_local: true,
@@ -2387,7 +2410,7 @@ mod tests {
         }
         assert!(cap_state.unfocus_on_leave());
 
-        // 3. Local -> Right triggers unfocus once
+        // 3. Local -> Right triggers unfocus once and saves focus
         srv_cmd_tx
             .send(RuntimeCommand::SwitchTarget(Some(Edge::Right)))
             .unwrap();
@@ -2400,8 +2423,9 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
         assert_eq!(cap_state.unfocus_count(), 1);
+        assert!(cap_state.has_saved_focus());
 
-        // 4. Remote Right -> Remote Left must NOT trigger unfocus again
+        // 4. Remote Right -> Remote Left must NOT trigger unfocus or refocus
         srv_cmd_tx
             .send(RuntimeCommand::SwitchTarget(Some(Edge::Left)))
             .unwrap();
@@ -2417,8 +2441,9 @@ mod tests {
             1,
             "remote -> remote switch must not trigger server unfocus again"
         );
+        assert_eq!(cap_state.refocus_count(), 0);
 
-        // 5. Return Local, then Local -> Left via EdgeCrossed triggers unfocus a second time
+        // 5. ReturnLocal restores saved focus (refocus_count == 1)
         srv_cmd_tx.send(RuntimeCommand::ReturnLocal).unwrap();
         for _ in 0..40 {
             if !cap_state.remote_mode.load(Ordering::SeqCst) {
@@ -2426,6 +2451,13 @@ mod tests {
             }
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
+        assert_eq!(
+            cap_state.refocus_count(),
+            1,
+            "returning to server via ReturnLocal must restore saved focus"
+        );
+
+        // 6. Local -> Left via EdgeCrossed -> EscapeHotkey also restores saved focus (refocus_count == 2)
         cap_tx
             .send(CaptureEvent::EdgeCrossed {
                 edge: Edge::Left,
@@ -2441,21 +2473,118 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
         assert_eq!(cap_state.unfocus_count(), 2);
-
-        // 6. Live-disable via UpdateServerTuning stops unfocusing on subsequent leaves
-        srv_cmd_tx.send(RuntimeCommand::ReturnLocal).unwrap();
+        cap_tx.send(CaptureEvent::EscapeHotkey).unwrap();
         for _ in 0..40 {
             if !cap_state.remote_mode.load(Ordering::SeqCst) {
                 break;
             }
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
+        assert_eq!(
+            cap_state.refocus_count(),
+            2,
+            "returning to server via EscapeHotkey must restore saved focus"
+        );
+
+        // 7. SystemSuspended discards saved focus (no refocus on leave)
+        srv_cmd_tx
+            .send(RuntimeCommand::SwitchTarget(Some(Edge::Right)))
+            .unwrap();
+        for _ in 0..40 {
+            if cap_state.remote_mode.load(Ordering::SeqCst) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(cap_state.unfocus_count(), 3);
+        let discards_before = cap_state.discard_focus_count();
+        cap_tx.send(CaptureEvent::SystemSuspended).unwrap();
+        for _ in 0..40 {
+            if !cap_state.remote_mode.load(Ordering::SeqCst) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(
+            cap_state.refocus_count(),
+            2,
+            "SystemSuspended must discard saved focus and not refocus"
+        );
+        assert!(cap_state.discard_focus_count() > discards_before);
+
+        // 8. SystemResumed discards saved focus (no refocus on leave)
+        srv_cmd_tx
+            .send(RuntimeCommand::SwitchTarget(Some(Edge::Right)))
+            .unwrap();
+        for _ in 0..40 {
+            if cap_state.remote_mode.load(Ordering::SeqCst) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(cap_state.unfocus_count(), 4);
+        let discards_before = cap_state.discard_focus_count();
+        cap_tx.send(CaptureEvent::SystemResumed).unwrap();
+        for _ in 0..40 {
+            if !cap_state.remote_mode.load(Ordering::SeqCst) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(
+            cap_state.refocus_count(),
+            2,
+            "SystemResumed must discard saved focus and not refocus"
+        );
+        assert!(cap_state.discard_focus_count() > discards_before);
+
+        // 9. Active peer disconnect discards saved focus (no refocus on teardown)
+        srv_cmd_tx
+            .send(RuntimeCommand::SwitchTarget(Some(Edge::Right)))
+            .unwrap();
+        for _ in 0..40 {
+            if cap_state.remote_mode.load(Ordering::SeqCst) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(cap_state.unfocus_count(), 5);
+        let discards_before = cap_state.discard_focus_count();
+        right_cmd_tx.send(RuntimeCommand::Shutdown).unwrap();
+        for _ in 0..80 {
+            if !cap_state.remote_mode.load(Ordering::SeqCst) && srv_rt.snapshot().peers.len() == 1 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(!cap_state.remote_mode.load(Ordering::SeqCst));
+        assert_eq!(
+            cap_state.refocus_count(),
+            2,
+            "active peer disconnect must discard saved focus and not refocus"
+        );
+        assert!(cap_state.discard_focus_count() > discards_before);
+
+        // 10. Live-disabling unfocus_on_leave while remote clears saved focus and stops refocusing
+        srv_cmd_tx
+            .send(RuntimeCommand::SwitchTarget(Some(Edge::Left)))
+            .unwrap();
+        for _ in 0..40 {
+            if cap_state.remote_mode.load(Ordering::SeqCst)
+                && srv_rt.snapshot().active_target == "unfocus-left"
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(cap_state.unfocus_count(), 6);
         srv_cmd_tx
             .send(RuntimeCommand::UpdateServerTuning {
                 edge_threshold_px: 4,
                 dead_corner_px: 24,
                 edge_dwell_ms: 0,
                 auto_lock_fullscreen: true,
+                allow_fullscreen_videos: true,
                 locked: false,
                 sync_lock_keys: true,
                 pin_media_keys_local: true,
@@ -2471,26 +2600,90 @@ mod tests {
             }
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
+        srv_cmd_tx.send(RuntimeCommand::ReturnLocal).unwrap();
+        for _ in 0..40 {
+            if !cap_state.remote_mode.load(Ordering::SeqCst) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(
+            cap_state.refocus_count(),
+            2,
+            "disabling unfocus_on_leave live while remote must not refocus on return"
+        );
+
+        // 11. Subsequent leave while disabled does not unfocus
         srv_cmd_tx
-            .send(RuntimeCommand::SwitchTarget(Some(Edge::Right)))
+            .send(RuntimeCommand::SwitchTarget(Some(Edge::Left)))
             .unwrap();
         for _ in 0..40 {
-            if cap_state.remote_mode.load(Ordering::SeqCst)
-                && srv_rt.snapshot().active_target == "unfocus-right"
-            {
+            if cap_state.remote_mode.load(Ordering::SeqCst) {
                 break;
             }
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
         assert_eq!(
             cap_state.unfocus_count(),
-            2,
+            6,
             "disabling unfocus_on_leave live must prevent subsequent unfocus calls"
         );
+        srv_cmd_tx.send(RuntimeCommand::ReturnLocal).unwrap();
+        for _ in 0..40 {
+            if !cap_state.remote_mode.load(Ordering::SeqCst) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+
+        // 12. Re-enable, leave to Left, then Shutdown while remote -> discards saved focus (no refocus)
+        srv_cmd_tx
+            .send(RuntimeCommand::UpdateServerTuning {
+                edge_threshold_px: 4,
+                dead_corner_px: 24,
+                edge_dwell_ms: 0,
+                auto_lock_fullscreen: true,
+                allow_fullscreen_videos: true,
+                locked: false,
+                sync_lock_keys: true,
+                pin_media_keys_local: true,
+                unfocus_on_leave: true,
+                clipboard: false,
+                drag_drop_files: true,
+                hotkeys: glide_backend::CaptureHotkeys::default(),
+            })
+            .unwrap();
+        for _ in 0..40 {
+            if cap_state.unfocus_on_leave() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        srv_cmd_tx
+            .send(RuntimeCommand::SwitchTarget(Some(Edge::Left)))
+            .unwrap();
+        for _ in 0..40 {
+            if cap_state.remote_mode.load(Ordering::SeqCst) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(cap_state.unfocus_count(), 7);
+        let discards_before = cap_state.discard_focus_count();
+        srv_cmd_tx.send(RuntimeCommand::Shutdown).unwrap();
+        let _ = tokio::time::timeout(Duration::from_secs(2), srv_task)
+            .await
+            .expect("server must shut down cleanly");
+        assert!(!cap_state.remote_mode.load(Ordering::SeqCst));
+        assert_eq!(
+            cap_state.refocus_count(),
+            2,
+            "server shutdown must discard saved focus and not refocus"
+        );
+        assert!(cap_state.discard_focus_count() > discards_before);
 
         right_task.abort();
         left_task.abort();
-        srv_task.abort();
     }
 
     #[tokio::test]
@@ -2508,6 +2701,9 @@ mod tests {
         let (capture_handle, cap_tx, cap_state) = create_mock_capture(geom.clone());
         let (mut injector, inj_log) = MockInjector::new(geom);
         let cli_unfocus_flag = Arc::clone(&injector.unfocus_on_leave_flag);
+        let cli_suspended = Arc::clone(&injector.suspended_flag);
+        let cli_resumed = Arc::clone(&injector.resumed_flag);
+        let cli_discards = Arc::clone(&injector.discard_focus_count);
         let cli_rt = RuntimeState::new();
         let (srv_cmd_tx, srv_cmd_rx) = tokio::sync::mpsc::unbounded_channel();
         let (cli_cmd_tx, mut cli_cmd_rx) = tokio::sync::mpsc::unbounded_channel();
@@ -2578,7 +2774,8 @@ mod tests {
             inj_log.lock().iter().filter(|a| pred(a)).count()
         };
 
-        // 1. Initial unfocus_on_leave = true -> server-initiated Leave triggers UnfocusWindow
+        // 1. Initial unfocus_on_leave = true -> server-initiated Leave triggers UnfocusWindow,
+        //    and returning via EnterAt restores focus (RefocusWindow)
         srv_cmd_tx
             .send(RuntimeCommand::SwitchTarget(Some(Edge::Right)))
             .unwrap();
@@ -2591,6 +2788,11 @@ mod tests {
         assert_eq!(
             count_action(|a| matches!(a, InjectedAction::EnterAt(_, _))),
             1
+        );
+        assert_eq!(
+            count_action(|a| matches!(a, InjectedAction::RefocusWindow)),
+            0,
+            "first EnterAt before any UnfocusWindow must not emit RefocusWindow"
         );
 
         srv_cmd_tx.send(RuntimeCommand::ReturnLocal).unwrap();
@@ -2607,7 +2809,35 @@ mod tests {
             1
         );
 
-        // 2. Live-disable via UpdateClientTuning -> Leave must NOT trigger UnfocusWindow
+        // Return to client -> must restore saved focus (RefocusWindow #1)!
+        srv_cmd_tx
+            .send(RuntimeCommand::SwitchTarget(Some(Edge::Right)))
+            .unwrap();
+        for _ in 0..40 {
+            if count_action(|a| matches!(a, InjectedAction::EnterAt(_, _))) == 2 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(
+            count_action(|a| matches!(a, InjectedAction::RefocusWindow)),
+            1,
+            "re-entering client after UnfocusWindow must emit RefocusWindow"
+        );
+
+        // Leave again so focus is saved before we toggle unfocus_on_leave off
+        srv_cmd_tx.send(RuntimeCommand::ReturnLocal).unwrap();
+        for _ in 0..40 {
+            if count_action(|a| matches!(a, InjectedAction::UnfocusWindow)) == 2
+                && cli_rt.snapshot().active_target == "unfocus-cli-srv"
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+
+        // 2. Live-disable via UpdateClientTuning -> clears saved focus (no RefocusWindow on EnterAt)
+        //    and Leave must NOT trigger UnfocusWindow
         cli_cmd_tx
             .send(RuntimeCommand::UpdateClientTuning {
                 sensitivity: 1.0,
@@ -2636,11 +2866,16 @@ mod tests {
             .send(RuntimeCommand::SwitchTarget(Some(Edge::Right)))
             .unwrap();
         for _ in 0..40 {
-            if count_action(|a| matches!(a, InjectedAction::EnterAt(_, _))) == 2 {
+            if count_action(|a| matches!(a, InjectedAction::EnterAt(_, _))) == 3 {
                 break;
             }
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
+        assert_eq!(
+            count_action(|a| matches!(a, InjectedAction::RefocusWindow)),
+            1,
+            "toggling unfocus_on_leave off must discard saved focus and not refocus"
+        );
         srv_cmd_tx.send(RuntimeCommand::ReturnLocal).unwrap();
         for _ in 0..40 {
             if count_action(|a| matches!(a, InjectedAction::ReleaseAll)) > releases_before
@@ -2652,11 +2887,12 @@ mod tests {
         }
         assert_eq!(
             count_action(|a| matches!(a, InjectedAction::UnfocusWindow)),
-            1,
+            2,
             "disabled unfocus_on_leave must not unfocus on Leave"
         );
 
         // 3. Live-enable via UpdateClientTuning -> edge-return leave() triggers UnfocusWindow
+        //    and subsequent edge Enter triggers RefocusWindow (#2)
         cli_cmd_tx
             .send(RuntimeCommand::UpdateClientTuning {
                 sensitivity: 1.0,
@@ -2692,13 +2928,17 @@ mod tests {
             }
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
+        assert_eq!(
+            count_action(|a| matches!(a, InjectedAction::RefocusWindow)),
+            1
+        );
         // Push left past client's Left return edge -> triggers client edge-return leave()!
         cap_tx
             .send(CaptureEvent::MouseDelta { dx: -60.0, dy: 0.0 })
             .unwrap();
         for _ in 0..40 {
             if !cap_state.remote_mode.load(Ordering::SeqCst)
-                && count_action(|a| matches!(a, InjectedAction::UnfocusWindow)) == 2
+                && count_action(|a| matches!(a, InjectedAction::UnfocusWindow)) == 3
             {
                 break;
             }
@@ -2707,11 +2947,114 @@ mod tests {
         assert!(!cap_state.remote_mode.load(Ordering::SeqCst));
         assert_eq!(
             count_action(|a| matches!(a, InjectedAction::UnfocusWindow)),
-            2,
+            3,
             "re-enabled unfocus_on_leave must trigger UnfocusWindow on edge-return leave()"
         );
 
-        cli_task.abort();
+        // Edge-enter again -> must restore saved focus (RefocusWindow #2)!
+        cap_tx
+            .send(CaptureEvent::EdgeCrossed {
+                edge: Edge::Right,
+                normalized_pos: 0.5,
+            })
+            .unwrap();
+        for _ in 0..40 {
+            if count_action(|a| matches!(a, InjectedAction::Enter(Edge::Left, _))) == 2 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(
+            count_action(|a| matches!(a, InjectedAction::RefocusWindow)),
+            2,
+            "edge Enter after edge-return UnfocusWindow must emit RefocusWindow"
+        );
+
+        // 4. OS suspend discards saved focus on client
+        srv_cmd_tx.send(RuntimeCommand::ReturnLocal).unwrap();
+        for _ in 0..40 {
+            if count_action(|a| matches!(a, InjectedAction::UnfocusWindow)) == 4
+                && cli_rt.snapshot().active_target == "unfocus-cli-srv"
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let discards_before = cli_discards.load(Ordering::SeqCst);
+        cli_suspended.store(true, Ordering::SeqCst);
+        for _ in 0..150 {
+            if cli_discards.load(Ordering::SeqCst) > discards_before {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(
+            cli_discards.load(Ordering::SeqCst) > discards_before,
+            "client suspend must discard saved focus"
+        );
+        srv_cmd_tx
+            .send(RuntimeCommand::SwitchTarget(Some(Edge::Right)))
+            .unwrap();
+        for _ in 0..40 {
+            if count_action(|a| matches!(a, InjectedAction::EnterAt(_, _))) == 4 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(
+            count_action(|a| matches!(a, InjectedAction::RefocusWindow)),
+            2,
+            "client must not refocus stale window after OS suspend"
+        );
+
+        // 5. OS resume discards saved focus on client
+        srv_cmd_tx.send(RuntimeCommand::ReturnLocal).unwrap();
+        for _ in 0..40 {
+            if count_action(|a| matches!(a, InjectedAction::UnfocusWindow)) == 5
+                && cli_rt.snapshot().active_target == "unfocus-cli-srv"
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let discards_before = cli_discards.load(Ordering::SeqCst);
+        cli_resumed.store(true, Ordering::SeqCst);
+        for _ in 0..150 {
+            if cli_discards.load(Ordering::SeqCst) > discards_before {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(
+            cli_discards.load(Ordering::SeqCst) > discards_before,
+            "client resume must discard saved focus"
+        );
+        srv_cmd_tx
+            .send(RuntimeCommand::SwitchTarget(Some(Edge::Right)))
+            .unwrap();
+        for _ in 0..40 {
+            if count_action(|a| matches!(a, InjectedAction::EnterAt(_, _))) == 5 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(
+            count_action(|a| matches!(a, InjectedAction::RefocusWindow)),
+            2,
+            "client must not refocus stale window after OS resume"
+        );
+
+        // 6. Client shutdown discards saved focus cleanly
+        let discards_before = cli_discards.load(Ordering::SeqCst);
+        cli_cmd_tx.send(RuntimeCommand::Shutdown).unwrap();
+        let _ = tokio::time::timeout(Duration::from_secs(2), cli_task)
+            .await
+            .expect("client must shut down cleanly");
+        assert!(
+            cli_discards.load(Ordering::SeqCst) > discards_before,
+            "client shutdown must discard saved focus"
+        );
+
         srv_task.abort();
     }
 }

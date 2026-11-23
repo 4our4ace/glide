@@ -192,6 +192,7 @@ pub async fn run_server_with_dnd(
     dnd.set_enabled(config.drag_drop_files);
     capture_ctrl.set_drag_drop_files(config.drag_drop_files);
     capture_ctrl.set_dnd_probe(Arc::clone(&dnd));
+    capture_ctrl.set_allow_fullscreen_videos(config.allow_fullscreen_videos);
     capture_ctrl.set_unfocus_on_leave(config.unfocus_on_leave);
 
     // Dedicated serial clipboard applier so OS clipboard locks (e.g. OpenClipboard / DIB->PNG)
@@ -463,6 +464,7 @@ pub async fn run_server_with_dnd(
                         jump_secs = jump.as_secs_f32(),
                         "Detected sleep/wall-clock jump on server; releasing remote focus, refreshing geometry & LAN IPs, and probing peers"
                     );
+                    capture_ctrl.discard_saved_focus();
                     cancel_pending_drag_handoff(
                         &mut pending_drag_handoff,
                         active_remote,
@@ -581,6 +583,7 @@ pub async fn run_server_with_dnd(
                             coalesce_armed = false;
                             last_motion_sent = None;
                             remote_modifiers = ModifierMask::EMPTY;
+                            capture_ctrl.discard_saved_focus();
                             let _ = capture_ctrl.leave_remote(peer.edge, 0.5);
                         }
                         let edges: Vec<Edge> = edge_to_peer.keys().copied().collect();
@@ -826,6 +829,7 @@ pub async fn run_server_with_dnd(
                         dead_corner_px,
                         edge_dwell_ms,
                         auto_lock_fullscreen,
+                        allow_fullscreen_videos,
                         locked: new_locked,
                         sync_lock_keys,
                         pin_media_keys_local,
@@ -838,6 +842,7 @@ pub async fn run_server_with_dnd(
                         config.dead_corner_px = dead_corner_px;
                         config.edge_dwell_ms = edge_dwell_ms;
                         config.auto_lock_fullscreen = auto_lock_fullscreen;
+                        config.allow_fullscreen_videos = allow_fullscreen_videos;
                         config.sync_lock_keys = sync_lock_keys;
                         config.pin_media_keys_local = pin_media_keys_local;
                         config.unfocus_on_leave = unfocus_on_leave;
@@ -854,6 +859,7 @@ pub async fn run_server_with_dnd(
                             auto_lock_fullscreen,
                             locked,
                         );
+                        capture_ctrl.set_allow_fullscreen_videos(allow_fullscreen_videos);
                         capture_ctrl.set_sync_lock_keys(sync_lock_keys);
                         capture_ctrl.set_drag_drop_files(drag_drop_files);
                         capture_ctrl.set_pin_media_keys_local(pin_media_keys_local);
@@ -1595,6 +1601,7 @@ pub async fn run_server_with_dnd(
                     }
 
                     CaptureEvent::SystemSuspended => {
+                        capture_ctrl.discard_saved_focus();
                         cancel_pending_drag_handoff(
                             &mut pending_drag_handoff,
                             active_remote,
@@ -1631,6 +1638,7 @@ pub async fn run_server_with_dnd(
                     CaptureEvent::SystemResumed => {
                         let now = Instant::now();
                         sleep_detector.reset();
+                        capture_ctrl.discard_saved_focus();
                         cancel_pending_drag_handoff(
                             &mut pending_drag_handoff,
                             active_remote,
@@ -1708,6 +1716,7 @@ pub async fn run_server_with_dnd(
                                 pending_dy = 0.0;
                                 coalesce_armed = false;
                                 last_motion_sent = None;
+                                capture_ctrl.discard_saved_focus();
                                 if let Some(edge) = active_edge.take() {
                                     let _ = capture_ctrl.leave_remote(edge, 0.5);
                                 }
@@ -2087,6 +2096,7 @@ pub async fn run_server_with_dnd(
                                 coalesce_armed = false;
                                 last_motion_sent = None;
                                 remote_modifiers = ModifierMask::EMPTY;
+                                capture_ctrl.discard_saved_focus();
                                 let _ = capture_ctrl.leave_remote(peer.edge, 0.5);
                             }
                             sync_runtime_peers(&runtime, &peers, active_remote, locked, None);
@@ -2137,6 +2147,7 @@ pub async fn run_server_with_dnd(
         }
     }
 
+    capture_ctrl.discard_saved_focus();
     cancel_pending_drag_handoff(
         &mut pending_drag_handoff,
         active_remote,
@@ -2323,6 +2334,7 @@ pub async fn run_native_server_with_runtime(
         dead_corner_px: config.dead_corner_px,
         edge_dwell_ms: config.edge_dwell_ms,
         auto_lock_fullscreen: config.auto_lock_fullscreen,
+        allow_fullscreen_videos: config.allow_fullscreen_videos,
         sync_lock_keys: config.sync_lock_keys,
         drag_drop_files: config.drag_drop_files,
         pin_media_keys_local: config.pin_media_keys_local,

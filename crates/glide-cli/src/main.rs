@@ -179,6 +179,10 @@ enum Command {
         #[arg(long)]
         no_fullscreen_lock: bool,
 
+        /// Also lock edge switching while watching fullscreen videos in browsers or media players
+        #[arg(long)]
+        lock_fullscreen_videos: bool,
+
         /// Forward media and volume keys to the active remote client instead of keeping them local
         #[arg(long)]
         forward_media_keys: bool,
@@ -457,6 +461,7 @@ async fn run_command(command: Command, config: Option<PathBuf>) -> Result<()> {
             dead_corner,
             edge_dwell_ms,
             no_fullscreen_lock,
+            lock_fullscreen_videos,
             forward_media_keys,
             unfocus_on_leave,
             coalesce_us,
@@ -490,6 +495,9 @@ async fn run_command(command: Command, config: Option<PathBuf>) -> Result<()> {
             }
             if no_fullscreen_lock {
                 cfg.auto_lock_fullscreen = false;
+            }
+            if lock_fullscreen_videos {
+                cfg.allow_fullscreen_videos = false;
             }
             if forward_media_keys {
                 cfg.pin_media_keys_local = false;
@@ -1079,6 +1087,28 @@ mod tests {
             cli_enabled.command,
             Some(Command::Client {
                 unfocus_on_leave: true,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn parses_lock_fullscreen_videos_flag_for_server() {
+        let srv_default = Cli::try_parse_from(["glide", "server"]).unwrap();
+        assert!(matches!(
+            srv_default.command,
+            Some(Command::Server {
+                lock_fullscreen_videos: false,
+                ..
+            })
+        ));
+
+        let srv_locked =
+            Cli::try_parse_from(["glide", "server", "--lock-fullscreen-videos"]).unwrap();
+        assert!(matches!(
+            srv_locked.command,
+            Some(Command::Server {
+                lock_fullscreen_videos: true,
                 ..
             })
         ));

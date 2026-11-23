@@ -3110,6 +3110,7 @@ mod tests {
                     "srv-corner-row",
                     "srv-dwell-row",
                     "fs-lock-row",
+                    "fs-allow-video-row",
                     "srv-sync-lock-row",
                     "srv-pin-media-row",
                     "srv-unfocus-row",
@@ -3938,5 +3939,185 @@ mod tests {
         rt.frame(0.0);
         assert!(rt.find("srv-unfocus-row").is_none());
         assert!(rt.find("srv-unfocus-toggle").is_none());
+    }
+
+    #[tokio::test]
+    async fn allow_fullscreen_videos_toggle_updates_config_and_follows_fullscreen_lock() {
+        struct CleanupDir(PathBuf);
+        impl Drop for CleanupDir {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+
+        let dir = std::env::temp_dir().join(format!(
+            "glide-ui-allow-fullscreen-videos-test-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let _cleanup = CleanupDir(dir.clone());
+
+        let (quit_tx, _quit_rx) = tokio::sync::mpsc::unbounded_channel();
+        let ctrl = Arc::new(AppController::new(
+            dir.join("config.toml"),
+            "http://127.0.0.1:0".into(),
+            quit_tx,
+        ));
+
+        let (cmd_tx, mut cmd_rx) = tokio::sync::mpsc::unbounded_channel();
+        let dummy_task = tokio::spawn(async {});
+        *ctrl.engine.lock() = Some(crate::ActiveEngine {
+            task: dummy_task,
+            cmd_tx,
+        });
+
+        let vis = Arc::new(WindowVisibility::new(true));
+        let mut ui = Ui::new(ctrl, tokio::runtime::Handle::current(), vis);
+        ui.tab = Tab::Input;
+        ui.role = Role::Server;
+        ui.theme = ThemePref::Light;
+        ui.is_windows = true;
+        ui.os_kind = OsKind::Windows;
+        ui.os_label = "Windows";
+
+        assert!(ui.config.server.auto_lock_fullscreen);
+        assert!(ui.config.server.allow_fullscreen_videos);
+
+        let text_sys = rune::text::TextSystem::new(FONTS, ("Inter", "JetBrains Mono"));
+        let mut rt = rune::Runtime::with_text(
+            ui,
+            view,
+            (GUI_WIDTH as f32, GUI_HEIGHT as f32),
+            rune::Env::new(false, 1.0),
+            text_sys,
+        );
+        rt.frame(0.0);
+        rt.settle_all();
+        rt.frame(0.0);
+
+        let click_key = |rt: &mut rune::Runtime<Ui>, key: &str| {
+            let (x, y) = rt
+                .find(key)
+                .unwrap_or_else(|| panic!("element `{key}` should exist"));
+            rt.pointer_down(x, y);
+            rt.pointer_up(x, y);
+            rt.frame(0.0);
+            rt.settle_all();
+            rt.frame(0.0);
+        };
+
+        let assert_row_fits = |rt: &rune::Runtime<Ui>, key: &str| {
+            let info = rt
+                .elements()
+                .into_iter()
+                .find(|e| e.key.as_deref() == Some(key))
+                .unwrap_or_else(|| panic!("row `{key}` should render"));
+            assert!(
+                info.rect[2] > 180.0
+                    && info.rect[3] >= 36.0
+                    && info.rect[0] + info.rect[2] <= GUI_WIDTH as f32 + 1.0
+                    && info.rect[1] + info.rect[3] <= GUI_HEIGHT as f32 + 1.0,
+                "row `{key}` should fit cleanly inside 900x640, got {:?}",
+                info.rect
+            );
+        };
+
+        // 1. With auto_lock_fullscreen = true, fs-allow-video-row (and the full 8-row edges-card)
+        // fits cleanly inside 900x640, and toggling flips true -> false -> true with live commands.
+        assert_row_fits(&rt, "fs-allow-video-row");
+        assert_row_fits(&rt, "srv-unfocus-row");
+
+        click_key(&mut rt, "fs-allow-video-toggle");
+        assert!(!rt.state.config.server.allow_fullscreen_videos);
+        let mut saw_video_false = false;
+        while let Ok(cmd) = cmd_rx.try_recv() {
+            if matches!(
+                cmd,
+                RuntimeCommand::UpdateServerTuning {
+                    auto_lock_fullscreen: true,
+                    allow_fullscreen_videos: false,
+                    ..
+                }
+            ) {
+                saw_video_false = true;
+            }
+        }
+        assert!(
+            saw_video_false,
+            "toggling fs-allow-video-toggle OFF must emit UpdateServerTuning {{ allow_fullscreen_videos: false }}"
+        );
+
+        click_key(&mut rt, "fs-allow-video-toggle");
+        assert!(rt.state.config.server.allow_fullscreen_videos);
+        let mut saw_video_true = false;
+        while let Ok(cmd) = cmd_rx.try_recv() {
+            if matches!(
+                cmd,
+                RuntimeCommand::UpdateServerTuning {
+                    auto_lock_fullscreen: true,
+                    allow_fullscreen_videos: true,
+                    ..
+                }
+            ) {
+                saw_video_true = true;
+            }
+        }
+        assert!(
+            saw_video_true,
+            "toggling fs-allow-video-toggle ON must emit UpdateServerTuning {{ allow_fullscreen_videos: true }}"
+        );
+
+        // 2. Flip allow_fullscreen_videos to false (non-default), then toggle fs-lock-toggle OFF
+        // and back ON to confirm fs-allow-video-row hides cleanly and restores with saved value.
+        click_key(&mut rt, "fs-allow-video-toggle");
+        assert!(!rt.state.config.server.allow_fullscreen_videos);
+        while cmd_rx.try_recv().is_ok() {}
+
+        click_key(&mut rt, "fs-lock-toggle");
+        assert!(!rt.state.config.server.auto_lock_fullscreen);
+        assert!(!rt.state.config.server.allow_fullscreen_videos);
+        assert!(rt.find("fs-allow-video-row").is_none());
+        assert!(rt.find("fs-allow-video-toggle").is_none());
+        let mut saw_lock_off = false;
+        while let Ok(cmd) = cmd_rx.try_recv() {
+            if matches!(
+                cmd,
+                RuntimeCommand::UpdateServerTuning {
+                    auto_lock_fullscreen: false,
+                    allow_fullscreen_videos: false,
+                    ..
+                }
+            ) {
+                saw_lock_off = true;
+            }
+        }
+        assert!(
+            saw_lock_off,
+            "toggling fs-lock-toggle OFF must emit UpdateServerTuning {{ auto_lock_fullscreen: false, allow_fullscreen_videos: false }}"
+        );
+
+        click_key(&mut rt, "fs-lock-toggle");
+        assert!(rt.state.config.server.auto_lock_fullscreen);
+        assert!(!rt.state.config.server.allow_fullscreen_videos);
+        assert_row_fits(&rt, "fs-allow-video-row");
+        assert!(rt.find("fs-allow-video-toggle").is_some());
+        let mut saw_lock_on = false;
+        while let Ok(cmd) = cmd_rx.try_recv() {
+            if matches!(
+                cmd,
+                RuntimeCommand::UpdateServerTuning {
+                    auto_lock_fullscreen: true,
+                    allow_fullscreen_videos: false,
+                    ..
+                }
+            ) {
+                saw_lock_on = true;
+            }
+        }
+        assert!(
+            saw_lock_on,
+            "toggling fs-lock-toggle back ON must preserve allow_fullscreen_videos: false in UpdateServerTuning"
+        );
     }
 }

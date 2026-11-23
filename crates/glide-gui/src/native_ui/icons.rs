@@ -303,6 +303,12 @@ static FULLSCREEN: Icon = Icon {
     body: r#"<path d="M5.6 2.8H3.4A0.6 0.6 0 0 0 2.8 3.4V5.6M10.4 2.8H12.6A0.6 0.6 0 0 1 13.2 3.4V5.6M13.2 10.4V12.6A0.6 0.6 0 0 1 12.6 13.2H10.4M5.6 13.2H3.4A0.6 0.6 0 0 1 2.8 12.6V10.4" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/>"#,
 };
 
+static FULLSCREEN_VIDEO: Icon = Icon {
+    name: "setting-fullscreen-video",
+    view: 16.0,
+    body: r#"<rect x="2.0" y="3.0" width="12.0" height="10.0" rx="1.8" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linejoin="round"/><path d="M6.5 5.5L10.8 8L6.5 10.5Z" fill="currentColor"/>"#,
+};
+
 static KEYBOARD: Icon = Icon {
     name: "setting-keyboard",
     view: 16.0,
@@ -627,6 +633,10 @@ pub fn timer_icon(color: Color) -> El {
 
 pub fn fullscreen_icon(color: Color) -> El {
     setting_glyph(&FULLSCREEN, color)
+}
+
+pub fn fullscreen_video_icon(color: Color) -> El {
+    setting_glyph(&FULLSCREEN_VIDEO, color)
 }
 
 pub fn keyboard_icon(color: Color) -> El {

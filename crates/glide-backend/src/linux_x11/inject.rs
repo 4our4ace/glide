@@ -185,6 +185,11 @@ impl InputInjector for X11Injector {
             .warp_pointer(x11rb::NONE, self.root, 0, 0, 0, 0, x as i16, y as i16)
             .context("X11 warp_pointer on Enter failed")?;
         self.cursor_hider.show(&self.conn, self.root);
+        if self.unfocus_on_leave {
+            self.focus_clearer.restore_focus(&self.conn, self.root);
+        } else {
+            self.focus_clearer.clear_saved();
+        }
         self.conn.flush().context("X11 flush failed")?;
 
         self.rem_x = 0.0;
@@ -207,6 +212,11 @@ impl InputInjector for X11Injector {
             .warp_pointer(x11rb::NONE, self.root, 0, 0, 0, 0, x as i16, y as i16)
             .context("X11 warp_pointer on EnterAt failed")?;
         self.cursor_hider.show(&self.conn, self.root);
+        if self.unfocus_on_leave {
+            self.focus_clearer.restore_focus(&self.conn, self.root);
+        } else {
+            self.focus_clearer.clear_saved();
+        }
         self.conn.flush().context("X11 flush failed")?;
 
         self.rem_x = 0.0;
@@ -476,6 +486,8 @@ impl InputInjector for X11Injector {
         self.cursor_hider.hide(&self.conn, self.root);
         if self.unfocus_on_leave {
             self.focus_clearer.clear_focus(&self.conn, self.root);
+        } else {
+            self.focus_clearer.clear_saved();
         }
         let _ = self.conn.flush();
         self.parked_pos = (px, py);
@@ -489,9 +501,17 @@ impl InputInjector for X11Injector {
 
     fn set_unfocus_on_leave(&mut self, enabled: bool) {
         self.unfocus_on_leave = enabled;
+        if !enabled {
+            self.focus_clearer.clear_saved();
+        }
+    }
+
+    fn discard_saved_focus(&mut self) {
+        self.focus_clearer.clear_saved();
     }
 
     fn show_cursor(&mut self) -> Result<()> {
+        self.focus_clearer.clear_saved();
         self.cursor_hider.show(&self.conn, self.root);
         let _ = self.conn.flush();
         Ok(())
