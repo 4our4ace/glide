@@ -5,17 +5,19 @@ use crate::geometry::DesktopGeometry;
 use crate::windows::{
     init_dpi_awareness, query_desktop_geometry, WindowsFocusState, GLIDE_EXTRA_INFO,
 };
-use crate::InputInjector;
+use crate::{InjectorEvent, InputInjector};
 use anyhow::Result;
 use glide_hid::{HidUsage, MouseButton};
 use glide_proto::{Edge, LockState, OsKind};
-use std::collections::HashSet;
+use parking_lot::Mutex;
+use std::collections::{HashMap, HashSet};
 use std::mem::size_of;
 use std::ptr;
 use std::sync::atomic::{AtomicIsize, AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant};
+use tokio::sync::mpsc;
 use tracing::{debug, trace};
 use windows_sys::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, WPARAM};
 use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
@@ -31,15 +33,57 @@ use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GetCursorPos, GetMessageW,
-    PostMessageW, RegisterClassW, SetCursorPos, TranslateMessage, MSG, PBT_APMRESUMEAUTOMATIC,
-    PBT_APMRESUMECRITICAL, PBT_APMRESUMESUSPEND, PBT_APMSUSPEND, WM_DISPLAYCHANGE, WM_DPICHANGED,
-    WM_POWERBROADCAST, WM_QUIT, WM_WTSSESSION_CHANGE, WNDCLASSW, WS_EX_NOACTIVATE,
-    WS_EX_TOOLWINDOW, WS_OVERLAPPED, WTS_SESSION_LOCK, WTS_SESSION_UNLOCK, XBUTTON1, XBUTTON2,
+    PostMessageW, PostQuitMessage, RegisterClassW, SetCursorPos, TranslateMessage, MSG,
+    PBT_APMRESUMEAUTOMATIC, PBT_APMRESUMECRITICAL, PBT_APMRESUMESUSPEND, PBT_APMSUSPEND, WM_APP,
+    WM_DESTROY, WM_DISPLAYCHANGE, WM_DPICHANGED, WM_POWERBROADCAST, WM_SETTINGCHANGE,
+    WM_WTSSESSION_CHANGE, WNDCLASSW, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_OVERLAPPED,
+    WTS_SESSION_LOCK, WTS_SESSION_UNLOCK, XBUTTON1, XBUTTON2,
 };
+
+const WM_APP_INJECTOR_STOP: u32 = WM_APP + 0x41;
 
 static INJECTOR_DISPLAY_GEN: AtomicU64 = AtomicU64::new(0);
 static INJECTOR_SUSPEND_GEN: AtomicU64 = AtomicU64::new(0);
 static INJECTOR_RESUME_GEN: AtomicU64 = AtomicU64::new(0);
+struct InjectorWatchEntry {
+    tx: mpsc::UnboundedSender<InjectorEvent>,
+    last_geom: Option<DesktopGeometry>,
+}
+
+static INJECTOR_EVENT_TXS: OnceLock<Mutex<HashMap<isize, InjectorWatchEntry>>> = OnceLock::new();
+
+fn injector_tx_map() -> &'static Mutex<HashMap<isize, InjectorWatchEntry>> {
+    INJECTOR_EVENT_TXS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn emit_injector_event(hwnd: HWND, event: InjectorEvent) {
+    if let Some(tx) = injector_tx_map()
+        .lock()
+        .get(&(hwnd as isize))
+        .map(|entry| entry.tx.clone())
+    {
+        let _ = tx.send(event);
+    }
+}
+
+fn emit_fresh_geometry(hwnd: HWND) {
+    if let Ok(geom) = query_desktop_geometry() {
+        let tx = {
+            let mut map = injector_tx_map().lock();
+            map.get_mut(&(hwnd as isize)).and_then(|entry| {
+                if entry.last_geom.as_ref() == Some(&geom) {
+                    None
+                } else {
+                    entry.last_geom = Some(geom.clone());
+                    Some(entry.tx.clone())
+                }
+            })
+        };
+        if let Some(tx) = tx {
+            let _ = tx.send(InjectorEvent::GeometryChanged(geom));
+        }
+    }
+}
 
 unsafe extern "system" fn injector_watch_wnd_proc(
     hwnd: HWND,
@@ -48,18 +92,22 @@ unsafe extern "system" fn injector_watch_wnd_proc(
     lparam: LPARAM,
 ) -> LRESULT {
     match msg {
-        WM_DISPLAYCHANGE | WM_DPICHANGED => {
+        WM_DISPLAYCHANGE | WM_DPICHANGED | WM_SETTINGCHANGE => {
             INJECTOR_DISPLAY_GEN.fetch_add(1, Ordering::Release);
+            emit_fresh_geometry(hwnd);
             0
         }
         WM_POWERBROADCAST => match wparam as u32 {
             PBT_APMSUSPEND => {
                 INJECTOR_SUSPEND_GEN.fetch_add(1, Ordering::Release);
+                emit_injector_event(hwnd, InjectorEvent::SystemSuspended);
                 1
             }
             PBT_APMRESUMEAUTOMATIC | PBT_APMRESUMESUSPEND | PBT_APMRESUMECRITICAL => {
                 INJECTOR_DISPLAY_GEN.fetch_add(1, Ordering::Release);
                 INJECTOR_RESUME_GEN.fetch_add(1, Ordering::Release);
+                emit_fresh_geometry(hwnd);
+                emit_injector_event(hwnd, InjectorEvent::SystemResumed);
                 1
             }
             _ => unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) },
@@ -67,22 +115,32 @@ unsafe extern "system" fn injector_watch_wnd_proc(
         WM_WTSSESSION_CHANGE => match wparam as u32 {
             WTS_SESSION_LOCK => {
                 INJECTOR_SUSPEND_GEN.fetch_add(1, Ordering::Release);
+                emit_injector_event(hwnd, InjectorEvent::SystemSuspended);
                 0
             }
             WTS_SESSION_UNLOCK => {
                 INJECTOR_DISPLAY_GEN.fetch_add(1, Ordering::Release);
                 INJECTOR_RESUME_GEN.fetch_add(1, Ordering::Release);
+                emit_fresh_geometry(hwnd);
+                emit_injector_event(hwnd, InjectorEvent::SystemResumed);
                 0
             }
             _ => 0,
         },
+        WM_DESTROY => {
+            injector_tx_map().lock().remove(&(hwnd as isize));
+            unsafe {
+                PostQuitMessage(0);
+            }
+            0
+        }
         _ => unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) },
     }
 }
 
 /// Spawns a lightweight hidden top-level window listening for display/DPI changes,
-/// sleep/wake power broadcasts, and WTS session lock/unlock events (best-effort).
-fn spawn_display_watcher() -> AtomicIsize {
+/// sleep/wake power broadcasts, and WTS session lock/unlock events (best-effort, **0.0 Hz idle**).
+fn spawn_display_watcher(event_tx: mpsc::UnboundedSender<InjectorEvent>) -> AtomicIsize {
     let (tx, rx) = std::sync::mpsc::sync_channel::<isize>(1);
     let spawn_res = thread::Builder::new()
         .name("glide-win-display-watch".into())
@@ -105,7 +163,7 @@ fn spawn_display_watcher() -> AtomicIsize {
                 RegisterClassW(&wc);
             }
             // Must be a hidden top-level window (NOT HWND_MESSAGE) to receive WM_DISPLAYCHANGE,
-            // WM_POWERBROADCAST, WM_DPICHANGED, and WM_WTSSESSION_CHANGE.
+            // WM_POWERBROADCAST, WM_DPICHANGED, WM_SETTINGCHANGE, and WM_WTSSESSION_CHANGE.
             let hwnd = unsafe {
                 CreateWindowExW(
                     WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE,
@@ -126,16 +184,28 @@ fn spawn_display_watcher() -> AtomicIsize {
                 let _ = tx.send(0);
                 return;
             }
+            let initial_geom = query_desktop_geometry().ok();
+            injector_tx_map().lock().insert(
+                hwnd as isize,
+                InjectorWatchEntry {
+                    tx: event_tx,
+                    last_geom: initial_geom,
+                },
+            );
             let wts_registered =
                 unsafe { WTSRegisterSessionNotification(hwnd, NOTIFY_FOR_THIS_SESSION) } != 0;
             let _ = tx.send(hwnd as isize);
             let mut msg: MSG = unsafe { std::mem::zeroed() };
             while unsafe { GetMessageW(&mut msg, ptr::null_mut(), 0, 0) } > 0 {
+                if msg.hwnd == hwnd && msg.message == WM_APP_INJECTOR_STOP {
+                    break;
+                }
                 unsafe {
                     TranslateMessage(&msg);
                     DispatchMessageW(&msg);
                 }
             }
+            injector_tx_map().lock().remove(&(hwnd as isize));
             unsafe {
                 if wts_registered {
                     WTSUnRegisterSessionNotification(hwnd);
@@ -155,10 +225,10 @@ fn spawn_display_watcher() -> AtomicIsize {
 pub struct WindowsInjector {
     geometry: DesktopGeometry,
     watch_hwnd: AtomicIsize,
+    event_rx: Option<mpsc::UnboundedReceiver<InjectorEvent>>,
     seen_display_gen: u64,
     seen_suspend_gen: u64,
     seen_resume_gen: u64,
-    last_geom_refresh: Instant,
     rem_x: f32,
     rem_y: f32,
     edge_push_accum: f32,
@@ -172,7 +242,8 @@ pub struct WindowsInjector {
 impl WindowsInjector {
     pub fn new() -> Result<Self> {
         init_dpi_awareness();
-        let watch_hwnd = spawn_display_watcher();
+        let (event_tx, event_rx) = mpsc::unbounded_channel();
+        let watch_hwnd = spawn_display_watcher(event_tx);
         let seen_display_gen = INJECTOR_DISPLAY_GEN.load(Ordering::Acquire);
         let seen_suspend_gen = INJECTOR_SUSPEND_GEN.load(Ordering::Acquire);
         let seen_resume_gen = INJECTOR_RESUME_GEN.load(Ordering::Acquire);
@@ -180,10 +251,10 @@ impl WindowsInjector {
         Ok(Self {
             geometry,
             watch_hwnd,
+            event_rx: Some(event_rx),
             seen_display_gen,
             seen_suspend_gen,
             seen_resume_gen,
-            last_geom_refresh: Instant::now(),
             rem_x: 0.0,
             rem_y: 0.0,
             edge_push_accum: 0.0,
@@ -197,12 +268,10 @@ impl WindowsInjector {
 
     fn refresh_geometry_if_needed(&mut self) -> bool {
         let current_gen = INJECTOR_DISPLAY_GEN.load(Ordering::Acquire);
-        let dirty = current_gen != self.seen_display_gen;
-        if !dirty && self.last_geom_refresh.elapsed() < Duration::from_secs(5) {
+        if current_gen == self.seen_display_gen {
             return false;
         }
         self.seen_display_gen = current_gen;
-        self.last_geom_refresh = Instant::now();
         if let Ok(new_geom) = query_desktop_geometry() {
             if new_geom != self.geometry {
                 self.geometry = new_geom;
@@ -210,8 +279,7 @@ impl WindowsInjector {
                 debug!(
                     monitors = self.geometry.monitors.len(),
                     primary_scale = self.geometry.primary_scale(),
-                    dirty,
-                    "WindowsInjector refreshed desktop geometry"
+                    "WindowsInjector refreshed desktop geometry on OS display change"
                 );
                 return true;
             }
@@ -269,6 +337,23 @@ impl InputInjector for WindowsInjector {
         OsKind::Windows
     }
 
+    fn take_event_rx(&mut self) -> Option<mpsc::UnboundedReceiver<InjectorEvent>> {
+        self.event_rx.take()
+    }
+
+    fn apply_geometry(&mut self, geometry: DesktopGeometry) {
+        self.seen_display_gen = INJECTOR_DISPLAY_GEN.load(Ordering::Acquire);
+        if geometry != self.geometry {
+            self.geometry = geometry;
+            self.edge_push_accum = 0.0;
+            debug!(
+                monitors = self.geometry.monitors.len(),
+                primary_scale = self.geometry.primary_scale(),
+                "WindowsInjector applied event-driven desktop geometry update"
+            );
+        }
+    }
+
     fn set_unfocus_on_leave(&mut self, enabled: bool) {
         self.unfocus_on_leave = enabled;
         if !enabled {
@@ -282,9 +367,7 @@ impl InputInjector for WindowsInjector {
 
     fn desktop_geometry(&mut self) -> Result<DesktopGeometry> {
         self.seen_display_gen = INJECTOR_DISPLAY_GEN.load(Ordering::Acquire);
-        self.last_geom_refresh = Instant::now();
         self.geometry = query_desktop_geometry()?;
-        self.last_geom_refresh = Instant::now();
         Ok(self.geometry.clone())
     }
 
@@ -391,8 +474,6 @@ impl InputInjector for WindowsInjector {
         edge_threshold_px: i32,
         dead_corner_px: i32,
     ) -> Result<Option<(Edge, f32)>> {
-        self.refresh_geometry_if_needed();
-
         self.rem_x += dx;
         self.rem_y += dy;
         let ix = self.rem_x.trunc() as i32;
@@ -428,9 +509,13 @@ impl InputInjector for WindowsInjector {
                     .hit_outer_edge_guarded(edge, pt.x, pt.y, 2, dead_corner_px)
             {
                 let lmb_held = self.pressed_buttons.contains(&MouseButton::Left);
-                let start = *self.edge_push_start.get_or_insert_with(Instant::now);
                 self.edge_push_accum += outward;
-                let drag_dwell_ok = !lmb_held || start.elapsed() >= Duration::from_millis(25);
+                let drag_dwell_ok = if lmb_held {
+                    let start = *self.edge_push_start.get_or_insert_with(Instant::now);
+                    start.elapsed() >= Duration::from_millis(25)
+                } else {
+                    true
+                };
                 if self.edge_push_accum >= edge_threshold_px.max(1) as f32 && drag_dwell_ok {
                     self.edge_push_accum = 0.0;
                     self.edge_push_start = None;
@@ -542,7 +627,7 @@ impl Drop for WindowsInjector {
         let hwnd = self.watch_hwnd.swap(0, Ordering::SeqCst) as HWND;
         if !hwnd.is_null() {
             unsafe {
-                PostMessageW(hwnd, WM_QUIT, 0, 0);
+                PostMessageW(hwnd, WM_APP_INJECTOR_STOP, 0, 0);
             }
         }
     }

@@ -168,8 +168,8 @@ impl AppController {
             {
                 task.abort();
                 let _ = task.await;
+                tokio::time::sleep(Duration::from_millis(30)).await;
             }
-            tokio::time::sleep(Duration::from_millis(30)).await;
         }
         self.runtime.update(|s| {
             s.mode = "stopped".into();
@@ -333,7 +333,14 @@ struct GuiIpcBackend(Arc<AppController>);
 
 impl glide_core::ipc::IpcBackend for GuiIpcBackend {
     fn status(&self) -> glide_core::ipc::IpcStatus {
-        glide_core::ipc::IpcStatus::from(self.0.runtime.snapshot())
+        self.0.runtime.read(|snap| glide_core::ipc::IpcStatus {
+            mode: snap.mode.clone(),
+            status: snap.status.clone(),
+            active_target: snap.active_target.clone(),
+            locked: snap.locked,
+            peers: snap.peers.clone(),
+            rtt_ms: snap.rtt_ms,
+        })
     }
 
     fn max_file_bytes(&self) -> usize {
@@ -1092,17 +1099,20 @@ async fn handle_http_conn(mut stream: TcpStream, ctrl: Arc<AppController>) -> Re
                        X-Frame-Options: DENY\r\n\
                        Referrer-Policy: no-referrer\r\n\
                        Connection: keep-alive\r\n\r\n";
-            tokio::time::timeout(HTTP_IO_TIMEOUT, stream.write_all(hdr.as_bytes()))
+            let (mut reader, mut writer) = stream.split();
+            tokio::time::timeout(HTTP_IO_TIMEOUT, writer.write_all(hdr.as_bytes()))
                 .await
                 .context("SSE header write timed out")??;
             let mut rx = ctrl.runtime.subscribe();
+            ctrl.send_cmd(RuntimeCommand::RefreshStats);
             let initial = serde_json::to_string(&ctrl.runtime.snapshot())?;
             tokio::time::timeout(
                 HTTP_IO_TIMEOUT,
-                stream.write_all(format!("data: {initial}\n\n").as_bytes()),
+                writer.write_all(format!("data: {initial}\n\n").as_bytes()),
             )
             .await
             .context("SSE initial write timed out")??;
+            let mut eof_buf = [0u8; 64];
             loop {
                 tokio::select! {
                     res = rx.recv() => {
@@ -1111,7 +1121,7 @@ async fn handle_http_conn(mut stream: TcpStream, ctrl: Arc<AppController>) -> Re
                                 let snap = serde_json::to_string(&ctrl.runtime.snapshot())?;
                                 let wrote = tokio::time::timeout(
                                     HTTP_IO_TIMEOUT,
-                                    stream.write_all(format!("data: {snap}\n\n").as_bytes()),
+                                    writer.write_all(format!("data: {snap}\n\n").as_bytes()),
                                 )
                                 .await;
                                 if !matches!(wrote, Ok(Ok(()))) {
@@ -1121,13 +1131,8 @@ async fn handle_http_conn(mut stream: TcpStream, ctrl: Arc<AppController>) -> Re
                             Err(_) => break,
                         }
                     }
-                    _ = tokio::time::sleep(Duration::from_secs(15)) => {
-                        let wrote = tokio::time::timeout(
-                            HTTP_IO_TIMEOUT,
-                            stream.write_all(b": keepalive\n\n"),
-                        )
-                        .await;
-                        if !matches!(wrote, Ok(Ok(()))) {
+                    read_res = reader.read(&mut eof_buf) => {
+                        if matches!(read_res, Ok(0) | Err(_)) {
                             break;
                         }
                     }

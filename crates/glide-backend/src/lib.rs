@@ -20,7 +20,9 @@ pub use fullscreen::{
     FullscreenAppKind,
 };
 pub use hotkeys::{CaptureHotkeys, HotkeyChord, HotkeyMods};
-pub use lifecycle::{ShutdownInhibitorGuard, SystemLifecycleEvent, SystemLifecycleMonitor};
+pub use lifecycle::{
+    NetworkChangeMonitor, ShutdownInhibitorGuard, SystemLifecycleEvent, SystemLifecycleMonitor,
+};
 
 /// User actions emitted by the native OS system tray (Windows 11 & Linux StatusNotifierItem).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -517,12 +519,35 @@ pub struct CaptureHandle {
     pub events: mpsc::UnboundedReceiver<CaptureEvent>,
 }
 
+/// Event-driven notifications pushed asynchronously by an [`InputInjector`] backend
+/// (**0.0 Hz idle polling** — replaces periodic geometry, suspend/resume, and cursor-reveal polls).
+#[derive(Debug, Clone)]
+pub enum InjectorEvent {
+    /// Display hotplug, resolution change, or DPI scale change reported by the OS.
+    GeometryChanged(DesktopGeometry),
+    /// OS entered sleep/suspend or locked the desktop session.
+    SystemSuspended,
+    /// OS resumed from sleep/suspend or unlocked the desktop session.
+    SystemResumed,
+    /// User physically moved a local mouse/touchpad while the cursor was hidden.
+    LocalCursorActivity,
+}
+
 /// Client-side OS input injection trait.
 pub trait InputInjector: Send {
     fn os_kind(&self) -> OsKind;
 
     /// Returns the current multi-monitor layout.
     fn desktop_geometry(&mut self) -> Result<DesktopGeometry>;
+
+    /// Takes the backend's event-driven notification stream (geometry hotplug, session
+    /// suspend/resume, and local cursor reveal). Returns `None` if already taken or unsupported.
+    fn take_event_rx(&mut self) -> Option<mpsc::UnboundedReceiver<InjectorEvent>> {
+        None
+    }
+
+    /// Applies a fresh [`DesktopGeometry`] delivered via [`InjectorEvent::GeometryChanged`].
+    fn apply_geometry(&mut self, _geometry: DesktopGeometry) {}
 
     /// Called when focus enters this client via a screen border.
     fn enter(&mut self, edge: Edge, normalized_pos: f32) -> Result<()>;

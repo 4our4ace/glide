@@ -24,7 +24,7 @@ use parking_lot::Mutex;
 use reis::ei;
 use reis::event::{DeviceCapability, EiEvent, EiEventConverter};
 use reis::PendingRequestResult;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::io;
 use std::os::fd::AsRawFd;
 use std::os::unix::net::UnixStream;
@@ -228,6 +228,7 @@ struct SharedState {
 struct WaylandCaptureControl {
     shared: Arc<SharedState>,
     cmd_tx: std::sync::mpsc::Sender<ControlMsg>,
+    eis_wake: crate::linux_x11::WakeSender,
 }
 
 impl CaptureControl for WaylandCaptureControl {
@@ -332,6 +333,7 @@ impl CaptureControl for WaylandCaptureControl {
 impl Drop for WaylandCaptureControl {
     fn drop(&mut self) {
         let _ = self.cmd_tx.send(ControlMsg::Shutdown);
+        self.eis_wake.wake();
     }
 }
 
@@ -744,12 +746,13 @@ fn start_wayland_capture_blocking(config: CaptureConfig) -> Result<CaptureHandle
         })?;
 
     // Thread 2: EIS receiver event loop (raw mouse deltas, buttons, scroll, evdev keys)
+    let (eis_wake_tx, eis_wake_rx) = crate::linux_x11::wake_pipe()?;
     let shared_eis = Arc::clone(&shared);
     std::thread::Builder::new()
         .name("glide-wl-ic-eis".into())
         .spawn(move || {
             let mut converter = EiEventConverter::new(&ei_ctx, handshake_resp);
-            let mut held_keys: HashSet<HidUsage> = HashSet::new();
+            let mut mods = ModifierMask::EMPTY;
             let hotkey_suppressor = AtomicHotkeySuppressor::new();
             let mut media_tracker = RemoteMediaKeyTracker::new();
             let mut was_in_remote = false;
@@ -764,7 +767,7 @@ fn start_wayland_capture_blocking(config: CaptureConfig) -> Result<CaptureHandle
                 if last_remote_gen != current_gen || (was_in_remote && !in_remote_now) {
                     media_tracker.clear();
                     shared_eis.remote_keys_down.clear();
-                    held_keys.clear();
+                    mods = ModifierMask::EMPTY;
                     hotkey_suppressor.clear();
                     last_remote_gen = current_gen;
                 }
@@ -799,7 +802,7 @@ fn start_wayland_capture_blocking(config: CaptureConfig) -> Result<CaptureHandle
                         EiEvent::DevicePaused(_) => {
                             media_tracker.clear();
                             shared_eis.remote_keys_down.clear();
-                            held_keys.clear();
+                            mods = ModifierMask::EMPTY;
                             hotkey_suppressor.clear();
                             last_remote_gen = shared_eis.remote_gen.load(Ordering::Acquire);
                         }
@@ -866,7 +869,7 @@ fn start_wayland_capture_blocking(config: CaptureConfig) -> Result<CaptureHandle
                             if last_remote_gen != current_gen {
                                 media_tracker.clear();
                                 shared_eis.remote_keys_down.clear();
-                                held_keys.clear();
+                                mods = ModifierMask::EMPTY;
                                 hotkey_suppressor.clear();
                                 last_remote_gen = current_gen;
                             }
@@ -874,15 +877,8 @@ fn start_wayland_capture_blocking(config: CaptureConfig) -> Result<CaptureHandle
                             let Some(usage) = HidUsage::from_evdev(k.key as u16) else {
                                 continue;
                             };
-                            let mut prev_mask = ModifierMask::EMPTY;
-                            for &held in &held_keys {
-                                prev_mask.update(held, true);
-                            }
-                            if pressed {
-                                held_keys.insert(usage);
-                            } else {
-                                held_keys.remove(&usage);
-                            }
+                            let prev_mask = mods;
+                            mods.update(usage, pressed);
 
                             let in_remote = shared_eis.in_remote.load(Ordering::Acquire);
                             match hotkey_suppressor.evaluate(
@@ -900,7 +896,7 @@ fn start_wayland_capture_blocking(config: CaptureConfig) -> Result<CaptureHandle
                                         .wrapping_add(1);
                                     media_tracker.clear();
                                     shared_eis.remote_keys_down.clear();
-                                    held_keys.clear();
+                                    mods = ModifierMask::EMPTY;
                                     hotkey_suppressor.clear();
                                     was_in_remote = false;
                                     if ev_tx.send(CaptureEvent::EscapeHotkey).is_err() {
@@ -954,22 +950,10 @@ fn start_wayland_capture_blocking(config: CaptureConfig) -> Result<CaptureHandle
                     }
                 }
 
-                // Wait for next readable EIS packet
-                let mut pfd = libc::pollfd {
-                    fd,
-                    events: libc::POLLIN,
-                    revents: 0,
-                };
-                let rc = unsafe { libc::poll(&mut pfd, 1, 250) };
-                if rc < 0 {
-                    let err = io::Error::last_os_error();
-                    if err.kind() == io::ErrorKind::Interrupted {
-                        continue;
-                    }
-                    break;
-                }
-                if rc > 0 {
-                    match ei_ctx.read() {
+                // Pure event-driven infinite sleep until next EIS packet or shutdown wake (0.0 Hz idle).
+                match crate::linux_x11::poll_fd_and_wake(fd, &eis_wake_rx, -1) {
+                    Ok(st) if st.wake_ready || st.wake_closed || st.fd_error => break,
+                    Ok(st) if st.fd_ready => match ei_ctx.read() {
                         Ok(0) => break,
                         Ok(_) => {}
                         Err(e) if e.kind() == io::ErrorKind::WouldBlock => {}
@@ -978,6 +962,11 @@ fn start_wayland_capture_blocking(config: CaptureConfig) -> Result<CaptureHandle
                             warn!(error = %e, "EIS capture read error");
                             break;
                         }
+                    },
+                    Ok(_) => {}
+                    Err(e) => {
+                        warn!(error = %e, "EIS capture poll error");
+                        break;
                     }
                 }
             }
@@ -985,7 +974,11 @@ fn start_wayland_capture_blocking(config: CaptureConfig) -> Result<CaptureHandle
 
     info!("Wayland InputCapture server backend ready (EIS)");
     Ok(CaptureHandle {
-        control: Box::new(WaylandCaptureControl { shared, cmd_tx }),
+        control: Box::new(WaylandCaptureControl {
+            shared,
+            cmd_tx,
+            eis_wake: eis_wake_tx,
+        }),
         events: ev_rx,
     })
 }

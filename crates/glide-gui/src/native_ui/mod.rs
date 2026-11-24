@@ -10,6 +10,7 @@ use crate::{launch_browser_window, AppController, GUI_HEIGHT, GUI_WIDTH};
 use glide_backend::hotkeys::{
     arrow_to_edge, CaptureHotkeys, HidUsage, HotkeyChord, HotkeyMods, ModifierMask,
 };
+use glide_backend::lifecycle::NetworkChangeMonitor;
 use glide_backend::os_integration::{
     configure_elevated_task, configure_firewall, ensure_receive_dir, is_autostart_enabled,
     open_path_in_os, resolve_receive_dir, reveal_in_file_manager, set_autostart,
@@ -23,7 +24,8 @@ use glide_core::runtime::{
     RuntimeCommand, StatusSnapshot,
 };
 use glide_net::discovery::{
-    discover_servers, local_ipv4_addresses, local_ipv4_addresses_async, machine_hostname,
+    discover_servers, insert_discovered_server, local_ipv4_addresses, local_ipv4_addresses_async,
+    machine_hostname, DiscoveredServer, PassiveDiscoverySession,
 };
 use glide_proto::{ClipboardFormat, Edge, OsKind};
 use rune::{
@@ -31,6 +33,7 @@ use rune::{
     Tx, WindowOptions,
 };
 use std::borrow::Cow;
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
@@ -2018,8 +2021,24 @@ fn on_reopen(s: &mut Ui, has_visible: bool, _tx: &mut Tx) -> bool {
         let (rev, snap) = s.ctrl.runtime.snapshot_with_rev();
         s.window_vis.record_rev(rev);
         s.apply_status_if_newer(rev, snap);
+        s.ctrl.send_cmd(RuntimeCommand::RefreshStats);
     }
     false
+}
+
+fn on_visibility(s: &mut Ui, visible: bool, _tx: &mut Tx) {
+    if s.window_vis.set_visible(visible) {
+        let (rev, snap) = s.ctrl.runtime.snapshot_with_rev();
+        s.window_vis.record_rev(rev);
+        s.apply_status_if_newer(rev, snap);
+        s.ctrl.send_cmd(RuntimeCommand::RefreshStats);
+    }
+}
+
+fn on_focus(s: &mut Ui, focused: bool, _tx: &mut Tx) {
+    if focused {
+        s.ctrl.send_cmd(RuntimeCommand::RefreshStats);
+    }
 }
 
 /// Runs the native Rune window on the calling (main) thread.
@@ -2072,8 +2091,11 @@ pub(crate) fn run(
             ..WindowOptions::default()
         })
         .keep_running()
+        .release_gpu_when_closed()
         .on_close(on_close)
-        .on_reopen(on_reopen);
+        .on_reopen(on_reopen)
+        .on_visibility(on_visibility)
+        .on_focus(on_focus);
 
     if minimized {
         app = app.windowless();
@@ -2110,6 +2132,7 @@ pub(crate) fn run(
         app = app.on_window(move |_| {
             if on_win_vis.set_visible(true) {
                 on_win_vis.push_fresh_snapshot(&on_win_ctrl, &on_win_handle);
+                on_win_ctrl.send_cmd(RuntimeCommand::RefreshStats);
             }
             #[cfg(target_os = "linux")]
             if !glide_backend::linux_wayland::is_wayland_session() {
@@ -2125,19 +2148,21 @@ pub(crate) fn run(
         let show_handle = handle.clone();
         let show_ctrl = Arc::clone(&ctrl);
         let show_vis = Arc::clone(&window_vis);
+        let show_rt = rt.clone();
         let fallback_url = ctrl.url.clone();
         *ctrl.ui_show.lock() = Some(Arc::new(move || {
             // Queue the latest snapshot BEFORE `open()` so Rune drains it on the same
             // turn before painting the revealed window (zero stale frame on reopen).
             if show_vis.set_visible(true) {
                 show_vis.push_fresh_snapshot(&show_ctrl, &show_handle);
+                show_ctrl.send_cmd(RuntimeCommand::RefreshStats);
             }
             show_handle.open();
             let h = show_handle.clone();
             let url = fallback_url.clone();
             let vis_check = Arc::clone(&show_vis);
-            std::thread::spawn(move || {
-                std::thread::sleep(Duration::from_millis(1500));
+            show_rt.spawn(async move {
+                tokio::time::sleep(Duration::from_millis(1500)).await;
                 if let Some(err) = h.window_error() {
                     vis_check.set_visible(false);
                     warn!(error = %err, "Native window could not open; launching browser fallback");
@@ -2353,6 +2378,50 @@ fn spawn_runtime_bridge(
     });
 }
 
+fn should_run_passive_discovery(ctrl: &AppController) -> bool {
+    ctrl.runtime.read(|snap| {
+        let running = snap.mode == "server" || snap.mode == "client";
+        let mode_is_client = snap.mode == "client";
+        let connected = snap.status.starts_with("Connected");
+        !running || (mode_is_client && !connected)
+    })
+}
+
+fn format_discovered_peers(
+    found: &HashMap<String, DiscoveredServer>,
+    my_fp: Option<&str>,
+) -> Vec<DiscoveredPeer> {
+    let mut list: Vec<&DiscoveredServer> = found
+        .values()
+        .filter(|s| my_fp != Some(s.fingerprint.as_str()))
+        .collect();
+    list.sort_by(|a, b| a.name.cmp(&b.name).then_with(|| a.addr.cmp(&b.addr)));
+    list.into_iter()
+        .map(|s| DiscoveredPeer {
+            name: s.name.clone(),
+            os: parse_os_str(&s.os),
+            addr: s.addr.to_string(),
+            fingerprint: s.fingerprint.clone(),
+        })
+        .collect()
+}
+
+async fn next_net_change(net_mon: &mut NetworkChangeMonitor) {
+    if net_mon.recv().await.is_none() {
+        std::future::pending::<()>().await;
+    }
+}
+
+async fn wait_hidden(vis_rx: &mut tokio::sync::watch::Receiver<bool>) -> bool {
+    vis_rx.wait_for(|&v| !v).await.is_ok()
+}
+
+/// Event-driven LAN server discovery loop for the native UI (**0.00 Hz idle**):
+/// - Completely parks (closing all discovery sockets) while minimized/occluded/in tray.
+/// - While visible and running as Server or connected Client, holds zero UDP sockets and
+///   refreshes local IPv4 addresses strictly on OS network-change events or window reopen.
+/// - While visible and stopped (or searching as Client), holds a passive UDP listener
+///   that probes once on open and immediately reflects newly started LAN servers or NIC changes.
 fn spawn_discovery_loop(
     ctrl: Arc<AppController>,
     rt: &tokio::runtime::Handle,
@@ -2360,50 +2429,20 @@ fn spawn_discovery_loop(
     vis: Arc<WindowVisibility>,
 ) {
     let mut vis_rx = vis.subscribe();
+    let mut rt_rx = ctrl.runtime.subscribe();
     rt.spawn(async move {
-        let mut force_refresh = true;
+        let mut net_mon = NetworkChangeMonitor::start();
         loop {
             if !vis.is_visible() {
-                // Window is hidden in the tray: perform 0 LAN scans and 0 UI wakeups until reopened.
+                // Window is hidden, minimized, or occluded: 0 UDP sockets and 0.00 Hz wakeups.
                 if vis_rx.wait_for(|&v| v).await.is_err() {
                     break;
                 }
-                force_refresh = true;
             }
 
-            let (running, mode_is_client, connected) = ctrl.runtime.read(|snap| {
-                let running = snap.mode == "server" || snap.mode == "client";
-                let mode_is_client = snap.mode == "client";
-                let connected = snap.status.starts_with("Connected");
-                (running, mode_is_client, connected)
-            });
-
-            if !running || (mode_is_client && !connected) {
-                force_refresh = false;
-                tokio::select! {
-                    (servers, ips) = run_discovery(&ctrl) => {
-                        if vis.is_visible() {
-                            handle.update_if(move |ui, _| {
-                                if ui.local_ips == ips && ui.discovered == servers {
-                                    return false;
-                                }
-                                ui.local_ips = ips;
-                                ui.discovered = servers;
-                                true
-                            });
-                        }
-                    }
-                    res = vis_rx.wait_for(|&v| !v) => {
-                        if res.is_err() {
-                            break;
-                        }
-                        continue;
-                    }
-                }
-            } else if force_refresh {
-                // Running server or connected client: refresh local IPs on initial open /
-                // reopen without issuing a 2s UDP LAN broadcast scan.
-                force_refresh = false;
+            if !should_run_passive_discovery(&ctrl) {
+                // Running server or connected client: refresh local IPs once on reopen/transition,
+                // then park until visibility changes, engine stops/disconnects, or NIC changes.
                 let ips = local_ipv4_addresses_async().await;
                 if vis.is_visible() {
                     handle.update_if(move |ui, _| {
@@ -2414,12 +2453,163 @@ fn spawn_discovery_loop(
                         true
                     });
                 }
+
+                loop {
+                    tokio::select! {
+                        ok = wait_hidden(&mut vis_rx) => {
+                            if !ok {
+                                return;
+                            }
+                            break;
+                        }
+                        res = rt_rx.recv() => {
+                            match res {
+                                Ok(()) | Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
+                                    while matches!(
+                                        rt_rx.try_recv(),
+                                        Ok(()) | Err(tokio::sync::broadcast::error::TryRecvError::Lagged(_))
+                                    ) {}
+                                    if should_run_passive_discovery(&ctrl) {
+                                        break;
+                                    }
+                                }
+                                Err(tokio::sync::broadcast::error::RecvError::Closed) => return,
+                            }
+                        }
+                        _ = next_net_change(&mut net_mon) => {
+                            let ips = local_ipv4_addresses_async().await;
+                            if vis.is_visible() {
+                                handle.update_if(move |ui, _| {
+                                    if ui.local_ips == ips {
+                                        return false;
+                                    }
+                                    ui.local_ips = ips;
+                                    true
+                                });
+                            }
+                        }
+                    }
+                }
+                continue;
             }
 
-            tokio::select! {
-                _ = tokio::time::sleep(Duration::from_millis(4500)) => {}
-                res = vis_rx.wait_for(|&v| !v) => {
-                    if res.is_err() {
+            let port = ctrl.config.lock().client.discovery_port;
+            let Ok(mut session) = PassiveDiscoverySession::start(port).await else {
+                // Port bind failure: update local IPs and wait for state/visibility/NIC change.
+                let ips = local_ipv4_addresses_async().await;
+                if vis.is_visible() {
+                    handle.update_if(move |ui, _| {
+                        if ui.local_ips == ips {
+                            return false;
+                        }
+                        ui.local_ips = ips;
+                        true
+                    });
+                }
+                tokio::select! {
+                    ok = wait_hidden(&mut vis_rx) => {
+                        if !ok {
+                            return;
+                        }
+                    }
+                    res = rt_rx.recv() => {
+                        if matches!(res, Err(tokio::sync::broadcast::error::RecvError::Closed)) {
+                            return;
+                        }
+                    }
+                    _ = next_net_change(&mut net_mon) => {}
+                }
+                continue;
+            };
+
+            let ips = session.local_ips();
+            if vis.is_visible() {
+                handle.update_if(move |ui, _| {
+                    if ui.local_ips == ips {
+                        return false;
+                    }
+                    ui.local_ips = ips;
+                    true
+                });
+            }
+
+            let mut found: HashMap<String, DiscoveredServer> = HashMap::new();
+            // One-shot stale-list expiry: if a previously displayed server shut down while the
+            // window was hidden or running, clear stale UI entries once if no reply arrives within
+            // 450 ms of our initial probe, then drop to `None` (0 armed timers when idle).
+            let mut stale_clear_sleep: Option<std::pin::Pin<Box<tokio::time::Sleep>>> =
+                Some(Box::pin(tokio::time::sleep(Duration::from_millis(450))));
+            loop {
+                tokio::select! {
+                    maybe_srv = session.recv_beacon() => {
+                        let Some(srv) = maybe_srv else {
+                            break;
+                        };
+                        stale_clear_sleep = None;
+                        insert_discovered_server(&mut found, srv);
+                        if vis.is_visible() {
+                            let my_fp = ctrl.fingerprint.lock().clone();
+                            let servers = format_discovered_peers(&found, my_fp.as_deref());
+                            handle.update_if(move |ui, _| {
+                                if ui.discovered == servers {
+                                    return false;
+                                }
+                                ui.discovered = servers;
+                                true
+                            });
+                        }
+                    }
+                    _ = async {
+                        if let Some(s) = stale_clear_sleep.as_mut() {
+                            s.as_mut().await;
+                        } else {
+                            std::future::pending::<()>().await;
+                        }
+                    } => {
+                        stale_clear_sleep = None;
+                        if found.is_empty() && vis.is_visible() {
+                            handle.update_if(move |ui, _| {
+                                if ui.discovered.is_empty() {
+                                    return false;
+                                }
+                                ui.discovered.clear();
+                                true
+                            });
+                        }
+                    }
+                    _ = next_net_change(&mut net_mon) => {
+                        stale_clear_sleep = None;
+                        let ips = session.refresh_and_probe().await;
+                        found.clear();
+                        if vis.is_visible() {
+                            handle.update_if(move |ui, _| {
+                                if ui.local_ips == ips && ui.discovered.is_empty() {
+                                    return false;
+                                }
+                                ui.local_ips = ips;
+                                ui.discovered.clear();
+                                true
+                            });
+                        }
+                    }
+                    res = rt_rx.recv() => {
+                        match res {
+                            Ok(()) | Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
+                                while matches!(
+                                    rt_rx.try_recv(),
+                                    Ok(()) | Err(tokio::sync::broadcast::error::TryRecvError::Lagged(_))
+                                ) {}
+                                if !should_run_passive_discovery(&ctrl) {
+                                    break;
+                                }
+                            }
+                            Err(tokio::sync::broadcast::error::RecvError::Closed) => return,
+                        }
+                    }
+                    ok = wait_hidden(&mut vis_rx) => {
+                        if !ok {
+                            return;
+                        }
                         break;
                     }
                 }

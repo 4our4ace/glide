@@ -36,7 +36,7 @@ use tracing::{debug, info, trace, warn};
 use windows_sys::Win32::Foundation::{
     CloseHandle, HANDLE, HWND, LPARAM, LRESULT, POINT, RECT, S_OK, WPARAM,
 };
-use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
+use windows_sys::Win32::System::LibraryLoader::{GetModuleHandleW, GetProcAddress};
 use windows_sys::Win32::System::RemoteDesktop::{
     WTSRegisterSessionNotification, WTSUnRegisterSessionNotification, NOTIFY_FOR_THIS_SESSION,
 };
@@ -60,21 +60,24 @@ use windows_sys::Win32::UI::Shell::{
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     CallNextHookEx, CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW,
     FindWindowExW, GetClipCursor, GetCursorPos, GetForegroundWindow, GetMessageW, GetWindowRect,
-    GetWindowThreadProcessId, PostMessageW, RegisterClassW, SetCursorPos, SetWindowsHookExW,
-    TranslateMessage, UnhookWindowsHookEx, HHOOK, KBDLLHOOKSTRUCT, LLKHF_EXTENDED, MSG,
-    MSLLHOOKSTRUCT, PBT_APMRESUMEAUTOMATIC, PBT_APMRESUMECRITICAL, PBT_APMRESUMESUSPEND,
-    PBT_APMSUSPEND, WH_KEYBOARD_LL, WH_MOUSE_LL, WM_APP, WM_DISPLAYCHANGE, WM_DPICHANGED,
-    WM_ENDSESSION, WM_INPUT, WM_KEYDOWN, WM_KEYUP, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MBUTTONDOWN,
-    WM_MBUTTONUP, WM_MOUSEHWHEEL, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_POWERBROADCAST,
-    WM_QUERYENDSESSION, WM_QUIT, WM_RBUTTONDOWN, WM_RBUTTONUP, WM_SYSKEYDOWN, WM_SYSKEYUP,
-    WM_WTSSESSION_CHANGE, WM_XBUTTONDOWN, WM_XBUTTONUP, WNDCLASSW, WS_EX_NOACTIVATE,
-    WS_EX_TOOLWINDOW, WS_OVERLAPPED, WTS_SESSION_LOCK, WTS_SESSION_UNLOCK, XBUTTON1, XBUTTON2,
+    GetWindowThreadProcessId, PostMessageW, PostQuitMessage, RegisterClassW, SetCursorPos,
+    SetWindowsHookExW, TranslateMessage, UnhookWindowsHookEx, HHOOK, KBDLLHOOKSTRUCT,
+    LLKHF_EXTENDED, MSG, MSLLHOOKSTRUCT, PBT_APMRESUMEAUTOMATIC, PBT_APMRESUMECRITICAL,
+    PBT_APMRESUMESUSPEND, PBT_APMSUSPEND, WH_KEYBOARD_LL, WH_MOUSE_LL, WM_APP, WM_DESTROY,
+    WM_DISPLAYCHANGE, WM_DPICHANGED, WM_ENDSESSION, WM_INPUT, WM_KEYDOWN, WM_KEYUP,
+    WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MBUTTONDOWN, WM_MBUTTONUP, WM_MOUSEHWHEEL, WM_MOUSEMOVE,
+    WM_MOUSEWHEEL, WM_POWERBROADCAST, WM_QUERYENDSESSION, WM_QUIT, WM_RBUTTONDOWN, WM_RBUTTONUP,
+    WM_SYSKEYDOWN, WM_SYSKEYUP, WM_WTSSESSION_CHANGE, WM_XBUTTONDOWN, WM_XBUTTONUP, WNDCLASSW,
+    WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_OVERLAPPED, WTS_SESSION_LOCK, WTS_SESSION_UNLOCK,
+    XBUTTON1, XBUTTON2,
 };
 
 const WM_APP_ENTER_REMOTE: u32 = WM_APP + 1;
 const WM_APP_LEAVE_REMOTE: u32 = WM_APP + 2;
 const WM_APP_ENSURE_RAW_INPUT: u32 = WM_APP + 3;
 const WM_APP_RELEASE_LOCAL_MODS: u32 = WM_APP + 4;
+const WM_APP_REFRESH_FG: u32 = WM_APP + 5;
+const WM_APP_STOP_FG: u32 = WM_APP + 6;
 
 const VK_PAUSE_CODE: u32 = 0x13;
 const VK_SNAPSHOT_CODE: u32 = 0x2C;
@@ -103,35 +106,36 @@ const DRAG_ARM_MIN_MOVE_SQ: i64 = 16;
 const DRAG_ARM_EDGE_DIST_PX: i32 = 160;
 /// Hysteresis distance (px) beyond which a retreating drag disarms the edge strip.
 const DRAG_DISARM_EDGE_DIST_PX: i32 = 220;
-/// Short cache TTL for foreground fullscreen + executable/pointer-lock inspection while pushing an edge.
-const FULLSCREEN_CACHE_TTL: Duration = Duration::from_millis(75);
 
-#[derive(Debug, Default)]
-struct WinFullscreenCache {
-    cached: Option<(Instant, isize, bool, bool)>,
-}
+/// Lock-free foreground fullscreen state published by the event-driven `SetWinEventHook` thread.
+const FG_NONE: u8 = 0;
+const FG_GAME_OR_OTHER: u8 = 1;
+const FG_VIDEO_PLAYER: u8 = 2;
+const FG_BROWSER: u8 = 3;
 
-impl WinFullscreenCache {
-    fn check_with<F: FnOnce() -> bool>(
-        &mut self,
-        now: Instant,
-        hwnd_raw: isize,
-        allow_fullscreen_videos: bool,
-        query: F,
-    ) -> bool {
-        if let Some((at, cached_hwnd, cached_allow, value)) = self.cached {
-            if cached_hwnd == hwnd_raw
-                && cached_allow == allow_fullscreen_videos
-                && now.saturating_duration_since(at) < FULLSCREEN_CACHE_TTL
-            {
-                return value;
-            }
-        }
-        let value = query();
-        self.cached = Some((now, hwnd_raw, allow_fullscreen_videos, value));
-        value
-    }
-}
+const EVENT_SYSTEM_FOREGROUND: u32 = 0x0003;
+const EVENT_SYSTEM_MOVESIZEEND: u32 = 0x000B;
+const EVENT_SYSTEM_MINIMIZESTART: u32 = 0x0016;
+const EVENT_SYSTEM_MINIMIZEEND: u32 = 0x0017;
+const WINEVENT_OUTOFCONTEXT: u32 = 0x0000;
+const WINEVENT_SKIPOWNPROCESS: u32 = 0x0002;
+
+type HWinEventHook = *mut std::ffi::c_void;
+type WinEventProc =
+    unsafe extern "system" fn(HWinEventHook, u32, HWND, i32, i32, u32, u32);
+type SetWinEventHookFn = unsafe extern "system" fn(
+    u32,
+    u32,
+    *mut std::ffi::c_void,
+    Option<WinEventProc>,
+    u32,
+    u32,
+    u32,
+) -> HWinEventHook;
+type UnhookWinEventFn = unsafe extern "system" fn(HWinEventHook) -> i32;
+
+static FG_WATCHER_HWND: AtomicIsize = AtomicIsize::new(0);
+static FG_REFRESH_QUEUED: AtomicBool = AtomicBool::new(false);
 
 enum LeaveTarget {
     Edge(Edge, f32),
@@ -147,6 +151,12 @@ struct GeomRefreshSignal {
 struct HookState {
     tx: mpsc::UnboundedSender<CaptureEvent>,
     capture_hwnd: AtomicIsize,
+    fg_watcher_hwnd: AtomicIsize,
+    fg_watcher_active: AtomicBool,
+    fg_watcher_shutdown: AtomicBool,
+    fg_fullscreen_kind: AtomicU8,
+    fg_browser_d3d_fs: AtomicBool,
+    fg_monitor_idx: AtomicU32,
     active_edges: AtomicEdgeMask,
     geometry: RwLock<DesktopGeometry>,
     geom_refresh_signal: (Mutex<GeomRefreshSignal>, Condvar),
@@ -155,7 +165,6 @@ struct HookState {
     locked: AtomicBool,
     auto_lock_fullscreen: AtomicBool,
     allow_fullscreen_videos: AtomicBool,
-    fullscreen_cache: Mutex<WinFullscreenCache>,
     sync_lock_keys: AtomicBool,
     drag_drop_files: AtomicBool,
     dnd_probe: OnceLock<Arc<dyn DndBackend>>,
@@ -314,9 +323,80 @@ impl HookState {
                 primary_scale = new_geom.primary_scale(),
                 "Refreshed Windows desktop geometry"
             );
+            self.request_fg_fullscreen_refresh();
             let _ = self.tx.send(CaptureEvent::GeometryChanged(new_geom));
         }
         changed
+    }
+
+    fn request_fg_fullscreen_refresh(&self) {
+        let hwnd = self.fg_watcher_hwnd.load(Ordering::Acquire) as HWND;
+        if !hwnd.is_null()
+            && !FG_REFRESH_QUEUED.swap(true, Ordering::AcqRel)
+            && unsafe { PostMessageW(hwnd, WM_APP_REFRESH_FG, 0, 0) } == 0
+        {
+            FG_REFRESH_QUEUED.store(false, Ordering::Release);
+        }
+    }
+
+    /// Evaluates foreground fullscreen classification off the low-level input hook thread
+    /// (called exclusively on `glide-win-fg` in response to `SetWinEventHook` notifications).
+    fn refresh_foreground_fullscreen_state(&self) {
+        let hwnd = unsafe { GetForegroundWindow() };
+        if hwnd.is_null() || super::is_shell_window_class(hwnd) {
+            self.fg_browser_d3d_fs.store(false, Ordering::Release);
+            self.fg_fullscreen_kind.store(FG_NONE, Ordering::Release);
+            return;
+        }
+        let mut rect: RECT = unsafe { std::mem::zeroed() };
+        if unsafe { GetWindowRect(hwnd, &mut rect) } == 0 {
+            self.fg_browser_d3d_fs.store(false, Ordering::Release);
+            self.fg_fullscreen_kind.store(FG_NONE, Ordering::Release);
+            return;
+        }
+        let matched_idx = {
+            let geom = self.geometry.read();
+            geom.monitors
+                .iter()
+                .position(|m| rect_covers_monitor(&rect, m))
+        };
+        let Some(mon_idx) = matched_idx else {
+            self.fg_browser_d3d_fs.store(false, Ordering::Release);
+            self.fg_fullscreen_kind.store(FG_NONE, Ordering::Release);
+            return;
+        };
+
+        let Some(exe_name) = foreground_exe_name(hwnd) else {
+            // Elevated or anti-cheat protected process (OpenProcess denied): fail closed and lock.
+            self.fg_browser_d3d_fs.store(false, Ordering::Release);
+            self.fg_monitor_idx.store(mon_idx as u32, Ordering::Release);
+            self.fg_fullscreen_kind
+                .store(FG_GAME_OR_OTHER, Ordering::Release);
+            return;
+        };
+
+        match classify_fullscreen_app(&exe_name) {
+            FullscreenAppKind::VideoPlayer => {
+                self.fg_browser_d3d_fs.store(false, Ordering::Release);
+                self.fg_monitor_idx.store(mon_idx as u32, Ordering::Release);
+                self.fg_fullscreen_kind
+                    .store(FG_VIDEO_PLAYER, Ordering::Release);
+            }
+            FullscreenAppKind::Browser => {
+                let mut quns: QUERY_USER_NOTIFICATION_STATE = 0;
+                let d3d_fs = unsafe { SHQueryUserNotificationState(&mut quns) } == S_OK
+                    && quns == QUNS_RUNNING_D3D_FULL_SCREEN;
+                self.fg_browser_d3d_fs.store(d3d_fs, Ordering::Release);
+                self.fg_monitor_idx.store(mon_idx as u32, Ordering::Release);
+                self.fg_fullscreen_kind.store(FG_BROWSER, Ordering::Release);
+            }
+            FullscreenAppKind::Other => {
+                self.fg_browser_d3d_fs.store(false, Ordering::Release);
+                self.fg_monitor_idx.store(mon_idx as u32, Ordering::Release);
+                self.fg_fullscreen_kind
+                    .store(FG_GAME_OR_OTHER, Ordering::Release);
+            }
+        }
     }
 
     fn restore_cursor_visibly(&self) {
@@ -432,7 +512,7 @@ struct WindowsCaptureControl {
 
 impl Drop for WindowsCaptureControl {
     fn drop(&mut self) {
-        // Always restore cursor & stop hook loop + geometry/focus helpers cleanly on shutdown
+        // Always restore cursor & stop hook loop + geometry/focus/fg-watcher helpers cleanly
         self.state.focus_state.shutdown();
         let was_remote = self.state.remote_mode.swap(false, Ordering::SeqCst);
         self.state.pending_meta.clear();
@@ -452,6 +532,19 @@ impl Drop for WindowsCaptureControl {
             let mut sig = lock.lock();
             sig.shutdown = true;
             cvar.notify_all();
+        }
+        self.state.fg_watcher_shutdown.store(true, Ordering::SeqCst);
+        let fg_hwnd = self.state.fg_watcher_hwnd.swap(0, Ordering::SeqCst) as HWND;
+        if !fg_hwnd.is_null() {
+            let _ = FG_WATCHER_HWND.compare_exchange(
+                fg_hwnd as isize,
+                0,
+                Ordering::SeqCst,
+                Ordering::Relaxed,
+            );
+            unsafe {
+                PostMessageW(fg_hwnd, WM_APP_STOP_FG, 0, 0);
+            }
         }
         let hwnd = self.hwnd.swap(0, Ordering::SeqCst) as HWND;
         if !hwnd.is_null() {
@@ -803,6 +896,14 @@ fn foreground_exe_name(hwnd: HWND) -> Option<String> {
     Some(name)
 }
 
+#[inline]
+fn rect_covers_monitor(rect: &RECT, m: &crate::geometry::MonitorRect) -> bool {
+    rect.left <= m.left()
+        && rect.top <= m.top()
+        && rect.right >= m.right()
+        && rect.bottom >= m.bottom()
+}
+
 fn eval_foreground_fullscreen_locked(
     hwnd: HWND,
     geom: &DesktopGeometry,
@@ -817,12 +918,11 @@ fn eval_foreground_fullscreen_locked(
         return false;
     }
 
-    let Some(matched_monitor) = geom.monitors.iter().find(|m| {
-        rect.left <= m.left()
-            && rect.top <= m.top()
-            && rect.right >= m.right()
-            && rect.bottom >= m.bottom()
-    }) else {
+    let Some(matched_monitor) = geom
+        .monitors
+        .iter()
+        .find(|m| rect_covers_monitor(&rect, m))
+    else {
         return false;
     };
 
@@ -860,21 +960,270 @@ fn eval_foreground_fullscreen_locked(
     }
 }
 
-/// Checks whether the active foreground window should auto-lock cursor switching on an outer edge,
-/// excluding Windows desktop shell windows (`Progman`, `WorkerW`, `Shell_TrayWnd`) and (when
-/// `allow_fullscreen_videos` is enabled) video players and non-pointer-locked fullscreen browsers.
-fn is_foreground_fullscreen_locked(state: &HookState, geom: &DesktopGeometry) -> bool {
-    let hwnd = unsafe { GetForegroundWindow() };
+fn foreground_window_covers_any_monitor(hwnd: HWND, geom: &DesktopGeometry) -> bool {
     if hwnd.is_null() {
         return false;
     }
+    let mut rect: RECT = unsafe { std::mem::zeroed() };
+    if unsafe { GetWindowRect(hwnd, &mut rect) } == 0 {
+        return false;
+    }
+    let covers = geom
+        .monitors
+        .iter()
+        .any(|m| rect_covers_monitor(&rect, m));
+    covers && !super::is_shell_window_class(hwnd)
+}
+
+/// Checks whether the active foreground window should auto-lock cursor switching on an outer edge,
+/// using the lock-free state published by the event-driven `SetWinEventHook` watcher thread
+/// (zero 75ms polling, zero idle caret-blink wakeups, zero `OpenProcess`/`FindWindowExW`/
+/// `SHQueryUserNotificationState` calls on the low-level input hook thread).
+fn is_foreground_fullscreen_locked(state: &HookState, geom: &DesktopGeometry) -> bool {
     let allow_videos = state.allow_fullscreen_videos.load(Ordering::Relaxed);
-    state
-        .fullscreen_cache
-        .lock()
-        .check_with(Instant::now(), hwnd as isize, allow_videos, || {
-            eval_foreground_fullscreen_locked(hwnd, geom, allow_videos)
-        })
+    if !state.fg_watcher_active.load(Ordering::Acquire) {
+        let hwnd = unsafe { GetForegroundWindow() };
+        if hwnd.is_null() {
+            return false;
+        }
+        return eval_foreground_fullscreen_locked(hwnd, geom, allow_videos);
+    }
+
+    // Fast (~200 ns) edge-touch rect check catches programmatic F11/video fullscreen enter & exit
+    // without focus change while keeping the SetWinEventHook watcher at true 0.00 Hz idle.
+    let fg_hwnd = unsafe { GetForegroundWindow() };
+    let covers_now = foreground_window_covers_any_monitor(fg_hwnd, geom);
+    let mut kind = state.fg_fullscreen_kind.load(Ordering::Acquire);
+    if covers_now && kind == FG_NONE {
+        // Fail closed for the brief ~0.2 ms while `glide-win-fg` classifies the window so a
+        // newly-fullscreen borderless game never leaks the cursor on the first edge flick; video
+        // players/browsers unlock on the next mouse event once classified.
+        state.request_fg_fullscreen_refresh();
+        return true;
+    } else if !covers_now && kind != FG_NONE {
+        state.fg_browser_d3d_fs.store(false, Ordering::Release);
+        state.fg_fullscreen_kind.store(FG_NONE, Ordering::Release);
+        state.request_fg_fullscreen_refresh();
+        kind = FG_NONE;
+    }
+
+    match kind {
+        FG_NONE => false,
+        FG_GAME_OR_OTHER => true,
+        FG_VIDEO_PLAYER => !allow_videos,
+        FG_BROWSER => {
+            if !allow_videos || state.fg_browser_d3d_fs.load(Ordering::Acquire) {
+                return true;
+            }
+            // HTML5 Pointer Lock / browser FPS games call ClipCursor() dynamically without
+            // changing foreground window or rect; GetClipCursor is a fast (~100 ns) read.
+            let mut clip: RECT = unsafe { std::mem::zeroed() };
+            if unsafe { GetClipCursor(&mut clip) } != 0 {
+                let clip_tuple = (clip.left, clip.top, clip.right, clip.bottom);
+                let mon_idx = state.fg_monitor_idx.load(Ordering::Acquire) as usize;
+                if let Some(m) = geom.monitors.get(mon_idx) {
+                    return is_cursor_rect_confined(clip_tuple, m, geom);
+                }
+                return geom
+                    .monitors
+                    .iter()
+                    .any(|m| is_cursor_rect_confined(clip_tuple, m, geom));
+            }
+            false
+        }
+        _ => false,
+    }
+}
+
+unsafe extern "system" fn fg_win_event_proc(
+    _hook: HWinEventHook,
+    _event: u32,
+    _hwnd: HWND,
+    _id_object: i32,
+    _id_child: i32,
+    _event_thread: u32,
+    _event_time: u32,
+) {
+    if !FG_REFRESH_QUEUED.swap(true, Ordering::AcqRel) {
+        let ctrl = FG_WATCHER_HWND.load(Ordering::Acquire) as HWND;
+        if ctrl.is_null() || unsafe { PostMessageW(ctrl, WM_APP_REFRESH_FG, 0, 0) } == 0 {
+            FG_REFRESH_QUEUED.store(false, Ordering::Release);
+        }
+    }
+}
+
+unsafe extern "system" fn fg_wnd_proc(
+    hwnd: HWND,
+    msg: u32,
+    wparam: WPARAM,
+    lparam: LPARAM,
+) -> LRESULT {
+    match msg {
+        WM_DESTROY => {
+            unsafe {
+                PostQuitMessage(0);
+            }
+            0
+        }
+        _ => unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) },
+    }
+}
+
+fn spawn_foreground_fullscreen_watcher(state: Arc<HookState>) {
+    let _ = thread::Builder::new()
+        .name("glide-win-fg".into())
+        .spawn(move || {
+            if state.fg_watcher_shutdown.load(Ordering::SeqCst) {
+                return;
+            }
+            let user32_name: Vec<u16> = "user32.dll\0".encode_utf16().collect();
+            let user32 = unsafe { GetModuleHandleW(user32_name.as_ptr()) };
+            if user32.is_null() {
+                return;
+            }
+            type FarProc = unsafe extern "system" fn() -> isize;
+            let Some(set_fp) = (unsafe { GetProcAddress(user32, b"SetWinEventHook\0".as_ptr()) })
+            else {
+                return;
+            };
+            let Some(unhook_fp) =
+                (unsafe { GetProcAddress(user32, b"UnhookWinEvent\0".as_ptr()) })
+            else {
+                return;
+            };
+            let set_win_event_hook: SetWinEventHookFn =
+                unsafe { std::mem::transmute::<FarProc, SetWinEventHookFn>(set_fp) };
+            let unhook_win_event: UnhookWinEventFn =
+                unsafe { std::mem::transmute::<FarProc, UnhookWinEventFn>(unhook_fp) };
+
+            let class_name: Vec<u16> = "GlideFgFullscreenWatchWindow\0".encode_utf16().collect();
+            let hinstance = unsafe { GetModuleHandleW(ptr::null()) };
+            let wc = WNDCLASSW {
+                style: 0,
+                lpfnWndProc: Some(fg_wnd_proc),
+                cbClsExtra: 0,
+                cbWndExtra: 0,
+                hInstance: hinstance,
+                hIcon: ptr::null_mut(),
+                hCursor: ptr::null_mut(),
+                hbrBackground: ptr::null_mut(),
+                lpszMenuName: ptr::null(),
+                lpszClassName: class_name.as_ptr(),
+            };
+            unsafe {
+                RegisterClassW(&wc);
+            }
+            let hwnd = unsafe {
+                CreateWindowExW(
+                    WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE,
+                    class_name.as_ptr(),
+                    class_name.as_ptr(),
+                    WS_OVERLAPPED,
+                    0,
+                    0,
+                    0,
+                    0,
+                    ptr::null_mut(),
+                    ptr::null_mut(),
+                    hinstance,
+                    ptr::null(),
+                )
+            };
+            if hwnd.is_null() {
+                return;
+            }
+
+            state.fg_watcher_hwnd.store(hwnd as isize, Ordering::SeqCst);
+            if state.fg_watcher_shutdown.load(Ordering::SeqCst) {
+                state.fg_watcher_hwnd.store(0, Ordering::SeqCst);
+                unsafe {
+                    DestroyWindow(hwnd);
+                }
+                return;
+            }
+            FG_REFRESH_QUEUED.store(false, Ordering::Release);
+            FG_WATCHER_HWND.store(hwnd as isize, Ordering::SeqCst);
+
+            let flags = WINEVENT_OUTOFCONTEXT | WINEVENT_SKIPOWNPROCESS;
+            let hooks = [
+                unsafe {
+                    set_win_event_hook(
+                        EVENT_SYSTEM_FOREGROUND,
+                        EVENT_SYSTEM_FOREGROUND,
+                        ptr::null_mut(),
+                        Some(fg_win_event_proc),
+                        0,
+                        0,
+                        flags,
+                    )
+                },
+                unsafe {
+                    set_win_event_hook(
+                        EVENT_SYSTEM_MOVESIZEEND,
+                        EVENT_SYSTEM_MOVESIZEEND,
+                        ptr::null_mut(),
+                        Some(fg_win_event_proc),
+                        0,
+                        0,
+                        flags,
+                    )
+                },
+                unsafe {
+                    set_win_event_hook(
+                        EVENT_SYSTEM_MINIMIZESTART,
+                        EVENT_SYSTEM_MINIMIZEEND,
+                        ptr::null_mut(),
+                        Some(fg_win_event_proc),
+                        0,
+                        0,
+                        flags,
+                    )
+                },
+            ];
+
+            if !hooks[0].is_null() {
+                state.refresh_foreground_fullscreen_state();
+                state.fg_watcher_active.store(true, Ordering::Release);
+                debug!("Windows event-driven SetWinEventHook fullscreen watcher active (0.00 Hz idle)");
+
+                let mut msg: MSG = unsafe { std::mem::zeroed() };
+                while unsafe { GetMessageW(&mut msg, ptr::null_mut(), 0, 0) } > 0 {
+                    if msg.hwnd == hwnd {
+                        if msg.message == WM_APP_STOP_FG {
+                            break;
+                        }
+                        if msg.message == WM_APP_REFRESH_FG {
+                            FG_REFRESH_QUEUED.store(false, Ordering::Release);
+                            state.refresh_foreground_fullscreen_state();
+                            continue;
+                        }
+                    }
+                    unsafe {
+                        TranslateMessage(&msg);
+                        DispatchMessageW(&msg);
+                    }
+                }
+            }
+
+            state.fg_watcher_active.store(false, Ordering::Release);
+            state.fg_watcher_hwnd.store(0, Ordering::SeqCst);
+            let _ = FG_WATCHER_HWND.compare_exchange(
+                hwnd as isize,
+                0,
+                Ordering::SeqCst,
+                Ordering::Relaxed,
+            );
+            for hook in hooks {
+                if !hook.is_null() {
+                    unsafe {
+                        unhook_win_event(hook);
+                    }
+                }
+            }
+            unsafe {
+                DestroyWindow(hwnd);
+            }
+        });
 }
 
 const MODIFIER_VK_BITS: [(u16, u8); 8] = [
@@ -1134,8 +1483,6 @@ unsafe extern "system" fn mouse_ll_proc(code: i32, wparam: WPARAM, lparam: LPARA
                 if !remote {
                     match msg {
                         WM_MOUSEMOVE => {
-                            let now = state.elapsed_ms();
-                            let last_raw = state.last_raw_mouse_ms.load(Ordering::Relaxed);
                             let missed = state
                                 .ll_moves_without_raw
                                 .fetch_add(1, Ordering::Relaxed)
@@ -1146,17 +1493,23 @@ unsafe extern "system" fn mouse_ll_proc(code: i32, wparam: WPARAM, lparam: LPARA
                             // precision touchpads / RDP sessions that do not emit relative WM_INPUT.
                             // Requiring >= 3 consecutive LL moves without Raw Input avoids spurious
                             // triggers after normal idle pauses when Raw Input is healthy.
-                            if missed >= 3 && (last_raw == 0 || now.saturating_sub(last_raw) > 150) {
-                                maybe_request_raw_input_reclaim(state, now);
-                                if !state.locked.load(Ordering::Relaxed)
-                                    && state.active_edges.load() != 0
-                                {
-                                    let mut cur_pt = POINT { x: 0, y: 0 };
-                                    if unsafe { GetCursorPos(&mut cur_pt) } != 0 {
-                                        let dx = (ms.pt.x - cur_pt.x) as f32;
-                                        let dy = (ms.pt.y - cur_pt.y) as f32;
-                                        if dx != 0.0 || dy != 0.0 {
-                                            return process_local_edge_motion(state, dx, dy, ms.pt);
+                            if missed >= 3 {
+                                let now = state.elapsed_ms();
+                                let last_raw = state.last_raw_mouse_ms.load(Ordering::Relaxed);
+                                if last_raw == 0 || now.saturating_sub(last_raw) > 150 {
+                                    maybe_request_raw_input_reclaim(state, now);
+                                    if !state.locked.load(Ordering::Relaxed)
+                                        && state.active_edges.load() != 0
+                                    {
+                                        let mut cur_pt = POINT { x: 0, y: 0 };
+                                        if unsafe { GetCursorPos(&mut cur_pt) } != 0 {
+                                            let dx = (ms.pt.x - cur_pt.x) as f32;
+                                            let dy = (ms.pt.y - cur_pt.y) as f32;
+                                            if dx != 0.0 || dy != 0.0 {
+                                                return process_local_edge_motion(
+                                                    state, dx, dy, ms.pt,
+                                                );
+                                            }
                                         }
                                     }
                                 }
@@ -1216,22 +1569,24 @@ unsafe extern "system" fn mouse_ll_proc(code: i32, wparam: WPARAM, lparam: LPARA
                         // re-claim if another window temporarily stole Raw Input.
                         // Never flush `pending_meta` on mouse motion so tiny hand tremor between
                         // `Win` and `L` never leaks `Super`.
-                        let now = state.elapsed_ms();
-                        let last_raw = state.last_raw_mouse_ms.load(Ordering::Relaxed);
                         let missed = state
                             .ll_moves_without_raw
                             .fetch_add(1, Ordering::Relaxed)
                             .saturating_add(1);
-                        if missed >= 3 && (last_raw == 0 || now.saturating_sub(last_raw) > 100) {
-                            if last_raw == 0 || now.saturating_sub(last_raw) > 250 {
-                                maybe_request_raw_input_reclaim(state, now);
-                            }
-                            let ax = state.anchor_x.load(Ordering::Relaxed);
-                            let ay = state.anchor_y.load(Ordering::Relaxed);
-                            let dx = (ms.pt.x - ax) as f32;
-                            let dy = (ms.pt.y - ay) as f32;
-                            if dx != 0.0 || dy != 0.0 {
-                                let _ = state.tx.send(CaptureEvent::MouseDelta { dx, dy });
+                        if missed >= 3 {
+                            let now = state.elapsed_ms();
+                            let last_raw = state.last_raw_mouse_ms.load(Ordering::Relaxed);
+                            if last_raw == 0 || now.saturating_sub(last_raw) > 100 {
+                                if last_raw == 0 || now.saturating_sub(last_raw) > 250 {
+                                    maybe_request_raw_input_reclaim(state, now);
+                                }
+                                let ax = state.anchor_x.load(Ordering::Relaxed);
+                                let ay = state.anchor_y.load(Ordering::Relaxed);
+                                let dx = (ms.pt.x - ax) as f32;
+                                let dy = (ms.pt.y - ay) as f32;
+                                if dx != 0.0 || dy != 0.0 {
+                                    let _ = state.tx.send(CaptureEvent::MouseDelta { dx, dy });
+                                }
                             }
                         }
                         true
@@ -1779,12 +2134,17 @@ pub fn start_windows_capture(config: CaptureConfig) -> Result<CaptureHandle> {
 
     let state = Arc::new(HookState {
         capture_hwnd: AtomicIsize::new(0),
+        fg_watcher_hwnd: AtomicIsize::new(0),
+        fg_watcher_active: AtomicBool::new(false),
+        fg_watcher_shutdown: AtomicBool::new(false),
+        fg_fullscreen_kind: AtomicU8::new(FG_NONE),
+        fg_browser_d3d_fs: AtomicBool::new(false),
+        fg_monitor_idx: AtomicU32::new(0),
         edge_threshold_px: AtomicI32::new(config.edge_threshold_px.max(1)),
         dead_corner_px: AtomicI32::new(config.dead_corner_px.max(0)),
         edge_dwell_ms: AtomicU64::new(config.edge_dwell_ms),
         auto_lock_fullscreen: AtomicBool::new(config.auto_lock_fullscreen),
         allow_fullscreen_videos: AtomicBool::new(config.allow_fullscreen_videos),
-        fullscreen_cache: Mutex::new(WinFullscreenCache::default()),
         sync_lock_keys: AtomicBool::new(config.sync_lock_keys),
         drag_drop_files: AtomicBool::new(config.drag_drop_files),
         dnd_probe: OnceLock::new(),
@@ -1878,6 +2238,9 @@ pub fn start_windows_capture(config: CaptureConfig) -> Result<CaptureHandle> {
     let hwnd_val = ready_rx
         .recv_timeout(Duration::from_secs(5))
         .context("timed out waiting for Windows capture hook thread")??;
+
+    // Event-driven SetWinEventHook foreground fullscreen watcher (0 Hz idle, off hook thread).
+    spawn_foreground_fullscreen_watcher(Arc::clone(&state));
 
     // Dormant helper thread (0% CPU when parked on Condvar) that executes
     // EnumDisplayMonitors / GetDpiForMonitor off the WH_MOUSE_LL/WH_KEYBOARD_LL hook thread.

@@ -133,6 +133,9 @@ pub enum RuntimeCommand {
     UpdateMaxFileBytes(usize),
     UpdateReceiveDir(Option<String>),
     ResendClipboard(usize),
+    /// Triggers a single on-demand `Ping` health/RTT sample (e.g. when the GUI window becomes
+    /// visible or focused), keeping idle network traffic at 0.00 Hz.
+    RefreshStats,
     Shutdown,
 }
 

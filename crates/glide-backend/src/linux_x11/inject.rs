@@ -3,14 +3,15 @@
 use crate::geometry::DesktopGeometry;
 use crate::linux_x11::{
     poll_randr_event, query_desktop_geometry, subscribe_randr_events, unsubscribe_randr_events,
-    X11CursorHider, X11FocusClearer,
+    X11CursorHider, X11FocusClearer, X11InjectorEventWatcher,
 };
-use crate::InputInjector;
+use crate::{InjectorEvent, InputInjector};
 use anyhow::{Context, Result};
 use glide_hid::{HidUsage, MouseButton};
 use glide_proto::{Edge, OsKind};
 use std::collections::HashSet;
 use std::time::{Duration, Instant};
+use tokio::sync::mpsc;
 use tracing::{debug, trace, warn};
 use x11rb::connection::Connection;
 use x11rb::protocol::xproto::{
@@ -26,7 +27,8 @@ pub struct X11Injector {
     root: Window,
     geometry: DesktopGeometry,
     randr_subscribed: bool,
-    last_geom_refresh: Instant,
+    event_watcher: Option<X11InjectorEventWatcher>,
+    event_rx: Option<mpsc::UnboundedReceiver<InjectorEvent>>,
     cursor_hider: X11CursorHider,
     focus_clearer: X11FocusClearer,
     unfocus_on_leave: bool,
@@ -68,6 +70,13 @@ impl X11Injector {
         let randr_subscribed = subscribe_randr_events(&conn, root);
         let cursor_hider = X11CursorHider::init(&conn);
         let geometry = query_desktop_geometry(&conn, screen_num)?;
+        let (event_watcher, event_rx) = match X11InjectorEventWatcher::start(geometry.clone()) {
+            Ok((w, rx)) => (Some(w), Some(rx)),
+            Err(e) => {
+                debug!(error = %e, "X11InjectorEventWatcher unavailable; continuing without push watcher");
+                (None, None)
+            }
+        };
         let (cx, cy) = geometry.primary_center();
         let now = Instant::now();
 
@@ -77,7 +86,8 @@ impl X11Injector {
             root,
             geometry,
             randr_subscribed,
-            last_geom_refresh: now,
+            event_watcher,
+            event_rx,
             cursor_hider,
             focus_clearer: X11FocusClearer::new(),
             unfocus_on_leave: false,
@@ -96,29 +106,28 @@ impl X11Injector {
         })
     }
 
+    fn apply_geometry_inner(&mut self, new_geom: DesktopGeometry) -> bool {
+        if new_geom != self.geometry {
+            self.geometry = new_geom;
+            self.edge_push_accum = 0.0;
+            let (min_x, min_y, max_x, max_y) = self.geometry.bounds();
+            self.est_x = self.est_x.clamp(min_x as f32, (max_x - 1) as f32);
+            self.est_y = self.est_y.clamp(min_y as f32, (max_y - 1) as f32);
+            debug!(
+                monitors = self.geometry.monitors.len(),
+                "X11Injector updated desktop geometry"
+            );
+            return true;
+        }
+        false
+    }
+
     fn refresh_geometry_if_needed(&mut self) -> bool {
-        let randr_dirty = self.randr_subscribed && poll_randr_event(&self.conn);
-        if self.randr_subscribed {
-            if !randr_dirty {
-                return false;
-            }
-        } else if self.last_geom_refresh.elapsed() < Duration::from_secs(15) {
+        if !self.randr_subscribed || !poll_randr_event(&self.conn) {
             return false;
         }
-        self.last_geom_refresh = Instant::now();
         if let Ok(new_geom) = query_desktop_geometry(&self.conn, self.screen_num) {
-            if new_geom != self.geometry {
-                self.geometry = new_geom;
-                self.edge_push_accum = 0.0;
-                let (min_x, min_y, max_x, max_y) = self.geometry.bounds();
-                self.est_x = self.est_x.clamp(min_x as f32, (max_x - 1) as f32);
-                self.est_y = self.est_y.clamp(min_y as f32, (max_y - 1) as f32);
-                debug!(
-                    monitors = self.geometry.monitors.len(),
-                    randr_dirty, "X11Injector refreshed desktop geometry"
-                );
-                return true;
-            }
+            return self.apply_geometry_inner(new_geom);
         }
         false
     }
@@ -164,10 +173,16 @@ impl InputInjector for X11Injector {
 
     fn desktop_geometry(&mut self) -> Result<DesktopGeometry> {
         let _ = poll_randr_event(&self.conn);
-        self.last_geom_refresh = Instant::now();
         self.geometry = query_desktop_geometry(&self.conn, self.screen_num)?;
-        self.last_geom_refresh = Instant::now();
         Ok(self.geometry.clone())
+    }
+
+    fn take_event_rx(&mut self) -> Option<mpsc::UnboundedReceiver<InjectorEvent>> {
+        self.event_rx.take()
+    }
+
+    fn apply_geometry(&mut self, geometry: DesktopGeometry) {
+        self.apply_geometry_inner(geometry);
     }
 
     fn poll_geometry_changed(&mut self) -> Option<DesktopGeometry> {
@@ -185,6 +200,9 @@ impl InputInjector for X11Injector {
             .warp_pointer(x11rb::NONE, self.root, 0, 0, 0, 0, x as i16, y as i16)
             .context("X11 warp_pointer on Enter failed")?;
         self.cursor_hider.show(&self.conn, self.root);
+        if let Some(ref w) = self.event_watcher {
+            w.set_cursor_hidden(false);
+        }
         if self.unfocus_on_leave {
             self.focus_clearer.restore_focus(&self.conn, self.root);
         } else {
@@ -212,6 +230,9 @@ impl InputInjector for X11Injector {
             .warp_pointer(x11rb::NONE, self.root, 0, 0, 0, 0, x as i16, y as i16)
             .context("X11 warp_pointer on EnterAt failed")?;
         self.cursor_hider.show(&self.conn, self.root);
+        if let Some(ref w) = self.event_watcher {
+            w.set_cursor_hidden(false);
+        }
         if self.unfocus_on_leave {
             self.focus_clearer.restore_focus(&self.conn, self.root);
         } else {
@@ -348,9 +369,13 @@ impl InputInjector for X11Injector {
             .hit_outer_edge_guarded(edge, px, py, 2, dead_corner_px)
         {
             let lmb_held = self.pressed_buttons.contains(&MouseButton::Left.to_x11_button());
-            let start = *self.edge_push_start.get_or_insert_with(Instant::now);
             self.edge_push_accum += outward;
-            let drag_dwell_ok = !lmb_held || start.elapsed() >= Duration::from_millis(25);
+            let drag_dwell_ok = if lmb_held {
+                let start = *self.edge_push_start.get_or_insert_with(Instant::now);
+                start.elapsed() >= Duration::from_millis(25)
+            } else {
+                true
+            };
             if self.edge_push_accum >= edge_threshold_px.max(1) as f32 && drag_dwell_ok {
                 let confirmed_norm = if synced_this_call {
                     norm
@@ -501,6 +526,11 @@ impl InputInjector for X11Injector {
             self.focus_clearer.discard(&self.conn);
         }
         let _ = self.conn.flush();
+        if self.cursor_hider.is_hidden() {
+            if let Some(ref w) = self.event_watcher {
+                w.set_cursor_hidden(true);
+            }
+        }
         self.parked_pos = (px, py);
         self.est_x = px as f32;
         self.est_y = py as f32;
@@ -524,6 +554,9 @@ impl InputInjector for X11Injector {
     fn show_cursor(&mut self) -> Result<()> {
         self.focus_clearer.discard(&self.conn);
         self.cursor_hider.show(&self.conn, self.root);
+        if let Some(ref w) = self.event_watcher {
+            w.set_cursor_hidden(false);
+        }
         let _ = self.conn.flush();
         Ok(())
     }
@@ -541,6 +574,9 @@ impl InputInjector for X11Injector {
             if (x - px).abs() > 4 || (y - py).abs() > 4 {
                 self.focus_clearer.discard(&self.conn);
                 self.cursor_hider.show(&self.conn, self.root);
+                if let Some(ref w) = self.event_watcher {
+                    w.set_cursor_hidden(false);
+                }
                 let _ = self.conn.flush();
                 debug!(x, y, "Local pointer moved while hidden; cursor revealed");
             }

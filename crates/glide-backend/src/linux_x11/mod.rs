@@ -634,6 +634,255 @@ pub(crate) fn poll_fd_and_wake(
     }
 }
 
+/// Decodes the raw `(dx, dy)` valuator deltas from an XInput2 `RawMotion` event.
+pub(crate) fn extract_xi_raw_xy(
+    mask: &[u32],
+    values: &[x11rb::protocol::xinput::Fp3232],
+) -> (f32, f32) {
+    let fp_to_f32 = |v: x11rb::protocol::xinput::Fp3232| -> f32 {
+        v.integral as f32 + (v.frac as f32 / 4_294_967_296.0)
+    };
+    let mut dx = 0.0f32;
+    let mut dy = 0.0f32;
+    if mask.is_empty() {
+        return (0.0, 0.0);
+    }
+    let m0 = mask[0];
+    let mut idx = 0usize;
+    if (m0 & 1) != 0 {
+        if let Some(&v) = values.get(idx) {
+            dx = fp_to_f32(v);
+        }
+        idx += 1;
+    }
+    if (m0 & 2) != 0 {
+        if let Some(&v) = values.get(idx) {
+            dy = fp_to_f32(v);
+        }
+    }
+    (dx, dy)
+}
+
+/// Pure event-driven X11 watcher for [`crate::InputInjector`] implementations.
+///
+/// Runs on a dedicated X11 connection blocking indefinitely in `poll(2)` (0.00 Hz idle wakeups):
+/// - Pushes [`crate::InjectorEvent::GeometryChanged`] immediately on XRandR layout notifications.
+/// - Subscribes to XInput2 `XI_RawMotion` **only while the local cursor is hidden** and pushes
+///   [`crate::InjectorEvent::LocalCursorActivity`] once physical local pointer travel exceeds a
+///   small jitter threshold, replacing all periodic cursor-reveal polling.
+pub(crate) struct X11InjectorEventWatcher {
+    cursor_hidden: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    hidden_gen: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    wake: WakeSender,
+    thread: Option<std::thread::JoinHandle<()>>,
+}
+
+impl X11InjectorEventWatcher {
+    pub(crate) fn start(
+        initial_geometry: DesktopGeometry,
+    ) -> Result<(
+        Self,
+        tokio::sync::mpsc::UnboundedReceiver<crate::InjectorEvent>,
+    )> {
+        use std::os::fd::AsRawFd;
+        use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+        use std::sync::Arc;
+        use x11rb::protocol::xinput::{EventMask as XiEventMask, XIEventMask};
+
+        let (conn, screen_num) =
+            RustConnection::connect(None).context("failed to connect X11 injector event watcher")?;
+        let root = conn.setup().roots[screen_num].root;
+        let randr_subscribed = subscribe_randr_events(&conn, root);
+        let xi_ready = conn
+            .xinput_xi_query_version(2, 2)
+            .ok()
+            .and_then(|c| c.reply().ok())
+            .is_some();
+        let _ = conn.flush();
+
+        let (wake_tx, wake_rx) = wake_pipe()?;
+        let (event_tx, event_rx) = tokio::sync::mpsc::unbounded_channel();
+
+        let cursor_hidden = Arc::new(AtomicBool::new(false));
+        let hidden_gen = Arc::new(AtomicU64::new(0));
+        let stop = Arc::new(AtomicBool::new(false));
+
+        let t_hidden = Arc::clone(&cursor_hidden);
+        let t_gen = Arc::clone(&hidden_gen);
+        let t_stop = Arc::clone(&stop);
+
+        let thread = std::thread::Builder::new()
+            .name("glide-x11-inj-ev".into())
+            .spawn(move || {
+                let mut last_geom = initial_geometry;
+                let mut raw_motion_selected = false;
+                let mut last_gen: u64 = 0;
+                let mut raw_dx: f64 = 0.0;
+                let mut raw_dy: f64 = 0.0;
+                let mut hidden_settle_until: Option<std::time::Instant> = None;
+                let mut emitted_for_gen = false;
+
+                let set_raw_motion = |conn: &RustConnection, enable: bool, selected: &mut bool| {
+                    if !xi_ready || *selected == enable {
+                        return;
+                    }
+                    let mask = if enable {
+                        vec![XIEventMask::RAW_MOTION]
+                    } else {
+                        Vec::new()
+                    };
+                    let em = XiEventMask {
+                        deviceid: 1, // XIAllMasterDevices
+                        mask,
+                    };
+                    if conn.xinput_xi_select_events(root, &[em]).is_ok() {
+                        let _ = conn.flush();
+                        *selected = enable;
+                    }
+                };
+
+                loop {
+                    if t_stop.load(Ordering::Acquire) {
+                        break;
+                    }
+
+                    let want_hidden = t_hidden.load(Ordering::Acquire);
+                    let cur_gen = t_gen.load(Ordering::Acquire);
+                    if want_hidden {
+                        if cur_gen != last_gen {
+                            last_gen = cur_gen;
+                            raw_dx = 0.0;
+                            raw_dy = 0.0;
+                            hidden_settle_until =
+                                Some(std::time::Instant::now() + std::time::Duration::from_millis(40));
+                            emitted_for_gen = false;
+                        }
+                        if !emitted_for_gen {
+                            set_raw_motion(&conn, true, &mut raw_motion_selected);
+                        }
+                    } else {
+                        set_raw_motion(&conn, false, &mut raw_motion_selected);
+                        raw_dx = 0.0;
+                        raw_dy = 0.0;
+                        hidden_settle_until = None;
+                        emitted_for_gen = false;
+                    }
+
+                    let mut randr_dirty = false;
+                    let mut conn_closed = false;
+                    loop {
+                        match conn.poll_for_event() {
+                            Ok(Some(
+                                Event::RandrScreenChangeNotify(_) | Event::RandrNotify(_),
+                            )) => {
+                                randr_dirty = true;
+                            }
+                            Ok(Some(Event::XinputRawMotion(rm))) => {
+                                if raw_motion_selected
+                                    && !emitted_for_gen
+                                    && t_hidden.load(Ordering::Acquire)
+                                {
+                                    // Absorb async /dev/uinput residual motion right after leave().
+                                    if hidden_settle_until
+                                        .is_some_and(|until| std::time::Instant::now() < until)
+                                    {
+                                        continue;
+                                    }
+                                    let (dx, dy) =
+                                        extract_xi_raw_xy(&rm.valuator_mask, &rm.axisvalues_raw);
+                                    raw_dx += dx as f64;
+                                    raw_dy += dy as f64;
+                                    if raw_dx.hypot(raw_dy) >= 12.0
+                                        && t_hidden.load(Ordering::Acquire)
+                                        && t_gen.load(Ordering::Acquire) == last_gen
+                                    {
+                                        emitted_for_gen = true;
+                                        set_raw_motion(&conn, false, &mut raw_motion_selected);
+                                        let _ = event_tx
+                                            .send(crate::InjectorEvent::LocalCursorActivity);
+                                    }
+                                }
+                            }
+                            Ok(Some(_)) => {}
+                            Ok(None) => break,
+                            Err(_) => {
+                                conn_closed = true;
+                                break;
+                            }
+                        }
+                    }
+                    if conn_closed {
+                        break;
+                    }
+
+                    if randr_dirty {
+                        if let Ok(new_geom) = query_desktop_geometry(&conn, screen_num) {
+                            if new_geom != last_geom {
+                                last_geom = new_geom.clone();
+                                let _ = event_tx
+                                    .send(crate::InjectorEvent::GeometryChanged(new_geom));
+                            }
+                        }
+                        // Re-drain any events buffered into x11rb during the RandR roundtrips.
+                        continue;
+                    }
+
+                    if t_stop.load(Ordering::Acquire) {
+                        break;
+                    }
+
+                    let _ = conn.flush();
+                    match poll_fd_and_wake(conn.stream().as_raw_fd(), &wake_rx, -1) {
+                        Ok(st) if !st.fd_error && !st.wake_closed => {}
+                        _ => break,
+                    }
+                }
+
+                set_raw_motion(&conn, false, &mut raw_motion_selected);
+                if randr_subscribed {
+                    unsubscribe_randr_events(&conn, root);
+                }
+                let _ = conn.flush();
+            })
+            .context("failed to spawn glide-x11-inj-ev thread")?;
+
+        Ok((
+            Self {
+                cursor_hidden,
+                hidden_gen,
+                stop,
+                wake: wake_tx,
+                thread: Some(thread),
+            },
+            event_rx,
+        ))
+    }
+
+    pub(crate) fn set_cursor_hidden(&self, hidden: bool) {
+        use std::sync::atomic::Ordering;
+
+        if hidden {
+            self.hidden_gen.fetch_add(1, Ordering::SeqCst);
+            self.cursor_hidden.store(true, Ordering::SeqCst);
+            self.wake.wake();
+        } else if self.cursor_hidden.swap(false, Ordering::SeqCst) {
+            self.wake.wake();
+        }
+    }
+}
+
+impl Drop for X11InjectorEventWatcher {
+    fn drop(&mut self) {
+        self.stop
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        self.wake.wake();
+        if let Some(handle) = self.thread.take() {
+            let _ = handle.join();
+        }
+    }
+}
+
 /// Runs X11 diagnostics for `glide doctor`.
 pub fn run_doctor() -> Result<DoctorReport> {
     let display = std::env::var("DISPLAY").unwrap_or_else(|_| "<unset>".into());

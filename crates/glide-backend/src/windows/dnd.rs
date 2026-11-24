@@ -28,7 +28,7 @@ use crate::geometry::DesktopGeometry;
 use crate::windows::{init_dpi_awareness, query_desktop_geometry, GLIDE_EXTRA_INFO};
 use anyhow::{anyhow, Context, Result};
 use glide_proto::{Edge, MAX_DRAG_FILES};
-use parking_lot::Mutex;
+use parking_lot::{Condvar, Mutex};
 use std::ffi::{c_void, OsString};
 use std::mem::size_of;
 use std::os::windows::ffi::{OsStrExt, OsStringExt};
@@ -61,7 +61,7 @@ use windows_sys::Win32::System::Com::{
 use windows_sys::Win32::System::DataExchange::{
     CloseClipboard, EmptyClipboard, OpenClipboard, RegisterClipboardFormatW, SetClipboardData,
 };
-use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
+use windows_sys::Win32::System::LibraryLoader::{GetModuleHandleW, GetProcAddress};
 use windows_sys::Win32::System::Memory::{
     GlobalAlloc, GlobalLock, GlobalSize, GlobalUnlock, GHND,
 };
@@ -81,14 +81,14 @@ use windows_sys::Win32::UI::Shell::{
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GetClientRect, GetCursorPos,
-    GetMessageW, GetSystemMetrics, GetWindowLongPtrW, KillTimer, PeekMessageW, PostMessageW,
-    RegisterClassW, SetLayeredWindowAttributes, SetTimer, SetWindowLongPtrW, SetWindowPos,
-    ShowWindow, TranslateMessage, GWLP_USERDATA, GWL_EXSTYLE, HWND_TOPMOST, LWA_ALPHA, MSG,
-    PM_REMOVE, SM_CXVIRTUALSCREEN, SM_CYVIRTUALSCREEN, SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN,
-    SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_NOSIZE, SWP_NOZORDER, SWP_SHOWWINDOW, SW_HIDE, SW_SHOW,
-    SW_SHOWNOACTIVATE, WM_APP, WM_DISPLAYCHANGE, WM_DPICHANGED, WM_ERASEBKGND, WM_LBUTTONDOWN,
-    WM_PAINT, WM_QUIT, WM_TIMER, WNDCLASSW, WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW,
-    WS_EX_TOPMOST, WS_EX_TRANSPARENT, WS_OVERLAPPED, WS_POPUP,
+    GetMessageW, GetWindowLongPtrW, MsgWaitForMultipleObjectsEx, PeekMessageW, PostMessageW,
+    RegisterClassW, SetLayeredWindowAttributes, SetWindowLongPtrW, SetWindowPos, ShowWindow,
+    TranslateMessage, GWLP_USERDATA, GWL_EXSTYLE, HWND_TOPMOST, LWA_ALPHA, MSG,
+    MWMO_INPUTAVAILABLE, PM_REMOVE, QS_ALLINPUT, SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_NOSIZE,
+    SWP_NOZORDER, SWP_SHOWWINDOW, SW_HIDE, SW_SHOW, SW_SHOWNOACTIVATE, WM_APP, WM_DISPLAYCHANGE,
+    WM_DPICHANGED, WM_ERASEBKGND, WM_LBUTTONDOWN, WM_NULL, WM_PAINT, WM_QUIT, WNDCLASSW,
+    WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_EX_TRANSPARENT,
+    WS_OVERLAPPED, WS_POPUP,
 };
 
 const WM_APP_SYNC_STRIPS: u32 = WM_APP + 21;
@@ -98,7 +98,88 @@ const WM_APP_PREVIEW_HIDE: u32 = WM_APP + 24;
 const WM_APP_PREVIEW_MOVE: u32 = WM_APP + 25;
 const WM_APP_DISPLAY_CHANGED: u32 = WM_APP + 26;
 
-const PREVIEW_TIMER_ID: usize = 7;
+const EVENT_OBJECT_LOCATIONCHANGE: u32 = 0x800B;
+const OBJID_CURSOR: i32 = -9;
+const WINEVENT_OUTOFCONTEXT: u32 = 0x0000;
+
+type HWinEventHook = *mut c_void;
+type WinEventProc =
+    unsafe extern "system" fn(HWinEventHook, u32, HWND, i32, i32, u32, u32);
+type SetWinEventHookFn = unsafe extern "system" fn(
+    u32,
+    u32,
+    *mut c_void,
+    Option<WinEventProc>,
+    u32,
+    u32,
+    u32,
+) -> HWinEventHook;
+type UnhookWinEventFn = unsafe extern "system" fn(HWinEventHook) -> i32;
+
+static PREVIEW_CTRL_HWND: AtomicIsize = AtomicIsize::new(0);
+static PREVIEW_MOVE_QUEUED: AtomicBool = AtomicBool::new(false);
+
+unsafe extern "system" fn preview_cursor_win_event_proc(
+    _hook: HWinEventHook,
+    _event: u32,
+    _hwnd: HWND,
+    id_object: i32,
+    _id_child: i32,
+    _event_thread: u32,
+    _event_time: u32,
+) {
+    if id_object == OBJID_CURSOR && !PREVIEW_MOVE_QUEUED.swap(true, Ordering::AcqRel) {
+        let ctrl = PREVIEW_CTRL_HWND.load(Ordering::Acquire) as HWND;
+        if ctrl.is_null() || unsafe { PostMessageW(ctrl, WM_APP_PREVIEW_MOVE, 0, 0) } == 0 {
+            PREVIEW_MOVE_QUEUED.store(false, Ordering::Release);
+        }
+    }
+}
+
+fn install_cursor_move_hook() -> HWinEventHook {
+    let user32_name: Vec<u16> = "user32.dll\0".encode_utf16().collect();
+    let user32 = unsafe { GetModuleHandleW(user32_name.as_ptr()) };
+    if user32.is_null() {
+        return ptr::null_mut();
+    }
+    type FarProc = unsafe extern "system" fn() -> isize;
+    let Some(fp) = (unsafe { GetProcAddress(user32, b"SetWinEventHook\0".as_ptr()) }) else {
+        return ptr::null_mut();
+    };
+    let set_hook: SetWinEventHookFn =
+        unsafe { std::mem::transmute::<FarProc, SetWinEventHookFn>(fp) };
+    unsafe {
+        set_hook(
+            EVENT_OBJECT_LOCATIONCHANGE,
+            EVENT_OBJECT_LOCATIONCHANGE,
+            ptr::null_mut(),
+            Some(preview_cursor_win_event_proc),
+            0,
+            0,
+            WINEVENT_OUTOFCONTEXT,
+        )
+    }
+}
+
+fn uninstall_cursor_move_hook(hook: HWinEventHook) {
+    if hook.is_null() {
+        return;
+    }
+    let user32_name: Vec<u16> = "user32.dll\0".encode_utf16().collect();
+    let user32 = unsafe { GetModuleHandleW(user32_name.as_ptr()) };
+    if user32.is_null() {
+        return;
+    }
+    type FarProc = unsafe extern "system" fn() -> isize;
+    if let Some(fp) = unsafe { GetProcAddress(user32, b"UnhookWinEvent\0".as_ptr()) } {
+        let unhook: UnhookWinEventFn =
+            unsafe { std::mem::transmute::<FarProc, UnhookWinEventFn>(fp) };
+        unsafe {
+            unhook(hook);
+        }
+    }
+}
+
 const MK_LBUTTON: u32 = 0x0001;
 const DSH_ALLOWDROPDESCRIPTIONTEXT: u32 = 0x0001;
 
@@ -150,6 +231,8 @@ struct LiveOleSession {
     cancel_requested: AtomicBool,
     synthesized_lmb_down: AtomicBool,
     done: AtomicBool,
+    starter_hwnd: AtomicIsize,
+    state_notify: (Mutex<()>, Condvar),
     result_rx: Mutex<Option<std::sync::mpsc::Receiver<Result<SessionResult>>>>,
 }
 
@@ -160,8 +243,35 @@ impl LiveOleSession {
             cancel_requested: AtomicBool::new(false),
             synthesized_lmb_down: AtomicBool::new(false),
             done: AtomicBool::new(false),
+            starter_hwnd: AtomicIsize::new(0),
+            state_notify: (Mutex::new(()), Condvar::new()),
             result_rx: Mutex::new(Some(rx)),
         }
+    }
+
+    fn notify_state(&self) {
+        let _g = self.state_notify.0.lock();
+        self.state_notify.1.notify_all();
+    }
+
+    fn mark_done(&self) {
+        self.done.store(true, Ordering::Release);
+        self.notify_state();
+    }
+
+    fn wait_unless(&self, delay: Duration, pred: impl Fn() -> bool) -> bool {
+        let mut g = self.state_notify.0.lock();
+        let deadline = Instant::now() + delay;
+        while !self.done.load(Ordering::Acquire)
+            && !self.cancel_requested.load(Ordering::Acquire)
+            && !pred()
+        {
+            let res = self.state_notify.1.wait_until(&mut g, deadline);
+            if res.timed_out() {
+                break;
+            }
+        }
+        self.done.load(Ordering::Acquire) || self.cancel_requested.load(Ordering::Acquire) || pred()
     }
 }
 
@@ -223,6 +333,13 @@ impl WindowsDndBackend {
     fn cancel_live_session_inner(&self) {
         if let Some(session) = self.shared.live_session.lock().take() {
             session.cancel_requested.store(true, Ordering::Release);
+            let starter = session.starter_hwnd.load(Ordering::Acquire) as HWND;
+            if !starter.is_null() {
+                unsafe {
+                    PostMessageW(starter, WM_NULL, 0, 0);
+                }
+            }
+            session.notify_state();
             if !session.done.load(Ordering::Acquire) {
                 if session.synthesized_lmb_down.load(Ordering::Acquire)
                     && (unsafe { GetAsyncKeyState(VK_LBUTTON as i32) } as u16 & 0x8000) != 0
@@ -429,8 +546,7 @@ impl DndBackend for WindowsDndBackend {
                 let nudge_session = Arc::clone(&session);
                 thread::spawn(move || {
                     for delay in [25u64, 60, 110, 120] {
-                        thread::sleep(Duration::from_millis(delay));
-                        if nudge_session.done.load(Ordering::Acquire) {
+                        if nudge_session.wait_unless(Duration::from_millis(delay), || false) {
                             return;
                         }
                         send_mouse_wiggle();
@@ -566,6 +682,7 @@ struct StripThreadCtx {
     last_dead_corner: i32,
     strips: Vec<StripWindow>,
     preview_win: Option<PreviewWindow>,
+    cursor_hook: HWinEventHook,
 }
 
 unsafe extern "system" fn strip_wnd_proc(
@@ -902,7 +1019,9 @@ fn show_or_update_preview(ctx: &mut StripThreadCtx) {
             if !pw.visible {
                 ShowWindow(pw.hwnd, SW_SHOWNOACTIVATE);
                 pw.visible = true;
-                SetTimer(ctx.ctrl_hwnd, PREVIEW_TIMER_ID, 8, None);
+                if ctx.cursor_hook.is_null() {
+                    ctx.cursor_hook = install_cursor_move_hook();
+                }
             }
             InvalidateRect(pw.hwnd, ptr::null(), 0);
         }
@@ -926,22 +1045,26 @@ fn move_preview_to_cursor(ctx: &mut StripThreadCtx) {
         unsafe {
             SetWindowPos(
                 pw.hwnd,
-                HWND_TOPMOST,
+                ptr::null_mut(),
                 x,
                 y,
                 0,
                 0,
-                SWP_NOSIZE | SWP_NOACTIVATE,
+                SWP_NOSIZE | SWP_NOACTIVATE | SWP_NOZORDER,
             );
         }
     }
 }
 
 fn hide_preview(ctx: &mut StripThreadCtx) {
+    if !ctx.cursor_hook.is_null() {
+        uninstall_cursor_move_hook(ctx.cursor_hook);
+        ctx.cursor_hook = ptr::null_mut();
+    }
+    PREVIEW_MOVE_QUEUED.store(false, Ordering::Release);
     if let Some(ref mut pw) = ctx.preview_win {
         if pw.visible {
             unsafe {
-                KillTimer(ctx.ctrl_hwnd, PREVIEW_TIMER_ID);
                 ShowWindow(pw.hwnd, SW_HIDE);
             }
             pw.visible = false;
@@ -1177,6 +1300,8 @@ fn run_ole_strip_thread(
         return;
     }
 
+    PREVIEW_MOVE_QUEUED.store(false, Ordering::Release);
+    PREVIEW_CTRL_HWND.store(ctrl_hwnd as isize, Ordering::SeqCst);
     let _ = ready_tx.send(Ok(ctrl_hwnd as isize));
     debug!("Windows OLE DnD edge-strip & preview thread ready");
 
@@ -1190,6 +1315,7 @@ fn run_ole_strip_thread(
         last_dead_corner: -1,
         strips: Vec::new(),
         preview_win: None,
+        cursor_hook: ptr::null_mut(),
     };
 
     let mut msg: MSG = unsafe { std::mem::zeroed() };
@@ -1220,10 +1346,7 @@ fn run_ole_strip_thread(
                     continue;
                 }
                 WM_APP_PREVIEW_MOVE => {
-                    move_preview_to_cursor(&mut ctx);
-                    continue;
-                }
-                WM_TIMER if msg.wParam == PREVIEW_TIMER_ID => {
+                    PREVIEW_MOVE_QUEUED.store(false, Ordering::Release);
                     move_preview_to_cursor(&mut ctx);
                     continue;
                 }
@@ -1236,6 +1359,12 @@ fn run_ole_strip_thread(
         }
     }
 
+    let _ = PREVIEW_CTRL_HWND.compare_exchange(
+        ctrl_hwnd as isize,
+        0,
+        Ordering::SeqCst,
+        Ordering::Relaxed,
+    );
     destroy_preview(&mut ctx);
     destroy_all_strips(&mut ctx.strips);
     unsafe {
@@ -2788,7 +2917,9 @@ unsafe extern "system" fn drop_src_query_continue_drag(
 
 unsafe extern "system" fn drop_src_give_feedback(this: *mut c_void, _dw_effect: u32) -> HRESULT {
     let me = unsafe { &*(this as *const LiveDropSource) };
-    me.feedback_seen.store(true, Ordering::Release);
+    if !me.feedback_seen.swap(true, Ordering::AcqRel) {
+        me.session.notify_state();
+    }
     // As soon as Windows Shell's own SHDoDragDrop visual feedback is active, hide our temporary
     // "Receiving..." preview overlay so there is zero double-card overlap or flicker.
     if !me.hid_preview.swap(true, Ordering::AcqRel) {
@@ -2797,7 +2928,7 @@ unsafe extern "system" fn drop_src_give_feedback(this: *mut c_void, _dw_effect: 
     DRAGDROP_S_USEDEFAULTCURSORS
 }
 
-// --- Invisible virtual-desktop drag-starter window (grants real foreground SetCapture to SHDoDragDrop) ---
+// --- Invisible cursor-centered drag-starter window (grants real foreground SetCapture to SHDoDragDrop) ---
 
 struct StarterState {
     got_lbutton_down: bool,
@@ -2854,20 +2985,9 @@ fn acquire_ole_drag_capture_window(
         let _ = GetCursorPos(&mut pt);
     }
 
-    // Cover the entire virtual desktop during the ~3ms capture click so fast inward mouse
-    // motion can never escape the starter window before SendInput(LEFTDOWN) lands.
-    let raw_vw = unsafe { GetSystemMetrics(SM_CXVIRTUALSCREEN) };
-    let raw_vh = unsafe { GetSystemMetrics(SM_CYVIRTUALSCREEN) };
-    let (vx, vy, vw, vh) = if raw_vw > 0 && raw_vh > 0 {
-        (
-            unsafe { GetSystemMetrics(SM_XVIRTUALSCREEN) },
-            unsafe { GetSystemMetrics(SM_YVIRTUALSCREEN) },
-            raw_vw,
-            raw_vh,
-        )
-    } else {
-        (pt.x - 64, pt.y - 64, 128, 128)
-    };
+    // Compact 128x128 layered starter centered on the cursor (~64 KiB backing store vs.
+    // 33-66 MiB for a full multi-monitor virtual desktop layered surface).
+    let (vx, vy, vw, vh) = (pt.x - 64, pt.y - 64, 128, 128);
 
     let class_name = encode_wide("GlideOleDragStarter");
     let hinstance = unsafe { GetModuleHandleW(ptr::null()) };
@@ -2914,6 +3034,7 @@ fn acquire_ole_drag_capture_window(
     let mut starter_state = StarterState {
         got_lbutton_down: false,
     };
+    session.starter_hwnd.store(hwnd as isize, Ordering::Release);
     unsafe {
         SetWindowLongPtrW(
             hwnd,
@@ -2929,7 +3050,7 @@ fn acquire_ole_drag_capture_window(
     if phys_lmb_down {
         // Server receiving Client -> Server drag while user physically holds LMB:
         // bounce UP -> DOWN (tagged GLIDE_EXTRA_INFO so mouse_ll_proc ignores both) onto
-        // our invisible full-desktop starter window so ole32 receives valid mouse capture.
+        // our invisible cursor-centered starter window so ole32 receives valid mouse capture.
         let inputs = [
             INPUT {
                 r#type: INPUT_MOUSE,
@@ -2970,13 +3091,8 @@ fn acquire_ole_drag_capture_window(
 
     let deadline = Instant::now() + Duration::from_millis(160);
     let mut msg: MSG = unsafe { std::mem::zeroed() };
-    while !starter_state.got_lbutton_down
-        && !session.cancel_requested.load(Ordering::Acquire)
-        && Instant::now() < deadline
-    {
-        let mut pumped = false;
+    while !starter_state.got_lbutton_down && !session.cancel_requested.load(Ordering::Acquire) {
         while unsafe { PeekMessageW(&mut msg, ptr::null_mut(), 0, 0, PM_REMOVE) } != 0 {
-            pumped = true;
             unsafe {
                 TranslateMessage(&msg);
                 DispatchMessageW(&msg);
@@ -2985,11 +3101,26 @@ fn acquire_ole_drag_capture_window(
                 break;
             }
         }
-        if !pumped {
-            thread::sleep(Duration::from_millis(2));
+        if starter_state.got_lbutton_down || session.cancel_requested.load(Ordering::Acquire) {
+            break;
+        }
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            break;
+        }
+        let wait_ms = remaining.as_millis().clamp(1, (u32::MAX - 1) as u128) as u32;
+        unsafe {
+            MsgWaitForMultipleObjectsEx(
+                0,
+                ptr::null(),
+                wait_ms,
+                QS_ALLINPUT,
+                MWMO_INPUTAVAILABLE,
+            );
         }
     }
 
+    session.starter_hwnd.store(0, Ordering::Release);
     unsafe {
         SetWindowLongPtrW(hwnd, GWLP_USERDATA, 0);
         if starter_state.got_lbutton_down {
@@ -3013,7 +3144,7 @@ fn run_windows_ole_drag_session(
 ) -> Result<SessionResult> {
     let hr_init = unsafe { OleInitialize(ptr::null()) };
     if hr_init < 0 {
-        session.done.store(true, Ordering::Release);
+        session.mark_done();
         warn!(
             hr = hr_init,
             ?mode,
@@ -3057,14 +3188,17 @@ fn run_windows_ole_drag_session(
             // Wake SHDoDragDrop immediately with a real (+1, 0), (-1, 0) pointer wiggle so
             // Explorer runs DragEnter and displays the native Shell drag image + "+ Copy to"
             // badge even if the user holds the cursor perfectly still!
-            thread::sleep(Duration::from_millis(15));
-            if !session_bg.done.load(Ordering::Acquire) {
-                send_mouse_wiggle();
+            if session_bg.wait_unless(Duration::from_millis(15), || false) {
+                return;
             }
+            send_mouse_wiggle();
             if mode == DragRunMode::ImmediatePostRelease {
                 for delay in [35u64, 65, 110] {
-                    thread::sleep(Duration::from_millis(delay));
-                    if session_bg.done.load(Ordering::Acquire) {
+                    let _ = session_bg
+                        .wait_unless(Duration::from_millis(delay), || fb_bg.load(Ordering::Acquire));
+                    if session_bg.done.load(Ordering::Acquire)
+                        || session_bg.cancel_requested.load(Ordering::Acquire)
+                    {
                         return;
                     }
                     if fb_bg.load(Ordering::Acquire) {
@@ -3076,7 +3210,10 @@ fn run_windows_ole_drag_session(
                     }
                     send_mouse_wiggle();
                 }
-                if !session_bg.done.load(Ordering::Acquire) && synth_bg {
+                if !session_bg.done.load(Ordering::Acquire)
+                    && !session_bg.cancel_requested.load(Ordering::Acquire)
+                    && synth_bg
+                {
                     send_mouse_button_input(MOUSEEVENTF_LEFTUP);
                 }
             }
@@ -3098,7 +3235,7 @@ fn run_windows_ole_drag_session(
     let lmb_still_down =
         (unsafe { GetAsyncKeyState(VK_LBUTTON as i32) } as u16 & 0x8000) != 0;
 
-    session.done.store(true, Ordering::Release);
+    session.mark_done();
 
     if !starter_hwnd.is_null() {
         unsafe {

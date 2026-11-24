@@ -625,7 +625,6 @@ mod tests {
     async fn server_and_client_survive_suspend_resume_with_health_probe_and_clean_shutdown() {
         use crate::client::run_client_with_backends;
         use crate::runtime::RuntimeCommand;
-        use std::sync::Arc;
         use tokio::sync::mpsc;
 
         let identity = ServerIdentity::generate_ephemeral().unwrap();
@@ -636,7 +635,7 @@ mod tests {
 
         let (capture_handle, cap_tx, cap_state) = create_mock_capture(single_monitor_geom("Srv"));
         let (mut injector, inj_log) = MockInjector::new(single_monitor_geom("Cli"));
-        let resumed_flag = Arc::clone(&injector.resumed_flag);
+        let cli_event_tx = injector.event_tx.clone();
 
         let srv_rt = RuntimeState::new();
         let cli_rt = RuntimeState::new();
@@ -723,7 +722,9 @@ mod tests {
 
         // Trigger SystemResumed on BOTH server and client -> both arm 1.5s HealthProbes and send Ping!
         cap_tx.send(CaptureEvent::SystemResumed).unwrap();
-        resumed_flag.store(true, Ordering::SeqCst);
+        cli_event_tx
+            .send(glide_backend::InjectorEvent::SystemResumed)
+            .unwrap();
 
         // Wait > 1.5s HealthProbe timeout to prove Ping/Pong cleared probes on BOTH sides
         tokio::time::sleep(Duration::from_millis(1900)).await;
@@ -844,7 +845,6 @@ mod tests {
     #[tokio::test]
     async fn client_fails_fast_when_server_ignores_post_resume_health_ping() {
         use glide_proto::{ControlMessage, PROTOCOL_VERSION};
-        use std::sync::Arc;
 
         let identity = ServerIdentity::generate_ephemeral().unwrap();
         let fp = identity.fingerprint.clone();
@@ -874,7 +874,7 @@ mod tests {
         });
 
         let (mut injector, _) = MockInjector::new(single_monitor_geom("Cli"));
-        let resumed_flag = Arc::clone(&injector.resumed_flag);
+        let cli_event_tx = injector.event_tx.clone();
         let cli_rt = RuntimeState::new();
         let mut cli_cfg = ClientConfig {
             name: "cli-probe".into(),
@@ -908,7 +908,9 @@ mod tests {
         assert!(cli_rt.snapshot().status.starts_with("Connected"));
 
         let started = std::time::Instant::now();
-        resumed_flag.store(true, Ordering::SeqCst);
+        cli_event_tx
+            .send(glide_backend::InjectorEvent::SystemResumed)
+            .unwrap();
 
         let err = tokio::time::timeout(Duration::from_millis(2800), cli_task)
             .await
@@ -2706,8 +2708,7 @@ mod tests {
         let (capture_handle, cap_tx, cap_state) = create_mock_capture(geom.clone());
         let (mut injector, inj_log) = MockInjector::new(geom);
         let cli_unfocus_flag = Arc::clone(&injector.unfocus_on_leave_flag);
-        let cli_suspended = Arc::clone(&injector.suspended_flag);
-        let cli_resumed = Arc::clone(&injector.resumed_flag);
+        let cli_event_tx = injector.event_tx.clone();
         let cli_discards = Arc::clone(&injector.discard_focus_count);
         let cli_rt = RuntimeState::new();
         let (srv_cmd_tx, srv_cmd_rx) = tokio::sync::mpsc::unbounded_channel();
@@ -2986,7 +2987,9 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
         let discards_before = cli_discards.load(Ordering::SeqCst);
-        cli_suspended.store(true, Ordering::SeqCst);
+        cli_event_tx
+            .send(glide_backend::InjectorEvent::SystemSuspended)
+            .unwrap();
         for _ in 0..150 {
             if cli_discards.load(Ordering::SeqCst) > discards_before {
                 break;
@@ -3023,7 +3026,9 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
         let discards_before = cli_discards.load(Ordering::SeqCst);
-        cli_resumed.store(true, Ordering::SeqCst);
+        cli_event_tx
+            .send(glide_backend::InjectorEvent::SystemResumed)
+            .unwrap();
         for _ in 0..150 {
             if cli_discards.load(Ordering::SeqCst) > discards_before {
                 break;
@@ -3770,5 +3775,437 @@ mod tests {
             .unwrap()
             .unwrap()
             .unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn server_evicts_dead_peer_on_screen_entry_with_zero_idle_keepalive() {
+        use crate::runtime::RuntimeCommand;
+        use glide_net::connect_client;
+        use glide_net::tls::TrustMode;
+        use glide_proto::{ControlMessage, OsKind, PROTOCOL_VERSION};
+        use tokio::sync::mpsc;
+
+        let identity = ServerIdentity::generate_ephemeral().unwrap();
+        let fp = identity.fingerprint.clone();
+        let endpoint =
+            GlideServerEndpoint::bind("127.0.0.1:0".parse().unwrap(), &identity).unwrap();
+        let addr = endpoint.local_addr();
+
+        let (capture_handle, cap_tx, cap_state) = create_mock_capture(single_monitor_geom("Srv"));
+        let srv_rt = RuntimeState::new();
+        let (srv_cmd_tx, srv_cmd_rx) = mpsc::unbounded_channel();
+
+        let srv_cfg = ServerConfig {
+            name: "srv-entry-probe".into(),
+            discovery: false,
+            ..Default::default()
+        };
+        let srv_rt_c = srv_rt.clone();
+        let srv_task = tokio::spawn(async move {
+            run_server_with_backends(
+                srv_cfg,
+                endpoint,
+                capture_handle,
+                None,
+                "linux-x11",
+                Some(srv_rt_c),
+                Some(srv_cmd_rx),
+            )
+            .await
+        });
+
+        let mut silent_peer = connect_client(addr, TrustMode::Pinned(fp)).await.unwrap();
+        silent_peer
+            .ctrl_send
+            .send(&ControlMessage::Hello {
+                version: PROTOCOL_VERSION,
+                peer_name: "dead-peer".into(),
+                edge_on_server: Edge::Right,
+                os: OsKind::LinuxX11,
+            })
+            .await
+            .unwrap();
+        let _welcome = silent_peer.ctrl_recv.recv().await.unwrap();
+
+        for _ in 0..40 {
+            if srv_rt.snapshot().peers.len() == 1 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert_eq!(srv_rt.snapshot().peers.len(), 1);
+        assert!(
+            srv_rt.snapshot().rtt_ms.is_some(),
+            "handshake RTT must populate immediately without polling"
+        );
+
+        // User crosses onto the unresponsive peer -> server arms one-shot 1.5s HealthProbe
+        let started = std::time::Instant::now();
+        cap_tx
+            .send(CaptureEvent::EdgeCrossed {
+                edge: Edge::Right,
+                normalized_pos: 0.5,
+            })
+            .unwrap();
+
+        let mut snapped_back = false;
+        while started.elapsed() < Duration::from_millis(2600) {
+            if srv_rt.snapshot().peers.is_empty() && !cap_state.remote_mode.load(Ordering::SeqCst)
+            {
+                snapped_back = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(30)).await;
+        }
+        assert!(
+            snapped_back,
+            "entering a dead peer must evict it and snap cursor back to local within ~1.5s"
+        );
+        assert!(cap_state.active_edges.lock().is_empty());
+
+        drop(silent_peer);
+        srv_cmd_tx.send(RuntimeCommand::Shutdown).unwrap();
+        tokio::time::timeout(Duration::from_secs(2), srv_task)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn network_change_monitor_triggers_server_health_probe_with_zero_polling() {
+        use crate::runtime::RuntimeCommand;
+        use crate::server::run_server_with_monitors;
+        use glide_backend::dnd::NoopDndBackend;
+        use glide_backend::lifecycle::NetworkChangeMonitor;
+        use glide_net::connect_client;
+        use glide_net::tls::TrustMode;
+        use glide_proto::{ControlMessage, OsKind, PROTOCOL_VERSION};
+        use std::sync::Arc;
+        use tokio::sync::mpsc;
+
+        let identity = ServerIdentity::generate_ephemeral().unwrap();
+        let fp = identity.fingerprint.clone();
+        let endpoint =
+            GlideServerEndpoint::bind("127.0.0.1:0".parse().unwrap(), &identity).unwrap();
+        let addr = endpoint.local_addr();
+
+        let (capture_handle, _cap_tx, cap_state) = create_mock_capture(single_monitor_geom("Srv"));
+        let srv_rt = RuntimeState::new();
+        let (srv_cmd_tx, srv_cmd_rx) = mpsc::unbounded_channel();
+        let (net_mon, net_tx) = NetworkChangeMonitor::from_channel();
+
+        let srv_cfg = ServerConfig {
+            name: "srv-netwatch".into(),
+            discovery: false,
+            ..Default::default()
+        };
+        let srv_rt_c = srv_rt.clone();
+        let srv_task = tokio::spawn(async move {
+            run_server_with_monitors(
+                srv_cfg,
+                endpoint,
+                capture_handle,
+                None,
+                Arc::new(NoopDndBackend),
+                None,
+                "linux-x11",
+                Some(srv_rt_c),
+                Some(srv_cmd_rx),
+                None,
+                Some(net_mon),
+            )
+            .await
+        });
+
+        let mut silent_peer = connect_client(addr, TrustMode::Pinned(fp)).await.unwrap();
+        silent_peer
+            .ctrl_send
+            .send(&ControlMessage::Hello {
+                version: PROTOCOL_VERSION,
+                peer_name: "roamed-dead-peer".into(),
+                edge_on_server: Edge::Right,
+                os: OsKind::LinuxX11,
+            })
+            .await
+            .unwrap();
+        let _welcome = silent_peer.ctrl_recv.recv().await.unwrap();
+
+        for _ in 0..40 {
+            if srv_rt.snapshot().peers.len() == 1 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert_eq!(srv_rt.snapshot().peers.len(), 1);
+
+        // Emit OS RTNETLINK / IP Helper network-change event -> server probes peer immediately
+        let started = std::time::Instant::now();
+        net_tx.send(()).unwrap();
+
+        let mut evicted = false;
+        while started.elapsed() < Duration::from_millis(2600) {
+            if srv_rt.snapshot().peers.is_empty() {
+                evicted = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(30)).await;
+        }
+        assert!(
+            evicted,
+            "NetworkChangeMonitor event must probe and evict silent peer within ~1.5s"
+        );
+        assert!(cap_state.active_edges.lock().is_empty());
+
+        drop(silent_peer);
+        srv_cmd_tx.send(RuntimeCommand::Shutdown).unwrap();
+        tokio::time::timeout(Duration::from_secs(2), srv_task)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn client_reveals_hidden_cursor_on_local_cursor_activity_with_zero_polling() {
+        use crate::client::run_client_with_backends;
+        use crate::runtime::RuntimeCommand;
+        use glide_backend::InjectorEvent;
+        use std::sync::Arc;
+        use tokio::sync::mpsc;
+
+        let identity = ServerIdentity::generate_ephemeral().unwrap();
+        let fp = identity.fingerprint.clone();
+        let endpoint =
+            GlideServerEndpoint::bind("127.0.0.1:0".parse().unwrap(), &identity).unwrap();
+        let addr = endpoint.local_addr();
+
+        let (capture_handle, _cap_tx, _cap_state) = create_mock_capture(single_monitor_geom("Srv"));
+        let (mut injector, _log) = MockInjector::new(single_monitor_geom("Cli"));
+        let cli_event_tx = injector.event_tx.clone();
+        let cursor_hidden = Arc::clone(&injector.cursor_hidden);
+        let show_cursor_calls = Arc::clone(&injector.show_cursor_calls);
+
+        let srv_rt = RuntimeState::new();
+        let cli_rt = RuntimeState::new();
+        let (srv_cmd_tx, srv_cmd_rx) = mpsc::unbounded_channel();
+        let (cli_cmd_tx, cli_cmd_rx) = mpsc::unbounded_channel();
+
+        let srv_cfg = ServerConfig {
+            name: "srv-reveal".into(),
+            discovery: false,
+            clipboard: false,
+            ..Default::default()
+        };
+        let cli_cfg = ClientConfig {
+            name: "cli-reveal".into(),
+            server: Some(addr.to_string()),
+            edge: Edge::Right,
+            trusted_fingerprint: Some(fp),
+            clipboard: false,
+            ..Default::default()
+        };
+
+        let srv_rt_c = srv_rt.clone();
+        let srv_task = tokio::spawn(async move {
+            run_server_with_backends(
+                srv_cfg,
+                endpoint,
+                capture_handle,
+                None,
+                "linux-x11",
+                Some(srv_rt_c),
+                Some(srv_cmd_rx),
+            )
+            .await
+        });
+        let cli_rt_c = cli_rt.clone();
+        let cli_task = tokio::spawn(async move {
+            let mut no_clip = None;
+            run_client_with_backends(
+                cli_cfg,
+                &mut injector,
+                &mut no_clip,
+                Some(cli_rt_c),
+                Some(cli_cmd_rx),
+            )
+            .await
+        });
+
+        for _ in 0..40 {
+            if srv_rt.snapshot().peers.len() == 1
+                && cli_rt.snapshot().status.starts_with("Connected")
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert_eq!(srv_rt.snapshot().peers.len(), 1);
+
+        // Switch onto client, then return to server so client hides its cursor
+        srv_cmd_tx
+            .send(RuntimeCommand::SwitchTarget(Some(Edge::Right)))
+            .unwrap();
+        for _ in 0..40 {
+            if cli_rt.snapshot().active_target == "Local (Controlling)" {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(!cursor_hidden.load(Ordering::SeqCst));
+
+        srv_cmd_tx.send(RuntimeCommand::ReturnLocal).unwrap();
+        for _ in 0..40 {
+            if cursor_hidden.load(Ordering::SeqCst) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(cursor_hidden.load(Ordering::SeqCst));
+
+        // Push event-driven LocalCursorActivity -> client must reveal cursor immediately
+        let calls_before = show_cursor_calls.load(Ordering::SeqCst);
+        let t0 = std::time::Instant::now();
+        cli_event_tx.send(InjectorEvent::LocalCursorActivity).unwrap();
+
+        for _ in 0..40 {
+            if !cursor_hidden.load(Ordering::SeqCst)
+                && show_cursor_calls.load(Ordering::SeqCst) > calls_before
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert!(!cursor_hidden.load(Ordering::SeqCst));
+        assert!(show_cursor_calls.load(Ordering::SeqCst) > calls_before);
+        assert!(
+            t0.elapsed() < Duration::from_millis(200),
+            "event-driven cursor reveal took {:?}",
+            t0.elapsed()
+        );
+
+        cli_cmd_tx.send(RuntimeCommand::Shutdown).unwrap();
+        srv_cmd_tx.send(RuntimeCommand::Shutdown).unwrap();
+        tokio::time::timeout(Duration::from_secs(2), cli_task)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(2), srv_task)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn client_detects_silent_dead_server_on_reboot_announcement_without_polling() {
+        use crate::client::run_client_session;
+        use glide_proto::{ControlMessage, PROTOCOL_VERSION};
+
+        let discovery_port = 24896;
+        let identity = ServerIdentity::generate_ephemeral().unwrap();
+        let fp = identity.fingerprint.clone();
+        let endpoint =
+            GlideServerEndpoint::bind("127.0.0.1:0".parse().unwrap(), &identity).unwrap();
+        let addr = endpoint.local_addr();
+
+        // Accept one client, finish Hello/Welcome handshake, then go completely silent
+        // (simulating a hard server power-off where no QUIC CONNECTION_CLOSE was ever sent).
+        let silent_server = tokio::spawn(async move {
+            let mut session = endpoint.accept().await.unwrap();
+            let hello = session.ctrl_recv.recv().await.unwrap();
+            assert!(matches!(hello, ControlMessage::Hello { .. }));
+            session
+                .ctrl_send
+                .send(&ControlMessage::Welcome {
+                    version: PROTOCOL_VERSION,
+                    server_name: "rebooting-srv".into(),
+                    accepted: true,
+                    reason: String::new(),
+                    server_scale: 1.0,
+                })
+                .await
+                .unwrap();
+            // Hold handles alive without replying to any Ping until test ends.
+            tokio::time::sleep(Duration::from_secs(10)).await;
+            drop((session, endpoint));
+        });
+
+        let (mut injector, _log) = MockInjector::new(single_monitor_geom("CliReboot"));
+        let cli_rt = RuntimeState::new();
+        let mut cli_cfg = ClientConfig {
+            name: "cli-reboot".into(),
+            server: Some(addr.to_string()),
+            discovery_port,
+            edge: Edge::Right,
+            trusted_fingerprint: Some(fp.clone()),
+            clipboard: false,
+            ..Default::default()
+        };
+
+        let cli_rt_c = cli_rt.clone();
+        let cli_task = tokio::spawn(async move {
+            let mut no_clip = None;
+            run_client_session(
+                &mut cli_cfg,
+                addr,
+                &mut injector,
+                &mut no_clip,
+                Some(&cli_rt_c),
+                None,
+            )
+            .await
+        });
+
+        for _ in 0..50 {
+            if cli_rt.snapshot().status.starts_with("Connected") {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(
+            cli_rt.snapshot().status.starts_with("Connected"),
+            "client must establish initial session"
+        );
+        // Allow listen_only discovery socket to finish binding and verify session stays calm at idle.
+        tokio::time::sleep(Duration::from_millis(120)).await;
+        assert!(
+            !cli_task.is_finished(),
+            "client must remain connected while idle before reboot announcement"
+        );
+
+        // Simulate the server rebooting on the LAN and emitting its single startup announcement.
+        let beacon_payload = serde_json::to_vec(&glide_net::discovery::ServerBeacon {
+            magic: "GLIDE_BEACON_V1".into(),
+            name: "rebooting-srv".into(),
+            quic_port: addr.port(),
+            fingerprint: fp,
+            os: "linux-x11".into(),
+            ips: vec!["127.0.0.1".into()],
+        })
+        .unwrap();
+        let started = std::time::Instant::now();
+        let udp = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        udp.send_to(&beacon_payload, ("127.0.0.1", discovery_port))
+            .await
+            .unwrap();
+
+        let res = tokio::time::timeout(Duration::from_millis(2600), cli_task)
+            .await
+            .expect("client must detect dead silent server within ~1.5s of reboot announcement")
+            .unwrap();
+        let err = res.expect_err("session against silent dead server must return error");
+        assert!(
+            err.to_string().contains("health ping"),
+            "expected health ping timeout error, got: {err}"
+        );
+        assert!(
+            started.elapsed() >= Duration::from_millis(1200),
+            "probe must wait for the 1.5s Pong timeout before disconnecting, elapsed={:?}",
+            started.elapsed()
+        );
+
+        silent_server.abort();
     }
 }

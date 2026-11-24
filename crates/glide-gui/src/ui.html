@@ -538,15 +538,13 @@
   }
   .empty strong { color: var(--text-2); font-weight: 500; font-size: 13px; }
   .empty .spin {
-    width: 14px;
-    height: 14px;
+    width: 10px;
+    height: 10px;
     margin-bottom: 6px;
     border-radius: 50%;
-    border: 1.5px solid var(--line-2);
-    border-top-color: var(--muted);
-    animation: spin 0.9s linear infinite;
+    border: 1.5px solid var(--muted);
+    opacity: 0.6;
   }
-  @keyframes spin { to { transform: rotate(360deg); } }
 
   /* ---------- Arrangement ---------- */
   .desk {
@@ -1312,7 +1310,9 @@ function guardRole(role) {
     if (role !== state.role) toast('Stop the current session to switch roles');
     return;
   }
+  const changed = role !== state.role;
   setRole(role);
+  if (changed && role === 'client') scanLan(true);
 }
 $('roleServerBtn').onclick = () => guardRole('server');
 $('roleClientBtn').onclick = () => guardRole('client');
@@ -2319,16 +2319,31 @@ async function init() {
   fitWindowToContent();
   requestAnimationFrame(() => requestAnimationFrame(() => document.body.classList.remove('preload')));
 
-  _es = new EventSource('/api/events');
-  _es.onmessage = (ev) => {
-    try { renderStatus(JSON.parse(ev.data)); } catch {}
-  };
+  function connectEvents() {
+    if (_es || document.hidden) return;
+    _es = new EventSource('/api/events');
+    _es.onmessage = (ev) => {
+      try { renderStatus(JSON.parse(ev.data)); } catch {}
+    };
+  }
+  function disconnectEvents() {
+    if (_es) {
+      _es.close();
+      _es = null;
+    }
+  }
+  document.addEventListener('visibilitychange', () => {
+    if (document.hidden) {
+      disconnectEvents();
+    } else {
+      connectEvents();
+      const connected = state.status && state.status.status && state.status.status.startsWith('Connected');
+      if (!state.running || (state.role === 'client' && !connected)) scanLan(true);
+    }
+  });
 
+  connectEvents();
   scanLan(true);
-  setInterval(() => {
-    const connected = state.status && state.status.status && state.status.status.startsWith('Connected');
-    if (!state.running || (state.role === 'client' && !connected)) scanLan(true);
-  }, 4500);
 }
 
 init();

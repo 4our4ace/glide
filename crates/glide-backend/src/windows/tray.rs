@@ -21,10 +21,11 @@ use windows_sys::Win32::UI::Shell::{
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     AppendMenuW, CreateIconIndirect, CreatePopupMenu, CreateWindowExW, DefWindowProcW, DestroyIcon,
-    DestroyMenu, DispatchMessageW, GetCursorPos, GetMessageW, LoadIconW, PostMessageW,
-    PostQuitMessage, RegisterClassW, SetForegroundWindow, TrackPopupMenu, TranslateMessage, HICON,
-    ICONINFO, IDI_APPLICATION, MF_SEPARATOR, MF_STRING, MSG, TPM_BOTTOMALIGN, TPM_LEFTALIGN,
-    WM_APP, WM_COMMAND, WM_LBUTTONDBLCLK, WM_LBUTTONUP, WM_QUIT, WM_RBUTTONUP, WNDCLASSW,
+    DestroyMenu, DestroyWindow, DispatchMessageW, GetCursorPos, GetMessageW, LoadIconW,
+    PostMessageW, PostQuitMessage, RegisterClassW, SetForegroundWindow, TrackPopupMenu,
+    TranslateMessage, HICON, ICONINFO, IDI_APPLICATION, MF_SEPARATOR, MF_STRING, MSG,
+    TPM_BOTTOMALIGN, TPM_LEFTALIGN, WM_APP, WM_COMMAND, WM_LBUTTONDBLCLK, WM_LBUTTONUP,
+    WM_RBUTTONUP, WNDCLASSW,
 };
 
 const WM_TRAY_ICON: u32 = WM_APP + 50;
@@ -156,8 +157,22 @@ unsafe extern "system" fn tray_wnd_proc(
             }
             0
         }
+        WM_TRAY_SHUTDOWN => {
+            unsafe {
+                PostQuitMessage(0);
+            }
+            0
+        }
         _ => unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) },
     }
+}
+
+const WM_TRAY_SHUTDOWN: u32 = WM_TRAY_ICON + 1;
+
+static TRAY_DONE: OnceLock<(Mutex<bool>, parking_lot::Condvar)> = OnceLock::new();
+
+fn tray_done() -> &'static (Mutex<bool>, parking_lot::Condvar) {
+    TRAY_DONE.get_or_init(|| (Mutex::new(true), parking_lot::Condvar::new()))
 }
 
 /// Spawns the native Windows 11 taskbar system tray icon on a background thread.
@@ -165,8 +180,9 @@ pub fn spawn_windows_tray() -> mpsc::UnboundedReceiver<TrayAction> {
     let (tx, rx) = mpsc::unbounded_channel();
     let cell = TRAY_TX.get_or_init(|| Mutex::new(None));
     *cell.lock() = Some(tx);
+    *tray_done().0.lock() = false;
 
-    let _ = thread::Builder::new()
+    let spawn_res = thread::Builder::new()
         .name("glide-win-tray".into())
         .spawn(move || {
             let class_name = wide("GlideSystemTrayWindow");
@@ -203,6 +219,9 @@ pub fn spawn_windows_tray() -> mpsc::UnboundedReceiver<TrayAction> {
                 )
             };
             if hwnd.is_null() {
+                let (lock, cvar) = tray_done();
+                *lock.lock() = true;
+                cvar.notify_all();
                 return;
             }
             TRAY_HWND.store(hwnd as isize, Ordering::Release);
@@ -243,20 +262,32 @@ pub fn spawn_windows_tray() -> mpsc::UnboundedReceiver<TrayAction> {
                 if !custom_icon.is_null() {
                     DestroyIcon(custom_icon);
                 }
+                DestroyWindow(hwnd);
             }
+            let (lock, cvar) = tray_done();
+            *lock.lock() = true;
+            cvar.notify_all();
         });
+
+    if spawn_res.is_err() {
+        let (lock, cvar) = tray_done();
+        *lock.lock() = true;
+        cvar.notify_all();
+    }
 
     rx
 }
 
-/// Requests the Windows system tray thread to remove its icon (`NIM_DELETE`) and exit cleanly.
+/// Requests the Windows system tray thread to remove its icon (`NIM_DELETE`) and waits
+/// event-driven (bounded to 250 ms) for completion with zero blind sleeping.
 pub fn shutdown_windows_tray() {
     let hwnd = TRAY_HWND.swap(0, Ordering::AcqRel) as HWND;
     if !hwnd.is_null() {
         unsafe {
-            PostMessageW(hwnd, WM_QUIT, 0, 0);
+            PostMessageW(hwnd, WM_TRAY_SHUTDOWN, 0, 0);
         }
-        // Give the tray thread a brief moment to run Shell_NotifyIconW(NIM_DELETE).
-        thread::sleep(std::time::Duration::from_millis(60));
     }
+    let (lock, cvar) = tray_done();
+    let mut done = lock.lock();
+    let _ = cvar.wait_while_for(&mut done, |d| !*d, std::time::Duration::from_millis(250));
 }

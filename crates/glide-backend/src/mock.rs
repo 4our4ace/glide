@@ -271,8 +271,12 @@ pub struct MockInjector {
     pub pending_geometry: Arc<Mutex<Option<DesktopGeometry>>>,
     pub suspended_flag: Arc<AtomicBool>,
     pub resumed_flag: Arc<AtomicBool>,
+    pub event_tx: mpsc::UnboundedSender<crate::InjectorEvent>,
+    event_rx: Option<mpsc::UnboundedReceiver<crate::InjectorEvent>>,
     pub unfocus_on_leave_flag: Arc<AtomicBool>,
     pub discard_focus_count: Arc<AtomicUsize>,
+    pub cursor_hidden: Arc<AtomicBool>,
+    pub show_cursor_calls: Arc<AtomicUsize>,
     pub unfocus_on_leave: bool,
     pub unfocus_calls: usize,
     pub has_saved_focus: bool,
@@ -288,14 +292,19 @@ pub struct MockInjector {
 impl MockInjector {
     pub fn new(geometry: DesktopGeometry) -> (Self, Arc<Mutex<Vec<InjectedAction>>>) {
         let log = Arc::new(Mutex::new(Vec::new()));
+        let (event_tx, event_rx) = mpsc::unbounded_channel();
         let (cx, cy) = geometry.primary_center();
         let me = Self {
             geometry,
             pending_geometry: Arc::new(Mutex::new(None)),
             suspended_flag: Arc::new(AtomicBool::new(false)),
             resumed_flag: Arc::new(AtomicBool::new(false)),
+            event_tx,
+            event_rx: Some(event_rx),
             unfocus_on_leave_flag: Arc::new(AtomicBool::new(false)),
             discard_focus_count: Arc::new(AtomicUsize::new(0)),
+            cursor_hidden: Arc::new(AtomicBool::new(false)),
+            show_cursor_calls: Arc::new(AtomicUsize::new(0)),
             unfocus_on_leave: false,
             unfocus_calls: 0,
             has_saved_focus: false,
@@ -326,6 +335,17 @@ impl MockInjector {
 impl InputInjector for MockInjector {
     fn os_kind(&self) -> OsKind {
         OsKind::LinuxX11
+    }
+
+    fn take_event_rx(&mut self) -> Option<mpsc::UnboundedReceiver<crate::InjectorEvent>> {
+        self.event_rx.take()
+    }
+
+    fn apply_geometry(&mut self, geometry: DesktopGeometry) {
+        if geometry != self.geometry {
+            self.geometry = geometry;
+            self.edge_push_accum = 0.0;
+        }
     }
 
     fn set_unfocus_on_leave(&mut self, enabled: bool) {
@@ -382,6 +402,7 @@ impl InputInjector for MockInjector {
         self.cursor_x = x as f32;
         self.cursor_y = y as f32;
         self.edge_push_accum = 0.0;
+        self.cursor_hidden.store(false, Ordering::SeqCst);
         let mut log = self.log.lock();
         log.push(InjectedAction::Enter(edge, normalized_pos));
         if std::mem::take(&mut self.has_saved_focus) && self.unfocus_on_leave {
@@ -396,6 +417,7 @@ impl InputInjector for MockInjector {
         self.cursor_x = x as f32;
         self.cursor_y = y as f32;
         self.edge_push_accum = 0.0;
+        self.cursor_hidden.store(false, Ordering::SeqCst);
         let mut log = self.log.lock();
         log.push(InjectedAction::EnterAt(norm_x, norm_y));
         if std::mem::take(&mut self.has_saved_focus) && self.unfocus_on_leave {
@@ -501,6 +523,7 @@ impl InputInjector for MockInjector {
 
     fn leave(&mut self) -> Result<()> {
         self.edge_push_accum = 0.0;
+        self.cursor_hidden.store(true, Ordering::SeqCst);
         if self.unfocus_on_leave {
             self.unfocus_calls += 1;
             self.has_saved_focus = true;
@@ -511,8 +534,14 @@ impl InputInjector for MockInjector {
         Ok(())
     }
 
+    fn is_cursor_hidden(&self) -> bool {
+        self.cursor_hidden.load(Ordering::SeqCst)
+    }
+
     fn show_cursor(&mut self) -> Result<()> {
         self.has_saved_focus = false;
+        self.cursor_hidden.store(false, Ordering::SeqCst);
+        self.show_cursor_calls.fetch_add(1, Ordering::SeqCst);
         Ok(())
     }
 }

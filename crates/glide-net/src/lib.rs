@@ -16,7 +16,7 @@ use glide_proto::{
 };
 use quinn::crypto::rustls::{QuicClientConfig, QuicServerConfig};
 pub use quinn::{Connection, Endpoint};
-use quinn::{IdleTimeout, RecvStream, SendStream, TransportConfig};
+use quinn::{RecvStream, SendStream, TransportConfig};
 use sha2::{Digest, Sha256};
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -27,13 +27,17 @@ use tls::{ensure_crypto_provider, FingerprintVerifier, ServerIdentity, TrustMode
 /// QUIC `CONNECTION_CLOSE` packets onto the wire during OS shutdown, sleep, or exit.
 pub const CLOSE_FLUSH_TIMEOUT: Duration = Duration::from_millis(50);
 
-/// Builds a QUIC `TransportConfig` tuned for interactive sub-millisecond LAN/Wi-Fi input.
+/// Builds a QUIC `TransportConfig` tuned for interactive sub-millisecond LAN/Wi-Fi input
+/// with **zero** idle time-based polling.
 ///
 /// - `initial_rtt(5ms)` avoids Quinn's default 333ms WAN RTT assumption.
-/// - `keep_alive_interval(45ms)` beats the 102.4ms 802.11 DTIM beacon and 50–100ms laptop
-///   Wi-Fi PSM sleep timers that otherwise cause 150–200ms wakeup spikes.
-/// - `enable_segmentation_offload(false)` eliminates the `quinn-udp` Windows 11 Wi-Fi
-///   GSO/USO silent batch-drop bug.
+/// - `keep_alive_interval(None)` + `max_idle_timeout(None)` guarantee **0.0 Hz** idle wakeups
+///   and **0.0** idle UDP packets/sec when no input is flowing, letting laptops enter deep CPU
+///   C-states and 802.11 Wi-Fi PSM sleep. Peer disconnect / dead-link recovery is strictly
+///   event-driven: Layer 1 OS shutdown/sleep/signal `CONNECTION_CLOSE` flushing + one-shot
+///   `HealthProbe` on screen entry, OS resume, NIC change, or active input burst.
+/// - `enable_segmentation_offload(false)` on Windows eliminates the `quinn-udp` Windows 11 Wi-Fi
+///   GSO/USO silent batch-drop bug while keeping Linux `UDP_SEGMENT` (GSO) fast for bulk streams.
 /// - `AckFrequencyConfig` (`ack_eliciting_threshold = 1`, `max_ack_delay = 2ms`,
 ///   `reordering_threshold = 1`) cuts reverse-direction Wi-Fi ACK airtime by 50% on 1000Hz
 ///   mouse streams while keeping solitary clicks/keys ACKed within <= 2ms and eliminating
@@ -41,13 +45,15 @@ pub const CLOSE_FLUSH_TIMEOUT: Duration = Duration::from_millis(50);
 /// - `mtu_discovery_config(None)` avoids transient probe stalls on LANs.
 /// - Tight datagram buffers (`2 KiB` send / `4 KiB` recv) prevent seconds of stale mouse
 ///   rubber-banding backlog during transient RF interference.
-/// - Bounded bulk windows (`512 KiB` send / `256 KiB` per-stream recv) stop Lane C clipboard
-///   and file streams from bloating the Wi-Fi AP buffer ahead of interactive input.
+/// - Bounded bulk windows (`512 KiB` send / `256 KiB` per-stream recv / `1 MiB` conn recv) stop
+///   Lane C clipboard and file streams from bloating the Wi-Fi AP buffer ahead of input.
 fn build_transport_config() -> TransportConfig {
     let mut transport = TransportConfig::default();
     transport.initial_rtt(Duration::from_millis(5));
-    transport.keep_alive_interval(Some(Duration::from_millis(45)));
+    transport.keep_alive_interval(None);
+    transport.max_idle_timeout(None);
     transport.mtu_discovery_config(None);
+    #[cfg(target_os = "windows")]
     transport.enable_segmentation_offload(false);
 
     let mut ack_cfg = quinn::AckFrequencyConfig::default();
@@ -57,13 +63,11 @@ fn build_transport_config() -> TransportConfig {
         .reordering_threshold(1u32.into());
     transport.ack_frequency_config(Some(ack_cfg));
 
-    if let Ok(timeout) = IdleTimeout::try_from(Duration::from_secs(4)) {
-        transport.max_idle_timeout(Some(timeout));
-    }
     transport.datagram_send_buffer_size(2048);
     transport.datagram_receive_buffer_size(Some(4096));
     transport.send_window(512 * 1024);
     transport.stream_receive_window((256u32 * 1024).into());
+    transport.receive_window((1024u32 * 1024).into());
     transport.max_concurrent_bidi_streams(4u32.into());
     transport.max_concurrent_uni_streams(32u32.into());
     transport
@@ -1166,8 +1170,10 @@ mod tests {
         let cfg = build_transport_config();
         let dbg = format!("{cfg:?}");
         assert!(dbg.contains("initial_rtt: 5ms"), "debug: {dbg}");
-        assert!(dbg.contains("keep_alive_interval: Some(45ms)"), "debug: {dbg}");
+        assert!(dbg.contains("keep_alive_interval: None"), "debug: {dbg}");
+        assert!(dbg.contains("max_idle_timeout: None"), "debug: {dbg}");
         assert!(dbg.contains("mtu_discovery_config: None"), "debug: {dbg}");
+        #[cfg(target_os = "windows")]
         assert!(
             dbg.contains("enable_segmentation_offload: false"),
             "debug: {dbg}"
@@ -1185,6 +1191,7 @@ mod tests {
         );
         assert!(dbg.contains("send_window: 524288"), "debug: {dbg}");
         assert!(dbg.contains("stream_receive_window: 262144"), "debug: {dbg}");
+        assert!(dbg.contains("receive_window: 1048576"), "debug: {dbg}");
     }
 
     #[tokio::test]

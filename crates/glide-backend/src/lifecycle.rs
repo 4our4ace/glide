@@ -458,11 +458,17 @@ mod linux {
 
         let (tx, rx) = mpsc::unbounded_channel();
         let task = handle.spawn(async move {
-            if let Err(e) = run_logind_monitor(tx).await {
+            if let Err(e) = run_logind_monitor(&tx).await {
                 debug!(
                     error = %e,
-                    "Linux systemd-logind lifecycle monitor unavailable; signal shutdown remains active"
+                    "Linux systemd-logind lifecycle monitor unavailable; falling back to zero-polling timerfd wake detector"
                 );
+                if let Err(te) = run_timerfd_resume_fallback(&tx).await {
+                    debug!(
+                        error = %te,
+                        "Linux timerfd resume fallback unavailable; signal shutdown remains active"
+                    );
+                }
             }
         });
 
@@ -472,6 +478,116 @@ mod linux {
                 task.abort();
             })),
         }
+    }
+
+    /// Zero-polling Linux non-logind suspend/clock-jump detector using
+    /// `timerfd_create(CLOCK_REALTIME)` armed with `TFD_TIMER_ABSTIME | TFD_TIMER_CANCEL_ON_SET`.
+    /// The kernel wakes this fd (`ECANCELED`) ONLY when the realtime clock jumps or resumes
+    /// from suspend — **0.0 Hz wakeups** while idle.
+    async fn run_timerfd_resume_fallback(
+        tx: &mpsc::UnboundedSender<SystemLifecycleEvent>,
+    ) -> std::io::Result<()> {
+        use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+
+        let raw_fd = unsafe {
+            libc::timerfd_create(
+                libc::CLOCK_REALTIME,
+                libc::TFD_NONBLOCK | libc::TFD_CLOEXEC,
+            )
+        };
+        if raw_fd < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        let owned = unsafe { OwnedFd::from_raw_fd(raw_fd) };
+
+        let arm_far_future = |fd: libc::c_int| -> std::io::Result<()> {
+            let now_secs = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs() as libc::time_t)
+                .unwrap_or(1_700_000_000);
+            let spec = libc::itimerspec {
+                it_interval: libc::timespec {
+                    tv_sec: 0,
+                    tv_nsec: 0,
+                },
+                it_value: libc::timespec {
+                    // 10 years ahead: never expires naturally, only cancelled by clock jump / resume.
+                    tv_sec: now_secs.saturating_add(86_400 * 365 * 10),
+                    tv_nsec: 0,
+                },
+            };
+            let rc = unsafe {
+                libc::timerfd_settime(
+                    fd,
+                    libc::TFD_TIMER_ABSTIME | libc::TFD_TIMER_CANCEL_ON_SET,
+                    &spec,
+                    std::ptr::null_mut(),
+                )
+            };
+            if rc < 0 {
+                Err(std::io::Error::last_os_error())
+            } else {
+                Ok(())
+            }
+        };
+
+        arm_far_future(owned.as_raw_fd())?;
+        // SAFETY: `owned` is a valid, uniquely owned `OwnedFd` whose underlying file descriptor
+        // remains open for the entire lifetime of `AsyncFd`.
+        let async_fd = unsafe {
+            tokio::io::unix::AsyncFd::register_with_interest(
+                owned,
+                tokio::io::Interest::READABLE,
+            )
+        }?;
+        debug!("Armed zero-polling Linux timerfd TFD_TIMER_CANCEL_ON_SET resume fallback");
+
+        loop {
+            let mut guard = tokio::select! {
+                _ = tx.closed() => break,
+                res = async_fd.readable() => res?,
+            };
+            let mut expirations: u64 = 0;
+            let rc = unsafe {
+                libc::read(
+                    async_fd.as_raw_fd(),
+                    (&mut expirations as *mut u64).cast::<libc::c_void>(),
+                    std::mem::size_of::<u64>(),
+                )
+            };
+            if rc < 0 {
+                let err = std::io::Error::last_os_error();
+                if err.kind() == std::io::ErrorKind::Interrupted {
+                    continue;
+                } else if err.raw_os_error() == Some(libc::ECANCELED) {
+                    guard.clear_ready();
+                    if let Err(rearm_err) = arm_far_future(async_fd.as_raw_fd()) {
+                        tracing::warn!(
+                            error = %rearm_err,
+                            "Failed re-arming Linux timerfd resume fallback after resume"
+                        );
+                        return Err(rearm_err);
+                    }
+                    if tx.send(SystemLifecycleEvent::Resumed).is_err() {
+                        break;
+                    }
+                } else if err.kind() == std::io::ErrorKind::WouldBlock {
+                    guard.clear_ready();
+                } else {
+                    return Err(err);
+                }
+            } else {
+                guard.clear_ready();
+                if let Err(rearm_err) = arm_far_future(async_fd.as_raw_fd()) {
+                    tracing::warn!(
+                        error = %rearm_err,
+                        "Failed re-arming Linux timerfd resume fallback"
+                    );
+                    return Err(rearm_err);
+                }
+            }
+        }
+        Ok(())
     }
 
     // Intentionally polls via `zbus` 5's re-exported `futures_core::Stream` trait so Layer 1
@@ -503,7 +619,7 @@ mod linux {
     }
 
     async fn run_logind_monitor(
-        tx: mpsc::UnboundedSender<SystemLifecycleEvent>,
+        tx: &mpsc::UnboundedSender<SystemLifecycleEvent>,
     ) -> zbus::Result<()> {
         let conn = zbus::Connection::system().await?;
         let proxy = zbus::Proxy::new(&conn, LOGIND_DEST, LOGIND_PATH, LOGIND_IFACE).await?;
@@ -824,6 +940,444 @@ mod windows {
     }
 }
 
+/// Pure event-driven OS network interface and IPv4 address change monitor (**0.0 Hz idle polling**).
+///
+/// Replaces all periodic `getifaddrs` / `GetAdaptersAddresses` polling loops across server,
+/// client, discovery, and GUI:
+/// - **Linux**: non-blocking `AF_NETLINK` `NETLINK_ROUTE` socket (`RTMGRP_LINK | RTMGRP_IPV4_IFADDR`)
+///   monitored asynchronously via `tokio::io::unix::AsyncFd` (**0 extra OS threads**).
+/// - **Windows**: native `iphlpapi.dll` `NotifyIpInterfaceChange` + `NotifyUnicastIpAddressChange`
+///   kernel callbacks (**0 extra OS threads**), cleanly cancelled on drop via `CancelMibChangeNotify2`.
+pub struct NetworkChangeMonitor {
+    events: Option<mpsc::UnboundedReceiver<()>>,
+    stop: Option<Box<dyn FnOnce() + Send>>,
+}
+
+impl NetworkChangeMonitor {
+    /// Starts the native OS network change monitor (best-effort; degrades cleanly to disabled).
+    pub fn start() -> Self {
+        #[cfg(target_os = "linux")]
+        {
+            netwatch_linux::start_linux_network_monitor()
+        }
+        #[cfg(target_os = "windows")]
+        {
+            netwatch_windows::start_windows_network_monitor()
+        }
+        #[cfg(not(any(target_os = "linux", target_os = "windows")))]
+        {
+            Self::disabled()
+        }
+    }
+
+    /// Creates a dormant monitor that emits no events and consumes zero resources.
+    pub fn disabled() -> Self {
+        Self {
+            events: None,
+            stop: None,
+        }
+    }
+
+    /// Creates a mock network change monitor driven by an explicit channel (for tests).
+    pub fn from_channel() -> (Self, mpsc::UnboundedSender<()>) {
+        let (tx, rx) = mpsc::unbounded_channel();
+        (
+            Self {
+                events: Some(rx),
+                stop: None,
+            },
+            tx,
+        )
+    }
+
+    /// Returns `true` if the underlying network event channel is still open.
+    pub fn is_active(&self) -> bool {
+        self.events.is_some()
+    }
+
+    /// Awaits the next OS network interface/IP change, coalescing any burst already queued.
+    pub async fn recv(&mut self) -> Option<()> {
+        let rx = self.events.as_mut()?;
+        let ev = rx.recv().await;
+        if ev.is_none() {
+            self.events = None;
+            return None;
+        }
+        // Drain any immediately queued burst notifications from the same link/DHCP transition.
+        while rx.try_recv().is_ok() {}
+        Some(())
+    }
+
+    /// Non-blockingly drains queued change notifications, returning `true` if at least one arrived.
+    pub fn try_recv(&mut self) -> bool {
+        let Some(rx) = self.events.as_mut() else {
+            return false;
+        };
+        let mut saw_any = false;
+        loop {
+            match rx.try_recv() {
+                Ok(()) => saw_any = true,
+                Err(mpsc::error::TryRecvError::Empty) => break,
+                Err(mpsc::error::TryRecvError::Disconnected) => {
+                    self.events = None;
+                    break;
+                }
+            }
+        }
+        saw_any
+    }
+}
+
+impl Drop for NetworkChangeMonitor {
+    fn drop(&mut self) {
+        self.events = None;
+        if let Some(stop) = self.stop.take() {
+            stop();
+        }
+    }
+}
+
+#[cfg(any(target_os = "linux", target_os = "windows"))]
+const NET_CHANGE_BURST_COALESCE: Duration = Duration::from_millis(100);
+
+#[cfg(target_os = "linux")]
+mod netwatch_linux {
+    use super::*;
+    use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+    use tracing::debug;
+
+    const RTMGRP_LINK: u32 = 1;
+    const RTMGRP_IPV4_IFADDR: u32 = 0x10;
+
+    enum DrainOutcome {
+        Drained { saw_packet: bool },
+        Closed,
+    }
+
+    fn drain_netlink_nonblocking(fd: std::os::fd::RawFd, buf: &mut [u8]) -> DrainOutcome {
+        let mut saw_packet = false;
+        loop {
+            let rc = unsafe {
+                libc::recv(
+                    fd,
+                    buf.as_mut_ptr().cast::<libc::c_void>(),
+                    buf.len(),
+                    libc::MSG_DONTWAIT,
+                )
+            };
+            if rc > 0 {
+                saw_packet = true;
+                continue;
+            }
+            if rc == 0 {
+                return DrainOutcome::Closed;
+            }
+            let err = std::io::Error::last_os_error();
+            if err.kind() == std::io::ErrorKind::Interrupted {
+                continue;
+            }
+            if err.raw_os_error() == Some(libc::ENOBUFS) {
+                // Kernel dropped netlink msgs during burst: still signal a refresh!
+                saw_packet = true;
+                continue;
+            }
+            if err.kind() == std::io::ErrorKind::WouldBlock {
+                return DrainOutcome::Drained { saw_packet };
+            }
+            return DrainOutcome::Closed;
+        }
+    }
+
+    pub(super) fn start_linux_network_monitor() -> NetworkChangeMonitor {
+        let Ok(handle) = tokio::runtime::Handle::try_current() else {
+            debug!("No active Tokio runtime; Linux RTNETLINK network monitor disabled");
+            return NetworkChangeMonitor::disabled();
+        };
+
+        let raw_fd = unsafe {
+            libc::socket(
+                libc::AF_NETLINK,
+                libc::SOCK_RAW | libc::SOCK_NONBLOCK | libc::SOCK_CLOEXEC,
+                libc::NETLINK_ROUTE,
+            )
+        };
+        if raw_fd < 0 {
+            debug!(
+                error = %std::io::Error::last_os_error(),
+                "Linux RTNETLINK socket unavailable"
+            );
+            return NetworkChangeMonitor::disabled();
+        }
+        let owned = unsafe { OwnedFd::from_raw_fd(raw_fd) };
+
+        let mut addr: libc::sockaddr_nl = unsafe { std::mem::zeroed() };
+        addr.nl_family = libc::AF_NETLINK as u16;
+        addr.nl_groups = RTMGRP_LINK | RTMGRP_IPV4_IFADDR;
+
+        let bind_rc = unsafe {
+            libc::bind(
+                owned.as_raw_fd(),
+                (&addr as *const libc::sockaddr_nl).cast::<libc::sockaddr>(),
+                std::mem::size_of::<libc::sockaddr_nl>() as libc::socklen_t,
+            )
+        };
+        if bind_rc < 0 {
+            debug!(
+                error = %std::io::Error::last_os_error(),
+                "Failed to bind Linux RTNETLINK socket"
+            );
+            return NetworkChangeMonitor::disabled();
+        }
+
+        let _enter = handle.enter();
+        // SAFETY: `owned` is a valid, uniquely owned `OwnedFd` whose underlying file
+        // descriptor remains open for the entire lifetime of `AsyncFd`.
+        let async_fd = match unsafe {
+            tokio::io::unix::AsyncFd::register_with_interest(
+                owned,
+                tokio::io::Interest::READABLE,
+            )
+        } {
+            Ok(fd) => fd,
+            Err(e) => {
+                debug!(
+                    error = %e,
+                    "Failed to register Linux RTNETLINK socket with Tokio reactor"
+                );
+                return NetworkChangeMonitor::disabled();
+            }
+        };
+
+        let (tx, rx) = mpsc::unbounded_channel();
+        let task = handle.spawn(async move {
+            debug!("Linux RTNETLINK network change monitor active (0.0 Hz idle)");
+            let mut buf = [0u8; 8192];
+
+            loop {
+                let saw_packet = {
+                    let mut guard = tokio::select! {
+                        _ = tx.closed() => break,
+                        res = async_fd.readable() => match res {
+                            Ok(g) => g,
+                            Err(_) => break,
+                        },
+                    };
+                    match drain_netlink_nonblocking(async_fd.as_raw_fd(), &mut buf) {
+                        DrainOutcome::Drained { saw_packet } => {
+                            guard.clear_ready();
+                            saw_packet
+                        }
+                        DrainOutcome::Closed => break,
+                    }
+                };
+
+                if saw_packet {
+                    // Coalesce multi-message link+DHCP kernel bursts via one-shot sleep ONLY
+                    // after an actual netlink event arrives (0 timers while idle).
+                    tokio::select! {
+                        _ = tx.closed() => break,
+                        _ = tokio::time::sleep(NET_CHANGE_BURST_COALESCE) => {}
+                    }
+                    // Drain any trailing messages accumulated during the coalesce window and
+                    // clear Tokio's readiness bit atomically if epoll fired during the sleep.
+                    if matches!(
+                        drain_netlink_nonblocking(async_fd.as_raw_fd(), &mut buf),
+                        DrainOutcome::Closed
+                    ) {
+                        break;
+                    }
+                    let mut closed_during_clear = false;
+                    let _ = async_fd.try_io(tokio::io::Interest::READABLE, |inner| {
+                        match drain_netlink_nonblocking(inner.as_raw_fd(), &mut buf) {
+                            DrainOutcome::Drained { .. } => {
+                                Err::<(), _>(std::io::Error::from(std::io::ErrorKind::WouldBlock))
+                            }
+                            DrainOutcome::Closed => {
+                                closed_during_clear = true;
+                                Ok(())
+                            }
+                        }
+                    });
+                    if closed_during_clear {
+                        break;
+                    }
+                    if tx.send(()).is_err() {
+                        break;
+                    }
+                }
+            }
+        });
+
+        NetworkChangeMonitor {
+            events: Some(rx),
+            stop: Some(Box::new(move || {
+                task.abort();
+            })),
+        }
+    }
+}
+
+#[cfg(target_os = "windows")]
+mod netwatch_windows {
+    use super::*;
+    use std::ffi::c_void;
+    use std::ptr;
+    use tracing::debug;
+    use windows_sys::Win32::Foundation::{FreeLibrary, HANDLE};
+    use windows_sys::Win32::System::LibraryLoader::{
+        GetProcAddress, LoadLibraryExW, LOAD_LIBRARY_SEARCH_SYSTEM32,
+    };
+
+    const AF_UNSPEC: u16 = 0;
+    const AF_INET: u16 = 2;
+
+    type NotifyChangeFn = unsafe extern "system" fn(
+        u16,
+        Option<unsafe extern "system" fn(*const c_void, *const c_void, u32)>,
+        *const c_void,
+        u8,
+        *mut HANDLE,
+    ) -> u32;
+    type CancelNotifyFn = unsafe extern "system" fn(HANDLE) -> u32;
+
+    unsafe extern "system" fn on_win_net_change(
+        ctx: *const c_void,
+        _row: *const c_void,
+        _notification_type: u32,
+    ) {
+        if let Some(tx) = unsafe { (ctx as *const mpsc::UnboundedSender<()>).as_ref() } {
+            let _ = tx.send(());
+        }
+    }
+
+    pub(super) fn start_windows_network_monitor() -> NetworkChangeMonitor {
+        let dll_name: Vec<u16> = "iphlpapi.dll\0".encode_utf16().collect();
+        let hmod =
+            unsafe { LoadLibraryExW(dll_name.as_ptr(), ptr::null_mut(), LOAD_LIBRARY_SEARCH_SYSTEM32) };
+        if hmod.is_null() {
+            debug!("Failed to load iphlpapi.dll; Windows network change monitor disabled");
+            return NetworkChangeMonitor::disabled();
+        }
+
+        let notify_if_ptr =
+            unsafe { GetProcAddress(hmod, b"NotifyIpInterfaceChange\0".as_ptr()) };
+        let notify_addr_ptr =
+            unsafe { GetProcAddress(hmod, b"NotifyUnicastIpAddressChange\0".as_ptr()) };
+        let cancel_ptr = unsafe { GetProcAddress(hmod, b"CancelMibChangeNotify2\0".as_ptr()) };
+
+        let (Some(cancel_fp), true) =
+            (cancel_ptr, notify_if_ptr.is_some() || notify_addr_ptr.is_some())
+        else {
+            unsafe {
+                FreeLibrary(hmod);
+            }
+            debug!("iphlpapi notification entrypoints unavailable");
+            return NetworkChangeMonitor::disabled();
+        };
+
+        type FarProc = unsafe extern "system" fn() -> isize;
+        let cancel_fn = unsafe { std::mem::transmute::<FarProc, CancelNotifyFn>(cancel_fp) };
+        let (raw_tx, mut raw_rx) = mpsc::unbounded_channel();
+        let ctx_ptr = Box::into_raw(Box::new(raw_tx));
+
+        let mut if_handle: HANDLE = ptr::null_mut();
+        if let Some(fp) = notify_if_ptr {
+            let notify_if = unsafe { std::mem::transmute::<FarProc, NotifyChangeFn>(fp) };
+            let rc = unsafe {
+                notify_if(
+                    AF_UNSPEC,
+                    Some(on_win_net_change),
+                    ctx_ptr.cast::<c_void>(),
+                    0,
+                    &mut if_handle,
+                )
+            };
+            if rc != 0 {
+                if_handle = ptr::null_mut();
+            }
+        }
+
+        let mut addr_handle: HANDLE = ptr::null_mut();
+        if let Some(fp) = notify_addr_ptr {
+            let notify_addr = unsafe { std::mem::transmute::<FarProc, NotifyChangeFn>(fp) };
+            let rc = unsafe {
+                notify_addr(
+                    AF_INET,
+                    Some(on_win_net_change),
+                    ctx_ptr.cast::<c_void>(),
+                    0,
+                    &mut addr_handle,
+                )
+            };
+            if rc != 0 {
+                addr_handle = ptr::null_mut();
+            }
+        }
+
+        if if_handle.is_null() && addr_handle.is_null() {
+            unsafe {
+                drop(Box::from_raw(ctx_ptr));
+                FreeLibrary(hmod);
+            }
+            debug!("Windows network change notifications failed to register");
+            return NetworkChangeMonitor::disabled();
+        }
+
+        // Coalesce multi-callback Wi-Fi/DHCP/interface bursts over 100 ms (matching Linux
+        // RTNETLINK) using a one-shot sleep ONLY after a real callback fires (0 timers while idle).
+        let (rx, coalesce_task) = match tokio::runtime::Handle::try_current() {
+            Ok(handle) => {
+                let (tx, rx) = mpsc::unbounded_channel();
+                let task = handle.spawn(async move {
+                    while raw_rx.recv().await.is_some() {
+                        tokio::select! {
+                            _ = tx.closed() => break,
+                            _ = tokio::time::sleep(NET_CHANGE_BURST_COALESCE) => {}
+                        }
+                        while raw_rx.try_recv().is_ok() {}
+                        if tx.send(()).is_err() {
+                            break;
+                        }
+                    }
+                });
+                (rx, Some(task))
+            }
+            Err(_) => (raw_rx, None),
+        };
+
+        debug!("Windows iphlpapi network change monitor active (0.0 Hz idle)");
+        let if_raw = if_handle as isize;
+        let addr_raw = addr_handle as isize;
+        let hmod_raw = hmod as isize;
+        let ctx_raw = ctx_ptr as usize;
+
+        NetworkChangeMonitor {
+            events: Some(rx),
+            stop: Some(Box::new(move || {
+                // CancelMibChangeNotify2 blocks until any in-flight callback completes,
+                // making subsequent Box::from_raw + FreeLibrary race-free.
+                if if_raw != 0 {
+                    unsafe {
+                        let _ = cancel_fn(if_raw as HANDLE);
+                    }
+                }
+                if addr_raw != 0 {
+                    unsafe {
+                        let _ = cancel_fn(addr_raw as HANDLE);
+                    }
+                }
+                unsafe {
+                    drop(Box::from_raw(ctx_raw as *mut mpsc::UnboundedSender<()>));
+                    FreeLibrary(hmod_raw as _);
+                }
+                if let Some(task) = coalesce_task {
+                    task.abort();
+                }
+            })),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -948,5 +1502,34 @@ mod tests {
         assert!(!mon.is_active());
         assert!(mon.try_recv().is_none());
         assert!(mon.recv().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn network_change_monitor_coalesces_bursts_and_starts_cleanly() {
+        let mut disabled = NetworkChangeMonitor::disabled();
+        assert!(!disabled.is_active());
+        assert!(!disabled.try_recv());
+        assert!(disabled.recv().await.is_none());
+
+        let (mut mock, tx) = NetworkChangeMonitor::from_channel();
+        assert!(mock.is_active());
+        tx.send(()).unwrap();
+        tx.send(()).unwrap();
+        tx.send(()).unwrap();
+        // recv() coalesces queued bursts into one notification.
+        assert!(mock.recv().await.is_some());
+        assert!(!mock.try_recv());
+        drop(tx);
+        assert!(mock.recv().await.is_none());
+        assert!(!mock.is_active());
+
+        // Native OS monitor starts and drops cleanly with zero polling.
+        let native = NetworkChangeMonitor::start();
+        #[cfg(target_os = "linux")]
+        assert!(
+            native.is_active(),
+            "Linux RTNETLINK NetworkChangeMonitor should activate cleanly"
+        );
+        drop(native);
     }
 }

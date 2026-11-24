@@ -16,6 +16,8 @@ use serde::{Deserialize, Serialize};
 use socket2::{Domain, Protocol, Socket, Type};
 use std::collections::{HashMap, HashSet};
 use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::net::UdpSocket;
 use tokio::task::JoinHandle;
@@ -149,7 +151,7 @@ fn validate_beacon(beacon: ServerBeacon, src_ip: std::net::IpAddr) -> Option<Dis
     })
 }
 
-fn insert_discovered_server(
+pub fn insert_discovered_server(
     found: &mut HashMap<String, DiscoveredServer>,
     server: DiscoveredServer,
 ) {
@@ -387,6 +389,10 @@ fn bind_interface_sender(ip: Ipv4Addr) -> Option<std::net::UdpSocket> {
     let _ = sock.set_broadcast(true);
     let _ = sock.set_multicast_if_v4(&ip);
     let _ = sock.set_multicast_ttl_v4(2);
+    // Keep multicast loopback enabled so same-host listeners sharing port 24801 via
+    // SO_REUSEPORT on Linux all receive multicast announcements (unicast loopback hashes
+    // to a single SO_REUSEPORT socket). The server responder ignores MAGIC_BEACON frames
+    // and only replies to MAGIC_PROBE, so self-echo emits zero packets and zero timers.
     let _ = sock.set_multicast_loop_v4(true);
     sock.set_nonblocking(true).ok()?;
     sock.bind(&SocketAddrV4::new(ip, 0).into()).ok()?;
@@ -410,8 +416,8 @@ fn send_alive(res: std::io::Result<usize>) -> bool {
     }
 }
 
-/// Caches interface-bound ephemeral UDP sockets so periodic beacons and probe retries do not
-/// churn sockets (`socket`/`setsockopt`/`bind`/`close`) or re-enumerate NICs on every tick.
+/// Caches interface-bound ephemeral UDP sockets so startup/roaming announcements and probes
+/// do not churn sockets (`socket`/`setsockopt`/`bind`/`close`) or re-enumerate NICs unnecessarily.
 struct BroadcastBlaster {
     sockets: HashMap<Ipv4Addr, (Ipv4Addr, std::net::UdpSocket)>,
     loopback: Option<std::net::UdpSocket>,
@@ -469,11 +475,11 @@ impl BroadcastBlaster {
     }
 }
 
-/// Spawns the server-side LAN discovery responder.
+/// Spawns the pure event-driven server-side LAN discovery responder (**0.0 Hz idle polling**).
 ///
-/// - Broadcasts beacons every 500 ms across EVERY active IPv4 interface (Ethernet, Wi-Fi, link-local)
-/// - Replies immediately to active `GLIDE_DISCOVER_V1` probes (rate-limited per source and globally)
-/// - Periodically re-scans interfaces every 3 s so newly plugged cables / dropped Wi-Fi recover automatically!
+/// - Announces once on startup across every active IPv4 interface so waiting clients connect immediately.
+/// - Replies instantaneously to inbound `GLIDE_DISCOVER_V1` probes (rate-limited per source and globally).
+/// - Zero periodic broadcast timers and zero periodic NIC polling.
 pub fn spawn_server_beacon(
     discovery_port: u16,
     name: String,
@@ -481,19 +487,48 @@ pub fn spawn_server_beacon(
     fingerprint: String,
     os: String,
 ) -> Result<JoinHandle<()>> {
-    spawn_server_beacon_with_refresh(discovery_port, name, quic_port, fingerprint, os, None)
+    spawn_server_beacon_with_controls(
+        discovery_port,
+        name,
+        quic_port,
+        fingerprint,
+        os,
+        None,
+        None,
+    )
 }
 
-/// Spawns the server-side LAN discovery responder with an optional external refresh trigger
-/// (e.g. signaled immediately on system resume/wake or interface roaming to re-join multicast
-/// and broadcast fresh LAN IPs without waiting for the 3-second polling interval).
+/// Spawns the pure event-driven server-side LAN discovery responder with an external refresh
+/// trigger (signaled immediately on OS resume/wake, NIC change, or peer disconnect).
 pub fn spawn_server_beacon_with_refresh(
     discovery_port: u16,
     name: String,
     quic_port: u16,
     fingerprint: String,
     os: String,
-    refresh_notify: Option<std::sync::Arc<tokio::sync::Notify>>,
+    refresh_notify: Option<Arc<tokio::sync::Notify>>,
+) -> Result<JoinHandle<()>> {
+    spawn_server_beacon_with_controls(
+        discovery_port,
+        name,
+        quic_port,
+        fingerprint,
+        os,
+        refresh_notify,
+        None,
+    )
+}
+
+/// Spawns the pure event-driven server-side LAN discovery responder with both an external refresh
+/// trigger and an `os_paused` gate so OS sleep/shutdown emits **0 packets and 0 NIC queries**.
+pub fn spawn_server_beacon_with_controls(
+    discovery_port: u16,
+    name: String,
+    quic_port: u16,
+    fingerprint: String,
+    os: String,
+    refresh_notify: Option<Arc<tokio::sync::Notify>>,
+    os_paused: Option<Arc<AtomicBool>>,
 ) -> Result<JoinHandle<()>> {
     // Bind immediately so port errors surface synchronously, without running synchronous
     // OS NIC enumeration (`getifaddrs` / `GetAdaptersAddresses`) on a Tokio worker thread.
@@ -501,9 +536,12 @@ pub fn spawn_server_beacon_with_refresh(
 
     let handle = tokio::spawn(async move {
         let mut buf = [0u8; 1024];
-        let mut beacon_tick = tokio::time::interval(Duration::from_millis(500));
-        beacon_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         let mut rate_limiter = ProbeRateLimiter::new(Instant::now());
+        let is_paused = || {
+            os_paused
+                .as_ref()
+                .is_some_and(|flag| flag.load(Ordering::Acquire))
+        };
 
         let make_payload = |ips: &[String]| -> Vec<u8> {
             let beacon = ServerBeacon {
@@ -518,7 +556,6 @@ pub fn spawn_server_beacon_with_refresh(
         };
 
         let initial_ifaces = active_ipv4_interfaces_async().await;
-        let mut last_iface_refresh = Instant::now();
         let mut blaster = BroadcastBlaster::new(&initial_ifaces);
         let mut cached_ips = ranked_ipv4_addresses(&initial_ifaces);
         let mut cached_payload = make_payload(&cached_ips);
@@ -540,6 +577,12 @@ pub fn spawn_server_beacon_with_refresh(
             }
         }
 
+        // Emit one startup announcement so any passive client waiting on the LAN connects
+        // immediately without requiring a periodic beacon timer.
+        if !is_paused() {
+            blaster.blast(&cached_payload, discovery_port, true);
+        }
+
         let apply_interface_refresh =
             |socket: &UdpSocket,
              joined_ifaces: &mut HashSet<Ipv4Addr>,
@@ -549,9 +592,6 @@ pub fn spawn_server_beacon_with_refresh(
              current: &[LocalIpv4Iface],
              force_rejoin: bool| {
                 if force_rejoin {
-                    // After sleep/wake or link bounce the OS/NIC may drop IGMP membership even
-                    // if it reacquires the same IP address — leave first (avoiding EADDRINUSE
-                    // when the kernel retained state and forcing a fresh IGMP report) then re-join.
                     for old_ip in joined_ifaces.drain() {
                         let _ = socket.leave_multicast_v4(DISCOVERY_MULTICAST_ADDR, old_ip);
                     }
@@ -610,9 +650,11 @@ pub fn spawn_server_beacon_with_refresh(
                         None => std::future::pending().await,
                     }
                 } => {
-                    debug!("LAN discovery beacon forcing immediate interface & multicast refresh");
+                    if is_paused() {
+                        continue;
+                    }
+                    debug!("LAN discovery beacon refreshing interfaces & announcing on event");
                     let current = active_ipv4_interfaces_async().await;
-                    last_iface_refresh = Instant::now();
                     apply_interface_refresh(
                         &socket,
                         &mut joined_ifaces,
@@ -624,25 +666,12 @@ pub fn spawn_server_beacon_with_refresh(
                     );
                     blaster.blast(&cached_payload, discovery_port, true);
                 }
-                _ = beacon_tick.tick() => {
-                    if last_iface_refresh.elapsed() >= Duration::from_secs(3) {
-                        let current = active_ipv4_interfaces_async().await;
-                        last_iface_refresh = Instant::now();
-                        apply_interface_refresh(
-                            &socket,
-                            &mut joined_ifaces,
-                            &mut blaster,
-                            &mut cached_ips,
-                            &mut cached_payload,
-                            &current,
-                            false,
-                        );
-                    }
-                    blaster.blast(&cached_payload, discovery_port, true);
-                }
                 recv = socket.recv_from(&mut buf) => {
                     match recv {
                         Ok((n, src)) => {
+                            if is_paused() {
+                                continue;
+                            }
                             if &buf[..n] == MAGIC_PROBE {
                                 let (allow_unicast, allow_bcast) =
                                     rate_limiter.check(src.ip(), Instant::now());
@@ -668,95 +697,200 @@ pub fn spawn_server_beacon_with_refresh(
     Ok(handle)
 }
 
-/// Actively probes EVERY local IPv4 interface AND listens for unsolicited server beacons
-/// for up to `timeout`. Works even when Windows Firewall drops inbound probes!
+/// Pure event-driven persistent LAN discovery listener (**0.0 Hz idle polling**).
+///
+/// Opens one ephemeral probe socket + one multicast/broadcast listener socket, emits a single
+/// initial `GLIDE_DISCOVER_V1` probe, and then blocks purely on `UdpSocket::recv_from().await`
+/// until a server replies or announces itself on startup / wake / NIC change.
+pub struct PassiveDiscoverySession {
+    discovery_port: u16,
+    probe_sock: Option<UdpSocket>,
+    beacon_sock: Option<UdpSocket>,
+    joined_ifaces: HashSet<Ipv4Addr>,
+    ifaces: Vec<LocalIpv4Iface>,
+    blaster: BroadcastBlaster,
+    buf_a: [u8; 2048],
+    buf_b: [u8; 2048],
+}
+
+impl PassiveDiscoverySession {
+    /// Starts a persistent passive discovery session and sends one initial probe burst.
+    pub async fn start(discovery_port: u16) -> Result<Self> {
+        let probe_sock = UdpSocket::bind("0.0.0.0:0").await?;
+        let _ = probe_sock.set_broadcast(true);
+        let ifaces = active_ipv4_interfaces_async().await;
+        let mut blaster = BroadcastBlaster::new(&ifaces);
+        let (beacon_sock, joined_ifaces) =
+            match bind_listener_socket_with_ifaces(discovery_port, &ifaces) {
+                Ok((s, joined)) => (Some(s), joined),
+                Err(_) => (None, HashSet::new()),
+            };
+
+        let _ = send_probe_from_socket(&probe_sock, discovery_port, &ifaces).await;
+        blaster.blast(MAGIC_PROBE, discovery_port, false);
+
+        Ok(Self {
+            discovery_port,
+            probe_sock: Some(probe_sock),
+            beacon_sock,
+            joined_ifaces,
+            ifaces,
+            blaster,
+            buf_a: [0u8; 2048],
+            buf_b: [0u8; 2048],
+        })
+    }
+
+    /// Starts a strictly listen-only passive discovery session that joins the multicast/broadcast
+    /// discovery port and emits **zero** `GLIDE_DISCOVER_V1` probe packets (0.00 Hz idle).
+    ///
+    /// Used while a client is already connected or waiting in reconnect backoff so server startup
+    /// / wake announcements are received instantaneously without probing the LAN.
+    pub async fn listen_only(discovery_port: u16) -> Result<Self> {
+        let ifaces = active_ipv4_interfaces_async().await;
+        let blaster = BroadcastBlaster::new(&ifaces);
+        let (beacon_sock, joined_ifaces) =
+            bind_listener_socket_with_ifaces(discovery_port, &ifaces)?;
+
+        Ok(Self {
+            discovery_port,
+            probe_sock: None,
+            beacon_sock: Some(beacon_sock),
+            joined_ifaces,
+            ifaces,
+            blaster,
+            buf_a: [0u8; 2048],
+            buf_b: [0u8; 2048],
+        })
+    }
+
+    /// Returns ranked non-loopback local IPv4 addresses cached from the last NIC refresh.
+    pub fn local_ips(&self) -> Vec<String> {
+        ranked_ipv4_addresses(&self.ifaces)
+    }
+
+    /// Sends one on-demand probe burst across cached interfaces (e.g., manual UI Refresh click).
+    pub async fn probe_once(&mut self) {
+        if let Some(ref sock) = self.probe_sock {
+            let _ = send_probe_from_socket(sock, self.discovery_port, &self.ifaces).await;
+        }
+        self.blaster
+            .blast(MAGIC_PROBE, self.discovery_port, false);
+    }
+
+    /// Refreshes local interfaces and multicast memberships without sending any probe packet
+    /// (for listen-only sessions after an OS network-change or wake event).
+    pub async fn refresh_interfaces_only(&mut self) -> Vec<String> {
+        let current = active_ipv4_interfaces_async().await;
+        if let Some(ref sock) = self.beacon_sock {
+            for old_ip in self.joined_ifaces.drain() {
+                let _ = sock.leave_multicast_v4(DISCOVERY_MULTICAST_ADDR, old_ip);
+            }
+            let _ = sock.leave_multicast_v4(DISCOVERY_MULTICAST_ADDR, Ipv4Addr::UNSPECIFIED);
+            for iface in &current {
+                match sock.join_multicast_v4(DISCOVERY_MULTICAST_ADDR, iface.ip) {
+                    Ok(()) => {
+                        self.joined_ifaces.insert(iface.ip);
+                    }
+                    Err(e) if e.kind() == std::io::ErrorKind::AddrInUse => {
+                        self.joined_ifaces.insert(iface.ip);
+                    }
+                    Err(_) => {}
+                }
+            }
+            let _ = sock.join_multicast_v4(DISCOVERY_MULTICAST_ADDR, Ipv4Addr::UNSPECIFIED);
+        }
+        self.blaster.refresh(&current);
+        self.ifaces = current;
+        self.local_ips()
+    }
+
+    /// Refreshes local interfaces + multicast memberships (called strictly on OS network change,
+    /// wake/resume, or manual refresh) and sends one fresh probe burst.
+    pub async fn refresh_and_probe(&mut self) -> Vec<String> {
+        let ips = self.refresh_interfaces_only().await;
+        self.probe_once().await;
+        ips
+    }
+
+    /// Awaits the next valid [`DiscoveredServer`] beacon purely event-driven (**0.0 Hz idle**).
+    pub async fn recv_beacon(&mut self) -> Option<DiscoveredServer> {
+        loop {
+            let probe_sock = &self.probe_sock;
+            let beacon_sock = &self.beacon_sock;
+            let buf_a = &mut self.buf_a;
+            let buf_b = &mut self.buf_b;
+
+            let pkt: std::io::Result<(&[u8], SocketAddr)> = tokio::select! {
+                res = async {
+                    match probe_sock {
+                        Some(s) => s.recv_from(buf_a).await,
+                        None => std::future::pending().await,
+                    }
+                } => {
+                    res.map(|(n, src)| (&buf_a[..n], src))
+                }
+                res = async {
+                    match beacon_sock {
+                        Some(s) => s.recv_from(buf_b).await,
+                        None => std::future::pending().await,
+                    }
+                } => {
+                    res.map(|(n, src)| (&buf_b[..n], src))
+                }
+            };
+
+            let (data, src) = match pkt {
+                Ok(p) => p,
+                Err(e) => {
+                    debug!(error = %e, "Passive discovery recv_from error");
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                    continue;
+                }
+            };
+
+            if let Ok(beacon) = serde_json::from_slice::<ServerBeacon>(data) {
+                if let Some(server) = validate_beacon(beacon, src.ip()) {
+                    return Some(server);
+                }
+            }
+        }
+    }
+}
+
+/// Actively probes every local IPv4 interface once and collects replies / server announcements
+/// for up to `timeout` (bounded one-shot scan for CLI `glide discover` and roaming lookup;
+/// **zero periodic probe retry timers**).
 pub async fn discover_servers(
     discovery_port: u16,
     timeout: Duration,
     name_filter: Option<&str>,
     stop_on_first: bool,
 ) -> Result<Vec<DiscoveredServer>> {
-    // Ephemeral probe socket for unicast replies
-    let probe_sock = UdpSocket::bind("0.0.0.0:0").await?;
-    let _ = probe_sock.set_broadcast(true);
-
-    // Enumerate NICs off the async worker pool once per discovery scan and reuse bound
-    // non-blocking sender sockets across retries.
-    let ifaces = active_ipv4_interfaces_async().await;
-    let mut blaster = BroadcastBlaster::new(&ifaces);
-
-    // Passive listener on discovery_port (joins multicast on all NICs to catch periodic 500ms beacons!)
-    let beacon_sock = bind_listener_socket_with_ifaces(discovery_port, &ifaces)
-        .ok()
-        .map(|(s, _)| s);
-
-    // Send from `probe_sock` FIRST so the server's per-source ProbeRateLimiter replies unicast
-    // to the socket we actually read from, then fan out across secondary NICs via `blaster`
-    // (skipping loopback on `blaster` since `probe_sock` already probed `127.0.0.1`).
-    let _ = send_probe_from_socket(&probe_sock, discovery_port, &ifaces).await;
-    blaster.blast(MAGIC_PROBE, discovery_port, false);
-
+    let mut session = PassiveDiscoverySession::start(discovery_port).await?;
     let mut found: HashMap<String, DiscoveredServer> = HashMap::new();
-    let deadline = tokio::time::Instant::now() + timeout;
-    let mut probe_retry = tokio::time::interval(Duration::from_millis(400));
-    probe_retry.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-    probe_retry.tick().await;
-
-    let mut buf_a = [0u8; 2048];
-    let mut buf_b = [0u8; 2048];
+    let deadline_sleep = tokio::time::sleep(timeout);
+    tokio::pin!(deadline_sleep);
 
     loop {
-        let now = tokio::time::Instant::now();
-        if now >= deadline {
-            break;
+        let server = tokio::select! {
+            _ = &mut deadline_sleep => break,
+            maybe = session.recv_beacon() => match maybe {
+                Some(s) => s,
+                None => break,
+            },
+        };
+
+        if let Some(filter) = name_filter {
+            if !server.name.eq_ignore_ascii_case(filter) {
+                continue;
+            }
         }
-        let remaining = deadline - now;
-
-        let recv_event: Option<std::io::Result<(&[u8], SocketAddr)>> = tokio::select! {
-            _ = tokio::time::sleep(remaining) => break,
-            _ = probe_retry.tick() => {
-                let _ = send_probe_from_socket(&probe_sock, discovery_port, &ifaces).await;
-                blaster.blast(MAGIC_PROBE, discovery_port, false);
-                continue;
-            }
-            res = probe_sock.recv_from(&mut buf_a) => {
-                Some(res.map(|(n, src)| (&buf_a[..n], src)))
-            }
-            res = async {
-                match &beacon_sock {
-                    Some(s) => s.recv_from(&mut buf_b).await,
-                    None => std::future::pending().await,
-                }
-            } => {
-                Some(res.map(|(n, src)| (&buf_b[..n], src)))
-            }
-        };
-
-        let (data, src) = match recv_event {
-            Some(Ok(pkt)) => pkt,
-            Some(Err(e)) => {
-                debug!(error = %e, "Discovery recv_from error; backing off briefly");
-                tokio::time::sleep(Duration::from_millis(50).min(remaining)).await;
-                continue;
-            }
-            None => continue,
-        };
-
-        if let Ok(beacon) = serde_json::from_slice::<ServerBeacon>(data) {
-            let Some(server) = validate_beacon(beacon, src.ip()) else {
-                continue;
-            };
-            if let Some(filter) = name_filter {
-                if !server.name.eq_ignore_ascii_case(filter) {
-                    continue;
-                }
-            }
-            insert_discovered_server(&mut found, server);
-            if stop_on_first && !found.is_empty() {
-                // Wait a tiny moment if we only saw loopback so a real LAN packet can win
-                if !found.values().all(|s| s.addr.ip().is_loopback()) {
-                    break;
-                }
+        insert_discovered_server(&mut found, server);
+        if stop_on_first && !found.is_empty() {
+            // Wait a tiny moment if we only saw loopback so a real LAN packet can win
+            if !found.values().all(|s| s.addr.ip().is_loopback()) {
+                break;
             }
         }
     }
@@ -1029,5 +1163,91 @@ mod tests {
             .recv_from(&mut buf)
             .expect_err("non-blocking interface sender must not block");
         assert_eq!(err.kind(), std::io::ErrorKind::WouldBlock);
+    }
+
+    #[tokio::test]
+    async fn passive_discovery_receives_startup_announcement_and_respects_os_paused() {
+        let port = 24893;
+        let fp = format!("{}22", "22:".repeat(31));
+
+        // 1. Start passive listener BEFORE server starts (zero periodic probing!).
+        let mut session = PassiveDiscoverySession::start(port).await.unwrap();
+
+        // 2. Start server paused -> must NOT emit any startup beacon or reply to probes.
+        let paused = Arc::new(AtomicBool::new(true));
+        let refresh = Arc::new(tokio::sync::Notify::new());
+        let handle = spawn_server_beacon_with_controls(
+            port,
+            "event-driven-srv".into(),
+            24811,
+            fp.clone(),
+            "linux-x11".into(),
+            Some(Arc::clone(&refresh)),
+            Some(Arc::clone(&paused)),
+        )
+        .unwrap();
+
+        tokio::time::sleep(Duration::from_millis(60)).await;
+        session.probe_once().await;
+        let while_paused = tokio::time::timeout(Duration::from_millis(120), session.recv_beacon()).await;
+        assert!(
+            while_paused.is_err(),
+            "paused server must not emit or reply to discovery beacons"
+        );
+
+        // 3. Un-pause and trigger refresh_notify -> passive listener receives announcement immediately!
+        paused.store(false, Ordering::Release);
+        refresh.notify_one();
+        let found = tokio::time::timeout(Duration::from_secs(1), session.recv_beacon())
+            .await
+            .expect("passive listener must receive event-driven server announcement immediately")
+            .expect("passive listener returned None");
+        handle.abort();
+
+        assert_eq!(found.name, "event-driven-srv");
+        assert_eq!(found.addr.port(), 24811);
+        assert_eq!(found.fingerprint, fp);
+    }
+
+    #[tokio::test]
+    async fn listen_only_passive_discovery_receives_announcement_without_sending_probes() {
+        let port = 24894;
+        let fp = format!("{}33", "33:".repeat(31));
+
+        // Bind a spy socket on the discovery port joined to multicast to verify ZERO probes are sent.
+        let ifaces = active_ipv4_interfaces_async().await;
+        let (spy_sock, _) = bind_listener_socket_with_ifaces(port, &ifaces).unwrap();
+
+        let mut session = PassiveDiscoverySession::listen_only(port).await.unwrap();
+
+        let mut spy_buf = [0u8; 256];
+        let saw_probe =
+            tokio::time::timeout(Duration::from_millis(120), spy_sock.recv_from(&mut spy_buf))
+                .await;
+        assert!(
+            saw_probe.is_err(),
+            "listen_only discovery session must emit zero probe packets"
+        );
+        drop(spy_sock);
+
+        // Start a server responder -> its single startup announcement must wake listen_only immediately.
+        let handle = spawn_server_beacon(
+            port,
+            "rebooted-srv".into(),
+            24812,
+            fp.clone(),
+            "linux-x11".into(),
+        )
+        .unwrap();
+
+        let found = tokio::time::timeout(Duration::from_secs(1), session.recv_beacon())
+            .await
+            .expect("listen_only listener must receive startup announcement immediately")
+            .expect("listen_only listener returned None");
+        handle.abort();
+
+        assert_eq!(found.name, "rebooted-srv");
+        assert_eq!(found.addr.port(), 24812);
+        assert_eq!(found.fingerprint, fp);
     }
 }

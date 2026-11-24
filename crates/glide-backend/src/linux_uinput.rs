@@ -13,9 +13,9 @@ use crate::linux_wayland::WaylandGeometryWatcher;
 use crate::linux_x11::inject::should_sync_x11_pointer;
 use crate::linux_x11::{
     poll_randr_event, query_desktop_geometry, subscribe_randr_events, unsubscribe_randr_events,
-    X11CursorHider, X11FocusClearer,
+    X11CursorHider, X11FocusClearer, X11InjectorEventWatcher,
 };
-use crate::InputInjector;
+use crate::{InjectorEvent, InputInjector};
 use anyhow::{anyhow, Context, Result};
 use glide_hid::{HidUsage, MouseButton};
 use glide_proto::{Edge, LockState, OsKind};
@@ -23,7 +23,8 @@ use std::collections::HashSet;
 use std::fs::{File, OpenOptions};
 use std::io::Write;
 use std::os::fd::AsRawFd;
-use std::time::{Duration, Instant};
+use std::time::Instant;
+use tokio::sync::mpsc;
 use tracing::{debug, trace, warn};
 use x11rb::connection::Connection;
 use x11rb::protocol::xproto::{ConnectionExt as XProtoExt, Window};
@@ -116,10 +117,11 @@ struct X11Helper {
 pub struct UinputInjector {
     file: File,
     x11: Option<X11Helper>,
+    x11_watcher: Option<X11InjectorEventWatcher>,
     wayland_geom: Option<WaylandGeometryWatcher>,
+    event_rx: Option<mpsc::UnboundedReceiver<InjectorEvent>>,
     wayland: bool,
     geometry: DesktopGeometry,
-    last_geom_refresh: Instant,
     parked_pos: (i32, i32),
     rem_x: f32,
     rem_y: f32,
@@ -196,13 +198,14 @@ impl UinputInjector {
         }
 
         let wayland = crate::linux_wayland::is_wayland_session();
-        let (x11, wayland_geom, geometry) = if wayland {
-            match WaylandGeometryWatcher::start() {
+        let (x11, x11_watcher, wayland_geom, event_rx, geometry) = if wayland {
+            let (ev_tx, ev_rx) = mpsc::unbounded_channel();
+            match WaylandGeometryWatcher::start_with_events(Some(ev_tx)) {
                 Ok(watcher) => {
                     let geom = watcher.current();
-                    (None, Some(watcher), geom)
+                    (None, None, Some(watcher), Some(ev_rx), geom)
                 }
-                Err(_) => (None, None, DesktopGeometry::fallback()),
+                Err(_) => (None, None, None, None, DesktopGeometry::fallback()),
             }
         } else {
             let (conn, screen_num) = RustConnection::connect(None)
@@ -211,6 +214,13 @@ impl UinputInjector {
             let randr_subscribed = subscribe_randr_events(&conn, root);
             let cursor_hider = X11CursorHider::init(&conn);
             let geometry = query_desktop_geometry(&conn, screen_num)?;
+            let (watcher, ev_rx) = match X11InjectorEventWatcher::start(geometry.clone()) {
+                Ok((w, rx)) => (Some(w), Some(rx)),
+                Err(e) => {
+                    debug!(error = %e, "X11InjectorEventWatcher unavailable for UinputInjector");
+                    (None, None)
+                }
+            };
             (
                 Some(X11Helper {
                     conn,
@@ -220,7 +230,9 @@ impl UinputInjector {
                     cursor_hider,
                     focus_clearer: X11FocusClearer::new(),
                 }),
+                watcher,
                 None,
+                ev_rx,
                 geometry,
             )
         };
@@ -235,10 +247,11 @@ impl UinputInjector {
         Ok(Self {
             file,
             x11,
+            x11_watcher,
             wayland_geom,
+            event_rx,
             wayland,
             geometry,
-            last_geom_refresh: now,
             parked_pos: (cx, cy),
             rem_x: 0.0,
             rem_y: 0.0,
@@ -301,7 +314,6 @@ impl UinputInjector {
             let _ = watcher.poll_changed();
             self.geometry = watcher.current();
         }
-        self.last_geom_refresh = Instant::now();
         Ok(())
     }
 
@@ -309,16 +321,23 @@ impl UinputInjector {
         let _ = self.refresh_geometry_if_needed();
     }
 
+    fn apply_geometry_inner(&mut self, new_geom: DesktopGeometry) -> bool {
+        if new_geom != self.geometry {
+            self.geometry = new_geom;
+            self.edge_push_accum = 0.0;
+            let (min_x, min_y, max_x, max_y) = self.geometry.bounds();
+            self.est_x = self.est_x.clamp(min_x as f32, (max_x - 1) as f32);
+            self.est_y = self.est_y.clamp(min_y as f32, (max_y - 1) as f32);
+            return true;
+        }
+        false
+    }
+
     fn refresh_geometry_if_needed(&mut self) -> bool {
         let next = if let Some(ref x11) = self.x11 {
-            if x11.randr_subscribed {
-                if !poll_randr_event(&x11.conn) {
-                    return false;
-                }
-            } else if self.last_geom_refresh.elapsed() < Duration::from_secs(15) {
+            if !x11.randr_subscribed || !poll_randr_event(&x11.conn) {
                 return false;
             }
-            self.last_geom_refresh = Instant::now();
             query_desktop_geometry(&x11.conn, x11.screen_num).ok()
         } else if let Some(ref watcher) = self.wayland_geom {
             watcher.poll_changed()
@@ -326,14 +345,7 @@ impl UinputInjector {
             None
         };
         if let Some(new_geom) = next {
-            if new_geom != self.geometry {
-                self.geometry = new_geom;
-                self.edge_push_accum = 0.0;
-                let (min_x, min_y, max_x, max_y) = self.geometry.bounds();
-                self.est_x = self.est_x.clamp(min_x as f32, (max_x - 1) as f32);
-                self.est_y = self.est_y.clamp(min_y as f32, (max_y - 1) as f32);
-                return true;
-            }
+            return self.apply_geometry_inner(new_geom);
         }
         false
     }
@@ -343,6 +355,9 @@ impl UinputInjector {
             x11.conn
                 .warp_pointer(x11rb::NONE, x11.root, 0, 0, 0, 0, x as i16, y as i16)?;
             x11.cursor_hider.show(&x11.conn, x11.root);
+            if let Some(ref w) = self.x11_watcher {
+                w.set_cursor_hidden(false);
+            }
             x11.conn.flush()?;
         } else {
             let (min_x, min_y, max_x, max_y) = self.geometry.bounds();
@@ -409,6 +424,14 @@ impl InputInjector for UinputInjector {
     fn desktop_geometry(&mut self) -> Result<DesktopGeometry> {
         self.refresh_geometry()?;
         Ok(self.geometry.clone())
+    }
+
+    fn take_event_rx(&mut self) -> Option<mpsc::UnboundedReceiver<InjectorEvent>> {
+        self.event_rx.take()
+    }
+
+    fn apply_geometry(&mut self, geometry: DesktopGeometry) {
+        self.apply_geometry_inner(geometry);
     }
 
     fn poll_geometry_changed(&mut self) -> Option<DesktopGeometry> {
@@ -506,9 +529,9 @@ impl InputInjector for UinputInjector {
             return Ok(None);
         }
 
-        // Keep a low-frequency outward calibration sync (> 48px: 150ms) so nonlinear Xorg/libinput
-        // acceleration or multi-monitor gaps can never leave est_x/est_y permanently drifted away
-        // from the real cursor at the return edge, while keeping near-edge checks responsive.
+        // Keep a low-frequency outward calibration sync (> 48px: 150ms) on X11 so nonlinear
+        // Xorg/libinput acceleration or multi-monitor gaps never leave est_x/est_y drifted.
+        // Skip on pure Wayland (`self.x11.is_none()`) where sync_pointer is a no-op.
         let dist = self.geometry.distance_to_edge(
             edge,
             self.est_x.round() as i32,
@@ -516,7 +539,9 @@ impl InputInjector for UinputInjector {
         );
 
         let mut synced_this_call = false;
-        if should_sync_x11_pointer(dist, self.edge_push_accum, self.last_pointer_sync.elapsed()) {
+        if self.x11.is_some()
+            && should_sync_x11_pointer(dist, self.edge_push_accum, self.last_pointer_sync.elapsed())
+        {
             let _ = self.sync_pointer()?;
             synced_this_call = true;
         }
@@ -660,6 +685,11 @@ impl InputInjector for UinputInjector {
                 x11.focus_clearer.discard(&x11.conn);
             }
             let _ = x11.conn.flush();
+            if x11.cursor_hider.is_hidden() {
+                if let Some(ref w) = self.x11_watcher {
+                    w.set_cursor_hidden(true);
+                }
+            }
         } else {
             let _ = self.warp_to(px, py);
         }
@@ -692,6 +722,9 @@ impl InputInjector for UinputInjector {
             x11.cursor_hider.show(&x11.conn, x11.root);
             let _ = x11.conn.flush();
         }
+        if let Some(ref w) = self.x11_watcher {
+            w.set_cursor_hidden(false);
+        }
         Ok(())
     }
 
@@ -712,6 +745,9 @@ impl InputInjector for UinputInjector {
                     x11.focus_clearer.discard(&x11.conn);
                     x11.cursor_hider.show(&x11.conn, x11.root);
                     let _ = x11.conn.flush();
+                }
+                if let Some(ref w) = self.x11_watcher {
+                    w.set_cursor_hidden(false);
                 }
                 debug!(x, y, "Local pointer moved while hidden; cursor revealed");
             }

@@ -223,6 +223,12 @@ impl HealthProbe {
     pub fn is_pending(&self) -> bool {
         self.pending_since.is_some()
     }
+
+    /// Returns the monotonic instant at which the currently in-flight probe times out,
+    /// or `None` when idle so callers can sleep with zero periodic timers.
+    pub fn deadline(&self) -> Option<Instant> {
+        self.pending_since.map(|sent| sent + self.timeout)
+    }
 }
 
 #[cfg(test)]
