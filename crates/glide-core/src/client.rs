@@ -22,14 +22,17 @@ use crate::runtime::{save_received_file, RuntimeCommand, RuntimeState};
 use anyhow::{anyhow, Context, Result};
 use bytes::Bytes;
 use glide_backend::dnd::{DndBackend, NoopDndBackend};
+use glide_backend::lifecycle::{
+    ShutdownInhibitorGuard, SystemLifecycleEvent, SystemLifecycleMonitor,
+};
 use glide_backend::os_integration::resolve_receive_dir;
 use glide_backend::{ClipboardBackend, ClipboardHandle, InputInjector};
 use glide_hid::MouseButton;
 use glide_net::discovery::{discover_servers, local_ipv4_addresses_async};
 use glide_net::tls::{normalize_fingerprint, TrustMode};
 use glide_net::{
-    connect_client, recv_bulk_stream_with_atomic_limit, send_clipboard_on, send_file_on_with_limit,
-    sha256_bytes_async, Connection,
+    close_and_flush_conn, connect_client, recv_bulk_stream_with_atomic_limit, send_clipboard_on,
+    send_file_on_with_limit, sha256_bytes_async, Connection,
 };
 use glide_proto::{
     BulkTransfer, ClipboardPayload, ControlMessage, DatagramMessage, FilePayload,
@@ -118,19 +121,42 @@ const LAG_WARN_MIN_INTERVAL: Duration = Duration::from_secs(2);
 
 enum ResolveOutcome {
     Addr(SocketAddr),
+    OsPaused { shutting_down: bool },
     Shutdown,
 }
 
 enum RoamLookup {
     Found(SocketAddr),
     NotFound,
+    OsPaused { shutting_down: bool },
     Shutdown,
 }
 
 enum WaitOutcome {
     Retry,
     FastRetry,
+    OsPaused { shutting_down: bool },
     Shutdown,
+}
+
+enum PauseOutcome {
+    Resumed,
+    Shutdown,
+}
+
+enum SessionOutcome {
+    Shutdown,
+    OsPaused { shutting_down: bool },
+    Disconnected { established: bool, err: anyhow::Error },
+}
+
+enum SessionExit {
+    Shutdown,
+    OsPaused {
+        shutting_down: bool,
+        guard: ShutdownInhibitorGuard,
+    },
+    Error(anyhow::Error),
 }
 
 async fn recv_cmd_opt(
@@ -138,6 +164,18 @@ async fn recv_cmd_opt(
 ) -> Option<RuntimeCommand> {
     match cmd_rx.as_mut() {
         Some(rx) => rx.recv().await,
+        None => std::future::pending().await,
+    }
+}
+
+async fn next_lifecycle_event(
+    lifecycle: &mut Option<&mut SystemLifecycleMonitor>,
+) -> SystemLifecycleEvent {
+    match lifecycle.as_mut() {
+        Some(mon) => match mon.recv().await {
+            Some(ev) => ev,
+            None => std::future::pending().await,
+        },
         None => std::future::pending().await,
     }
 }
@@ -196,6 +234,72 @@ fn apply_pre_session_cmd(
     }
 }
 
+/// Parks the client reconnect supervisor while the OS is sleeping or shutting down with
+/// zero timers or polling, resuming immediately on [`SystemLifecycleEvent::Resumed`] or
+/// exiting on [`RuntimeCommand::Shutdown`].
+async fn wait_while_os_paused(
+    mut shutting_down: bool,
+    config: &mut ClientConfig,
+    injector: &mut dyn InputInjector,
+    runtime: Option<&RuntimeState>,
+    lifecycle: &mut Option<&mut SystemLifecycleMonitor>,
+    cmd_rx: &mut Option<&mut mpsc::UnboundedReceiver<RuntimeCommand>>,
+) -> PauseOutcome {
+    injector.discard_saved_focus();
+    let _ = injector.release_all();
+    let _ = injector.show_cursor();
+    let update_paused_status = |rt: Option<&RuntimeState>, is_shutdown: bool| {
+        if let Some(rt) = rt {
+            rt.update(|s| {
+                s.status = if is_shutdown {
+                    "Paused (OS shutting down)".into()
+                } else {
+                    "Paused (OS sleeping)".into()
+                };
+                s.active_target = "Local".into();
+                s.remote_fingerprint = None;
+                s.rtt_ms = None;
+            });
+        }
+    };
+    update_paused_status(runtime, shutting_down);
+
+    loop {
+        let Some(mon) = lifecycle.as_mut() else {
+            return PauseOutcome::Resumed;
+        };
+        tokio::select! {
+            cmd = recv_cmd_opt(cmd_rx) => {
+                if apply_pre_session_cmd(cmd, config, Some(&mut *injector)) {
+                    return PauseOutcome::Shutdown;
+                }
+            }
+            ev = mon.recv() => {
+                match ev {
+                    Some(SystemLifecycleEvent::Resumed) => {
+                        info!("OS resumed; resuming Glide client reconnects");
+                        return PauseOutcome::Resumed;
+                    }
+                    Some(SystemLifecycleEvent::PreparingToShutdown(guard)) => {
+                        if !shutting_down {
+                            shutting_down = true;
+                            update_paused_status(runtime, true);
+                        }
+                        drop(guard);
+                    }
+                    Some(SystemLifecycleEvent::PreparingToSleep(guard)) => {
+                        drop(guard);
+                    }
+                    None => {
+                        warn!("OS lifecycle monitor ended while paused; resuming Glide client");
+                        return PauseOutcome::Resumed;
+                    }
+                }
+            }
+        }
+    }
+}
+
 /// Returns the normalized 64-hex-char SHA-256 fingerprint of the expected server, either from
 /// `config.trusted_fingerprint` or (when using TOFU) from `config.resolved_tofu_path()`.
 fn known_server_fingerprint(config: &ClientConfig) -> Option<String> {
@@ -234,10 +338,12 @@ async fn resolve_explicit_addr(raw: &str) -> Result<SocketAddr> {
 }
 
 /// Searches the local network for a server matching `expected_norm_fp` (used when a server
-/// roams between Wi-Fi and Ethernet and acquires a new LAN IP). Interruptible by `Shutdown`.
+/// roams between Wi-Fi and Ethernet and acquires a new LAN IP). Interruptible by `Shutdown`
+/// and OS sleep/shutdown lifecycle events.
 async fn discover_roamed_server_by_fingerprint(
     config: &mut ClientConfig,
     expected_norm_fp: &str,
+    lifecycle: &mut Option<&mut SystemLifecycleMonitor>,
     cmd_rx: &mut Option<&mut mpsc::UnboundedReceiver<RuntimeCommand>>,
 ) -> RoamLookup {
     let discover_fut = discover_servers(
@@ -252,6 +358,19 @@ async fn discover_roamed_server_by_fingerprint(
             cmd = recv_cmd_opt(cmd_rx) => {
                 if apply_pre_session_cmd(cmd, config, None) {
                     return RoamLookup::Shutdown;
+                }
+            }
+            ev = next_lifecycle_event(lifecycle) => {
+                match ev {
+                    SystemLifecycleEvent::PreparingToShutdown(guard) => {
+                        drop(guard);
+                        return RoamLookup::OsPaused { shutting_down: true };
+                    }
+                    SystemLifecycleEvent::PreparingToSleep(guard) => {
+                        drop(guard);
+                        return RoamLookup::OsPaused { shutting_down: false };
+                    }
+                    SystemLifecycleEvent::Resumed => {}
                 }
             }
             res = &mut discover_fut => {
@@ -270,9 +389,11 @@ async fn discover_roamed_server_by_fingerprint(
 
 /// Resolves the target server socket address either from explicit `config.server`
 /// or by auto-discovering a running Glide server on the local network (checking `cmd_rx`
-/// for `RuntimeCommand::Shutdown` so stopping the client never stalls).
+/// for `RuntimeCommand::Shutdown` and `lifecycle` for OS sleep/shutdown so stopping or
+/// suspending the client never stalls).
 async fn resolve_server_addr(
     config: &mut ClientConfig,
+    lifecycle: &mut Option<&mut SystemLifecycleMonitor>,
     cmd_rx: &mut Option<&mut mpsc::UnboundedReceiver<RuntimeCommand>>,
 ) -> Result<ResolveOutcome> {
     if let Some(raw) = config.server.clone() {
@@ -280,9 +401,23 @@ async fn resolve_server_addr(
         tokio::pin!(resolve_fut);
         loop {
             tokio::select! {
+                biased;
                 cmd = recv_cmd_opt(cmd_rx) => {
                     if apply_pre_session_cmd(cmd, config, None) {
                         return Ok(ResolveOutcome::Shutdown);
+                    }
+                }
+                ev = next_lifecycle_event(lifecycle) => {
+                    match ev {
+                        SystemLifecycleEvent::PreparingToShutdown(guard) => {
+                            drop(guard);
+                            return Ok(ResolveOutcome::OsPaused { shutting_down: true });
+                        }
+                        SystemLifecycleEvent::PreparingToSleep(guard) => {
+                            drop(guard);
+                            return Ok(ResolveOutcome::OsPaused { shutting_down: false });
+                        }
+                        SystemLifecycleEvent::Resumed => {}
                     }
                 }
                 res = &mut resolve_fut => {
@@ -311,6 +446,19 @@ async fn resolve_server_addr(
                 cmd = recv_cmd_opt(cmd_rx) => {
                     if apply_pre_session_cmd(cmd, config, None) {
                         return Ok(ResolveOutcome::Shutdown);
+                    }
+                }
+                ev = next_lifecycle_event(lifecycle) => {
+                    match ev {
+                        SystemLifecycleEvent::PreparingToShutdown(guard) => {
+                            drop(guard);
+                            return Ok(ResolveOutcome::OsPaused { shutting_down: true });
+                        }
+                        SystemLifecycleEvent::PreparingToSleep(guard) => {
+                            drop(guard);
+                            return Ok(ResolveOutcome::OsPaused { shutting_down: false });
+                        }
+                        SystemLifecycleEvent::Resumed => {}
                     }
                 }
                 res = &mut discover_fut => {
@@ -379,7 +527,7 @@ pub async fn run_client_session_with_dnd(
     cmd_rx: Option<&mut mpsc::UnboundedReceiver<RuntimeCommand>>,
 ) -> Result<()> {
     let shared_clip_backend = share_clipboard_backend(clipboard);
-    run_client_session_tracked(
+    match run_client_session_tracked(
         config,
         server_addr,
         injector,
@@ -389,13 +537,18 @@ pub async fn run_client_session_with_dnd(
         receive_dir,
         runtime,
         cmd_rx,
+        None,
     )
     .await
-    .1
+    {
+        SessionOutcome::Shutdown | SessionOutcome::OsPaused { .. } => Ok(()),
+        SessionOutcome::Disconnected { err, .. } => Err(err),
+    }
 }
 
 /// Internal session runner that also reports whether the handshake completed successfully so
-/// the reconnect supervisor can reset backoff immediately after any previously healthy session.
+/// the reconnect supervisor can reset backoff immediately after any previously healthy session,
+/// and surfaces OS sleep/shutdown pauses after flushing QUIC `CONNECTION_CLOSE`.
 #[allow(clippy::too_many_arguments)]
 async fn run_client_session_tracked(
     config: &mut ClientConfig,
@@ -407,7 +560,8 @@ async fn run_client_session_tracked(
     receive_dir: Option<PathBuf>,
     runtime: Option<&RuntimeState>,
     mut cmd_rx: Option<&mut mpsc::UnboundedReceiver<RuntimeCommand>>,
-) -> (bool, Result<()>) {
+    mut lifecycle: Option<&mut SystemLifecycleMonitor>,
+) -> SessionOutcome {
     injector.set_unfocus_on_leave(config.unfocus_on_leave);
     let trust = build_trust_mode(config);
     let mut session = {
@@ -417,18 +571,36 @@ async fn run_client_session_tracked(
             tokio::select! {
                 cmd = recv_cmd_opt(&mut cmd_rx) => {
                     if apply_pre_session_cmd(cmd, config, Some(&mut *injector)) {
-                        return (false, Ok(()));
+                        return SessionOutcome::Shutdown;
+                    }
+                }
+                ev = next_lifecycle_event(&mut lifecycle) => {
+                    match ev {
+                        SystemLifecycleEvent::PreparingToShutdown(guard) => {
+                            drop(guard);
+                            return SessionOutcome::OsPaused { shutting_down: true };
+                        }
+                        SystemLifecycleEvent::PreparingToSleep(guard) => {
+                            drop(guard);
+                            return SessionOutcome::OsPaused { shutting_down: false };
+                        }
+                        SystemLifecycleEvent::Resumed => {}
                     }
                 }
                 res = &mut connect_fut => {
                     match res {
                         Ok(Ok(s)) => break s,
-                        Ok(Err(e)) => return (false, Err(e)),
+                        Ok(Err(e)) => {
+                            return SessionOutcome::Disconnected {
+                                established: false,
+                                err: e,
+                            };
+                        }
                         Err(_) => {
-                            return (
-                                false,
-                                Err(anyhow!("timed out connecting to Glide server {server_addr}")),
-                            );
+                            return SessionOutcome::Disconnected {
+                                established: false,
+                                err: anyhow!("timed out connecting to Glide server {server_addr}"),
+                            };
                         }
                     }
                 }
@@ -449,8 +621,11 @@ async fn run_client_session_tracked(
         })
         .await
     {
-        session.conn.close(0u32.into(), b"hello failed");
-        return (false, Err(e));
+        close_and_flush_conn(&session.conn, session.endpoint.as_ref(), 0, b"hello failed").await;
+        return SessionOutcome::Disconnected {
+            established: false,
+            err: e,
+        };
     }
 
     let welcome = {
@@ -460,8 +635,41 @@ async fn run_client_session_tracked(
             tokio::select! {
                 cmd = recv_cmd_opt(&mut cmd_rx) => {
                     if apply_pre_session_cmd(cmd, config, Some(&mut *injector)) {
-                        session.conn.close(0u32.into(), b"client shutdown");
-                        return (false, Ok(()));
+                        close_and_flush_conn(
+                            &session.conn,
+                            session.endpoint.as_ref(),
+                            0,
+                            b"client shutdown",
+                        )
+                        .await;
+                        return SessionOutcome::Shutdown;
+                    }
+                }
+                ev = next_lifecycle_event(&mut lifecycle) => {
+                    match ev {
+                        SystemLifecycleEvent::PreparingToShutdown(guard) => {
+                            close_and_flush_conn(
+                                &session.conn,
+                                session.endpoint.as_ref(),
+                                0,
+                                b"os shutdown",
+                            )
+                            .await;
+                            drop(guard);
+                            return SessionOutcome::OsPaused { shutting_down: true };
+                        }
+                        SystemLifecycleEvent::PreparingToSleep(guard) => {
+                            close_and_flush_conn(
+                                &session.conn,
+                                session.endpoint.as_ref(),
+                                0,
+                                b"os sleep",
+                            )
+                            .await;
+                            drop(guard);
+                            return SessionOutcome::OsPaused { shutting_down: false };
+                        }
+                        SystemLifecycleEvent::Resumed => {}
                     }
                 }
                 res = &mut welcome_fut => {
@@ -469,11 +677,17 @@ async fn run_client_session_tracked(
                         Ok(Ok(w)) => break w,
                         Ok(Err(e)) => {
                             session.conn.close(0u32.into(), b"welcome failed");
-                            return (false, Err(e));
+                            return SessionOutcome::Disconnected {
+                                established: false,
+                                err: e,
+                            };
                         }
                         Err(_) => {
                             session.conn.close(0u32.into(), b"welcome timeout");
-                            return (false, Err(anyhow!("timed out waiting for server Welcome")));
+                            return SessionOutcome::Disconnected {
+                                established: false,
+                                err: anyhow!("timed out waiting for server Welcome"),
+                            };
                         }
                     }
                 }
@@ -504,14 +718,17 @@ async fn run_client_session_tracked(
             ..
         } => {
             session.conn.close(0u32.into(), b"rejected");
-            return (false, Err(anyhow!("server rejected connection: {reason}")));
+            return SessionOutcome::Disconnected {
+                established: false,
+                err: anyhow!("server rejected connection: {reason}"),
+            };
         }
         other => {
             session.conn.close(0u32.into(), b"bad handshake");
-            return (
-                false,
-                Err(anyhow!("unexpected handshake response: {other:?}")),
-            );
+            return SessionOutcome::Disconnected {
+                established: false,
+                err: anyhow!("unexpected handshake response: {other:?}"),
+            };
         }
     };
 
@@ -604,6 +821,7 @@ async fn run_client_session_tracked(
     };
 
     let conn = session.conn;
+    let client_endpoint = session.endpoint;
 
     // Dedicated control stream reader task so `tokio::select!` never cancels a partially-read
     // framed control message during 1000Hz `read_datagram()` traffic.
@@ -697,7 +915,7 @@ async fn run_client_session_tracked(
         }
     };
 
-    let session_result: Result<()> = loop {
+    let session_exit: SessionExit = loop {
         let dpi_mult = if config.auto_dpi_scale {
             (client_scale / server_scale).clamp(0.25, 4.0)
         } else {
@@ -706,6 +924,64 @@ async fn run_client_session_tracked(
         let eff_sens = (config.sensitivity * dpi_mult).clamp(0.05, 10.0);
 
         tokio::select! {
+            ev = next_lifecycle_event(&mut lifecycle) => {
+                match ev {
+                    SystemLifecycleEvent::PreparingToShutdown(guard) => {
+                        info!("OS preparing to shut down; releasing client input and flushing QUIC CONNECTION_CLOSE");
+                        break SessionExit::OsPaused {
+                            shutting_down: true,
+                            guard,
+                        };
+                    }
+                    SystemLifecycleEvent::PreparingToSleep(guard) => {
+                        info!("OS preparing to sleep; releasing client input and flushing QUIC CONNECTION_CLOSE");
+                        break SessionExit::OsPaused {
+                            shutting_down: false,
+                            guard,
+                        };
+                    }
+                    SystemLifecycleEvent::Resumed => {
+                        let now = Instant::now();
+                        info!("OS lifecycle monitor reported resume while connected; refreshing geometry & probing server");
+                        sleep_detector.reset();
+                        injector.discard_saved_focus();
+                        if focused {
+                            focused = false;
+                            let _ = injector.release_all();
+                            let _ = injector.show_cursor();
+                        }
+                        let fresh_geom = injector.desktop_geometry().ok();
+                        last_ip_check = now;
+                        ip_check_gen = ip_check_gen.wrapping_add(1);
+                        ip_check_in_flight += 1;
+                        let gen = ip_check_gen;
+                        let tx = ip_tx.clone();
+                        tokio::spawn(async move {
+                            let ips = local_ipv4_addresses_async().await;
+                            let _ = tx.send((gen, ips, true));
+                        });
+                        if let Some(ref g) = fresh_geom {
+                            client_geom = g.clone();
+                            client_scale = g.primary_scale();
+                        }
+                        if let Some(rt) = runtime {
+                            rt.update(|s| {
+                                if let Some(g) = fresh_geom {
+                                    s.geometry = g;
+                                }
+                                s.active_target = server_name.clone();
+                            });
+                        }
+                        let ts_us = health_probe.start_probe(now);
+                        if ctrl_out_tx.send(ControlMessage::Ping { ts_us }).is_err() {
+                            break SessionExit::Error(anyhow!(
+                                "server unreachable after resume: control writer closed"
+                            ));
+                        }
+                    }
+                }
+            }
+
             _ = ping_interval.tick() => {
                 let now = Instant::now();
 
@@ -759,7 +1035,7 @@ async fn run_client_session_tracked(
                     }
                     let ts_us = health_probe.start_probe(now);
                     if ctrl_out_tx.send(ControlMessage::Ping { ts_us }).is_err() {
-                        break Err(anyhow!("server unreachable after resume: control writer closed"));
+                        break SessionExit::Error(anyhow!("server unreachable after resume: control writer closed"));
                     }
                 } else if now.saturating_duration_since(last_ip_check) >= Duration::from_secs(3) {
                     // 3. Wi-Fi <-> Ethernet roaming detection (offloaded off select! loop)
@@ -778,11 +1054,11 @@ async fn run_client_session_tracked(
 
                 // 4. Fail fast if QUIC closed or post-resume/roaming health Ping received no reply within 1.5s
                 if conn.close_reason().is_some() {
-                    break Err(anyhow!("server QUIC connection closed"));
+                    break SessionExit::Error(anyhow!("server QUIC connection closed"));
                 }
                 if health_probe.is_timed_out(now) {
                     conn.close(1u32.into(), b"health probe timeout");
-                    break Err(anyhow!("server did not respond to post-resume health ping"));
+                    break SessionExit::Error(anyhow!("server did not respond to post-resume health ping"));
                 }
 
                 // 5. Live monitor hotplug / DPI scaling refresh
@@ -850,7 +1126,7 @@ async fn run_client_session_tracked(
                     if !from_wake {
                         let ts_us = health_probe.start_probe(Instant::now());
                         if ctrl_out_tx.send(ControlMessage::Ping { ts_us }).is_err() {
-                            break Err(anyhow!(
+                            break SessionExit::Error(anyhow!(
                                 "server unreachable after network change: control writer closed"
                             ));
                         }
@@ -865,7 +1141,7 @@ async fn run_client_session_tracked(
             cmd = recv_cmd_opt(&mut cmd_rx) => {
                 let Some(cmd) = cmd else {
                     info!("Client command channel closed; shutting down session");
-                    break Ok(());
+                    break SessionExit::Shutdown;
                 };
                 match cmd {
                     RuntimeCommand::UpdateClientTuning {
@@ -959,7 +1235,7 @@ async fn run_client_session_tracked(
                     }
                     RuntimeCommand::Shutdown => {
                         info!("Client received graceful shutdown command");
-                        break Ok(());
+                        break SessionExit::Shutdown;
                     }
                     _ => {}
                 }
@@ -968,7 +1244,7 @@ async fn run_client_session_tracked(
             dgram = conn.read_datagram() => {
                 let bytes = match dgram {
                     Ok(b) => b,
-                    Err(e) => break Err(anyhow!("datagram stream closed: {e}")),
+                    Err(e) => break SessionExit::Error(anyhow!("datagram stream closed: {e}")),
                 };
                 health_probe.mark_alive();
                 if !focused {
@@ -1103,7 +1379,7 @@ async fn run_client_session_tracked(
                                         })
                                         .is_err()
                                     {
-                                        break Err(anyhow!("control writer closed during Leave"));
+                                        break SessionExit::Error(anyhow!("control writer closed during Leave"));
                                     }
 
                                     if let Some(paths) = staged_paths {
@@ -1173,7 +1449,7 @@ async fn run_client_session_tracked(
                             }
                         }
                         if let Some(err) = dgram_err {
-                            break Err(err);
+                            break SessionExit::Error(err);
                         }
                     }
                     DatagramMessage::MouseScroll { dx_120, dy_120, .. } => {
@@ -1191,8 +1467,8 @@ async fn run_client_session_tracked(
             ctrl = ctrl_in_rx.recv() => {
                 let msg = match ctrl {
                     Some(Ok(m)) => m,
-                    Some(Err(e)) => break Err(e),
-                    None => break Err(anyhow!("control stream closed")),
+                    Some(Err(e)) => break SessionExit::Error(e),
+                    None => break SessionExit::Error(anyhow!("control stream closed")),
                 };
                 health_probe.mark_alive();
                 match msg {
@@ -1471,7 +1747,7 @@ async fn run_client_session_tracked(
                     None => {
                         bulk_open = false;
                         if conn.close_reason().is_some() {
-                            break Err(anyhow!("server QUIC connection closed"));
+                            break SessionExit::Error(anyhow!("server QUIC connection closed"));
                         }
                         debug!("Remote bulk uni-stream loop ended");
                     }
@@ -1518,25 +1794,60 @@ async fn run_client_session_tracked(
             inc.cancel(Arc::clone(&dnd));
         }
     }
-    if session_result.is_ok() {
-        conn.close(0u32.into(), b"client shutdown");
-    } else if conn.close_reason().is_none() {
-        conn.close(0u32.into(), b"client disconnected");
-    }
     drop(_clip_apply_guard);
     drop(_ctrl_reader_guard);
     drop(_ctrl_writer_guard);
     drop(_bulk_guard);
-    dnd.set_drag_armed(false);
-    injector.discard_saved_focus();
-    let _ = injector.release_all();
-    let _ = injector.show_cursor();
-    (true, session_result)
+
+    match session_exit {
+        SessionExit::Shutdown => {
+            close_and_flush_conn(&conn, client_endpoint.as_ref(), 0, b"client shutdown").await;
+            dnd.set_drag_armed(false);
+            injector.discard_saved_focus();
+            let _ = injector.release_all();
+            let _ = injector.show_cursor();
+            SessionOutcome::Shutdown
+        }
+        SessionExit::OsPaused {
+            shutting_down,
+            guard,
+        } => {
+            let reason: &[u8] = if shutting_down {
+                b"os shutdown"
+            } else {
+                b"os sleep"
+            };
+            close_and_flush_conn(&conn, client_endpoint.as_ref(), 0, reason).await;
+            dnd.set_drag_armed(false);
+            injector.discard_saved_focus();
+            let _ = injector.release_all();
+            let _ = injector.show_cursor();
+            // Drop the OS delay inhibitor ONLY AFTER QUIC CONNECTION_CLOSE has been flushed
+            // onto the wire and local keys/cursor have been restored.
+            drop(guard);
+            SessionOutcome::OsPaused { shutting_down }
+        }
+        SessionExit::Error(err) => {
+            if conn.close_reason().is_none() {
+                close_and_flush_conn(&conn, client_endpoint.as_ref(), 0, b"client disconnected")
+                    .await;
+            }
+            dnd.set_drag_armed(false);
+            injector.discard_saved_focus();
+            let _ = injector.release_all();
+            let _ = injector.show_cursor();
+            SessionOutcome::Disconnected {
+                established: true,
+                err,
+            }
+        }
+    }
 }
 
 /// Sleeps up to `delay` between reconnect attempts while watching for graceful shutdown,
-/// OS wake/sleep jumps, monitor hotplug, or LAN interface changes so wake/roaming retries
-/// immediately without waiting for the backoff timer.
+/// OS lifecycle pause/resume, wake/sleep jumps, monitor hotplug, or LAN interface changes
+/// so wake/roaming retries immediately without waiting for the backoff timer.
+#[allow(clippy::too_many_arguments)]
 async fn wait_reconnect_delay(
     delay: Duration,
     config: &mut ClientConfig,
@@ -1544,6 +1855,7 @@ async fn wait_reconnect_delay(
     sleep_detector: &mut SleepDetector,
     last_local_ips: &mut Vec<String>,
     runtime: Option<&RuntimeState>,
+    lifecycle: &mut Option<&mut SystemLifecycleMonitor>,
     cmd_rx: &mut Option<&mut mpsc::UnboundedReceiver<RuntimeCommand>>,
 ) -> WaitOutcome {
     let sleep_fut = tokio::time::sleep(delay);
@@ -1561,6 +1873,34 @@ async fn wait_reconnect_delay(
             cmd = recv_cmd_opt(cmd_rx) => {
                 if apply_pre_session_cmd(cmd, config, Some(&mut *injector)) {
                     return WaitOutcome::Shutdown;
+                }
+            }
+            ev = next_lifecycle_event(lifecycle) => {
+                match ev {
+                    SystemLifecycleEvent::PreparingToShutdown(guard) => {
+                        drop(guard);
+                        return WaitOutcome::OsPaused { shutting_down: true };
+                    }
+                    SystemLifecycleEvent::PreparingToSleep(guard) => {
+                        drop(guard);
+                        return WaitOutcome::OsPaused { shutting_down: false };
+                    }
+                    SystemLifecycleEvent::Resumed => {
+                        info!("OS resumed during reconnect backoff; retrying immediately");
+                        injector.discard_saved_focus();
+                        let fresh_geom = injector.desktop_geometry().ok();
+                        let fresh_ips = local_ipv4_addresses_async().await;
+                        *last_local_ips = fresh_ips.clone();
+                        if let Some(rt) = runtime {
+                            rt.update(|s| {
+                                if let Some(g) = fresh_geom {
+                                    s.geometry = g;
+                                }
+                                s.local_ips = fresh_ips;
+                            });
+                        }
+                        return WaitOutcome::FastRetry;
+                    }
                 }
             }
             Some(fresh_ips) = ip_rx.recv() => {
@@ -1656,6 +1996,31 @@ pub async fn run_client_with_backends(
 /// Runs the Glide client reconnect supervisor with explicit DnD backend and optional receive_dir.
 #[allow(clippy::too_many_arguments)]
 pub async fn run_client_with_backends_and_dnd(
+    config: ClientConfig,
+    injector: &mut dyn InputInjector,
+    clipboard: &mut Option<ClipboardHandle>,
+    dnd: Arc<dyn DndBackend>,
+    receive_dir: Option<PathBuf>,
+    runtime: Option<RuntimeState>,
+    cmd_rx: Option<mpsc::UnboundedReceiver<RuntimeCommand>>,
+) -> Result<()> {
+    run_client_with_backends_and_lifecycle(
+        config,
+        injector,
+        clipboard,
+        dnd,
+        receive_dir,
+        runtime,
+        cmd_rx,
+        None,
+    )
+    .await
+}
+
+/// Runs the Glide client reconnect supervisor with explicit DnD backend, optional receive_dir,
+/// and an OS [`SystemLifecycleMonitor`] for event-driven shutdown/sleep snap-back and auto-resume.
+#[allow(clippy::too_many_arguments)]
+pub async fn run_client_with_backends_and_lifecycle(
     mut config: ClientConfig,
     injector: &mut dyn InputInjector,
     clipboard: &mut Option<ClipboardHandle>,
@@ -1663,6 +2028,7 @@ pub async fn run_client_with_backends_and_dnd(
     receive_dir: Option<PathBuf>,
     runtime: Option<RuntimeState>,
     mut cmd_rx: Option<mpsc::UnboundedReceiver<RuntimeCommand>>,
+    mut lifecycle: Option<SystemLifecycleMonitor>,
 ) -> Result<()> {
     injector.set_unfocus_on_leave(config.unfocus_on_leave);
     let geom = injector.desktop_geometry().unwrap_or_default();
@@ -1682,8 +2048,67 @@ pub async fn run_client_with_backends_and_dnd(
     let mut backoff = ReconnectBackoff::default();
     let mut sleep_detector = SleepDetector::default();
     let mut roamed_addr: Option<SocketAddr> = None;
+    let mut pending_os_pause: Option<bool> = None;
 
     loop {
+        if let Some(mon) = lifecycle.as_mut() {
+            while let Some(ev) = mon.try_recv() {
+                match ev {
+                    SystemLifecycleEvent::PreparingToShutdown(guard) => {
+                        drop(guard);
+                        pending_os_pause = Some(true);
+                    }
+                    SystemLifecycleEvent::PreparingToSleep(guard) => {
+                        drop(guard);
+                        pending_os_pause = Some(pending_os_pause.unwrap_or(false));
+                    }
+                    SystemLifecycleEvent::Resumed => {
+                        pending_os_pause = None;
+                        backoff.reset();
+                    }
+                }
+            }
+        }
+
+        if let Some(shutting_down) = pending_os_pause.take() {
+            let mut lc_ref = lifecycle.as_mut();
+            let mut rx_ref = cmd_rx.as_mut();
+            match wait_while_os_paused(
+                shutting_down,
+                &mut config,
+                injector,
+                runtime.as_ref(),
+                &mut lc_ref,
+                &mut rx_ref,
+            )
+            .await
+            {
+                PauseOutcome::Shutdown => {
+                    info!("Client received graceful shutdown while OS-paused");
+                    break;
+                }
+                PauseOutcome::Resumed => {
+                    backoff.reset();
+                    sleep_detector.reset();
+                    let _ = injector.poll_system_suspended();
+                    let _ = injector.poll_system_resumed();
+                    injector.discard_saved_focus();
+                    let fresh_geom = injector.desktop_geometry().ok();
+                    let fresh_ips = local_ipv4_addresses_async().await;
+                    last_local_ips = fresh_ips.clone();
+                    if let Some(ref rt) = runtime {
+                        rt.update(|s| {
+                            if let Some(g) = fresh_geom {
+                                s.geometry = g;
+                            }
+                            s.local_ips = fresh_ips;
+                        });
+                    }
+                    continue;
+                }
+            }
+        }
+
         let target_addr = if let Some(addr) = roamed_addr {
             if let Some(ref rt) = runtime {
                 rt.update(|s| {
@@ -1704,8 +2129,9 @@ pub async fn run_client_with_backends_and_dnd(
                     };
                 });
             }
+            let mut lc_ref = lifecycle.as_mut();
             let mut rx_ref = cmd_rx.as_mut();
-            resolve_server_addr(&mut config, &mut rx_ref).await
+            resolve_server_addr(&mut config, &mut lc_ref, &mut rx_ref).await
         };
 
         let mut immediate_retry = false;
@@ -1715,9 +2141,13 @@ pub async fn run_client_with_backends_and_dnd(
                 info!("Client received graceful shutdown while resolving server");
                 break;
             }
+            Ok(ResolveOutcome::OsPaused { shutting_down }) => {
+                pending_os_pause = Some(shutting_down);
+                continue;
+            }
             Ok(ResolveOutcome::Addr(addr)) => {
                 sleep_detector.reset();
-                let (established, res) = run_client_session_tracked(
+                match run_client_session_tracked(
                     &mut config,
                     addr,
                     injector,
@@ -1727,15 +2157,22 @@ pub async fn run_client_with_backends_and_dnd(
                     receive_dir.clone(),
                     runtime.as_ref(),
                     cmd_rx.as_mut(),
+                    lifecycle.as_mut(),
                 )
-                .await;
-
-                match res {
-                    Ok(()) => {
+                .await
+                {
+                    SessionOutcome::Shutdown => {
                         info!("Session ended cleanly");
                         break;
                     }
-                    Err(e) => {
+                    SessionOutcome::OsPaused { shutting_down } => {
+                        pending_os_pause = Some(shutting_down);
+                        continue;
+                    }
+                    SessionOutcome::Disconnected {
+                        established,
+                        err: e,
+                    } => {
                         warn!(
                             error = %e,
                             %addr,
@@ -1769,10 +2206,12 @@ pub async fn run_client_with_backends_and_dnd(
                             }
                             if config.server.is_some() {
                                 if let Some(expected_fp) = known_server_fingerprint(&config) {
+                                    let mut lc_ref = lifecycle.as_mut();
                                     let mut rx_ref = cmd_rx.as_mut();
                                     match discover_roamed_server_by_fingerprint(
                                         &mut config,
                                         &expected_fp,
+                                        &mut lc_ref,
                                         &mut rx_ref,
                                     )
                                     .await
@@ -1780,6 +2219,10 @@ pub async fn run_client_with_backends_and_dnd(
                                         RoamLookup::Shutdown => {
                                             info!("Client received shutdown during roaming discovery");
                                             break;
+                                        }
+                                        RoamLookup::OsPaused { shutting_down } => {
+                                            pending_os_pause = Some(shutting_down);
+                                            continue;
                                         }
                                         RoamLookup::Found(new_addr) if new_addr != addr => {
                                             info!(
@@ -1806,10 +2249,12 @@ pub async fn run_client_with_backends_and_dnd(
                 }
                 if config.server.is_some() {
                     if let Some(expected_fp) = known_server_fingerprint(&config) {
+                        let mut lc_ref = lifecycle.as_mut();
                         let mut rx_ref = cmd_rx.as_mut();
                         match discover_roamed_server_by_fingerprint(
                             &mut config,
                             &expected_fp,
+                            &mut lc_ref,
                             &mut rx_ref,
                         )
                         .await
@@ -1817,6 +2262,10 @@ pub async fn run_client_with_backends_and_dnd(
                             RoamLookup::Shutdown => {
                                 info!("Client received shutdown during roaming discovery");
                                 break;
+                            }
+                            RoamLookup::OsPaused { shutting_down } => {
+                                pending_os_pause = Some(shutting_down);
+                                continue;
                             }
                             RoamLookup::Found(new_addr) => {
                                 info!(
@@ -1855,6 +2304,7 @@ pub async fn run_client_with_backends_and_dnd(
 
         let delay = backoff.next_delay();
         sleep_detector.reset();
+        let mut lc_ref = lifecycle.as_mut();
         let mut rx_ref = cmd_rx.as_mut();
         match wait_reconnect_delay(
             delay,
@@ -1863,6 +2313,7 @@ pub async fn run_client_with_backends_and_dnd(
             &mut sleep_detector,
             &mut last_local_ips,
             runtime.as_ref(),
+            &mut lc_ref,
             &mut rx_ref,
         )
         .await
@@ -1870,6 +2321,9 @@ pub async fn run_client_with_backends_and_dnd(
             WaitOutcome::Shutdown => {
                 info!("Client received graceful shutdown command during reconnect backoff");
                 break;
+            }
+            WaitOutcome::OsPaused { shutting_down } => {
+                pending_os_pause = Some(shutting_down);
             }
             WaitOutcome::FastRetry => {
                 backoff.reset();
@@ -1919,7 +2373,8 @@ pub async fn run_native_client_with_runtime(
     };
 
     let dnd = glide_backend::start_dnd();
-    run_client_with_backends_and_dnd(
+    let lifecycle = SystemLifecycleMonitor::start();
+    run_client_with_backends_and_lifecycle(
         config,
         injector.as_mut(),
         &mut clipboard,
@@ -1927,6 +2382,7 @@ pub async fn run_native_client_with_runtime(
         None,
         runtime,
         cmd_rx,
+        Some(lifecycle),
     )
     .await
 }
@@ -1941,7 +2397,7 @@ mod tests {
     use super::*;
     use glide_backend::geometry::{DesktopGeometry, MonitorRect};
     use glide_backend::mock::MockInjector;
-    use std::sync::atomic::Ordering;
+    use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::Arc;
 
     fn test_geom() -> DesktopGeometry {
@@ -1987,6 +2443,7 @@ mod tests {
         let mut config = ClientConfig::default();
         let mut sleep_det = SleepDetector::default();
         let mut ips = local_ipv4_addresses_async().await;
+        let mut lifecycle: Option<&mut SystemLifecycleMonitor> = None;
         let mut cmd_rx: Option<&mut mpsc::UnboundedReceiver<RuntimeCommand>> = None;
 
         tokio::spawn(async move {
@@ -2002,6 +2459,7 @@ mod tests {
             &mut sleep_det,
             &mut ips,
             None,
+            &mut lifecycle,
             &mut cmd_rx,
         )
         .await;
@@ -2020,6 +2478,7 @@ mod tests {
         let mut config = ClientConfig::default();
         let mut sleep_det = SleepDetector::default();
         let mut ips = local_ipv4_addresses_async().await;
+        let mut lifecycle: Option<&mut SystemLifecycleMonitor> = None;
         let (tx, mut rx) = mpsc::unbounded_channel();
         let mut cmd_rx = Some(&mut rx);
 
@@ -2036,11 +2495,108 @@ mod tests {
             &mut sleep_det,
             &mut ips,
             None,
+            &mut lifecycle,
             &mut cmd_rx,
         )
         .await;
 
         assert!(matches!(outcome, WaitOutcome::Shutdown));
+        assert!(started.elapsed() < Duration::from_millis(400));
+    }
+
+    #[tokio::test]
+    async fn wait_while_os_paused_releases_duplicate_inhibitors_and_resumes_on_event() {
+        let (mut injector, _) = MockInjector::new(test_geom());
+        let mut config = ClientConfig::default();
+        let rt = RuntimeState::new();
+        let (mut monitor, lc_tx) = SystemLifecycleMonitor::from_channel();
+        let mut lc_ref = Some(&mut monitor);
+        let mut cmd_rx: Option<&mut mpsc::UnboundedReceiver<RuntimeCommand>> = None;
+
+        let dup_released = Arc::new(AtomicBool::new(false));
+        let dup_released_c = Arc::clone(&dup_released);
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(40)).await;
+            let _ = lc_tx.send(SystemLifecycleEvent::PreparingToShutdown(
+                ShutdownInhibitorGuard::with_on_drop(move || {
+                    dup_released_c.store(true, Ordering::SeqCst);
+                }),
+            ));
+            tokio::time::sleep(Duration::from_millis(40)).await;
+            let _ = lc_tx.send(SystemLifecycleEvent::Resumed);
+        });
+
+        let started = Instant::now();
+        let outcome = wait_while_os_paused(
+            false,
+            &mut config,
+            &mut injector,
+            Some(&rt),
+            &mut lc_ref,
+            &mut cmd_rx,
+        )
+        .await;
+
+        assert!(matches!(outcome, PauseOutcome::Resumed));
+        assert!(dup_released.load(Ordering::SeqCst));
+        assert_eq!(rt.snapshot().status, "Paused (OS shutting down)");
+        assert!(started.elapsed() < Duration::from_millis(600));
+    }
+
+    #[tokio::test]
+    async fn wait_while_os_paused_exits_immediately_on_shutdown_command() {
+        let (mut injector, _) = MockInjector::new(test_geom());
+        let mut config = ClientConfig::default();
+        let (mut monitor, _lc_tx) = SystemLifecycleMonitor::from_channel();
+        let mut lc_ref = Some(&mut monitor);
+        let (cmd_tx, mut cmd_rx) = mpsc::unbounded_channel();
+        let mut cmd_ref = Some(&mut cmd_rx);
+
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(30)).await;
+            let _ = cmd_tx.send(RuntimeCommand::Shutdown);
+        });
+
+        let started = Instant::now();
+        let outcome = wait_while_os_paused(
+            false,
+            &mut config,
+            &mut injector,
+            None,
+            &mut lc_ref,
+            &mut cmd_ref,
+        )
+        .await;
+
+        assert!(matches!(outcome, PauseOutcome::Shutdown));
+        assert!(started.elapsed() < Duration::from_millis(400));
+    }
+
+    #[tokio::test]
+    async fn wait_while_os_paused_resumes_cleanly_if_monitor_disconnects() {
+        let (mut injector, _) = MockInjector::new(test_geom());
+        let mut config = ClientConfig::default();
+        let (mut monitor, lc_tx) = SystemLifecycleMonitor::from_channel();
+        let mut lc_ref = Some(&mut monitor);
+        let mut cmd_rx: Option<&mut mpsc::UnboundedReceiver<RuntimeCommand>> = None;
+
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(30)).await;
+            drop(lc_tx);
+        });
+
+        let started = Instant::now();
+        let outcome = wait_while_os_paused(
+            true,
+            &mut config,
+            &mut injector,
+            None,
+            &mut lc_ref,
+            &mut cmd_rx,
+        )
+        .await;
+
+        assert!(matches!(outcome, PauseOutcome::Resumed));
         assert!(started.elapsed() < Duration::from_millis(400));
     }
 }

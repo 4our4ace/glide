@@ -19,6 +19,7 @@ use crate::resilience::{HealthProbe, SleepDetector};
 use crate::runtime::{save_received_file, PeerSummary, RuntimeCommand, RuntimeState};
 use anyhow::Result;
 use glide_backend::dnd::{DndBackend, NoopDndBackend};
+use glide_backend::lifecycle::{SystemLifecycleEvent, SystemLifecycleMonitor};
 use glide_backend::os_integration::resolve_receive_dir;
 use glide_backend::{
     CaptureControl, CaptureEvent, CaptureHandle, ClipboardBackend, ClipboardHandle,
@@ -38,7 +39,7 @@ use glide_proto::{
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::{mpsc, Notify};
@@ -144,6 +145,18 @@ impl Drop for EndpointCloseOnDrop {
     }
 }
 
+async fn next_lifecycle_event(
+    lifecycle: &mut Option<SystemLifecycleMonitor>,
+) -> SystemLifecycleEvent {
+    match lifecycle.as_mut() {
+        Some(mon) => match mon.recv().await {
+            Some(ev) => ev,
+            None => std::future::pending().await,
+        },
+        None => std::future::pending().await,
+    }
+}
+
 /// Runs the Glide server with pre-constructed OS (or mock) backends, optional live GUI state,
 /// and optional runtime command channel (using a no-op DnD backend).
 pub async fn run_server_with_backends(
@@ -172,6 +185,35 @@ pub async fn run_server_with_backends(
 /// Runs the Glide server with explicit OS/mock backends including cross-edge drag-and-drop.
 #[allow(clippy::too_many_arguments)]
 pub async fn run_server_with_dnd(
+    config: ServerConfig,
+    endpoint: GlideServerEndpoint,
+    capture: CaptureHandle,
+    clipboard: Option<ClipboardHandle>,
+    dnd: Arc<dyn DndBackend>,
+    receive_dir: Option<PathBuf>,
+    os_label: &str,
+    runtime: Option<RuntimeState>,
+    cmd_rx: Option<mpsc::UnboundedReceiver<RuntimeCommand>>,
+) -> Result<()> {
+    run_server_with_lifecycle(
+        config,
+        endpoint,
+        capture,
+        clipboard,
+        dnd,
+        receive_dir,
+        os_label,
+        runtime,
+        cmd_rx,
+        None,
+    )
+    .await
+}
+
+/// Runs the Glide server with explicit OS/mock backends, cross-edge drag-and-drop, and an
+/// OS [`SystemLifecycleMonitor`] for event-driven shutdown/sleep snap-back and auto-resume.
+#[allow(clippy::too_many_arguments)]
+pub async fn run_server_with_lifecycle(
     mut config: ServerConfig,
     endpoint: GlideServerEndpoint,
     capture: CaptureHandle,
@@ -181,8 +223,10 @@ pub async fn run_server_with_dnd(
     os_label: &str,
     runtime: Option<RuntimeState>,
     mut cmd_rx: Option<mpsc::UnboundedReceiver<RuntimeCommand>>,
+    mut lifecycle: Option<SystemLifecycleMonitor>,
 ) -> Result<()> {
     let _endpoint_guard = EndpointCloseOnDrop(endpoint.clone());
+    let flush_endpoint = endpoint.clone();
     let local_addr: SocketAddr = endpoint.local_addr();
     let fingerprint = endpoint.fingerprint().to_string();
     let capture_ctrl: Arc<dyn CaptureControl> = Arc::from(capture.control);
@@ -273,17 +317,24 @@ pub async fn run_server_with_dnd(
 
     let (peer_tx, mut peer_rx) = mpsc::unbounded_channel::<PeerEvent>();
     let max_file_bytes = Arc::new(AtomicUsize::new(config.resolved_max_file_bytes()));
+    let os_paused = Arc::new(AtomicBool::new(false));
 
     let server_name = config.name.clone();
     let accept_tx = peer_tx.clone();
     let accept_scale = Arc::clone(&server_scale);
     let accept_max_file_bytes = Arc::clone(&max_file_bytes);
+    let accept_paused = Arc::clone(&os_paused);
     let _accept_guard = AbortOnDrop(tokio::spawn(async move {
         while let Some(incoming) = endpoint.accept_incoming().await {
+            if accept_paused.load(Ordering::Acquire) {
+                incoming.refuse();
+                continue;
+            }
             let sname = server_name.clone();
             let tx = accept_tx.clone();
             let scale = f32::from_bits(accept_scale.load(Ordering::Relaxed));
             let limit = Arc::clone(&accept_max_file_bytes);
+            let task_paused = Arc::clone(&accept_paused);
             tokio::spawn(async move {
                 let session = match tokio::time::timeout(
                     Duration::from_secs(5),
@@ -301,7 +352,13 @@ pub async fn run_server_with_dnd(
                         return;
                     }
                 };
-                if let Err(e) = handle_incoming_session(session, sname, scale, tx, limit).await {
+                if task_paused.load(Ordering::Acquire) {
+                    session.conn.close(0u32.into(), b"server paused");
+                    return;
+                }
+                if let Err(e) =
+                    handle_incoming_session(session, sname, scale, tx, limit, task_paused).await
+                {
                     warn!(error = %e, "Incoming client handshake failed");
                 }
             });
@@ -355,6 +412,12 @@ pub async fn run_server_with_dnd(
                               locked: bool,
                               best_rtt: Option<f32>| {
         if let Some(ref rt) = rt {
+            if os_paused.load(Ordering::Acquire) {
+                rt.update(|s| {
+                    s.locked = locked;
+                });
+                return;
+            }
             let summaries: Vec<PeerSummary> = peers
                 .values()
                 .map(|p| PeerSummary {
@@ -438,6 +501,114 @@ pub async fn run_server_with_dnd(
 
     loop {
         tokio::select! {
+            ev = next_lifecycle_event(&mut lifecycle) => {
+                match ev {
+                    ev @ (SystemLifecycleEvent::PreparingToShutdown(_)
+                    | SystemLifecycleEvent::PreparingToSleep(_)) => {
+                        let (shutting_down, guard) = match ev {
+                            SystemLifecycleEvent::PreparingToShutdown(g) => (true, g),
+                            SystemLifecycleEvent::PreparingToSleep(g) => (false, g),
+                            SystemLifecycleEvent::Resumed => unreachable!(),
+                        };
+                        let close_reason: &[u8] = if shutting_down {
+                            b"os shutdown"
+                        } else {
+                            b"os sleep"
+                        };
+                        os_paused.store(true, Ordering::SeqCst);
+                        info!(
+                            shutting_down,
+                            peers = peers.len(),
+                            "OS preparing to sleep/shut down; gating accepts, closing peers, and flushing QUIC CONNECTION_CLOSE"
+                        );
+                        capture_ctrl.discard_saved_focus();
+                        cancel_pending_drag_handoff(
+                            &mut pending_drag_handoff,
+                            active_remote,
+                            &capture_ctrl,
+                            &dnd,
+                        );
+                        cancel_outgoing_drag(&mut outgoing_drag, &peers);
+                        incoming_drag_peer = None;
+                        early_drag_files.clear();
+                        if let Some(inc) = incoming_drag.take() {
+                            if !inc.drop_requested {
+                                inc.cancel(Arc::clone(&dnd));
+                            }
+                        }
+                        if active_remote.take().is_some() {
+                            active_edge = None;
+                            remote_modifiers = ModifierMask::EMPTY;
+                            pending_dx = 0.0;
+                            pending_dy = 0.0;
+                            coalesce_armed = false;
+                            last_motion_sent = None;
+                            let (lx, ly) = capture_ctrl.last_local_cursor_norm();
+                            let _ = capture_ctrl.leave_remote_at(lx, ly);
+                        }
+                        edge_to_peer.clear();
+                        capture_ctrl.set_active_edges(&[]);
+                        dnd.set_active_edges(&[], config.dead_corner_px);
+                        for (_, peer) in peers.drain() {
+                            peer.conn.close(0u32.into(), close_reason);
+                        }
+                        while let Ok(pe) = peer_rx.try_recv() {
+                            if let PeerEvent::Connected { peer } = pe {
+                                peer.conn.close(0u32.into(), close_reason);
+                            }
+                        }
+                        flush_endpoint.flush_closed().await;
+                        if let Some(ref rt) = runtime {
+                            rt.update(|s| {
+                                s.status = if shutting_down {
+                                    "Paused (OS shutting down)".into()
+                                } else {
+                                    "Paused (OS sleeping)".into()
+                                };
+                                s.active_target = "Local".into();
+                                s.peers.clear();
+                                s.rtt_ms = None;
+                            });
+                        }
+                        // Drop the OS delay inhibitor ONLY AFTER QUIC CONNECTION_CLOSE frames
+                        // have been flushed to all peers.
+                        drop(guard);
+                    }
+
+                    SystemLifecycleEvent::Resumed => {
+                        let was_paused = os_paused.swap(false, Ordering::SeqCst);
+                        let now = Instant::now();
+                        sleep_detector.reset();
+                        capture_ctrl.discard_saved_focus();
+                        info!(
+                            was_paused,
+                            "OS lifecycle resumed; re-enabling server accepts and refreshing discovery beacon"
+                        );
+                        let fresh_geom = capture_ctrl.desktop_geometry();
+                        server_scale.store(fresh_geom.primary_scale().to_bits(), Ordering::Relaxed);
+                        last_ip_check = now;
+                        ip_check_gen = ip_check_gen.wrapping_add(1);
+                        ip_check_in_flight += 1;
+                        let gen = ip_check_gen;
+                        let tx = ip_tx.clone();
+                        tokio::spawn(async move {
+                            let ips = local_ipv4_addresses_async().await;
+                            let _ = tx.send((gen, ips, true));
+                        });
+                        if let Some(ref rt) = runtime {
+                            rt.update(|s| {
+                                s.geometry = fresh_geom;
+                            });
+                        }
+                        beacon_refresh.notify_one();
+                        if !was_paused {
+                            probe_all_peers(&mut peers, now);
+                        }
+                        sync_runtime_peers(&runtime, &peers, active_remote, locked, None);
+                    }
+                }
+            }
+
             _ = &mut coalesce_sleep, if coalesce_armed => {
                 if let Some(retry_delay) = flush_pending_motion(
                     &peers,
@@ -456,6 +627,9 @@ pub async fn run_server_with_dnd(
             }
 
             _ = ping_interval.tick() => {
+                if os_paused.load(Ordering::Acquire) {
+                    continue;
+                }
                 let now = Instant::now();
 
                 // 1. Cross-platform sleep/suspend jump detection (> 5s monotonic or wall-clock leap)
@@ -1627,16 +1801,18 @@ pub async fn run_server_with_dnd(
                                     cursor_norm_y: 0.5,
                                 });
                             }
+                            active_edge = None;
+                            remote_modifiers = ModifierMask::EMPTY;
+                            pending_dx = 0.0;
+                            pending_dy = 0.0;
+                            coalesce_armed = false;
+                            last_motion_sent = None;
+                            let (lx, ly) = capture_ctrl.last_local_cursor_norm();
+                            let _ = capture_ctrl.leave_remote_at(lx, ly);
                         }
-                        active_edge = None;
-                        remote_modifiers = ModifierMask::EMPTY;
-                        pending_dx = 0.0;
-                        pending_dy = 0.0;
-                        coalesce_armed = false;
-                        last_motion_sent = None;
-                        let (lx, ly) = capture_ctrl.last_local_cursor_norm();
-                        let _ = capture_ctrl.leave_remote_at(lx, ly);
-                        sync_runtime_peers(&runtime, &peers, active_remote, locked, None);
+                        if !os_paused.load(Ordering::Acquire) {
+                            sync_runtime_peers(&runtime, &peers, active_remote, locked, None);
+                        }
                     }
 
                     CaptureEvent::SystemResumed => {
@@ -1687,8 +1863,10 @@ pub async fn run_server_with_dnd(
                             });
                         }
                         beacon_refresh.notify_one();
-                        probe_all_peers(&mut peers, now);
-                        sync_runtime_peers(&runtime, &peers, active_remote, locked, None);
+                        if !os_paused.load(Ordering::Acquire) {
+                            probe_all_peers(&mut peers, now);
+                            sync_runtime_peers(&runtime, &peers, active_remote, locked, None);
+                        }
                     }
                 }
             }
@@ -1697,6 +1875,14 @@ pub async fn run_server_with_dnd(
                 let Some(pe) = pe else { break };
                 match pe {
                     PeerEvent::Connected { peer } => {
+                        if os_paused.load(Ordering::Acquire) {
+                            debug!(
+                                peer = %peer.name,
+                                "Closing peer connection accepted while server is OS-paused"
+                            );
+                            peer.conn.close(0u32.into(), b"server paused");
+                            continue;
+                        }
                         if let Some(old_id) = edge_to_peer.insert(peer.edge, peer.id) {
                             if let Some(old_peer) = peers.remove(&old_id) {
                                 info!(old = %old_peer.name, edge = ?peer.edge, "Replacing previous peer on edge");
@@ -2151,6 +2337,7 @@ pub async fn run_server_with_dnd(
         }
     }
 
+    os_paused.store(true, Ordering::SeqCst);
     capture_ctrl.discard_saved_focus();
     cancel_pending_drag_handoff(
         &mut pending_drag_handoff,
@@ -2180,6 +2367,7 @@ pub async fn run_server_with_dnd(
     drop(_clip_apply_guard);
     drop(_accept_guard);
     drop(_beacon_guard);
+    flush_endpoint.close_and_flush(0, b"server stopped").await;
     drop(_endpoint_guard);
     if let Some(ref rt) = runtime {
         rt.update(|s| {
@@ -2198,6 +2386,7 @@ async fn handle_incoming_session(
     server_scale: f32,
     peer_tx: mpsc::UnboundedSender<PeerEvent>,
     max_file_bytes: Arc<AtomicUsize>,
+    os_paused: Arc<AtomicBool>,
 ) -> Result<()> {
     let hello = tokio::time::timeout(Duration::from_secs(5), session.ctrl_recv.recv()).await??;
     let (peer_name, edge, os) = match hello {
@@ -2230,6 +2419,11 @@ async fn handle_incoming_session(
         }
     };
 
+    if os_paused.load(Ordering::Acquire) {
+        session.conn.close(0u32.into(), b"server paused");
+        return Ok(());
+    }
+
     session
         .ctrl_send
         .send(&ControlMessage::Welcome {
@@ -2247,6 +2441,11 @@ async fn handle_incoming_session(
     let conn = session.conn;
     let mut ctrl_send = session.ctrl_send;
     let mut ctrl_recv = session.ctrl_recv;
+
+    if os_paused.load(Ordering::Acquire) {
+        conn.close(0u32.into(), b"server paused");
+        return Ok(());
+    }
 
     let _ctrl_writer_guard = AbortOnDrop(tokio::spawn(async move {
         while let Some(msg) = ctrl_out_rx.recv().await {
@@ -2358,6 +2557,7 @@ pub async fn run_native_server_with_runtime(
     };
 
     let dnd = glide_backend::start_dnd();
+    let lifecycle = SystemLifecycleMonitor::start();
 
     let os_label = match glide_backend::current_os_kind() {
         OsKind::Windows => "windows",
@@ -2367,8 +2567,17 @@ pub async fn run_native_server_with_runtime(
         OsKind::Unknown => "unknown",
     };
 
-    run_server_with_dnd(
-        config, endpoint, capture, clipboard, dnd, None, os_label, runtime, cmd_rx,
+    run_server_with_lifecycle(
+        config,
+        endpoint,
+        capture,
+        clipboard,
+        dnd,
+        None,
+        os_label,
+        runtime,
+        cmd_rx,
+        Some(lifecycle),
     )
     .await
 }

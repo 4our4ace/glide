@@ -63,12 +63,12 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
     GetWindowThreadProcessId, PostMessageW, RegisterClassW, SetCursorPos, SetWindowsHookExW,
     TranslateMessage, UnhookWindowsHookEx, HHOOK, KBDLLHOOKSTRUCT, LLKHF_EXTENDED, MSG,
     MSLLHOOKSTRUCT, PBT_APMRESUMEAUTOMATIC, PBT_APMRESUMECRITICAL, PBT_APMRESUMESUSPEND,
-    PBT_APMSUSPEND, WH_KEYBOARD_LL, WH_MOUSE_LL, WM_APP, WM_DISPLAYCHANGE, WM_DPICHANGED, WM_INPUT,
-    WM_KEYDOWN, WM_KEYUP, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MBUTTONDOWN, WM_MBUTTONUP,
-    WM_MOUSEHWHEEL, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_POWERBROADCAST, WM_QUIT, WM_RBUTTONDOWN,
-    WM_RBUTTONUP, WM_SYSKEYDOWN, WM_SYSKEYUP, WM_WTSSESSION_CHANGE, WM_XBUTTONDOWN, WM_XBUTTONUP,
-    WNDCLASSW, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_OVERLAPPED, WTS_SESSION_LOCK,
-    WTS_SESSION_UNLOCK, XBUTTON1, XBUTTON2,
+    PBT_APMSUSPEND, WH_KEYBOARD_LL, WH_MOUSE_LL, WM_APP, WM_DISPLAYCHANGE, WM_DPICHANGED,
+    WM_ENDSESSION, WM_INPUT, WM_KEYDOWN, WM_KEYUP, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MBUTTONDOWN,
+    WM_MBUTTONUP, WM_MOUSEHWHEEL, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_POWERBROADCAST,
+    WM_QUERYENDSESSION, WM_QUIT, WM_RBUTTONDOWN, WM_RBUTTONUP, WM_SYSKEYDOWN, WM_SYSKEYUP,
+    WM_WTSSESSION_CHANGE, WM_XBUTTONDOWN, WM_XBUTTONUP, WNDCLASSW, WS_EX_NOACTIVATE,
+    WS_EX_TOOLWINDOW, WS_OVERLAPPED, WTS_SESSION_LOCK, WTS_SESSION_UNLOCK, XBUTTON1, XBUTTON2,
 };
 
 const WM_APP_ENTER_REMOTE: u32 = WM_APP + 1;
@@ -1731,6 +1731,25 @@ unsafe extern "system" fn capture_wnd_proc(
             }
             _ => unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) },
         },
+        WM_QUERYENDSESSION => {
+            with_hook_state(|state| {
+                state.release_to_local_on_suspend("WM_QUERYENDSESSION");
+            });
+            1 // TRUE: allow Windows session end / shutdown to proceed
+        }
+        WM_ENDSESSION => {
+            if wparam != 0 {
+                with_hook_state(|state| {
+                    state.release_to_local_on_suspend("WM_ENDSESSION");
+                });
+            } else {
+                ensure_mouse_raw_input_registered(hwnd);
+                with_hook_state(|state| {
+                    state.handle_resume_or_unlock("WM_ENDSESSION_CANCELLED");
+                });
+            }
+            0
+        }
         WM_WTSSESSION_CHANGE => match wparam as u32 {
             WTS_SESSION_LOCK => {
                 with_hook_state(|state| {

@@ -435,13 +435,32 @@ fn spawn_tray_listener(
     });
 }
 
-/// Serves the loopback control API until a quit request (tray, `/api/quit`, the window, Ctrl+C),
-/// then asks the native window to close.
+/// Serves the loopback control API until a quit request (tray, `/api/quit`, the window, or an
+/// OS termination signal: `SIGINT`/`SIGTERM`/`SIGHUP` on Unix; `CTRL_C`/`CTRL_CLOSE`/
+/// `CTRL_LOGOFF`/`CTRL_SHUTDOWN` on Windows), flushing engine shutdown before closing the UI.
 async fn serve(
     listener: TcpListener,
     ctrl: Arc<AppController>,
-    mut quit_rx: mpsc::UnboundedReceiver<()>,
+    quit_rx: mpsc::UnboundedReceiver<()>,
 ) {
+    serve_with_signal(
+        listener,
+        ctrl,
+        quit_rx,
+        glide_backend::lifecycle::shutdown_signal(),
+    )
+    .await;
+}
+
+async fn serve_with_signal<F>(
+    listener: TcpListener,
+    ctrl: Arc<AppController>,
+    mut quit_rx: mpsc::UnboundedReceiver<()>,
+    shutdown: F,
+) where
+    F: std::future::Future<Output = &'static str>,
+{
+    tokio::pin!(shutdown);
     loop {
         tokio::select! {
             accept = listener.accept() => {
@@ -461,8 +480,9 @@ async fn serve(
                 info!("Exiting Glide GUI");
                 break;
             }
-            _ = tokio::signal::ctrl_c() => {
-                info!("Shutting down Glide GUI (Ctrl+C)");
+            sig = &mut shutdown => {
+                info!(signal = sig, "Shutting down Glide GUI on OS signal");
+                ctrl.stop_engine().await;
                 break;
             }
         }
@@ -1735,5 +1755,58 @@ mod tests {
         assert!(r3.contains("not currently running"));
 
         srv.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn gui_signal_shutdown_flushes_active_engine_before_quitting_ui() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let url = format!("http://127.0.0.1:{}", addr.port());
+        let tmp_cfg = std::env::temp_dir().join(format!(
+            "glide-gui-sig-test-{}-{}.toml",
+            std::process::id(),
+            addr.port()
+        ));
+        let _ = std::fs::remove_file(&tmp_cfg);
+        let (quit_tx, quit_rx) = mpsc::unbounded_channel();
+        let ctrl = Arc::new(AppController::new(tmp_cfg.clone(), url, quit_tx));
+
+        let events = Arc::new(Mutex::new(Vec::<&'static str>::new()));
+        let events_ui = Arc::clone(&events);
+        *ctrl.ui_quit.lock() = Some(Arc::new(move || {
+            events_ui.lock().push("ui_quit");
+        }));
+
+        let (cmd_tx, mut cmd_rx) = mpsc::unbounded_channel();
+        let events_engine = Arc::clone(&events);
+        let engine_task = tokio::spawn(async move {
+            if let Some(RuntimeCommand::Shutdown) = cmd_rx.recv().await {
+                // Simulate a bounded QUIC close_and_flush before engine exit.
+                tokio::time::sleep(Duration::from_millis(20)).await;
+                events_engine.lock().push("engine_flushed");
+            }
+        });
+        *ctrl.engine.lock() = Some(ActiveEngine {
+            task: engine_task,
+            cmd_tx,
+        });
+
+        let (sig_tx, sig_rx) = tokio::sync::oneshot::channel::<&'static str>();
+        let serve_task = tokio::spawn(serve_with_signal(
+            listener,
+            Arc::clone(&ctrl),
+            quit_rx,
+            async move { sig_rx.await.unwrap_or("SIGTERM") },
+        ));
+
+        sig_tx.send("SIGTERM").unwrap();
+        tokio::time::timeout(Duration::from_secs(2), serve_task)
+            .await
+            .expect("serve_with_signal did not exit promptly on OS signal")
+            .unwrap();
+
+        assert_eq!(*events.lock(), vec!["engine_flushed", "ui_quit"]);
+        assert!(ctrl.engine.lock().is_none());
+        let _ = std::fs::remove_file(&tmp_cfg);
     }
 }

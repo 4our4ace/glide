@@ -3062,4 +3062,713 @@ mod tests {
 
         srv_task.abort();
     }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn client_os_shutdown_flushes_quic_close_before_dropping_inhibitor_and_resumes_on_cancel()
+    {
+        use crate::client::run_client_with_backends_and_lifecycle;
+        use crate::runtime::RuntimeCommand;
+        use crate::server::run_server_with_lifecycle;
+        use glide_backend::dnd::NoopDndBackend;
+        use glide_backend::lifecycle::{
+            ShutdownInhibitorGuard, SystemLifecycleEvent, SystemLifecycleMonitor,
+        };
+        use std::sync::atomic::AtomicBool;
+        use std::sync::Arc;
+        use std::time::Instant;
+        use tokio::sync::{mpsc, oneshot};
+
+        let identity = ServerIdentity::generate_ephemeral().unwrap();
+        let fp = identity.fingerprint.clone();
+        let endpoint =
+            GlideServerEndpoint::bind("127.0.0.1:0".parse().unwrap(), &identity).unwrap();
+        let addr = endpoint.local_addr();
+
+        let (capture_handle, cap_tx, cap_state) = create_mock_capture(single_monitor_geom("Srv"));
+        let (mut injector, inj_log) = MockInjector::new(single_monitor_geom("Cli"));
+        let discard_focus_count = Arc::clone(&injector.discard_focus_count);
+        let srv_rt = RuntimeState::new();
+        let cli_rt = RuntimeState::new();
+        let (srv_cmd_tx, srv_cmd_rx) = mpsc::unbounded_channel();
+        let (cli_cmd_tx, cli_cmd_rx) = mpsc::unbounded_channel();
+        let (cli_lc, cli_lc_tx) = SystemLifecycleMonitor::from_channel();
+
+        let srv_cfg = ServerConfig {
+            name: "srv-lc-client".into(),
+            discovery: false,
+            clipboard: false,
+            motion_coalesce_us: 0,
+            ..Default::default()
+        };
+        let cli_cfg = ClientConfig {
+            name: "cli-lc-shutdown".into(),
+            server: Some(addr.to_string()),
+            edge: Edge::Right,
+            trusted_fingerprint: Some(fp),
+            clipboard: false,
+            ..Default::default()
+        };
+
+        let srv_rt_c = srv_rt.clone();
+        let srv_task = tokio::spawn(async move {
+            run_server_with_lifecycle(
+                srv_cfg,
+                endpoint,
+                capture_handle,
+                None,
+                Arc::new(NoopDndBackend),
+                None,
+                "linux-x11",
+                Some(srv_rt_c),
+                Some(srv_cmd_rx),
+                None,
+            )
+            .await
+        });
+
+        let cli_rt_c = cli_rt.clone();
+        let cli_task = tokio::spawn(async move {
+            let mut no_clip = None;
+            run_client_with_backends_and_lifecycle(
+                cli_cfg,
+                &mut injector,
+                &mut no_clip,
+                Arc::new(NoopDndBackend),
+                None,
+                Some(cli_rt_c),
+                Some(cli_cmd_rx),
+                Some(cli_lc),
+            )
+            .await
+        });
+
+        // Wait for initial connection
+        for _ in 0..60 {
+            if srv_rt.snapshot().peers.len() == 1
+                && cli_rt.snapshot().status.starts_with("Connected")
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert_eq!(srv_rt.snapshot().peers.len(), 1);
+
+        // Move focus onto client and hold Ctrl
+        cap_tx
+            .send(CaptureEvent::EdgeCrossed {
+                edge: Edge::Right,
+                normalized_pos: 0.5,
+            })
+            .unwrap();
+        cap_tx
+            .send(CaptureEvent::Key {
+                usage: HidUsage::CONTROL_LEFT,
+                pressed: true,
+            })
+            .unwrap();
+        for _ in 0..40 {
+            if cap_state.remote_mode.load(Ordering::SeqCst)
+                && inj_log
+                    .lock()
+                    .contains(&InjectedAction::Key(HidUsage::CONTROL_LEFT, true))
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(cap_state.remote_mode.load(Ordering::SeqCst));
+
+        // Simulate client OS shutdown with a rendezvous inside ShutdownInhibitorGuard::on_drop.
+        // Holding the client task frozen inside `on_drop` guarantees that NO code after
+        // `drop(guard)` has executed yet, proving that both local cleanup AND QUIC
+        // CONNECTION_CLOSE flushing occurred strictly before releasing the OS inhibitor.
+        let release_before_drop = Arc::new(AtomicBool::new(false));
+        let discard_before_drop = Arc::new(AtomicBool::new(false));
+        let inhibitor_dropped = Arc::new(AtomicBool::new(false));
+        let (drop_entered_tx, drop_entered_rx) = oneshot::channel::<()>();
+        let (allow_drop_tx, allow_drop_rx) = std::sync::mpsc::sync_channel::<()>(1);
+
+        let discards_before = discard_focus_count.load(Ordering::SeqCst);
+        let inj_log_drop = Arc::clone(&inj_log);
+        let discard_focus_drop = Arc::clone(&discard_focus_count);
+        let release_before_drop_c = Arc::clone(&release_before_drop);
+        let discard_before_drop_c = Arc::clone(&discard_before_drop);
+        let inhibitor_dropped_c = Arc::clone(&inhibitor_dropped);
+        let guard = ShutdownInhibitorGuard::with_on_drop(move || {
+            let log = inj_log_drop.lock();
+            release_before_drop_c.store(
+                log.contains(&InjectedAction::ReleaseAll),
+                Ordering::SeqCst,
+            );
+            drop(log);
+            discard_before_drop_c.store(
+                discard_focus_drop.load(Ordering::SeqCst) > discards_before,
+                Ordering::SeqCst,
+            );
+            let _ = drop_entered_tx.send(());
+            let _ = allow_drop_rx.recv_timeout(Duration::from_secs(2));
+            inhibitor_dropped_c.store(true, Ordering::SeqCst);
+        });
+        let t_shutdown = Instant::now();
+        cli_lc_tx
+            .send(SystemLifecycleEvent::PreparingToShutdown(guard))
+            .unwrap();
+
+        tokio::time::timeout(Duration::from_secs(1), drop_entered_rx)
+            .await
+            .expect("client must drop ShutdownInhibitorGuard promptly")
+            .unwrap();
+
+        // Strictly before `drop(guard)` returns: local input cleanup must already be complete.
+        assert!(
+            release_before_drop.load(Ordering::SeqCst),
+            "client must call release_all() before dropping ShutdownInhibitorGuard"
+        );
+        assert!(
+            discard_before_drop.load(Ordering::SeqCst),
+            "client must call discard_saved_focus() before dropping ShutdownInhibitorGuard"
+        );
+
+        // Strictly while the client task is still frozen inside `drop(guard)`, the server must
+        // observe the already-flushed QUIC CONNECTION_CLOSE and snap back to local well under 400ms.
+        let mut snapped_back = false;
+        for _ in 0..50 {
+            if !cap_state.remote_mode.load(Ordering::SeqCst)
+                && srv_rt.snapshot().peers.is_empty()
+            {
+                snapped_back = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(
+            snapped_back,
+            "server must observe flushed QUIC CONNECTION_CLOSE before inhibitor drop finishes; remote={}, peers={}, elapsed={:?}",
+            cap_state.remote_mode.load(Ordering::SeqCst),
+            srv_rt.snapshot().peers.len(),
+            t_shutdown.elapsed()
+        );
+        assert!(
+            t_shutdown.elapsed() < Duration::from_millis(600),
+            "snap-back took {:?} (expected immediate QUIC CONNECTION_CLOSE)",
+            t_shutdown.elapsed()
+        );
+
+        // Unblock inhibitor drop and confirm completion.
+        let _ = allow_drop_tx.send(());
+        for _ in 0..40 {
+            if inhibitor_dropped.load(Ordering::SeqCst) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert!(inhibitor_dropped.load(Ordering::SeqCst));
+
+        // Client must stay parked in wait_while_os_paused without reconnecting while OS is paused
+        for _ in 0..30 {
+            if cli_rt.snapshot().status == "Paused (OS shutting down)" {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(cli_rt.snapshot().status, "Paused (OS shutting down)");
+        tokio::time::sleep(Duration::from_millis(250)).await;
+        assert!(
+            srv_rt.snapshot().peers.is_empty(),
+            "client must not reconnect while OS is paused"
+        );
+
+        // Simulate cancelled shutdown / wake -> client automatically resumes and reconnects!
+        cli_lc_tx.send(SystemLifecycleEvent::Resumed).unwrap();
+        let mut reconnected = false;
+        for _ in 0..80 {
+            if srv_rt.snapshot().peers.len() == 1
+                && cli_rt.snapshot().status.starts_with("Connected")
+            {
+                reconnected = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(
+            reconnected,
+            "client must automatically reconnect after Resumed; status={}",
+            cli_rt.snapshot().status
+        );
+
+        cli_cmd_tx.send(RuntimeCommand::Shutdown).unwrap();
+        srv_cmd_tx.send(RuntimeCommand::Shutdown).unwrap();
+        tokio::time::timeout(Duration::from_secs(2), cli_task)
+            .await
+            .expect("client must exit cleanly")
+            .unwrap()
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(2), srv_task)
+            .await
+            .expect("server must exit cleanly")
+            .unwrap()
+            .unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn server_os_sleep_gates_accepts_flushes_peers_before_dropping_inhibitor_and_resumes() {
+        use crate::client::run_client_with_backends_and_lifecycle;
+        use crate::runtime::RuntimeCommand;
+        use crate::server::run_server_with_lifecycle;
+        use glide_backend::dnd::NoopDndBackend;
+        use glide_backend::lifecycle::{
+            ShutdownInhibitorGuard, SystemLifecycleEvent, SystemLifecycleMonitor,
+        };
+        use glide_net::connect_client;
+        use glide_net::tls::TrustMode;
+        use std::sync::atomic::AtomicBool;
+        use std::sync::Arc;
+        use std::time::Instant;
+        use tokio::sync::{mpsc, oneshot};
+
+        let identity = ServerIdentity::generate_ephemeral().unwrap();
+        let fp = identity.fingerprint.clone();
+        let endpoint =
+            GlideServerEndpoint::bind("127.0.0.1:0".parse().unwrap(), &identity).unwrap();
+        let addr = endpoint.local_addr();
+
+        let (capture_handle, cap_tx, cap_state) = create_mock_capture(single_monitor_geom("Srv"));
+        let (mut injector, inj_log) = MockInjector::new(single_monitor_geom("Cli"));
+        let srv_rt = RuntimeState::new();
+        let cli_rt = RuntimeState::new();
+        let (srv_cmd_tx, srv_cmd_rx) = mpsc::unbounded_channel();
+        let (cli_cmd_tx, cli_cmd_rx) = mpsc::unbounded_channel();
+        let (srv_lc, srv_lc_tx) = SystemLifecycleMonitor::from_channel();
+
+        let srv_cfg = ServerConfig {
+            name: "srv-lc-sleep".into(),
+            discovery: false,
+            clipboard: false,
+            motion_coalesce_us: 0,
+            ..Default::default()
+        };
+        let cli_cfg = ClientConfig {
+            name: "cli-peer".into(),
+            server: Some(addr.to_string()),
+            edge: Edge::Right,
+            trusted_fingerprint: Some(fp.clone()),
+            clipboard: false,
+            ..Default::default()
+        };
+
+        let srv_rt_c = srv_rt.clone();
+        let srv_task = tokio::spawn(async move {
+            run_server_with_lifecycle(
+                srv_cfg,
+                endpoint,
+                capture_handle,
+                None,
+                Arc::new(NoopDndBackend),
+                None,
+                "linux-x11",
+                Some(srv_rt_c),
+                Some(srv_cmd_rx),
+                Some(srv_lc),
+            )
+            .await
+        });
+
+        let cli_rt_c = cli_rt.clone();
+        let cli_task = tokio::spawn(async move {
+            let mut no_clip = None;
+            run_client_with_backends_and_lifecycle(
+                cli_cfg,
+                &mut injector,
+                &mut no_clip,
+                Arc::new(NoopDndBackend),
+                None,
+                Some(cli_rt_c),
+                Some(cli_cmd_rx),
+                None,
+            )
+            .await
+        });
+
+        // Wait for connection and move focus to client with held key
+        for _ in 0..60 {
+            if srv_rt.snapshot().peers.len() == 1
+                && cli_rt.snapshot().status.starts_with("Connected")
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert_eq!(srv_rt.snapshot().peers.len(), 1);
+
+        cap_tx
+            .send(CaptureEvent::EdgeCrossed {
+                edge: Edge::Right,
+                normalized_pos: 0.5,
+            })
+            .unwrap();
+        cap_tx
+            .send(CaptureEvent::Key {
+                usage: HidUsage::SHIFT_LEFT,
+                pressed: true,
+            })
+            .unwrap();
+        for _ in 0..40 {
+            if cap_state.remote_mode.load(Ordering::SeqCst)
+                && inj_log
+                    .lock()
+                    .contains(&InjectedAction::Key(HidUsage::SHIFT_LEFT, true))
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(cap_state.remote_mode.load(Ordering::SeqCst));
+
+        // Trigger PreparingToSleep on the server with a rendezvous inside `on_drop`.
+        // Snapshotting server state at drop entry AND verifying the client already received
+        // QUIC CONNECTION_CLOSE while the server is frozen inside `on_drop` proves strict
+        // flush-before-inhibitor-drop ordering.
+        let local_restored_before_drop = Arc::new(AtomicBool::new(false));
+        let edges_cleared_before_drop = Arc::new(AtomicBool::new(false));
+        let peers_cleared_before_drop = Arc::new(AtomicBool::new(false));
+        let status_paused_before_drop = Arc::new(AtomicBool::new(false));
+        let inhibitor_dropped = Arc::new(AtomicBool::new(false));
+        let (drop_entered_tx, drop_entered_rx) = oneshot::channel::<()>();
+        let (allow_drop_tx, allow_drop_rx) = std::sync::mpsc::sync_channel::<()>(1);
+
+        let cap_state_drop = Arc::clone(&cap_state);
+        let srv_rt_drop = srv_rt.clone();
+        let local_restored_c = Arc::clone(&local_restored_before_drop);
+        let edges_cleared_c = Arc::clone(&edges_cleared_before_drop);
+        let peers_cleared_c = Arc::clone(&peers_cleared_before_drop);
+        let status_paused_c = Arc::clone(&status_paused_before_drop);
+        let inhibitor_dropped_c = Arc::clone(&inhibitor_dropped);
+        let guard = ShutdownInhibitorGuard::with_on_drop(move || {
+            local_restored_c.store(
+                !cap_state_drop.remote_mode.load(Ordering::SeqCst),
+                Ordering::SeqCst,
+            );
+            edges_cleared_c.store(
+                cap_state_drop.active_edges.lock().is_empty(),
+                Ordering::SeqCst,
+            );
+            let snap = srv_rt_drop.snapshot();
+            peers_cleared_c.store(snap.peers.is_empty(), Ordering::SeqCst);
+            status_paused_c.store(snap.status == "Paused (OS sleeping)", Ordering::SeqCst);
+            let _ = drop_entered_tx.send(());
+            let _ = allow_drop_rx.recv_timeout(Duration::from_secs(2));
+            inhibitor_dropped_c.store(true, Ordering::SeqCst);
+        });
+        let t_sleep = Instant::now();
+        srv_lc_tx
+            .send(SystemLifecycleEvent::PreparingToSleep(guard))
+            .unwrap();
+
+        tokio::time::timeout(Duration::from_secs(1), drop_entered_rx)
+            .await
+            .expect("server must drop ShutdownInhibitorGuard promptly")
+            .unwrap();
+
+        assert!(
+            local_restored_before_drop.load(Ordering::SeqCst),
+            "server must restore local capture before dropping inhibitor"
+        );
+        assert!(
+            edges_cleared_before_drop.load(Ordering::SeqCst),
+            "server must clear active edges before dropping inhibitor"
+        );
+        assert!(
+            peers_cleared_before_drop.load(Ordering::SeqCst),
+            "server must drain peers before dropping inhibitor"
+        );
+        assert!(
+            status_paused_before_drop.load(Ordering::SeqCst),
+            "server must update paused runtime status before dropping inhibitor"
+        );
+
+        // Strictly while the server task is still frozen inside `drop(guard)`, the client must
+        // receive the already-flushed QUIC CONNECTION_CLOSE and release all held keys.
+        let mut client_released = false;
+        for _ in 0..50 {
+            if inj_log.lock().contains(&InjectedAction::ReleaseAll) {
+                client_released = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(
+            client_released,
+            "client must observe flushed QUIC CONNECTION_CLOSE before server inhibitor drop finishes; elapsed={:?}",
+            t_sleep.elapsed()
+        );
+        assert!(t_sleep.elapsed() < Duration::from_millis(600));
+
+        // Unblock inhibitor drop and confirm completion.
+        let _ = allow_drop_tx.send(());
+        for _ in 0..40 {
+            if inhibitor_dropped.load(Ordering::SeqCst) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert!(inhibitor_dropped.load(Ordering::SeqCst));
+
+        // Duplicate CaptureEvent::SystemSuspended (as Windows emits alongside PBT_APMSUSPEND /
+        // WM_QUERYENDSESSION) must NOT clobber the paused runtime status or warp the cursor again.
+        let leaves_before = cap_state.leave_remote_at_calls.load(Ordering::SeqCst);
+        cap_tx.send(CaptureEvent::SystemSuspended).unwrap();
+        tokio::time::sleep(Duration::from_millis(40)).await;
+        assert_eq!(
+            srv_rt.snapshot().status,
+            "Paused (OS sleeping)",
+            "SystemSuspended while os_paused must not clobber paused runtime status"
+        );
+        assert_eq!(
+            cap_state.leave_remote_at_calls.load(Ordering::SeqCst),
+            leaves_before,
+            "SystemSuspended while already local must not issue a spurious leave_remote_at warp"
+        );
+
+        // While server is os_paused, direct QUIC connects MUST be refused/gated and peer count stays 0
+        let probe_res = tokio::time::timeout(
+            Duration::from_millis(400),
+            connect_client(addr, TrustMode::Pinned(fp)),
+        )
+        .await;
+        assert!(
+            !matches!(probe_res, Ok(Ok(_))),
+            "server must refuse new connections while os_paused"
+        );
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert!(
+            srv_rt.snapshot().peers.is_empty(),
+            "no peers may register while server is os_paused"
+        );
+
+        // Resume server -> accepts un-gate and client automatically reconnects
+        srv_lc_tx.send(SystemLifecycleEvent::Resumed).unwrap();
+        let mut reconnected = false;
+        for _ in 0..200 {
+            if srv_rt.snapshot().peers.len() == 1
+                && cli_rt.snapshot().status.starts_with("Connected")
+            {
+                reconnected = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        assert!(
+            reconnected,
+            "client must reconnect after server Resumed; srv_status={}, cli_status={}",
+            srv_rt.snapshot().status,
+            cli_rt.snapshot().status
+        );
+
+        cli_cmd_tx.send(RuntimeCommand::Shutdown).unwrap();
+        srv_cmd_tx.send(RuntimeCommand::Shutdown).unwrap();
+        tokio::time::timeout(Duration::from_secs(2), cli_task)
+            .await
+            .expect("client must exit cleanly")
+            .unwrap()
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(2), srv_task)
+            .await
+            .expect("server must exit cleanly")
+            .unwrap()
+            .unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn graceful_shutdown_flushes_quic_close_for_instant_snap_back_both_directions() {
+        use crate::client::run_client_with_backends;
+        use crate::runtime::RuntimeCommand;
+        use std::time::Instant;
+        use tokio::sync::mpsc;
+
+        let identity = ServerIdentity::generate_ephemeral().unwrap();
+        let fp = identity.fingerprint.clone();
+        let endpoint =
+            GlideServerEndpoint::bind("127.0.0.1:0".parse().unwrap(), &identity).unwrap();
+        let addr = endpoint.local_addr();
+
+        let (capture_handle, cap_tx, cap_state) = create_mock_capture(single_monitor_geom("Srv"));
+        let srv_rt = RuntimeState::new();
+        let (srv_cmd_tx, srv_cmd_rx) = mpsc::unbounded_channel();
+
+        let srv_cfg = ServerConfig {
+            name: "srv-flush".into(),
+            discovery: false,
+            clipboard: false,
+            motion_coalesce_us: 0,
+            ..Default::default()
+        };
+        let srv_rt_c = srv_rt.clone();
+        let srv_task = tokio::spawn(async move {
+            run_server_with_backends(
+                srv_cfg,
+                endpoint,
+                capture_handle,
+                None,
+                "linux-x11",
+                Some(srv_rt_c),
+                Some(srv_cmd_rx),
+            )
+            .await
+        });
+
+        // Direction 1: Client graceful Shutdown snaps server back to local immediately (< 500ms)
+        let (mut inj1, _) = MockInjector::new(single_monitor_geom("Cli1"));
+        let cli1_rt = RuntimeState::new();
+        let (cli1_cmd_tx, cli1_cmd_rx) = mpsc::unbounded_channel();
+        let cli1_cfg = ClientConfig {
+            name: "cli1".into(),
+            server: Some(addr.to_string()),
+            edge: Edge::Right,
+            trusted_fingerprint: Some(fp.clone()),
+            clipboard: false,
+            ..Default::default()
+        };
+        let cli1_rt_c = cli1_rt.clone();
+        let cli1_task = tokio::spawn(async move {
+            let mut no_clip = None;
+            run_client_with_backends(
+                cli1_cfg,
+                &mut inj1,
+                &mut no_clip,
+                Some(cli1_rt_c),
+                Some(cli1_cmd_rx),
+            )
+            .await
+        });
+
+        for _ in 0..60 {
+            if srv_rt.snapshot().peers.len() == 1 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert_eq!(srv_rt.snapshot().peers.len(), 1);
+        cap_tx
+            .send(CaptureEvent::EdgeCrossed {
+                edge: Edge::Right,
+                normalized_pos: 0.5,
+            })
+            .unwrap();
+        for _ in 0..40 {
+            if cap_state.remote_mode.load(Ordering::SeqCst) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(cap_state.remote_mode.load(Ordering::SeqCst));
+
+        let t1 = Instant::now();
+        cli1_cmd_tx.send(RuntimeCommand::Shutdown).unwrap();
+        tokio::time::timeout(Duration::from_secs(2), cli1_task)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        let mut srv_snapped = false;
+        for _ in 0..50 {
+            if !cap_state.remote_mode.load(Ordering::SeqCst) && srv_rt.snapshot().peers.is_empty() {
+                srv_snapped = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(srv_snapped, "server must snap back on client shutdown");
+        assert!(
+            t1.elapsed() < Duration::from_millis(600),
+            "client shutdown snap-back took {:?}",
+            t1.elapsed()
+        );
+
+        // Direction 2: Server graceful Shutdown flushes close so client immediately releases keys
+        let (mut inj2, log2) = MockInjector::new(single_monitor_geom("Cli2"));
+        let cli2_rt = RuntimeState::new();
+        let (cli2_cmd_tx, cli2_cmd_rx) = mpsc::unbounded_channel();
+        let cli2_cfg = ClientConfig {
+            name: "cli2".into(),
+            server: Some(addr.to_string()),
+            edge: Edge::Right,
+            trusted_fingerprint: Some(fp),
+            clipboard: false,
+            ..Default::default()
+        };
+        let cli2_rt_c = cli2_rt.clone();
+        let cli2_task = tokio::spawn(async move {
+            let mut no_clip = None;
+            run_client_with_backends(
+                cli2_cfg,
+                &mut inj2,
+                &mut no_clip,
+                Some(cli2_rt_c),
+                Some(cli2_cmd_rx),
+            )
+            .await
+        });
+
+        for _ in 0..60 {
+            if srv_rt.snapshot().peers.len() == 1
+                && cli2_rt.snapshot().status.starts_with("Connected")
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert_eq!(srv_rt.snapshot().peers.len(), 1);
+        cap_tx
+            .send(CaptureEvent::EdgeCrossed {
+                edge: Edge::Right,
+                normalized_pos: 0.5,
+            })
+            .unwrap();
+        cap_tx
+            .send(CaptureEvent::Key {
+                usage: HidUsage::ALT_LEFT,
+                pressed: true,
+            })
+            .unwrap();
+        for _ in 0..40 {
+            if log2
+                .lock()
+                .contains(&InjectedAction::Key(HidUsage::ALT_LEFT, true))
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+
+        let t2 = Instant::now();
+        srv_cmd_tx.send(RuntimeCommand::Shutdown).unwrap();
+        tokio::time::timeout(Duration::from_secs(2), srv_task)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        let mut cli_released = false;
+        for _ in 0..50 {
+            if log2.lock().contains(&InjectedAction::ReleaseAll)
+                && !cli2_rt.snapshot().status.starts_with("Connected")
+            {
+                cli_released = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(cli_released, "client must release all keys on server shutdown");
+        assert!(
+            t2.elapsed() < Duration::from_millis(600),
+            "server shutdown client release took {:?}",
+            t2.elapsed()
+        );
+
+        cli2_cmd_tx.send(RuntimeCommand::Shutdown).unwrap();
+        tokio::time::timeout(Duration::from_secs(2), cli2_task)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+    }
 }

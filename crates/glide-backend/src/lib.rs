@@ -11,6 +11,7 @@ pub mod fullscreen;
 pub mod geometry;
 pub mod hotkeys;
 pub mod icon;
+pub mod lifecycle;
 pub mod mock;
 pub mod os_integration;
 
@@ -19,6 +20,7 @@ pub use fullscreen::{
     FullscreenAppKind,
 };
 pub use hotkeys::{CaptureHotkeys, HotkeyChord, HotkeyMods};
+pub use lifecycle::{ShutdownInhibitorGuard, SystemLifecycleEvent, SystemLifecycleMonitor};
 
 /// User actions emitted by the native OS system tray (Windows 11 & Linux StatusNotifierItem).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
