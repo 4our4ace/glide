@@ -303,6 +303,12 @@ static FULLSCREEN: Icon = Icon {
     body: r#"<path d="M5.6 2.8H3.4A0.6 0.6 0 0 0 2.8 3.4V5.6M10.4 2.8H12.6A0.6 0.6 0 0 1 13.2 3.4V5.6M13.2 10.4V12.6A0.6 0.6 0 0 1 12.6 13.2H10.4M5.6 13.2H3.4A0.6 0.6 0 0 1 2.8 12.6V10.4" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/>"#,
 };
 
+static FULLSCREEN_VIDEO: Icon = Icon {
+    name: "setting-fullscreen-video",
+    view: 16.0,
+    body: r#"<rect x="2.0" y="3.0" width="12.0" height="10.0" rx="1.8" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linejoin="round"/><path d="M6.5 5.5L10.8 8L6.5 10.5Z" fill="currentColor"/>"#,
+};
+
 static KEYBOARD: Icon = Icon {
     name: "setting-keyboard",
     view: 16.0,
@@ -313,6 +319,12 @@ static VOLUME: Icon = Icon {
     name: "setting-volume",
     view: 16.0,
     body: r#"<path d="M2.2 6.2H4.5L7.6 3.5V12.5L4.5 9.8H2.2V6.2Z" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linejoin="round"/><path d="M10.2 5.9A3.0 3.0 0 0 1 10.2 10.1M12.5 3.9A5.6 5.6 0 0 1 12.5 12.1" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/>"#,
+};
+
+static UNFOCUS_WINDOW: Icon = Icon {
+    name: "setting-unfocus-window",
+    view: 16.0,
+    body: r#"<path d="M7.6 3.4H3.6A1.4 1.4 0 0 0 2.2 4.8V12.0A1.4 1.4 0 0 0 3.6 13.4H11.2A1.4 1.4 0 0 0 12.6 12.0V8.4M2.2 6.4H6.2M8.8 7.2L13.6 2.4M10.4 2.4H13.6V5.6" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/>"#,
 };
 
 static MOUSE: Icon = Icon {
@@ -623,12 +635,20 @@ pub fn fullscreen_icon(color: Color) -> El {
     setting_glyph(&FULLSCREEN, color)
 }
 
+pub fn fullscreen_video_icon(color: Color) -> El {
+    setting_glyph(&FULLSCREEN_VIDEO, color)
+}
+
 pub fn keyboard_icon(color: Color) -> El {
     setting_glyph(&KEYBOARD, color)
 }
 
 pub fn volume_icon(color: Color) -> El {
     setting_glyph(&VOLUME, color)
+}
+
+pub fn unfocus_window_icon(color: Color) -> El {
+    setting_glyph(&UNFOCUS_WINDOW, color)
 }
 
 pub fn mouse_icon(color: Color) -> El {

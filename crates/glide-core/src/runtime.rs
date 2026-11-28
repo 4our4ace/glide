@@ -94,9 +94,11 @@ pub enum RuntimeCommand {
         dead_corner_px: i32,
         edge_dwell_ms: u64,
         auto_lock_fullscreen: bool,
+        allow_fullscreen_videos: bool,
         locked: bool,
         sync_lock_keys: bool,
         pin_media_keys_local: bool,
+        unfocus_on_leave: bool,
         clipboard: bool,
         drag_drop_files: bool,
         hotkeys: CaptureHotkeys,
@@ -110,6 +112,7 @@ pub enum RuntimeCommand {
         edge_threshold_px: i32,
         dead_corner_px: i32,
         sync_lock_keys: bool,
+        unfocus_on_leave: bool,
         clipboard: bool,
         drag_drop_files: bool,
         key_remap: Vec<KeyRemapRule>,
@@ -130,6 +133,9 @@ pub enum RuntimeCommand {
     UpdateMaxFileBytes(usize),
     UpdateReceiveDir(Option<String>),
     ResendClipboard(usize),
+    /// Triggers a single on-demand `Ping` health/RTT sample (e.g. when the GUI window becomes
+    /// visible or focused), keeping idle network traffic at 0.00 Hz.
+    RefreshStats,
     Shutdown,
 }
 

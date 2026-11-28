@@ -172,6 +172,9 @@ impl StagedEdgeTracker {
     /// or lock out subsequent `touch()` refreshes after a >4s hover.
     #[inline]
     pub fn active_mask(&self) -> u8 {
+        if self.mask.load(Ordering::Acquire) == 0 {
+            return 0;
+        }
         self.active_mask_at(self.now_ms())
     }
 

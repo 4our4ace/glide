@@ -21,7 +21,10 @@ use x11rb::connection::Connection;
 use x11rb::protocol::randr::{ConnectionExt as RandrExt, NotifyMask};
 use x11rb::protocol::xfixes::ConnectionExt as XFixesExt;
 use x11rb::protocol::xinput::ConnectionExt as XInputExt;
-use x11rb::protocol::xproto::Window;
+use x11rb::protocol::xproto::{
+    Atom, AtomEnum, ClientMessageData, ClientMessageEvent, ConnectionExt as XProtoExt,
+    CreateWindowAux, EventMask, InputFocus, MapState, Window, WindowClass, CLIENT_MESSAGE_EVENT,
+};
 use x11rb::protocol::xtest::ConnectionExt as XTestExt;
 use x11rb::protocol::Event;
 use x11rb::rust_connection::RustConnection;
@@ -196,6 +199,280 @@ impl X11CursorHider {
     }
 }
 
+#[derive(Clone, Copy)]
+enum SavedX11Focus {
+    /// Managed top-level window read from EWMH `_NET_ACTIVE_WINDOW` on `root`.
+    Ewmh(Window),
+    /// Direct X11 focus window read from `GetInputFocus` (fallback on non-EWMH WMs).
+    Raw(Window),
+}
+
+/// Clears keyboard focus on X11 when focus leaves this machine and optionally restores focus to
+/// the previously active window when control returns.
+///
+/// Lazily creates an offscreen 1×1 `InputOnly` `override_redirect` window (allocating zero X11
+/// resources when unused), maps it only while unfocused, and directs `SetInputFocus` to it with
+/// `revert_to = PointerRoot` so WMs like KWin/Mutter do not immediately jump focus to another app.
+/// Unmapping the sink window on restore or discard ensures keyboard focus is never trapped on the
+/// invisible window if the saved app closed, the session disconnected, or the toggle was disabled.
+#[derive(Default)]
+pub struct X11FocusClearer {
+    win: Option<Window>,
+    mapped: bool,
+    saved_focus: Option<SavedX11Focus>,
+    /// Cached `_NET_ACTIVE_WINDOW` atom (`None` = not yet queried, `Some(NONE)` = unavailable).
+    net_active_atom: Option<Atom>,
+}
+
+impl X11FocusClearer {
+    pub fn new() -> Self {
+        Self {
+            win: None,
+            mapped: false,
+            saved_focus: None,
+            net_active_atom: None,
+        }
+    }
+
+    fn resolve_net_active_atom(&mut self, conn: &RustConnection) -> Option<Atom> {
+        let atom = match self.net_active_atom {
+            Some(a) => a,
+            None => {
+                let interned = conn
+                    .intern_atom(false, b"_NET_ACTIVE_WINDOW")
+                    .ok()
+                    .and_then(|c| c.reply().ok())
+                    .map(|r| r.atom)
+                    .unwrap_or(x11rb::NONE);
+                self.net_active_atom = Some(interned);
+                interned
+            }
+        };
+        (atom != x11rb::NONE).then_some(atom)
+    }
+
+    fn query_ewmh_active_window(&mut self, conn: &RustConnection, root: Window) -> Option<Window> {
+        let atom = self.resolve_net_active_atom(conn)?;
+        let reply = conn
+            .get_property(false, root, atom, AtomEnum::WINDOW, 0, 1)
+            .ok()?
+            .reply()
+            .ok()?;
+        if reply.format != 32 || reply.value.len() < 4 {
+            return None;
+        }
+        let win = u32::from_ne_bytes([
+            reply.value[0],
+            reply.value[1],
+            reply.value[2],
+            reply.value[3],
+        ]);
+        if win == x11rb::NONE || win == root || Some(win) == self.win {
+            return None;
+        }
+        Some(win)
+    }
+
+    fn unmap_sink(&mut self, conn: &RustConnection) {
+        if !self.mapped {
+            return;
+        }
+        self.mapped = false;
+        if let Some(w) = self.win {
+            // Because SetInputFocus used revert_to = PointerRoot, unmapping releases focus
+            // cleanly ONLY if `w` still owns it, without disturbing any window the user focused.
+            if let Ok(cookie) = conn.unmap_window(w) {
+                cookie.ignore_error();
+            }
+            let _ = conn.flush();
+        }
+    }
+
+    /// Discards any saved window and unmaps the focus-sink window so keyboard focus is never
+    /// stranded on the invisible window after disconnect, suspend/resume, or toggle-off.
+    pub fn discard(&mut self, conn: &RustConnection) {
+        self.saved_focus = None;
+        self.unmap_sink(conn);
+    }
+
+    pub fn clear_focus(&mut self, conn: &RustConnection, root: Window) {
+        let pointer_root = u32::from(u8::from(InputFocus::POINTER_ROOT));
+        match conn.get_input_focus().ok().and_then(|c| c.reply().ok()) {
+            Some(reply) if Some(reply.focus) == self.win => {
+                // Focus is already on our sink (e.g. duplicate Leave or remote-to-remote switch);
+                // preserve any previously saved window.
+            }
+            Some(reply)
+                if reply.focus != x11rb::NONE
+                    && reply.focus != pointer_root
+                    && reply.focus != root =>
+            {
+                // Prefer the managed top-level EWMH _NET_ACTIVE_WINDOW over a raw child
+                // focus-proxy or transient override_redirect popup when available.
+                if let Some(ewmh_win) = self.query_ewmh_active_window(conn, root) {
+                    self.saved_focus = Some(SavedX11Focus::Ewmh(ewmh_win));
+                } else {
+                    self.saved_focus = Some(SavedX11Focus::Raw(reply.focus));
+                }
+            }
+            _ => {
+                self.saved_focus = None;
+            }
+        }
+
+        let target_win = match self.win {
+            Some(w) => {
+                if !self.mapped {
+                    if let Ok(cookie) = conn.map_window(w) {
+                        cookie.ignore_error();
+                        self.mapped = true;
+                    }
+                }
+                w
+            }
+            None => match conn.generate_id() {
+                Ok(w) => {
+                    let aux = CreateWindowAux::new().override_redirect(1);
+                    let created = conn
+                        .create_window(
+                            0,
+                            w,
+                            root,
+                            -10,
+                            -10,
+                            1,
+                            1,
+                            0,
+                            WindowClass::INPUT_ONLY,
+                            0,
+                            &aux,
+                        )
+                        .and_then(|c| {
+                            c.ignore_error();
+                            conn.map_window(w)
+                        });
+                    match created {
+                        Ok(map_cookie) => {
+                            map_cookie.ignore_error();
+                            self.win = Some(w);
+                            self.mapped = true;
+                            w
+                        }
+                        Err(e) => {
+                            tracing::debug!(
+                                error = %e,
+                                "Failed creating X11 focus sink window; falling back to root"
+                            );
+                            root
+                        }
+                    }
+                }
+                Err(e) => {
+                    tracing::debug!(
+                        error = %e,
+                        "Failed generating X11 window ID for focus sink; falling back to root"
+                    );
+                    root
+                }
+            },
+        };
+
+        match conn.set_input_focus(InputFocus::POINTER_ROOT, target_win, x11rb::CURRENT_TIME) {
+            Ok(cookie) => {
+                cookie.ignore_error();
+                let _ = conn.flush();
+            }
+            Err(e) => tracing::debug!(error = %e, "X11 SetInputFocus send failed"),
+        }
+    }
+
+    pub fn restore_focus(&mut self, conn: &RustConnection, root: Window) {
+        let saved = self.saved_focus.take();
+
+        let Some(saved) = saved else {
+            self.unmap_sink(conn);
+            return;
+        };
+
+        let pointer_root = u32::from(u8::from(InputFocus::POINTER_ROOT));
+        let Some(cur) = conn.get_input_focus().ok().and_then(|c| c.reply().ok()) else {
+            self.unmap_sink(conn);
+            return;
+        };
+        let focus_still_cleared = Some(cur.focus) == self.win
+            || cur.focus == x11rb::NONE
+            || cur.focus == pointer_root
+            || cur.focus == root;
+        if !focus_still_cleared {
+            self.unmap_sink(conn);
+            return;
+        }
+
+        let target_win = match saved {
+            SavedX11Focus::Ewmh(w) | SavedX11Focus::Raw(w) => w,
+        };
+        let Some(attrs) = conn
+            .get_window_attributes(target_win)
+            .ok()
+            .and_then(|c| c.reply().ok())
+        else {
+            self.unmap_sink(conn);
+            return;
+        };
+        if attrs.map_state != MapState::VIEWABLE {
+            self.unmap_sink(conn);
+            return;
+        }
+
+        // Restore X11 input focus directly (using POINTER_ROOT so it never falls back to root)
+        // so WMs that kept `active_client == target_win` across our override_redirect sink still
+        // restore keyboard focus immediately.
+        match conn.set_input_focus(InputFocus::POINTER_ROOT, target_win, x11rb::CURRENT_TIME) {
+            Ok(cookie) => cookie.ignore_error(),
+            Err(e) => tracing::debug!(error = %e, "X11 restore SetInputFocus send failed"),
+        }
+
+        // Also send EWMH `_NET_ACTIVE_WINDOW` (source indication 2 = pager) for managed windows
+        // so Mutter/KWin/Xfwm4/Openbox refresh decorations and deliver `WM_TAKE_FOCUS` to
+        // ICCCM Globally Active clients (e.g. JetBrains/Java/Qt/Wine).
+        if let SavedX11Focus::Ewmh(w) = saved {
+            if let Some(atom) = self.resolve_net_active_atom(conn) {
+                let ev = ClientMessageEvent {
+                    response_type: CLIENT_MESSAGE_EVENT,
+                    format: 32,
+                    sequence: 0,
+                    window: w,
+                    type_: atom,
+                    data: ClientMessageData::from([2u32, x11rb::CURRENT_TIME, 0, 0, 0]),
+                };
+                if let Ok(cookie) = conn.send_event(
+                    false,
+                    root,
+                    EventMask::SUBSTRUCTURE_REDIRECT | EventMask::SUBSTRUCTURE_NOTIFY,
+                    ev,
+                ) {
+                    cookie.ignore_error();
+                }
+            }
+        }
+
+        // Unmap the sink AFTER moving focus off it so it stays clean and never intercepts input.
+        self.unmap_sink(conn);
+        let _ = conn.flush();
+    }
+
+    pub fn destroy(&mut self, conn: &RustConnection) {
+        self.saved_focus = None;
+        self.mapped = false;
+        if let Some(w) = self.win.take() {
+            if let Ok(cookie) = conn.destroy_window(w) {
+                cookie.ignore_error();
+            }
+            let _ = conn.flush();
+        }
+    }
+}
+
 /// Non-blocking pipe sender used to wake a background `poll(2)` thread without touching
 /// any X11 or Wayland connection mutex.
 pub(crate) struct WakeSender {
@@ -357,6 +634,255 @@ pub(crate) fn poll_fd_and_wake(
     }
 }
 
+/// Decodes the raw `(dx, dy)` valuator deltas from an XInput2 `RawMotion` event.
+pub(crate) fn extract_xi_raw_xy(
+    mask: &[u32],
+    values: &[x11rb::protocol::xinput::Fp3232],
+) -> (f32, f32) {
+    let fp_to_f32 = |v: x11rb::protocol::xinput::Fp3232| -> f32 {
+        v.integral as f32 + (v.frac as f32 / 4_294_967_296.0)
+    };
+    let mut dx = 0.0f32;
+    let mut dy = 0.0f32;
+    if mask.is_empty() {
+        return (0.0, 0.0);
+    }
+    let m0 = mask[0];
+    let mut idx = 0usize;
+    if (m0 & 1) != 0 {
+        if let Some(&v) = values.get(idx) {
+            dx = fp_to_f32(v);
+        }
+        idx += 1;
+    }
+    if (m0 & 2) != 0 {
+        if let Some(&v) = values.get(idx) {
+            dy = fp_to_f32(v);
+        }
+    }
+    (dx, dy)
+}
+
+/// Pure event-driven X11 watcher for [`crate::InputInjector`] implementations.
+///
+/// Runs on a dedicated X11 connection blocking indefinitely in `poll(2)` (0.00 Hz idle wakeups):
+/// - Pushes [`crate::InjectorEvent::GeometryChanged`] immediately on XRandR layout notifications.
+/// - Subscribes to XInput2 `XI_RawMotion` **only while the local cursor is hidden** and pushes
+///   [`crate::InjectorEvent::LocalCursorActivity`] once physical local pointer travel exceeds a
+///   small jitter threshold, replacing all periodic cursor-reveal polling.
+pub(crate) struct X11InjectorEventWatcher {
+    cursor_hidden: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    hidden_gen: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    wake: WakeSender,
+    thread: Option<std::thread::JoinHandle<()>>,
+}
+
+impl X11InjectorEventWatcher {
+    pub(crate) fn start(
+        initial_geometry: DesktopGeometry,
+    ) -> Result<(
+        Self,
+        tokio::sync::mpsc::UnboundedReceiver<crate::InjectorEvent>,
+    )> {
+        use std::os::fd::AsRawFd;
+        use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+        use std::sync::Arc;
+        use x11rb::protocol::xinput::{EventMask as XiEventMask, XIEventMask};
+
+        let (conn, screen_num) =
+            RustConnection::connect(None).context("failed to connect X11 injector event watcher")?;
+        let root = conn.setup().roots[screen_num].root;
+        let randr_subscribed = subscribe_randr_events(&conn, root);
+        let xi_ready = conn
+            .xinput_xi_query_version(2, 2)
+            .ok()
+            .and_then(|c| c.reply().ok())
+            .is_some();
+        let _ = conn.flush();
+
+        let (wake_tx, wake_rx) = wake_pipe()?;
+        let (event_tx, event_rx) = tokio::sync::mpsc::unbounded_channel();
+
+        let cursor_hidden = Arc::new(AtomicBool::new(false));
+        let hidden_gen = Arc::new(AtomicU64::new(0));
+        let stop = Arc::new(AtomicBool::new(false));
+
+        let t_hidden = Arc::clone(&cursor_hidden);
+        let t_gen = Arc::clone(&hidden_gen);
+        let t_stop = Arc::clone(&stop);
+
+        let thread = std::thread::Builder::new()
+            .name("glide-x11-inj-ev".into())
+            .spawn(move || {
+                let mut last_geom = initial_geometry;
+                let mut raw_motion_selected = false;
+                let mut last_gen: u64 = 0;
+                let mut raw_dx: f64 = 0.0;
+                let mut raw_dy: f64 = 0.0;
+                let mut hidden_settle_until: Option<std::time::Instant> = None;
+                let mut emitted_for_gen = false;
+
+                let set_raw_motion = |conn: &RustConnection, enable: bool, selected: &mut bool| {
+                    if !xi_ready || *selected == enable {
+                        return;
+                    }
+                    let mask = if enable {
+                        vec![XIEventMask::RAW_MOTION]
+                    } else {
+                        Vec::new()
+                    };
+                    let em = XiEventMask {
+                        deviceid: 1, // XIAllMasterDevices
+                        mask,
+                    };
+                    if conn.xinput_xi_select_events(root, &[em]).is_ok() {
+                        let _ = conn.flush();
+                        *selected = enable;
+                    }
+                };
+
+                loop {
+                    if t_stop.load(Ordering::Acquire) {
+                        break;
+                    }
+
+                    let want_hidden = t_hidden.load(Ordering::Acquire);
+                    let cur_gen = t_gen.load(Ordering::Acquire);
+                    if want_hidden {
+                        if cur_gen != last_gen {
+                            last_gen = cur_gen;
+                            raw_dx = 0.0;
+                            raw_dy = 0.0;
+                            hidden_settle_until =
+                                Some(std::time::Instant::now() + std::time::Duration::from_millis(40));
+                            emitted_for_gen = false;
+                        }
+                        if !emitted_for_gen {
+                            set_raw_motion(&conn, true, &mut raw_motion_selected);
+                        }
+                    } else {
+                        set_raw_motion(&conn, false, &mut raw_motion_selected);
+                        raw_dx = 0.0;
+                        raw_dy = 0.0;
+                        hidden_settle_until = None;
+                        emitted_for_gen = false;
+                    }
+
+                    let mut randr_dirty = false;
+                    let mut conn_closed = false;
+                    loop {
+                        match conn.poll_for_event() {
+                            Ok(Some(
+                                Event::RandrScreenChangeNotify(_) | Event::RandrNotify(_),
+                            )) => {
+                                randr_dirty = true;
+                            }
+                            Ok(Some(Event::XinputRawMotion(rm))) => {
+                                if raw_motion_selected
+                                    && !emitted_for_gen
+                                    && t_hidden.load(Ordering::Acquire)
+                                {
+                                    // Absorb async /dev/uinput residual motion right after leave().
+                                    if hidden_settle_until
+                                        .is_some_and(|until| std::time::Instant::now() < until)
+                                    {
+                                        continue;
+                                    }
+                                    let (dx, dy) =
+                                        extract_xi_raw_xy(&rm.valuator_mask, &rm.axisvalues_raw);
+                                    raw_dx += dx as f64;
+                                    raw_dy += dy as f64;
+                                    if raw_dx.hypot(raw_dy) >= 12.0
+                                        && t_hidden.load(Ordering::Acquire)
+                                        && t_gen.load(Ordering::Acquire) == last_gen
+                                    {
+                                        emitted_for_gen = true;
+                                        set_raw_motion(&conn, false, &mut raw_motion_selected);
+                                        let _ = event_tx
+                                            .send(crate::InjectorEvent::LocalCursorActivity);
+                                    }
+                                }
+                            }
+                            Ok(Some(_)) => {}
+                            Ok(None) => break,
+                            Err(_) => {
+                                conn_closed = true;
+                                break;
+                            }
+                        }
+                    }
+                    if conn_closed {
+                        break;
+                    }
+
+                    if randr_dirty {
+                        if let Ok(new_geom) = query_desktop_geometry(&conn, screen_num) {
+                            if new_geom != last_geom {
+                                last_geom = new_geom.clone();
+                                let _ = event_tx
+                                    .send(crate::InjectorEvent::GeometryChanged(new_geom));
+                            }
+                        }
+                        // Re-drain any events buffered into x11rb during the RandR roundtrips.
+                        continue;
+                    }
+
+                    if t_stop.load(Ordering::Acquire) {
+                        break;
+                    }
+
+                    let _ = conn.flush();
+                    match poll_fd_and_wake(conn.stream().as_raw_fd(), &wake_rx, -1) {
+                        Ok(st) if !st.fd_error && !st.wake_closed => {}
+                        _ => break,
+                    }
+                }
+
+                set_raw_motion(&conn, false, &mut raw_motion_selected);
+                if randr_subscribed {
+                    unsubscribe_randr_events(&conn, root);
+                }
+                let _ = conn.flush();
+            })
+            .context("failed to spawn glide-x11-inj-ev thread")?;
+
+        Ok((
+            Self {
+                cursor_hidden,
+                hidden_gen,
+                stop,
+                wake: wake_tx,
+                thread: Some(thread),
+            },
+            event_rx,
+        ))
+    }
+
+    pub(crate) fn set_cursor_hidden(&self, hidden: bool) {
+        use std::sync::atomic::Ordering;
+
+        if hidden {
+            self.hidden_gen.fetch_add(1, Ordering::SeqCst);
+            self.cursor_hidden.store(true, Ordering::SeqCst);
+            self.wake.wake();
+        } else if self.cursor_hidden.swap(false, Ordering::SeqCst) {
+            self.wake.wake();
+        }
+    }
+}
+
+impl Drop for X11InjectorEventWatcher {
+    fn drop(&mut self) {
+        self.stop
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        self.wake.wake();
+        if let Some(handle) = self.thread.take() {
+            let _ = handle.join();
+        }
+    }
+}
+
 /// Runs X11 diagnostics for `glide doctor`.
 pub fn run_doctor() -> Result<DoctorReport> {
     let display = std::env::var("DISPLAY").unwrap_or_else(|_| "<unset>".into());
@@ -424,7 +950,6 @@ mod tests {
     use glide_hid::{HidUsage, MouseButton};
     use glide_net::sha256_bytes;
     use glide_proto::{ClipboardFormat, ClipboardPayload, Edge};
-    use x11rb::protocol::xproto::ConnectionExt as XProtoExt;
 
     #[test]
     #[ignore = "requires an active X11 DISPLAY (e.g. Xvfb :99)"]

@@ -538,15 +538,13 @@
   }
   .empty strong { color: var(--text-2); font-weight: 500; font-size: 13px; }
   .empty .spin {
-    width: 14px;
-    height: 14px;
+    width: 10px;
+    height: 10px;
     margin-bottom: 6px;
     border-radius: 50%;
-    border: 1.5px solid var(--line-2);
-    border-top-color: var(--muted);
-    animation: spin 0.9s linear infinite;
+    border: 1.5px solid var(--muted);
+    opacity: 0.6;
   }
-  @keyframes spin { to { transform: rotate(360deg); } }
 
   /* ---------- Arrangement ---------- */
   .desk {
@@ -945,9 +943,17 @@
                 <div class="row-text"><div class="row-label">Pause in fullscreen apps</div><div class="row-desc">Games keep the cursor</div></div>
                 <label class="switch"><input type="checkbox" id="fullscreenLockToggle" checked><span class="slider"></span></label>
               </div>
+              <div class="row" id="allowFullscreenVideosField">
+                <div class="row-text"><div class="row-label">Allow fullscreen videos</div><div class="row-desc">Don&rsquo;t pause in video players &amp; browsers</div></div>
+                <label class="switch"><input type="checkbox" id="allowFullscreenVideosToggle" checked><span class="slider"></span></label>
+              </div>
               <div class="row">
                 <div class="row-text"><div class="row-label">Sync Caps &amp; Num Lock</div><div class="row-desc">Keyboard lights stay consistent</div></div>
                 <label class="switch"><input type="checkbox" id="syncLockToggle" checked><span class="slider"></span></label>
+              </div>
+              <div class="row" id="unfocusOnLeaveField">
+                <div class="row-text"><div class="row-label">Unfocus window on leave</div><div class="row-desc">Clear focus away and restore on return</div></div>
+                <label class="switch"><input type="checkbox" id="unfocusOnLeaveToggle"><span class="slider"></span></label>
               </div>
             </div>
           </div>
@@ -1288,6 +1294,11 @@ function setRole(role) {
   if (!state.running) {
     $('startStopBtn').textContent = role === 'server' ? 'Start Server' : 'Connect';
   }
+  if (state.config) {
+    $('unfocusOnLeaveToggle').checked = !!(
+      role === 'client' ? state.config.client?.unfocus_on_leave : state.config.server?.unfocus_on_leave
+    );
+  }
   updateLayoutHint();
   renderDeskLayout(true);
   renderClientEdgePills();
@@ -1299,7 +1310,9 @@ function guardRole(role) {
     if (role !== state.role) toast('Stop the current session to switch roles');
     return;
   }
+  const changed = role !== state.role;
   setRole(role);
+  if (changed && role === 'client') scanLan(true);
 }
 $('roleServerBtn').onclick = () => guardRole('server');
 $('roleClientBtn').onclick = () => guardRole('client');
@@ -1920,6 +1933,10 @@ function renderShortcuts() {
   }
 }
 
+function updateAllowFullscreenVideosVisibility() {
+  $('allowFullscreenVideosField').style.display = $('fullscreenLockToggle').checked ? '' : 'none';
+}
+
 function syncFormFromConfig() {
   const c = state.config;
   if (!c) return;
@@ -1933,7 +1950,12 @@ function syncFormFromConfig() {
   $('deadCornerSlider').value = c.server.dead_corner_px;
   $('dwellSlider').value = c.server.edge_dwell_ms;
   $('fullscreenLockToggle').checked = !!c.server.auto_lock_fullscreen;
+  $('allowFullscreenVideosToggle').checked = c.server?.allow_fullscreen_videos !== false;
+  updateAllowFullscreenVideosVisibility();
   $('syncLockToggle').checked = !!c.server.sync_lock_keys;
+  $('unfocusOnLeaveToggle').checked = !!(
+    state.role === 'client' ? c.client?.unfocus_on_leave : c.server?.unfocus_on_leave
+  );
   $('clipToggle').checked = !!c.server.clipboard;
   refreshRangeLabels();
 
@@ -1973,8 +1995,14 @@ async function pushConfig() {
   c.client.dead_corner_px = dead;
   c.server.edge_dwell_ms = dwell;
   c.server.auto_lock_fullscreen = $('fullscreenLockToggle').checked;
+  if (c.server) c.server.allow_fullscreen_videos = $('allowFullscreenVideosToggle').checked;
   c.server.sync_lock_keys = $('syncLockToggle').checked;
   c.client.sync_lock_keys = $('syncLockToggle').checked;
+  if (state.role === 'client') {
+    if (c.client) c.client.unfocus_on_leave = $('unfocusOnLeaveToggle').checked;
+  } else if (c.server) {
+    c.server.unfocus_on_leave = $('unfocusOnLeaveToggle').checked;
+  }
   c.server.clipboard = $('clipToggle').checked;
   c.client.clipboard = $('clipToggle').checked;
 
@@ -1996,10 +2024,14 @@ RANGE_IDS.forEach(id => {
 
 [
   'autoDpiToggle', 'invertScrollToggle', 'inputBackendSelect',
-  'fullscreenLockToggle', 'syncLockToggle', 'clipToggle',
+  'allowFullscreenVideosToggle', 'syncLockToggle', 'unfocusOnLeaveToggle', 'clipToggle',
   'discoveryToggle', 'manualServerInput'
 ].forEach(id => { $(id).onchange = () => pushConfig(); });
 
+$('fullscreenLockToggle').onchange = () => {
+  updateAllowFullscreenVideosVisibility();
+  pushConfig();
+};
 $('serverPortInput').onchange = () => { renderLocalIps(state.localIps); pushConfig(); };
 
 // Start / Stop / Lock / Quit
@@ -2251,6 +2283,10 @@ async function init() {
   }
 
   const isWin = state.os.toLowerCase().includes('win');
+  const isWayland = state.os.toLowerCase().includes('wayland');
+  if (isWayland) {
+    $('unfocusOnLeaveField').style.display = 'none';
+  }
   if (isWin) {
     $('linuxBackendField').style.display = 'none';
     $('winOnlyBadge').style.display = 'none';
@@ -2283,16 +2319,31 @@ async function init() {
   fitWindowToContent();
   requestAnimationFrame(() => requestAnimationFrame(() => document.body.classList.remove('preload')));
 
-  _es = new EventSource('/api/events');
-  _es.onmessage = (ev) => {
-    try { renderStatus(JSON.parse(ev.data)); } catch {}
-  };
+  function connectEvents() {
+    if (_es || document.hidden) return;
+    _es = new EventSource('/api/events');
+    _es.onmessage = (ev) => {
+      try { renderStatus(JSON.parse(ev.data)); } catch {}
+    };
+  }
+  function disconnectEvents() {
+    if (_es) {
+      _es.close();
+      _es = null;
+    }
+  }
+  document.addEventListener('visibilitychange', () => {
+    if (document.hidden) {
+      disconnectEvents();
+    } else {
+      connectEvents();
+      const connected = state.status && state.status.status && state.status.status.startsWith('Connected');
+      if (!state.running || (state.role === 'client' && !connected)) scanLan(true);
+    }
+  });
 
+  connectEvents();
   scanLan(true);
-  setInterval(() => {
-    const connected = state.status && state.status.status && state.status.status.startsWith('Connected');
-    if (!state.running || (state.role === 'client' && !connected)) scanLan(true);
-  }, 4500);
 }
 
 init();

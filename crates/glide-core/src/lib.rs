@@ -582,6 +582,11 @@ mod tests {
         }
 
         // Client B must be entered and must NOT have received Client A's stale coalesced (99, 77) move!
+        assert_eq!(
+            cap_state.reset_remote_keys_calls.load(Ordering::SeqCst),
+            1,
+            "direct peer-to-peer switch must reset capture remote_keys_down"
+        );
         {
             let lb = log_b.lock();
             assert!(lb.iter().any(|a| matches!(a, InjectedAction::EnterAt(_, _))));
@@ -620,7 +625,6 @@ mod tests {
     async fn server_and_client_survive_suspend_resume_with_health_probe_and_clean_shutdown() {
         use crate::client::run_client_with_backends;
         use crate::runtime::RuntimeCommand;
-        use std::sync::Arc;
         use tokio::sync::mpsc;
 
         let identity = ServerIdentity::generate_ephemeral().unwrap();
@@ -631,7 +635,7 @@ mod tests {
 
         let (capture_handle, cap_tx, cap_state) = create_mock_capture(single_monitor_geom("Srv"));
         let (mut injector, inj_log) = MockInjector::new(single_monitor_geom("Cli"));
-        let resumed_flag = Arc::clone(&injector.resumed_flag);
+        let cli_event_tx = injector.event_tx.clone();
 
         let srv_rt = RuntimeState::new();
         let cli_rt = RuntimeState::new();
@@ -718,7 +722,9 @@ mod tests {
 
         // Trigger SystemResumed on BOTH server and client -> both arm 1.5s HealthProbes and send Ping!
         cap_tx.send(CaptureEvent::SystemResumed).unwrap();
-        resumed_flag.store(true, Ordering::SeqCst);
+        cli_event_tx
+            .send(glide_backend::InjectorEvent::SystemResumed)
+            .unwrap();
 
         // Wait > 1.5s HealthProbe timeout to prove Ping/Pong cleared probes on BOTH sides
         tokio::time::sleep(Duration::from_millis(1900)).await;
@@ -839,7 +845,6 @@ mod tests {
     #[tokio::test]
     async fn client_fails_fast_when_server_ignores_post_resume_health_ping() {
         use glide_proto::{ControlMessage, PROTOCOL_VERSION};
-        use std::sync::Arc;
 
         let identity = ServerIdentity::generate_ephemeral().unwrap();
         let fp = identity.fingerprint.clone();
@@ -869,7 +874,7 @@ mod tests {
         });
 
         let (mut injector, _) = MockInjector::new(single_monitor_geom("Cli"));
-        let resumed_flag = Arc::clone(&injector.resumed_flag);
+        let cli_event_tx = injector.event_tx.clone();
         let cli_rt = RuntimeState::new();
         let mut cli_cfg = ClientConfig {
             name: "cli-probe".into(),
@@ -903,7 +908,9 @@ mod tests {
         assert!(cli_rt.snapshot().status.starts_with("Connected"));
 
         let started = std::time::Instant::now();
-        resumed_flag.store(true, Ordering::SeqCst);
+        cli_event_tx
+            .send(glide_backend::InjectorEvent::SystemResumed)
+            .unwrap();
 
         let err = tokio::time::timeout(Duration::from_millis(2800), cli_task)
             .await
@@ -1346,9 +1353,11 @@ mod tests {
                 dead_corner_px: 24,
                 edge_dwell_ms: 0,
                 auto_lock_fullscreen: true,
+                allow_fullscreen_videos: true,
                 locked: false,
                 sync_lock_keys: true,
                 pin_media_keys_local: true,
+                unfocus_on_leave: false,
                 clipboard: true,
                 drag_drop_files: false,
                 hotkeys: glide_backend::CaptureHotkeys::default(),
@@ -1727,7 +1736,12 @@ mod tests {
             .await
         });
 
-        // 1. Live UpdateServerTuning updates MockCaptureState.hotkeys immediately
+        assert!(
+            cap_state.allow_fullscreen_videos(),
+            "allow_fullscreen_videos must default to true on server startup"
+        );
+
+        // 1. Live UpdateServerTuning updates MockCaptureState.hotkeys and allow_fullscreen_videos immediately
         let custom_hotkeys = CaptureHotkeys {
             switch_mods: Some(HotkeyMods::CTRL | HotkeyMods::SHIFT),
             lock: Some(HotkeyChord::new(
@@ -1745,9 +1759,11 @@ mod tests {
                 dead_corner_px: 24,
                 edge_dwell_ms: 0,
                 auto_lock_fullscreen: true,
+                allow_fullscreen_videos: false,
                 locked: false,
                 sync_lock_keys: true,
                 pin_media_keys_local: true,
+                unfocus_on_leave: false,
                 clipboard: false,
                 drag_drop_files: true,
                 hotkeys: custom_hotkeys,
@@ -1756,24 +1772,29 @@ mod tests {
 
         let mut updated = false;
         for _ in 0..30 {
-            if *cap_state.hotkeys.lock() == custom_hotkeys {
+            if *cap_state.hotkeys.lock() == custom_hotkeys && !cap_state.allow_fullscreen_videos() {
                 updated = true;
                 break;
             }
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
-        assert!(updated, "UpdateServerTuning must hot-reload CaptureHotkeys");
+        assert!(
+            updated,
+            "UpdateServerTuning must hot-reload CaptureHotkeys and allow_fullscreen_videos"
+        );
 
-        // 2. Disabling all shortcuts via UpdateServerTuning propagates cleanly
+        // 2. Disabling all shortcuts and re-enabling allow_fullscreen_videos propagates cleanly
         srv_cmd_tx
             .send(RuntimeCommand::UpdateServerTuning {
                 edge_threshold_px: 4,
                 dead_corner_px: 24,
                 edge_dwell_ms: 0,
                 auto_lock_fullscreen: true,
+                allow_fullscreen_videos: true,
                 locked: false,
                 sync_lock_keys: true,
                 pin_media_keys_local: true,
+                unfocus_on_leave: false,
                 clipboard: false,
                 drag_drop_files: true,
                 hotkeys: CaptureHotkeys::disabled(),
@@ -1781,7 +1802,9 @@ mod tests {
             .unwrap();
         let mut disabled = false;
         for _ in 0..30 {
-            if *cap_state.hotkeys.lock() == CaptureHotkeys::disabled() {
+            if *cap_state.hotkeys.lock() == CaptureHotkeys::disabled()
+                && cap_state.allow_fullscreen_videos()
+            {
                 disabled = true;
                 break;
             }
@@ -1789,7 +1812,7 @@ mod tests {
         }
         assert!(
             disabled,
-            "UpdateServerTuning must support disabling all shortcuts live"
+            "UpdateServerTuning must support disabling all shortcuts and toggling allow_fullscreen_videos live"
         );
 
         // 3. SetHotkeysSuspended toggles hotkeys_suspended on and off live
@@ -2257,5 +2280,1932 @@ mod tests {
         cli_task.abort();
         srv_task.abort();
         let _ = std::fs::remove_dir_all(&root_tmp);
+    }
+
+    #[tokio::test]
+    async fn server_unfocus_on_leave_triggers_only_when_enabled_live_reloads_and_skips_remote_to_remote(
+    ) {
+        use crate::runtime::RuntimeCommand;
+
+        let identity = ServerIdentity::generate_ephemeral().unwrap();
+        let fp = identity.fingerprint.clone();
+        let endpoint =
+            GlideServerEndpoint::bind("127.0.0.1:0".parse().unwrap(), &identity).unwrap();
+        let addr = endpoint.local_addr();
+
+        let geom = single_monitor_geom("UnfocusSrv");
+        let (capture_handle, cap_tx, cap_state) = create_mock_capture(geom.clone());
+        let (mut right_inj, _right_log) = MockInjector::new(geom.clone());
+        let (mut left_inj, _left_log) = MockInjector::new(geom);
+        let srv_rt = RuntimeState::new();
+        let (srv_cmd_tx, srv_cmd_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (right_cmd_tx, mut right_cmd_rx) = tokio::sync::mpsc::unbounded_channel();
+
+        let srv_cfg = ServerConfig {
+            name: "unfocus-srv".into(),
+            discovery: false,
+            clipboard: false,
+            motion_coalesce_us: 0,
+            unfocus_on_leave: false,
+            ..Default::default()
+        };
+        let mut right_cfg = ClientConfig {
+            name: "unfocus-right".into(),
+            server: Some(addr.to_string()),
+            edge: Edge::Right,
+            trusted_fingerprint: Some(fp.clone()),
+            clipboard: false,
+            ..Default::default()
+        };
+        let mut left_cfg = ClientConfig {
+            name: "unfocus-left".into(),
+            server: Some(addr.to_string()),
+            edge: Edge::Left,
+            trusted_fingerprint: Some(fp),
+            clipboard: false,
+            ..Default::default()
+        };
+
+        let srv_rt_c = srv_rt.clone();
+        let srv_task = tokio::spawn(async move {
+            let _ = run_server_with_backends(
+                srv_cfg,
+                endpoint,
+                capture_handle,
+                None,
+                "windows",
+                Some(srv_rt_c),
+                Some(srv_cmd_rx),
+            )
+            .await;
+        });
+        let right_task = tokio::spawn(async move {
+            let mut opt_clip = None;
+            let _ = run_client_session(
+                &mut right_cfg,
+                addr,
+                &mut right_inj,
+                &mut opt_clip,
+                None,
+                Some(&mut right_cmd_rx),
+            )
+            .await;
+        });
+        let left_task = tokio::spawn(async move {
+            let mut opt_clip = None;
+            let _ =
+                run_client_session(&mut left_cfg, addr, &mut left_inj, &mut opt_clip, None, None)
+                    .await;
+        });
+
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+        while srv_rt.snapshot().peers.len() < 2 {
+            assert!(tokio::time::Instant::now() < deadline);
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(!cap_state.unfocus_on_leave());
+        assert_eq!(cap_state.unfocus_count(), 0);
+        assert_eq!(cap_state.refocus_count(), 0);
+
+        // 1. Disabled by default: Local -> Right -> Local must neither unfocus nor refocus
+        srv_cmd_tx
+            .send(RuntimeCommand::SwitchTarget(Some(Edge::Right)))
+            .unwrap();
+        for _ in 0..40 {
+            if cap_state.remote_mode.load(Ordering::SeqCst)
+                && srv_rt.snapshot().active_target == "unfocus-right"
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(cap_state.remote_mode.load(Ordering::SeqCst));
+        assert_eq!(cap_state.unfocus_count(), 0);
+
+        srv_cmd_tx.send(RuntimeCommand::ReturnLocal).unwrap();
+        for _ in 0..40 {
+            if !cap_state.remote_mode.load(Ordering::SeqCst) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(!cap_state.remote_mode.load(Ordering::SeqCst));
+        assert_eq!(cap_state.refocus_count(), 0);
+
+        // 2. Live-enable via UpdateServerTuning
+        srv_cmd_tx
+            .send(RuntimeCommand::UpdateServerTuning {
+                edge_threshold_px: 4,
+                dead_corner_px: 24,
+                edge_dwell_ms: 0,
+                auto_lock_fullscreen: true,
+                allow_fullscreen_videos: true,
+                locked: false,
+                sync_lock_keys: true,
+                pin_media_keys_local: true,
+                unfocus_on_leave: true,
+                clipboard: false,
+                drag_drop_files: true,
+                hotkeys: glide_backend::CaptureHotkeys::default(),
+            })
+            .unwrap();
+        for _ in 0..40 {
+            if cap_state.unfocus_on_leave() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(cap_state.unfocus_on_leave());
+
+        // 3. Local -> Right triggers unfocus once and saves focus
+        srv_cmd_tx
+            .send(RuntimeCommand::SwitchTarget(Some(Edge::Right)))
+            .unwrap();
+        for _ in 0..40 {
+            if cap_state.remote_mode.load(Ordering::SeqCst)
+                && srv_rt.snapshot().active_target == "unfocus-right"
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(cap_state.unfocus_count(), 1);
+        assert!(cap_state.has_saved_focus());
+
+        // 4. Remote Right -> Remote Left must NOT trigger unfocus or refocus
+        srv_cmd_tx
+            .send(RuntimeCommand::SwitchTarget(Some(Edge::Left)))
+            .unwrap();
+        for _ in 0..40 {
+            if srv_rt.snapshot().active_target == "unfocus-left" {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(srv_rt.snapshot().active_target, "unfocus-left");
+        assert_eq!(
+            cap_state.unfocus_count(),
+            1,
+            "remote -> remote switch must not trigger server unfocus again"
+        );
+        assert_eq!(cap_state.refocus_count(), 0);
+
+        // 5. ReturnLocal restores saved focus (refocus_count == 1)
+        srv_cmd_tx.send(RuntimeCommand::ReturnLocal).unwrap();
+        for _ in 0..40 {
+            if !cap_state.remote_mode.load(Ordering::SeqCst) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(
+            cap_state.refocus_count(),
+            1,
+            "returning to server via ReturnLocal must restore saved focus"
+        );
+
+        // 6. Local -> Left via EdgeCrossed -> EscapeHotkey also restores saved focus (refocus_count == 2)
+        cap_tx
+            .send(CaptureEvent::EdgeCrossed {
+                edge: Edge::Left,
+                normalized_pos: 0.5,
+            })
+            .unwrap();
+        for _ in 0..40 {
+            if cap_state.remote_mode.load(Ordering::SeqCst)
+                && srv_rt.snapshot().active_target == "unfocus-left"
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(cap_state.unfocus_count(), 2);
+        cap_tx.send(CaptureEvent::EscapeHotkey).unwrap();
+        for _ in 0..40 {
+            if !cap_state.remote_mode.load(Ordering::SeqCst) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(
+            cap_state.refocus_count(),
+            2,
+            "returning to server via EscapeHotkey must restore saved focus"
+        );
+
+        // 7. SystemSuspended discards saved focus (no refocus on leave)
+        srv_cmd_tx
+            .send(RuntimeCommand::SwitchTarget(Some(Edge::Right)))
+            .unwrap();
+        for _ in 0..40 {
+            if cap_state.remote_mode.load(Ordering::SeqCst) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(cap_state.unfocus_count(), 3);
+        let discards_before = cap_state.discard_focus_count();
+        cap_tx.send(CaptureEvent::SystemSuspended).unwrap();
+        for _ in 0..40 {
+            if !cap_state.remote_mode.load(Ordering::SeqCst) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(
+            cap_state.refocus_count(),
+            2,
+            "SystemSuspended must discard saved focus and not refocus"
+        );
+        assert!(cap_state.discard_focus_count() > discards_before);
+
+        // 8. SystemResumed discards saved focus (no refocus on leave)
+        srv_cmd_tx
+            .send(RuntimeCommand::SwitchTarget(Some(Edge::Right)))
+            .unwrap();
+        for _ in 0..40 {
+            if cap_state.remote_mode.load(Ordering::SeqCst) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(cap_state.unfocus_count(), 4);
+        let discards_before = cap_state.discard_focus_count();
+        cap_tx.send(CaptureEvent::SystemResumed).unwrap();
+        for _ in 0..40 {
+            if !cap_state.remote_mode.load(Ordering::SeqCst) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(
+            cap_state.refocus_count(),
+            2,
+            "SystemResumed must discard saved focus and not refocus"
+        );
+        assert!(cap_state.discard_focus_count() > discards_before);
+
+        // 9. Active peer disconnect discards saved focus (no refocus on teardown)
+        srv_cmd_tx
+            .send(RuntimeCommand::SwitchTarget(Some(Edge::Right)))
+            .unwrap();
+        for _ in 0..40 {
+            if cap_state.remote_mode.load(Ordering::SeqCst) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(cap_state.unfocus_count(), 5);
+        let discards_before = cap_state.discard_focus_count();
+        right_cmd_tx.send(RuntimeCommand::Shutdown).unwrap();
+        for _ in 0..80 {
+            if !cap_state.remote_mode.load(Ordering::SeqCst) && srv_rt.snapshot().peers.len() == 1 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(!cap_state.remote_mode.load(Ordering::SeqCst));
+        assert_eq!(
+            cap_state.refocus_count(),
+            2,
+            "active peer disconnect must discard saved focus and not refocus"
+        );
+        assert!(cap_state.discard_focus_count() > discards_before);
+
+        // 10. Live-disabling unfocus_on_leave while remote clears saved focus and stops refocusing
+        srv_cmd_tx
+            .send(RuntimeCommand::SwitchTarget(Some(Edge::Left)))
+            .unwrap();
+        for _ in 0..40 {
+            if cap_state.remote_mode.load(Ordering::SeqCst)
+                && srv_rt.snapshot().active_target == "unfocus-left"
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(cap_state.unfocus_count(), 6);
+        srv_cmd_tx
+            .send(RuntimeCommand::UpdateServerTuning {
+                edge_threshold_px: 4,
+                dead_corner_px: 24,
+                edge_dwell_ms: 0,
+                auto_lock_fullscreen: true,
+                allow_fullscreen_videos: true,
+                locked: false,
+                sync_lock_keys: true,
+                pin_media_keys_local: true,
+                unfocus_on_leave: false,
+                clipboard: false,
+                drag_drop_files: true,
+                hotkeys: glide_backend::CaptureHotkeys::default(),
+            })
+            .unwrap();
+        for _ in 0..40 {
+            if !cap_state.unfocus_on_leave() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        srv_cmd_tx.send(RuntimeCommand::ReturnLocal).unwrap();
+        for _ in 0..40 {
+            if !cap_state.remote_mode.load(Ordering::SeqCst) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(
+            cap_state.refocus_count(),
+            2,
+            "disabling unfocus_on_leave live while remote must not refocus on return"
+        );
+
+        // 11. Subsequent leave while disabled does not unfocus
+        srv_cmd_tx
+            .send(RuntimeCommand::SwitchTarget(Some(Edge::Left)))
+            .unwrap();
+        for _ in 0..40 {
+            if cap_state.remote_mode.load(Ordering::SeqCst) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(
+            cap_state.unfocus_count(),
+            6,
+            "disabling unfocus_on_leave live must prevent subsequent unfocus calls"
+        );
+        srv_cmd_tx.send(RuntimeCommand::ReturnLocal).unwrap();
+        for _ in 0..40 {
+            if !cap_state.remote_mode.load(Ordering::SeqCst) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+
+        // 12. Re-enable, leave to Left, then Shutdown while remote -> discards saved focus (no refocus)
+        srv_cmd_tx
+            .send(RuntimeCommand::UpdateServerTuning {
+                edge_threshold_px: 4,
+                dead_corner_px: 24,
+                edge_dwell_ms: 0,
+                auto_lock_fullscreen: true,
+                allow_fullscreen_videos: true,
+                locked: false,
+                sync_lock_keys: true,
+                pin_media_keys_local: true,
+                unfocus_on_leave: true,
+                clipboard: false,
+                drag_drop_files: true,
+                hotkeys: glide_backend::CaptureHotkeys::default(),
+            })
+            .unwrap();
+        for _ in 0..40 {
+            if cap_state.unfocus_on_leave() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        srv_cmd_tx
+            .send(RuntimeCommand::SwitchTarget(Some(Edge::Left)))
+            .unwrap();
+        for _ in 0..40 {
+            if cap_state.remote_mode.load(Ordering::SeqCst) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(cap_state.unfocus_count(), 7);
+        let discards_before = cap_state.discard_focus_count();
+        srv_cmd_tx.send(RuntimeCommand::Shutdown).unwrap();
+        let _ = tokio::time::timeout(Duration::from_secs(2), srv_task)
+            .await
+            .expect("server must shut down cleanly");
+        assert!(!cap_state.remote_mode.load(Ordering::SeqCst));
+        assert_eq!(
+            cap_state.refocus_count(),
+            2,
+            "server shutdown must discard saved focus and not refocus"
+        );
+        assert!(cap_state.discard_focus_count() > discards_before);
+
+        right_task.abort();
+        left_task.abort();
+    }
+
+    #[tokio::test]
+    async fn client_unfocus_on_leave_triggers_only_when_enabled_and_live_reloads() {
+        use crate::runtime::RuntimeCommand;
+        use std::sync::Arc;
+
+        let identity = ServerIdentity::generate_ephemeral().unwrap();
+        let fp = identity.fingerprint.clone();
+        let endpoint =
+            GlideServerEndpoint::bind("127.0.0.1:0".parse().unwrap(), &identity).unwrap();
+        let addr = endpoint.local_addr();
+
+        let geom = single_monitor_geom("UnfocusCli");
+        let (capture_handle, cap_tx, cap_state) = create_mock_capture(geom.clone());
+        let (mut injector, inj_log) = MockInjector::new(geom);
+        let cli_unfocus_flag = Arc::clone(&injector.unfocus_on_leave_flag);
+        let cli_event_tx = injector.event_tx.clone();
+        let cli_discards = Arc::clone(&injector.discard_focus_count);
+        let cli_rt = RuntimeState::new();
+        let (srv_cmd_tx, srv_cmd_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (cli_cmd_tx, mut cli_cmd_rx) = tokio::sync::mpsc::unbounded_channel();
+
+        let srv_cfg = ServerConfig {
+            name: "unfocus-cli-srv".into(),
+            discovery: false,
+            clipboard: false,
+            motion_coalesce_us: 0,
+            unfocus_on_leave: true,
+            ..Default::default()
+        };
+        let mut cli_cfg = ClientConfig {
+            name: "unfocus-cli".into(),
+            server: Some(addr.to_string()),
+            edge: Edge::Right,
+            trusted_fingerprint: Some(fp),
+            clipboard: false,
+            unfocus_on_leave: true,
+            ..Default::default()
+        };
+
+        let srv_task = tokio::spawn(async move {
+            let _ = run_server_with_backends(
+                srv_cfg,
+                endpoint,
+                capture_handle,
+                None,
+                "linux-x11",
+                None,
+                Some(srv_cmd_rx),
+            )
+            .await;
+        });
+        let cli_rt_c = cli_rt.clone();
+        let cli_task = tokio::spawn(async move {
+            let mut opt_clip = None;
+            let _ = run_client_session(
+                &mut cli_cfg,
+                addr,
+                &mut injector,
+                &mut opt_clip,
+                Some(&cli_rt_c),
+                Some(&mut cli_cmd_rx),
+            )
+            .await;
+        });
+
+        for _ in 0..40 {
+            if *cap_state.active_edges.lock() == vec![Edge::Right]
+                && cli_rt.snapshot().status.starts_with("Connected")
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert_eq!(*cap_state.active_edges.lock(), vec![Edge::Right]);
+        assert!(
+            cap_state.unfocus_on_leave(),
+            "server startup must propagate initial unfocus_on_leave = true"
+        );
+        assert!(
+            cli_unfocus_flag.load(Ordering::SeqCst),
+            "client startup must propagate initial unfocus_on_leave = true"
+        );
+
+        let count_action = |pred: fn(&InjectedAction) -> bool| -> usize {
+            inj_log.lock().iter().filter(|a| pred(a)).count()
+        };
+
+        // 1. Initial unfocus_on_leave = true -> server-initiated Leave triggers UnfocusWindow,
+        //    and returning via EnterAt restores focus (RefocusWindow)
+        srv_cmd_tx
+            .send(RuntimeCommand::SwitchTarget(Some(Edge::Right)))
+            .unwrap();
+        for _ in 0..40 {
+            if count_action(|a| matches!(a, InjectedAction::EnterAt(_, _))) == 1 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(
+            count_action(|a| matches!(a, InjectedAction::EnterAt(_, _))),
+            1
+        );
+        assert_eq!(
+            count_action(|a| matches!(a, InjectedAction::RefocusWindow)),
+            0,
+            "first EnterAt before any UnfocusWindow must not emit RefocusWindow"
+        );
+
+        srv_cmd_tx.send(RuntimeCommand::ReturnLocal).unwrap();
+        for _ in 0..40 {
+            if count_action(|a| matches!(a, InjectedAction::UnfocusWindow)) == 1
+                && cli_rt.snapshot().active_target == "unfocus-cli-srv"
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(
+            count_action(|a| matches!(a, InjectedAction::UnfocusWindow)),
+            1
+        );
+
+        // Return to client -> must restore saved focus (RefocusWindow #1)!
+        srv_cmd_tx
+            .send(RuntimeCommand::SwitchTarget(Some(Edge::Right)))
+            .unwrap();
+        for _ in 0..40 {
+            if count_action(|a| matches!(a, InjectedAction::EnterAt(_, _))) == 2 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(
+            count_action(|a| matches!(a, InjectedAction::RefocusWindow)),
+            1,
+            "re-entering client after UnfocusWindow must emit RefocusWindow"
+        );
+
+        // Leave again so focus is saved before we toggle unfocus_on_leave off
+        srv_cmd_tx.send(RuntimeCommand::ReturnLocal).unwrap();
+        for _ in 0..40 {
+            if count_action(|a| matches!(a, InjectedAction::UnfocusWindow)) == 2
+                && cli_rt.snapshot().active_target == "unfocus-cli-srv"
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+
+        // 2. Live-disable via UpdateClientTuning -> clears saved focus (no RefocusWindow on EnterAt)
+        //    and Leave must NOT trigger UnfocusWindow
+        cli_cmd_tx
+            .send(RuntimeCommand::UpdateClientTuning {
+                sensitivity: 1.0,
+                scroll_speed: 1.0,
+                invert_scroll: false,
+                auto_dpi_scale: false,
+                edge_threshold_px: 4,
+                dead_corner_px: 24,
+                sync_lock_keys: true,
+                unfocus_on_leave: false,
+                clipboard: false,
+                drag_drop_files: true,
+                key_remap: Vec::new(),
+            })
+            .unwrap();
+        for _ in 0..40 {
+            if !cli_unfocus_flag.load(Ordering::SeqCst) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(!cli_unfocus_flag.load(Ordering::SeqCst));
+
+        let releases_before = count_action(|a| matches!(a, InjectedAction::ReleaseAll));
+        srv_cmd_tx
+            .send(RuntimeCommand::SwitchTarget(Some(Edge::Right)))
+            .unwrap();
+        for _ in 0..40 {
+            if count_action(|a| matches!(a, InjectedAction::EnterAt(_, _))) == 3 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(
+            count_action(|a| matches!(a, InjectedAction::RefocusWindow)),
+            1,
+            "toggling unfocus_on_leave off must discard saved focus and not refocus"
+        );
+        srv_cmd_tx.send(RuntimeCommand::ReturnLocal).unwrap();
+        for _ in 0..40 {
+            if count_action(|a| matches!(a, InjectedAction::ReleaseAll)) > releases_before
+                && cli_rt.snapshot().active_target == "unfocus-cli-srv"
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(
+            count_action(|a| matches!(a, InjectedAction::UnfocusWindow)),
+            2,
+            "disabled unfocus_on_leave must not unfocus on Leave"
+        );
+
+        // 3. Live-enable via UpdateClientTuning -> edge-return leave() triggers UnfocusWindow
+        //    and subsequent edge Enter triggers RefocusWindow (#2)
+        cli_cmd_tx
+            .send(RuntimeCommand::UpdateClientTuning {
+                sensitivity: 1.0,
+                scroll_speed: 1.0,
+                invert_scroll: false,
+                auto_dpi_scale: false,
+                edge_threshold_px: 4,
+                dead_corner_px: 24,
+                sync_lock_keys: true,
+                unfocus_on_leave: true,
+                clipboard: false,
+                drag_drop_files: true,
+                key_remap: Vec::new(),
+            })
+            .unwrap();
+        for _ in 0..40 {
+            if cli_unfocus_flag.load(Ordering::SeqCst) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(cli_unfocus_flag.load(Ordering::SeqCst));
+
+        cap_tx
+            .send(CaptureEvent::EdgeCrossed {
+                edge: Edge::Right,
+                normalized_pos: 0.5,
+            })
+            .unwrap();
+        for _ in 0..40 {
+            if count_action(|a| matches!(a, InjectedAction::Enter(Edge::Left, _))) == 1 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(
+            count_action(|a| matches!(a, InjectedAction::RefocusWindow)),
+            1
+        );
+        // Push left past client's Left return edge -> triggers client edge-return leave()!
+        cap_tx
+            .send(CaptureEvent::MouseDelta { dx: -60.0, dy: 0.0 })
+            .unwrap();
+        for _ in 0..40 {
+            if !cap_state.remote_mode.load(Ordering::SeqCst)
+                && count_action(|a| matches!(a, InjectedAction::UnfocusWindow)) == 3
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(!cap_state.remote_mode.load(Ordering::SeqCst));
+        assert_eq!(
+            count_action(|a| matches!(a, InjectedAction::UnfocusWindow)),
+            3,
+            "re-enabled unfocus_on_leave must trigger UnfocusWindow on edge-return leave()"
+        );
+
+        // Edge-enter again -> must restore saved focus (RefocusWindow #2)!
+        cap_tx
+            .send(CaptureEvent::EdgeCrossed {
+                edge: Edge::Right,
+                normalized_pos: 0.5,
+            })
+            .unwrap();
+        for _ in 0..40 {
+            if count_action(|a| matches!(a, InjectedAction::Enter(Edge::Left, _))) == 2 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(
+            count_action(|a| matches!(a, InjectedAction::RefocusWindow)),
+            2,
+            "edge Enter after edge-return UnfocusWindow must emit RefocusWindow"
+        );
+
+        // 4. OS suspend discards saved focus on client
+        srv_cmd_tx.send(RuntimeCommand::ReturnLocal).unwrap();
+        for _ in 0..40 {
+            if count_action(|a| matches!(a, InjectedAction::UnfocusWindow)) == 4
+                && cli_rt.snapshot().active_target == "unfocus-cli-srv"
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let discards_before = cli_discards.load(Ordering::SeqCst);
+        cli_event_tx
+            .send(glide_backend::InjectorEvent::SystemSuspended)
+            .unwrap();
+        for _ in 0..150 {
+            if cli_discards.load(Ordering::SeqCst) > discards_before {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(
+            cli_discards.load(Ordering::SeqCst) > discards_before,
+            "client suspend must discard saved focus"
+        );
+        srv_cmd_tx
+            .send(RuntimeCommand::SwitchTarget(Some(Edge::Right)))
+            .unwrap();
+        for _ in 0..40 {
+            if count_action(|a| matches!(a, InjectedAction::EnterAt(_, _))) == 4 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(
+            count_action(|a| matches!(a, InjectedAction::RefocusWindow)),
+            2,
+            "client must not refocus stale window after OS suspend"
+        );
+
+        // 5. OS resume discards saved focus on client
+        srv_cmd_tx.send(RuntimeCommand::ReturnLocal).unwrap();
+        for _ in 0..40 {
+            if count_action(|a| matches!(a, InjectedAction::UnfocusWindow)) == 5
+                && cli_rt.snapshot().active_target == "unfocus-cli-srv"
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let discards_before = cli_discards.load(Ordering::SeqCst);
+        cli_event_tx
+            .send(glide_backend::InjectorEvent::SystemResumed)
+            .unwrap();
+        for _ in 0..150 {
+            if cli_discards.load(Ordering::SeqCst) > discards_before {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(
+            cli_discards.load(Ordering::SeqCst) > discards_before,
+            "client resume must discard saved focus"
+        );
+        srv_cmd_tx
+            .send(RuntimeCommand::SwitchTarget(Some(Edge::Right)))
+            .unwrap();
+        for _ in 0..40 {
+            if count_action(|a| matches!(a, InjectedAction::EnterAt(_, _))) == 5 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(
+            count_action(|a| matches!(a, InjectedAction::RefocusWindow)),
+            2,
+            "client must not refocus stale window after OS resume"
+        );
+
+        // 6. Client shutdown discards saved focus cleanly
+        let discards_before = cli_discards.load(Ordering::SeqCst);
+        cli_cmd_tx.send(RuntimeCommand::Shutdown).unwrap();
+        let _ = tokio::time::timeout(Duration::from_secs(2), cli_task)
+            .await
+            .expect("client must shut down cleanly");
+        assert!(
+            cli_discards.load(Ordering::SeqCst) > discards_before,
+            "client shutdown must discard saved focus"
+        );
+
+        srv_task.abort();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn client_os_shutdown_flushes_quic_close_before_dropping_inhibitor_and_resumes_on_cancel()
+    {
+        use crate::client::run_client_with_backends_and_lifecycle;
+        use crate::runtime::RuntimeCommand;
+        use crate::server::run_server_with_lifecycle;
+        use glide_backend::dnd::NoopDndBackend;
+        use glide_backend::lifecycle::{
+            ShutdownInhibitorGuard, SystemLifecycleEvent, SystemLifecycleMonitor,
+        };
+        use std::sync::atomic::AtomicBool;
+        use std::sync::Arc;
+        use std::time::Instant;
+        use tokio::sync::{mpsc, oneshot};
+
+        let identity = ServerIdentity::generate_ephemeral().unwrap();
+        let fp = identity.fingerprint.clone();
+        let endpoint =
+            GlideServerEndpoint::bind("127.0.0.1:0".parse().unwrap(), &identity).unwrap();
+        let addr = endpoint.local_addr();
+
+        let (capture_handle, cap_tx, cap_state) = create_mock_capture(single_monitor_geom("Srv"));
+        let (mut injector, inj_log) = MockInjector::new(single_monitor_geom("Cli"));
+        let discard_focus_count = Arc::clone(&injector.discard_focus_count);
+        let srv_rt = RuntimeState::new();
+        let cli_rt = RuntimeState::new();
+        let (srv_cmd_tx, srv_cmd_rx) = mpsc::unbounded_channel();
+        let (cli_cmd_tx, cli_cmd_rx) = mpsc::unbounded_channel();
+        let (cli_lc, cli_lc_tx) = SystemLifecycleMonitor::from_channel();
+
+        let srv_cfg = ServerConfig {
+            name: "srv-lc-client".into(),
+            discovery: false,
+            clipboard: false,
+            motion_coalesce_us: 0,
+            ..Default::default()
+        };
+        let cli_cfg = ClientConfig {
+            name: "cli-lc-shutdown".into(),
+            server: Some(addr.to_string()),
+            edge: Edge::Right,
+            trusted_fingerprint: Some(fp),
+            clipboard: false,
+            ..Default::default()
+        };
+
+        let srv_rt_c = srv_rt.clone();
+        let srv_task = tokio::spawn(async move {
+            run_server_with_lifecycle(
+                srv_cfg,
+                endpoint,
+                capture_handle,
+                None,
+                Arc::new(NoopDndBackend),
+                None,
+                "linux-x11",
+                Some(srv_rt_c),
+                Some(srv_cmd_rx),
+                None,
+            )
+            .await
+        });
+
+        let cli_rt_c = cli_rt.clone();
+        let cli_task = tokio::spawn(async move {
+            let mut no_clip = None;
+            run_client_with_backends_and_lifecycle(
+                cli_cfg,
+                &mut injector,
+                &mut no_clip,
+                Arc::new(NoopDndBackend),
+                None,
+                Some(cli_rt_c),
+                Some(cli_cmd_rx),
+                Some(cli_lc),
+            )
+            .await
+        });
+
+        // Wait for initial connection
+        for _ in 0..60 {
+            if srv_rt.snapshot().peers.len() == 1
+                && cli_rt.snapshot().status.starts_with("Connected")
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert_eq!(srv_rt.snapshot().peers.len(), 1);
+
+        // Move focus onto client and hold Ctrl
+        cap_tx
+            .send(CaptureEvent::EdgeCrossed {
+                edge: Edge::Right,
+                normalized_pos: 0.5,
+            })
+            .unwrap();
+        cap_tx
+            .send(CaptureEvent::Key {
+                usage: HidUsage::CONTROL_LEFT,
+                pressed: true,
+            })
+            .unwrap();
+        for _ in 0..40 {
+            if cap_state.remote_mode.load(Ordering::SeqCst)
+                && inj_log
+                    .lock()
+                    .contains(&InjectedAction::Key(HidUsage::CONTROL_LEFT, true))
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(cap_state.remote_mode.load(Ordering::SeqCst));
+
+        // Simulate client OS shutdown with a rendezvous inside ShutdownInhibitorGuard::on_drop.
+        // Holding the client task frozen inside `on_drop` guarantees that NO code after
+        // `drop(guard)` has executed yet, proving that both local cleanup AND QUIC
+        // CONNECTION_CLOSE flushing occurred strictly before releasing the OS inhibitor.
+        let release_before_drop = Arc::new(AtomicBool::new(false));
+        let discard_before_drop = Arc::new(AtomicBool::new(false));
+        let inhibitor_dropped = Arc::new(AtomicBool::new(false));
+        let (drop_entered_tx, drop_entered_rx) = oneshot::channel::<()>();
+        let (allow_drop_tx, allow_drop_rx) = std::sync::mpsc::sync_channel::<()>(1);
+
+        let discards_before = discard_focus_count.load(Ordering::SeqCst);
+        let inj_log_drop = Arc::clone(&inj_log);
+        let discard_focus_drop = Arc::clone(&discard_focus_count);
+        let release_before_drop_c = Arc::clone(&release_before_drop);
+        let discard_before_drop_c = Arc::clone(&discard_before_drop);
+        let inhibitor_dropped_c = Arc::clone(&inhibitor_dropped);
+        let guard = ShutdownInhibitorGuard::with_on_drop(move || {
+            let log = inj_log_drop.lock();
+            release_before_drop_c.store(
+                log.contains(&InjectedAction::ReleaseAll),
+                Ordering::SeqCst,
+            );
+            drop(log);
+            discard_before_drop_c.store(
+                discard_focus_drop.load(Ordering::SeqCst) > discards_before,
+                Ordering::SeqCst,
+            );
+            let _ = drop_entered_tx.send(());
+            let _ = allow_drop_rx.recv_timeout(Duration::from_secs(2));
+            inhibitor_dropped_c.store(true, Ordering::SeqCst);
+        });
+        let t_shutdown = Instant::now();
+        cli_lc_tx
+            .send(SystemLifecycleEvent::PreparingToShutdown(guard))
+            .unwrap();
+
+        tokio::time::timeout(Duration::from_secs(1), drop_entered_rx)
+            .await
+            .expect("client must drop ShutdownInhibitorGuard promptly")
+            .unwrap();
+
+        // Strictly before `drop(guard)` returns: local input cleanup must already be complete.
+        assert!(
+            release_before_drop.load(Ordering::SeqCst),
+            "client must call release_all() before dropping ShutdownInhibitorGuard"
+        );
+        assert!(
+            discard_before_drop.load(Ordering::SeqCst),
+            "client must call discard_saved_focus() before dropping ShutdownInhibitorGuard"
+        );
+
+        // Strictly while the client task is still frozen inside `drop(guard)`, the server must
+        // observe the already-flushed QUIC CONNECTION_CLOSE and snap back to local well under 400ms.
+        let mut snapped_back = false;
+        for _ in 0..50 {
+            if !cap_state.remote_mode.load(Ordering::SeqCst)
+                && srv_rt.snapshot().peers.is_empty()
+            {
+                snapped_back = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(
+            snapped_back,
+            "server must observe flushed QUIC CONNECTION_CLOSE before inhibitor drop finishes; remote={}, peers={}, elapsed={:?}",
+            cap_state.remote_mode.load(Ordering::SeqCst),
+            srv_rt.snapshot().peers.len(),
+            t_shutdown.elapsed()
+        );
+        assert!(
+            t_shutdown.elapsed() < Duration::from_millis(600),
+            "snap-back took {:?} (expected immediate QUIC CONNECTION_CLOSE)",
+            t_shutdown.elapsed()
+        );
+
+        // Unblock inhibitor drop and confirm completion.
+        let _ = allow_drop_tx.send(());
+        for _ in 0..40 {
+            if inhibitor_dropped.load(Ordering::SeqCst) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert!(inhibitor_dropped.load(Ordering::SeqCst));
+
+        // Client must stay parked in wait_while_os_paused without reconnecting while OS is paused
+        for _ in 0..30 {
+            if cli_rt.snapshot().status == "Paused (OS shutting down)" {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(cli_rt.snapshot().status, "Paused (OS shutting down)");
+        tokio::time::sleep(Duration::from_millis(250)).await;
+        assert!(
+            srv_rt.snapshot().peers.is_empty(),
+            "client must not reconnect while OS is paused"
+        );
+
+        // Simulate cancelled shutdown / wake -> client automatically resumes and reconnects!
+        cli_lc_tx.send(SystemLifecycleEvent::Resumed).unwrap();
+        let mut reconnected = false;
+        for _ in 0..80 {
+            if srv_rt.snapshot().peers.len() == 1
+                && cli_rt.snapshot().status.starts_with("Connected")
+            {
+                reconnected = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(
+            reconnected,
+            "client must automatically reconnect after Resumed; status={}",
+            cli_rt.snapshot().status
+        );
+
+        cli_cmd_tx.send(RuntimeCommand::Shutdown).unwrap();
+        srv_cmd_tx.send(RuntimeCommand::Shutdown).unwrap();
+        tokio::time::timeout(Duration::from_secs(2), cli_task)
+            .await
+            .expect("client must exit cleanly")
+            .unwrap()
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(2), srv_task)
+            .await
+            .expect("server must exit cleanly")
+            .unwrap()
+            .unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn server_os_sleep_gates_accepts_flushes_peers_before_dropping_inhibitor_and_resumes() {
+        use crate::client::run_client_with_backends_and_lifecycle;
+        use crate::runtime::RuntimeCommand;
+        use crate::server::run_server_with_lifecycle;
+        use glide_backend::dnd::NoopDndBackend;
+        use glide_backend::lifecycle::{
+            ShutdownInhibitorGuard, SystemLifecycleEvent, SystemLifecycleMonitor,
+        };
+        use glide_net::connect_client;
+        use glide_net::tls::TrustMode;
+        use std::sync::atomic::AtomicBool;
+        use std::sync::Arc;
+        use std::time::Instant;
+        use tokio::sync::{mpsc, oneshot};
+
+        let identity = ServerIdentity::generate_ephemeral().unwrap();
+        let fp = identity.fingerprint.clone();
+        let endpoint =
+            GlideServerEndpoint::bind("127.0.0.1:0".parse().unwrap(), &identity).unwrap();
+        let addr = endpoint.local_addr();
+
+        let (capture_handle, cap_tx, cap_state) = create_mock_capture(single_monitor_geom("Srv"));
+        let (mut injector, inj_log) = MockInjector::new(single_monitor_geom("Cli"));
+        let srv_rt = RuntimeState::new();
+        let cli_rt = RuntimeState::new();
+        let (srv_cmd_tx, srv_cmd_rx) = mpsc::unbounded_channel();
+        let (cli_cmd_tx, cli_cmd_rx) = mpsc::unbounded_channel();
+        let (srv_lc, srv_lc_tx) = SystemLifecycleMonitor::from_channel();
+
+        let srv_cfg = ServerConfig {
+            name: "srv-lc-sleep".into(),
+            discovery: false,
+            clipboard: false,
+            motion_coalesce_us: 0,
+            ..Default::default()
+        };
+        let cli_cfg = ClientConfig {
+            name: "cli-peer".into(),
+            server: Some(addr.to_string()),
+            edge: Edge::Right,
+            trusted_fingerprint: Some(fp.clone()),
+            clipboard: false,
+            ..Default::default()
+        };
+
+        let srv_rt_c = srv_rt.clone();
+        let srv_task = tokio::spawn(async move {
+            run_server_with_lifecycle(
+                srv_cfg,
+                endpoint,
+                capture_handle,
+                None,
+                Arc::new(NoopDndBackend),
+                None,
+                "linux-x11",
+                Some(srv_rt_c),
+                Some(srv_cmd_rx),
+                Some(srv_lc),
+            )
+            .await
+        });
+
+        let cli_rt_c = cli_rt.clone();
+        let cli_task = tokio::spawn(async move {
+            let mut no_clip = None;
+            run_client_with_backends_and_lifecycle(
+                cli_cfg,
+                &mut injector,
+                &mut no_clip,
+                Arc::new(NoopDndBackend),
+                None,
+                Some(cli_rt_c),
+                Some(cli_cmd_rx),
+                None,
+            )
+            .await
+        });
+
+        // Wait for connection and move focus to client with held key
+        for _ in 0..60 {
+            if srv_rt.snapshot().peers.len() == 1
+                && cli_rt.snapshot().status.starts_with("Connected")
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert_eq!(srv_rt.snapshot().peers.len(), 1);
+
+        cap_tx
+            .send(CaptureEvent::EdgeCrossed {
+                edge: Edge::Right,
+                normalized_pos: 0.5,
+            })
+            .unwrap();
+        cap_tx
+            .send(CaptureEvent::Key {
+                usage: HidUsage::SHIFT_LEFT,
+                pressed: true,
+            })
+            .unwrap();
+        for _ in 0..40 {
+            if cap_state.remote_mode.load(Ordering::SeqCst)
+                && inj_log
+                    .lock()
+                    .contains(&InjectedAction::Key(HidUsage::SHIFT_LEFT, true))
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(cap_state.remote_mode.load(Ordering::SeqCst));
+
+        // Trigger PreparingToSleep on the server with a rendezvous inside `on_drop`.
+        // Snapshotting server state at drop entry AND verifying the client already received
+        // QUIC CONNECTION_CLOSE while the server is frozen inside `on_drop` proves strict
+        // flush-before-inhibitor-drop ordering.
+        let local_restored_before_drop = Arc::new(AtomicBool::new(false));
+        let edges_cleared_before_drop = Arc::new(AtomicBool::new(false));
+        let peers_cleared_before_drop = Arc::new(AtomicBool::new(false));
+        let status_paused_before_drop = Arc::new(AtomicBool::new(false));
+        let inhibitor_dropped = Arc::new(AtomicBool::new(false));
+        let (drop_entered_tx, drop_entered_rx) = oneshot::channel::<()>();
+        let (allow_drop_tx, allow_drop_rx) = std::sync::mpsc::sync_channel::<()>(1);
+
+        let cap_state_drop = Arc::clone(&cap_state);
+        let srv_rt_drop = srv_rt.clone();
+        let local_restored_c = Arc::clone(&local_restored_before_drop);
+        let edges_cleared_c = Arc::clone(&edges_cleared_before_drop);
+        let peers_cleared_c = Arc::clone(&peers_cleared_before_drop);
+        let status_paused_c = Arc::clone(&status_paused_before_drop);
+        let inhibitor_dropped_c = Arc::clone(&inhibitor_dropped);
+        let guard = ShutdownInhibitorGuard::with_on_drop(move || {
+            local_restored_c.store(
+                !cap_state_drop.remote_mode.load(Ordering::SeqCst),
+                Ordering::SeqCst,
+            );
+            edges_cleared_c.store(
+                cap_state_drop.active_edges.lock().is_empty(),
+                Ordering::SeqCst,
+            );
+            let snap = srv_rt_drop.snapshot();
+            peers_cleared_c.store(snap.peers.is_empty(), Ordering::SeqCst);
+            status_paused_c.store(snap.status == "Paused (OS sleeping)", Ordering::SeqCst);
+            let _ = drop_entered_tx.send(());
+            let _ = allow_drop_rx.recv_timeout(Duration::from_secs(2));
+            inhibitor_dropped_c.store(true, Ordering::SeqCst);
+        });
+        let t_sleep = Instant::now();
+        srv_lc_tx
+            .send(SystemLifecycleEvent::PreparingToSleep(guard))
+            .unwrap();
+
+        tokio::time::timeout(Duration::from_secs(1), drop_entered_rx)
+            .await
+            .expect("server must drop ShutdownInhibitorGuard promptly")
+            .unwrap();
+
+        assert!(
+            local_restored_before_drop.load(Ordering::SeqCst),
+            "server must restore local capture before dropping inhibitor"
+        );
+        assert!(
+            edges_cleared_before_drop.load(Ordering::SeqCst),
+            "server must clear active edges before dropping inhibitor"
+        );
+        assert!(
+            peers_cleared_before_drop.load(Ordering::SeqCst),
+            "server must drain peers before dropping inhibitor"
+        );
+        assert!(
+            status_paused_before_drop.load(Ordering::SeqCst),
+            "server must update paused runtime status before dropping inhibitor"
+        );
+
+        // Strictly while the server task is still frozen inside `drop(guard)`, the client must
+        // receive the already-flushed QUIC CONNECTION_CLOSE and release all held keys.
+        let mut client_released = false;
+        for _ in 0..50 {
+            if inj_log.lock().contains(&InjectedAction::ReleaseAll) {
+                client_released = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(
+            client_released,
+            "client must observe flushed QUIC CONNECTION_CLOSE before server inhibitor drop finishes; elapsed={:?}",
+            t_sleep.elapsed()
+        );
+        assert!(t_sleep.elapsed() < Duration::from_millis(600));
+
+        // Unblock inhibitor drop and confirm completion.
+        let _ = allow_drop_tx.send(());
+        for _ in 0..40 {
+            if inhibitor_dropped.load(Ordering::SeqCst) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert!(inhibitor_dropped.load(Ordering::SeqCst));
+
+        // Duplicate CaptureEvent::SystemSuspended (as Windows emits alongside PBT_APMSUSPEND /
+        // WM_QUERYENDSESSION) must NOT clobber the paused runtime status or warp the cursor again.
+        let leaves_before = cap_state.leave_remote_at_calls.load(Ordering::SeqCst);
+        cap_tx.send(CaptureEvent::SystemSuspended).unwrap();
+        tokio::time::sleep(Duration::from_millis(40)).await;
+        assert_eq!(
+            srv_rt.snapshot().status,
+            "Paused (OS sleeping)",
+            "SystemSuspended while os_paused must not clobber paused runtime status"
+        );
+        assert_eq!(
+            cap_state.leave_remote_at_calls.load(Ordering::SeqCst),
+            leaves_before,
+            "SystemSuspended while already local must not issue a spurious leave_remote_at warp"
+        );
+
+        // While server is os_paused, direct QUIC connects MUST be refused/gated and peer count stays 0
+        let probe_res = tokio::time::timeout(
+            Duration::from_millis(400),
+            connect_client(addr, TrustMode::Pinned(fp)),
+        )
+        .await;
+        assert!(
+            !matches!(probe_res, Ok(Ok(_))),
+            "server must refuse new connections while os_paused"
+        );
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert!(
+            srv_rt.snapshot().peers.is_empty(),
+            "no peers may register while server is os_paused"
+        );
+
+        // Resume server -> accepts un-gate and client automatically reconnects
+        srv_lc_tx.send(SystemLifecycleEvent::Resumed).unwrap();
+        let mut reconnected = false;
+        for _ in 0..200 {
+            if srv_rt.snapshot().peers.len() == 1
+                && cli_rt.snapshot().status.starts_with("Connected")
+            {
+                reconnected = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        assert!(
+            reconnected,
+            "client must reconnect after server Resumed; srv_status={}, cli_status={}",
+            srv_rt.snapshot().status,
+            cli_rt.snapshot().status
+        );
+
+        cli_cmd_tx.send(RuntimeCommand::Shutdown).unwrap();
+        srv_cmd_tx.send(RuntimeCommand::Shutdown).unwrap();
+        tokio::time::timeout(Duration::from_secs(2), cli_task)
+            .await
+            .expect("client must exit cleanly")
+            .unwrap()
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(2), srv_task)
+            .await
+            .expect("server must exit cleanly")
+            .unwrap()
+            .unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn graceful_shutdown_flushes_quic_close_for_instant_snap_back_both_directions() {
+        use crate::client::run_client_with_backends;
+        use crate::runtime::RuntimeCommand;
+        use std::time::Instant;
+        use tokio::sync::mpsc;
+
+        let identity = ServerIdentity::generate_ephemeral().unwrap();
+        let fp = identity.fingerprint.clone();
+        let endpoint =
+            GlideServerEndpoint::bind("127.0.0.1:0".parse().unwrap(), &identity).unwrap();
+        let addr = endpoint.local_addr();
+
+        let (capture_handle, cap_tx, cap_state) = create_mock_capture(single_monitor_geom("Srv"));
+        let srv_rt = RuntimeState::new();
+        let (srv_cmd_tx, srv_cmd_rx) = mpsc::unbounded_channel();
+
+        let srv_cfg = ServerConfig {
+            name: "srv-flush".into(),
+            discovery: false,
+            clipboard: false,
+            motion_coalesce_us: 0,
+            ..Default::default()
+        };
+        let srv_rt_c = srv_rt.clone();
+        let srv_task = tokio::spawn(async move {
+            run_server_with_backends(
+                srv_cfg,
+                endpoint,
+                capture_handle,
+                None,
+                "linux-x11",
+                Some(srv_rt_c),
+                Some(srv_cmd_rx),
+            )
+            .await
+        });
+
+        // Direction 1: Client graceful Shutdown snaps server back to local immediately (< 500ms)
+        let (mut inj1, _) = MockInjector::new(single_monitor_geom("Cli1"));
+        let cli1_rt = RuntimeState::new();
+        let (cli1_cmd_tx, cli1_cmd_rx) = mpsc::unbounded_channel();
+        let cli1_cfg = ClientConfig {
+            name: "cli1".into(),
+            server: Some(addr.to_string()),
+            edge: Edge::Right,
+            trusted_fingerprint: Some(fp.clone()),
+            clipboard: false,
+            ..Default::default()
+        };
+        let cli1_rt_c = cli1_rt.clone();
+        let cli1_task = tokio::spawn(async move {
+            let mut no_clip = None;
+            run_client_with_backends(
+                cli1_cfg,
+                &mut inj1,
+                &mut no_clip,
+                Some(cli1_rt_c),
+                Some(cli1_cmd_rx),
+            )
+            .await
+        });
+
+        for _ in 0..60 {
+            if srv_rt.snapshot().peers.len() == 1 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert_eq!(srv_rt.snapshot().peers.len(), 1);
+        cap_tx
+            .send(CaptureEvent::EdgeCrossed {
+                edge: Edge::Right,
+                normalized_pos: 0.5,
+            })
+            .unwrap();
+        for _ in 0..40 {
+            if cap_state.remote_mode.load(Ordering::SeqCst) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(cap_state.remote_mode.load(Ordering::SeqCst));
+
+        let t1 = Instant::now();
+        cli1_cmd_tx.send(RuntimeCommand::Shutdown).unwrap();
+        tokio::time::timeout(Duration::from_secs(2), cli1_task)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        let mut srv_snapped = false;
+        for _ in 0..50 {
+            if !cap_state.remote_mode.load(Ordering::SeqCst) && srv_rt.snapshot().peers.is_empty() {
+                srv_snapped = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(srv_snapped, "server must snap back on client shutdown");
+        assert!(
+            t1.elapsed() < Duration::from_millis(600),
+            "client shutdown snap-back took {:?}",
+            t1.elapsed()
+        );
+
+        // Direction 2: Server graceful Shutdown flushes close so client immediately releases keys
+        let (mut inj2, log2) = MockInjector::new(single_monitor_geom("Cli2"));
+        let cli2_rt = RuntimeState::new();
+        let (cli2_cmd_tx, cli2_cmd_rx) = mpsc::unbounded_channel();
+        let cli2_cfg = ClientConfig {
+            name: "cli2".into(),
+            server: Some(addr.to_string()),
+            edge: Edge::Right,
+            trusted_fingerprint: Some(fp),
+            clipboard: false,
+            ..Default::default()
+        };
+        let cli2_rt_c = cli2_rt.clone();
+        let cli2_task = tokio::spawn(async move {
+            let mut no_clip = None;
+            run_client_with_backends(
+                cli2_cfg,
+                &mut inj2,
+                &mut no_clip,
+                Some(cli2_rt_c),
+                Some(cli2_cmd_rx),
+            )
+            .await
+        });
+
+        for _ in 0..60 {
+            if srv_rt.snapshot().peers.len() == 1
+                && cli2_rt.snapshot().status.starts_with("Connected")
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert_eq!(srv_rt.snapshot().peers.len(), 1);
+        cap_tx
+            .send(CaptureEvent::EdgeCrossed {
+                edge: Edge::Right,
+                normalized_pos: 0.5,
+            })
+            .unwrap();
+        cap_tx
+            .send(CaptureEvent::Key {
+                usage: HidUsage::ALT_LEFT,
+                pressed: true,
+            })
+            .unwrap();
+        for _ in 0..40 {
+            if log2
+                .lock()
+                .contains(&InjectedAction::Key(HidUsage::ALT_LEFT, true))
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+
+        let t2 = Instant::now();
+        srv_cmd_tx.send(RuntimeCommand::Shutdown).unwrap();
+        tokio::time::timeout(Duration::from_secs(2), srv_task)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        let mut cli_released = false;
+        for _ in 0..50 {
+            if log2.lock().contains(&InjectedAction::ReleaseAll)
+                && !cli2_rt.snapshot().status.starts_with("Connected")
+            {
+                cli_released = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(cli_released, "client must release all keys on server shutdown");
+        assert!(
+            t2.elapsed() < Duration::from_millis(600),
+            "server shutdown client release took {:?}",
+            t2.elapsed()
+        );
+
+        cli2_cmd_tx.send(RuntimeCommand::Shutdown).unwrap();
+        tokio::time::timeout(Duration::from_secs(2), cli2_task)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn server_evicts_dead_peer_on_screen_entry_with_zero_idle_keepalive() {
+        use crate::runtime::RuntimeCommand;
+        use glide_net::connect_client;
+        use glide_net::tls::TrustMode;
+        use glide_proto::{ControlMessage, OsKind, PROTOCOL_VERSION};
+        use tokio::sync::mpsc;
+
+        let identity = ServerIdentity::generate_ephemeral().unwrap();
+        let fp = identity.fingerprint.clone();
+        let endpoint =
+            GlideServerEndpoint::bind("127.0.0.1:0".parse().unwrap(), &identity).unwrap();
+        let addr = endpoint.local_addr();
+
+        let (capture_handle, cap_tx, cap_state) = create_mock_capture(single_monitor_geom("Srv"));
+        let srv_rt = RuntimeState::new();
+        let (srv_cmd_tx, srv_cmd_rx) = mpsc::unbounded_channel();
+
+        let srv_cfg = ServerConfig {
+            name: "srv-entry-probe".into(),
+            discovery: false,
+            ..Default::default()
+        };
+        let srv_rt_c = srv_rt.clone();
+        let srv_task = tokio::spawn(async move {
+            run_server_with_backends(
+                srv_cfg,
+                endpoint,
+                capture_handle,
+                None,
+                "linux-x11",
+                Some(srv_rt_c),
+                Some(srv_cmd_rx),
+            )
+            .await
+        });
+
+        let mut silent_peer = connect_client(addr, TrustMode::Pinned(fp)).await.unwrap();
+        silent_peer
+            .ctrl_send
+            .send(&ControlMessage::Hello {
+                version: PROTOCOL_VERSION,
+                peer_name: "dead-peer".into(),
+                edge_on_server: Edge::Right,
+                os: OsKind::LinuxX11,
+            })
+            .await
+            .unwrap();
+        let _welcome = silent_peer.ctrl_recv.recv().await.unwrap();
+
+        for _ in 0..40 {
+            if srv_rt.snapshot().peers.len() == 1 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert_eq!(srv_rt.snapshot().peers.len(), 1);
+        assert!(
+            srv_rt.snapshot().rtt_ms.is_some(),
+            "handshake RTT must populate immediately without polling"
+        );
+
+        // User crosses onto the unresponsive peer -> server arms one-shot 1.5s HealthProbe
+        let started = std::time::Instant::now();
+        cap_tx
+            .send(CaptureEvent::EdgeCrossed {
+                edge: Edge::Right,
+                normalized_pos: 0.5,
+            })
+            .unwrap();
+
+        let mut snapped_back = false;
+        while started.elapsed() < Duration::from_millis(2600) {
+            if srv_rt.snapshot().peers.is_empty() && !cap_state.remote_mode.load(Ordering::SeqCst)
+            {
+                snapped_back = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(30)).await;
+        }
+        assert!(
+            snapped_back,
+            "entering a dead peer must evict it and snap cursor back to local within ~1.5s"
+        );
+        assert!(cap_state.active_edges.lock().is_empty());
+
+        drop(silent_peer);
+        srv_cmd_tx.send(RuntimeCommand::Shutdown).unwrap();
+        tokio::time::timeout(Duration::from_secs(2), srv_task)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn network_change_monitor_triggers_server_health_probe_with_zero_polling() {
+        use crate::runtime::RuntimeCommand;
+        use crate::server::run_server_with_monitors;
+        use glide_backend::dnd::NoopDndBackend;
+        use glide_backend::lifecycle::NetworkChangeMonitor;
+        use glide_net::connect_client;
+        use glide_net::tls::TrustMode;
+        use glide_proto::{ControlMessage, OsKind, PROTOCOL_VERSION};
+        use std::sync::Arc;
+        use tokio::sync::mpsc;
+
+        let identity = ServerIdentity::generate_ephemeral().unwrap();
+        let fp = identity.fingerprint.clone();
+        let endpoint =
+            GlideServerEndpoint::bind("127.0.0.1:0".parse().unwrap(), &identity).unwrap();
+        let addr = endpoint.local_addr();
+
+        let (capture_handle, _cap_tx, cap_state) = create_mock_capture(single_monitor_geom("Srv"));
+        let srv_rt = RuntimeState::new();
+        let (srv_cmd_tx, srv_cmd_rx) = mpsc::unbounded_channel();
+        let (net_mon, net_tx) = NetworkChangeMonitor::from_channel();
+
+        let srv_cfg = ServerConfig {
+            name: "srv-netwatch".into(),
+            discovery: false,
+            ..Default::default()
+        };
+        let srv_rt_c = srv_rt.clone();
+        let srv_task = tokio::spawn(async move {
+            run_server_with_monitors(
+                srv_cfg,
+                endpoint,
+                capture_handle,
+                None,
+                Arc::new(NoopDndBackend),
+                None,
+                "linux-x11",
+                Some(srv_rt_c),
+                Some(srv_cmd_rx),
+                None,
+                Some(net_mon),
+            )
+            .await
+        });
+
+        let mut silent_peer = connect_client(addr, TrustMode::Pinned(fp)).await.unwrap();
+        silent_peer
+            .ctrl_send
+            .send(&ControlMessage::Hello {
+                version: PROTOCOL_VERSION,
+                peer_name: "roamed-dead-peer".into(),
+                edge_on_server: Edge::Right,
+                os: OsKind::LinuxX11,
+            })
+            .await
+            .unwrap();
+        let _welcome = silent_peer.ctrl_recv.recv().await.unwrap();
+
+        for _ in 0..40 {
+            if srv_rt.snapshot().peers.len() == 1 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert_eq!(srv_rt.snapshot().peers.len(), 1);
+
+        // Emit OS RTNETLINK / IP Helper network-change event -> server probes peer immediately
+        let started = std::time::Instant::now();
+        net_tx.send(()).unwrap();
+
+        let mut evicted = false;
+        while started.elapsed() < Duration::from_millis(2600) {
+            if srv_rt.snapshot().peers.is_empty() {
+                evicted = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(30)).await;
+        }
+        assert!(
+            evicted,
+            "NetworkChangeMonitor event must probe and evict silent peer within ~1.5s"
+        );
+        assert!(cap_state.active_edges.lock().is_empty());
+
+        drop(silent_peer);
+        srv_cmd_tx.send(RuntimeCommand::Shutdown).unwrap();
+        tokio::time::timeout(Duration::from_secs(2), srv_task)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn client_reveals_hidden_cursor_on_local_cursor_activity_with_zero_polling() {
+        use crate::client::run_client_with_backends;
+        use crate::runtime::RuntimeCommand;
+        use glide_backend::InjectorEvent;
+        use std::sync::Arc;
+        use tokio::sync::mpsc;
+
+        let identity = ServerIdentity::generate_ephemeral().unwrap();
+        let fp = identity.fingerprint.clone();
+        let endpoint =
+            GlideServerEndpoint::bind("127.0.0.1:0".parse().unwrap(), &identity).unwrap();
+        let addr = endpoint.local_addr();
+
+        let (capture_handle, _cap_tx, _cap_state) = create_mock_capture(single_monitor_geom("Srv"));
+        let (mut injector, _log) = MockInjector::new(single_monitor_geom("Cli"));
+        let cli_event_tx = injector.event_tx.clone();
+        let cursor_hidden = Arc::clone(&injector.cursor_hidden);
+        let show_cursor_calls = Arc::clone(&injector.show_cursor_calls);
+
+        let srv_rt = RuntimeState::new();
+        let cli_rt = RuntimeState::new();
+        let (srv_cmd_tx, srv_cmd_rx) = mpsc::unbounded_channel();
+        let (cli_cmd_tx, cli_cmd_rx) = mpsc::unbounded_channel();
+
+        let srv_cfg = ServerConfig {
+            name: "srv-reveal".into(),
+            discovery: false,
+            clipboard: false,
+            ..Default::default()
+        };
+        let cli_cfg = ClientConfig {
+            name: "cli-reveal".into(),
+            server: Some(addr.to_string()),
+            edge: Edge::Right,
+            trusted_fingerprint: Some(fp),
+            clipboard: false,
+            ..Default::default()
+        };
+
+        let srv_rt_c = srv_rt.clone();
+        let srv_task = tokio::spawn(async move {
+            run_server_with_backends(
+                srv_cfg,
+                endpoint,
+                capture_handle,
+                None,
+                "linux-x11",
+                Some(srv_rt_c),
+                Some(srv_cmd_rx),
+            )
+            .await
+        });
+        let cli_rt_c = cli_rt.clone();
+        let cli_task = tokio::spawn(async move {
+            let mut no_clip = None;
+            run_client_with_backends(
+                cli_cfg,
+                &mut injector,
+                &mut no_clip,
+                Some(cli_rt_c),
+                Some(cli_cmd_rx),
+            )
+            .await
+        });
+
+        for _ in 0..40 {
+            if srv_rt.snapshot().peers.len() == 1
+                && cli_rt.snapshot().status.starts_with("Connected")
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert_eq!(srv_rt.snapshot().peers.len(), 1);
+
+        // Switch onto client, then return to server so client hides its cursor
+        srv_cmd_tx
+            .send(RuntimeCommand::SwitchTarget(Some(Edge::Right)))
+            .unwrap();
+        for _ in 0..40 {
+            if cli_rt.snapshot().active_target == "Local (Controlling)" {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(!cursor_hidden.load(Ordering::SeqCst));
+
+        srv_cmd_tx.send(RuntimeCommand::ReturnLocal).unwrap();
+        for _ in 0..40 {
+            if cursor_hidden.load(Ordering::SeqCst) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(cursor_hidden.load(Ordering::SeqCst));
+
+        // Push event-driven LocalCursorActivity -> client must reveal cursor immediately
+        let calls_before = show_cursor_calls.load(Ordering::SeqCst);
+        let t0 = std::time::Instant::now();
+        cli_event_tx.send(InjectorEvent::LocalCursorActivity).unwrap();
+
+        for _ in 0..40 {
+            if !cursor_hidden.load(Ordering::SeqCst)
+                && show_cursor_calls.load(Ordering::SeqCst) > calls_before
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert!(!cursor_hidden.load(Ordering::SeqCst));
+        assert!(show_cursor_calls.load(Ordering::SeqCst) > calls_before);
+        assert!(
+            t0.elapsed() < Duration::from_millis(200),
+            "event-driven cursor reveal took {:?}",
+            t0.elapsed()
+        );
+
+        cli_cmd_tx.send(RuntimeCommand::Shutdown).unwrap();
+        srv_cmd_tx.send(RuntimeCommand::Shutdown).unwrap();
+        tokio::time::timeout(Duration::from_secs(2), cli_task)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(2), srv_task)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn client_detects_silent_dead_server_on_reboot_announcement_without_polling() {
+        use crate::client::run_client_session;
+        use glide_proto::{ControlMessage, PROTOCOL_VERSION};
+
+        let discovery_port = 24896;
+        let identity = ServerIdentity::generate_ephemeral().unwrap();
+        let fp = identity.fingerprint.clone();
+        let endpoint =
+            GlideServerEndpoint::bind("127.0.0.1:0".parse().unwrap(), &identity).unwrap();
+        let addr = endpoint.local_addr();
+
+        // Accept one client, finish Hello/Welcome handshake, then go completely silent
+        // (simulating a hard server power-off where no QUIC CONNECTION_CLOSE was ever sent).
+        let silent_server = tokio::spawn(async move {
+            let mut session = endpoint.accept().await.unwrap();
+            let hello = session.ctrl_recv.recv().await.unwrap();
+            assert!(matches!(hello, ControlMessage::Hello { .. }));
+            session
+                .ctrl_send
+                .send(&ControlMessage::Welcome {
+                    version: PROTOCOL_VERSION,
+                    server_name: "rebooting-srv".into(),
+                    accepted: true,
+                    reason: String::new(),
+                    server_scale: 1.0,
+                })
+                .await
+                .unwrap();
+            // Hold handles alive without replying to any Ping until test ends.
+            tokio::time::sleep(Duration::from_secs(10)).await;
+            drop((session, endpoint));
+        });
+
+        let (mut injector, _log) = MockInjector::new(single_monitor_geom("CliReboot"));
+        let cli_rt = RuntimeState::new();
+        let mut cli_cfg = ClientConfig {
+            name: "cli-reboot".into(),
+            server: Some(addr.to_string()),
+            discovery_port,
+            edge: Edge::Right,
+            trusted_fingerprint: Some(fp.clone()),
+            clipboard: false,
+            ..Default::default()
+        };
+
+        let cli_rt_c = cli_rt.clone();
+        let cli_task = tokio::spawn(async move {
+            let mut no_clip = None;
+            run_client_session(
+                &mut cli_cfg,
+                addr,
+                &mut injector,
+                &mut no_clip,
+                Some(&cli_rt_c),
+                None,
+            )
+            .await
+        });
+
+        for _ in 0..50 {
+            if cli_rt.snapshot().status.starts_with("Connected") {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(
+            cli_rt.snapshot().status.starts_with("Connected"),
+            "client must establish initial session"
+        );
+        // Allow listen_only discovery socket to finish binding and verify session stays calm at idle.
+        tokio::time::sleep(Duration::from_millis(120)).await;
+        assert!(
+            !cli_task.is_finished(),
+            "client must remain connected while idle before reboot announcement"
+        );
+
+        // Simulate the server rebooting on the LAN and emitting its single startup announcement.
+        let beacon_payload = serde_json::to_vec(&glide_net::discovery::ServerBeacon {
+            magic: "GLIDE_BEACON_V1".into(),
+            name: "rebooting-srv".into(),
+            quic_port: addr.port(),
+            fingerprint: fp,
+            os: "linux-x11".into(),
+            ips: vec!["127.0.0.1".into()],
+        })
+        .unwrap();
+        let started = std::time::Instant::now();
+        let udp = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        udp.send_to(&beacon_payload, ("127.0.0.1", discovery_port))
+            .await
+            .unwrap();
+
+        let res = tokio::time::timeout(Duration::from_millis(2600), cli_task)
+            .await
+            .expect("client must detect dead silent server within ~1.5s of reboot announcement")
+            .unwrap();
+        let err = res.expect_err("session against silent dead server must return error");
+        assert!(
+            err.to_string().contains("health ping"),
+            "expected health ping timeout error, got: {err}"
+        );
+        assert!(
+            started.elapsed() >= Duration::from_millis(1200),
+            "probe must wait for the 1.5s Pong timeout before disconnecting, elapsed={:?}",
+            started.elapsed()
+        );
+
+        silent_server.abort();
     }
 }

@@ -182,7 +182,14 @@ impl DirectIpcBackend {
 
 impl IpcBackend for DirectIpcBackend {
     fn status(&self) -> IpcStatus {
-        IpcStatus::from(self.runtime.snapshot())
+        self.runtime.read(|snap| IpcStatus {
+            mode: snap.mode.clone(),
+            status: snap.status.clone(),
+            active_target: snap.active_target.clone(),
+            locked: snap.locked,
+            peers: snap.peers.clone(),
+            rtt_ms: snap.rtt_ms,
+        })
     }
 
     fn max_file_bytes(&self) -> usize {

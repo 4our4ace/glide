@@ -1728,7 +1728,7 @@ fn input_server_cols(s: &Ui, p: Palette) -> El {
     let dead = s.config.server.dead_corner_px;
     let dwell = s.config.server.edge_dwell_ms;
 
-    let edge_rows = [
+    let mut edge_rows = vec![
         slider_row(
             p,
             "srv-thresh-row",
@@ -1791,6 +1791,30 @@ fn input_server_cols(s: &Ui, p: Palette) -> El {
                 },
             ),
         ),
+    ];
+
+    if s.config.server.auto_lock_fullscreen {
+        edge_rows.push(setting_row(
+            p,
+            "fs-allow-video-row",
+            icons::fullscreen_video_icon(p.text_2),
+            "Allow fullscreen videos",
+            Some("Don’t pause in video players & browsers"),
+            toggle(
+                p,
+                "fs-allow-video-toggle",
+                "Allow fullscreen videos",
+                s.config.server.allow_fullscreen_videos,
+                |s, _| {
+                    s.config.server.allow_fullscreen_videos =
+                        !s.config.server.allow_fullscreen_videos;
+                    s.push_config();
+                },
+            ),
+        ));
+    }
+
+    edge_rows.extend([
         setting_row(
             p,
             "srv-sync-lock-row",
@@ -1825,7 +1849,27 @@ fn input_server_cols(s: &Ui, p: Palette) -> El {
                 },
             ),
         ),
-    ];
+    ]);
+
+    if !matches!(s.os_kind, OsKind::LinuxWayland) {
+        edge_rows.push(setting_row(
+            p,
+            "srv-unfocus-row",
+            icons::unfocus_window_icon(p.text_2),
+            "Unfocus window on leave",
+            Some("Clear focus away and restore on return"),
+            toggle(
+                p,
+                "srv-unfocus-toggle",
+                "Unfocus window on leave",
+                s.config.server.unfocus_on_leave,
+                |s, _| {
+                    s.config.server.unfocus_on_leave = !s.config.server.unfocus_on_leave;
+                    s.push_config();
+                },
+            ),
+        ));
+    }
 
     let left_col = col()
         .key("input-server-left")
@@ -2030,7 +2074,7 @@ fn input_client_cols(s: &Ui, p: Palette) -> El {
     let thresh = s.config.client.edge_threshold_px;
     let dead = s.config.client.dead_corner_px;
 
-    let return_rows = [
+    let mut return_rows = vec![
         slider_row(
             p,
             "cli-thresh-row",
@@ -2079,6 +2123,26 @@ fn input_client_cols(s: &Ui, p: Palette) -> El {
             ),
         ),
     ];
+
+    if !matches!(s.os_kind, OsKind::LinuxWayland) {
+        return_rows.push(setting_row(
+            p,
+            "cli-unfocus-row",
+            icons::unfocus_window_icon(p.text_2),
+            "Unfocus window on leave",
+            Some("Clear focus away and restore on return"),
+            toggle(
+                p,
+                "cli-unfocus-toggle",
+                "Unfocus window on leave",
+                s.config.client.unfocus_on_leave,
+                |s, _| {
+                    s.config.client.unfocus_on_leave = !s.config.client.unfocus_on_leave;
+                    s.push_config();
+                },
+            ),
+        ));
+    }
 
     let left_col = col()
         .key("input-client-left")

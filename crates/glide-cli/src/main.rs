@@ -18,7 +18,7 @@ use glide_core::config::{
 use glide_core::ipc::{
     send_default_request, start_default_ipc, DirectIpcBackend, IpcAction, SwitchDestination,
 };
-use glide_core::runtime::RuntimeState;
+use glide_core::runtime::{RuntimeCommand, RuntimeState};
 use glide_core::server::run_native_server_with_runtime;
 use glide_gui::{run_gui_blocking, GuiOptions, DEFAULT_GUI_PORT};
 use glide_hid::HidUsage;
@@ -179,9 +179,17 @@ enum Command {
         #[arg(long)]
         no_fullscreen_lock: bool,
 
+        /// Also lock edge switching while watching fullscreen videos in browsers or media players
+        #[arg(long)]
+        lock_fullscreen_videos: bool,
+
         /// Forward media and volume keys to the active remote client instead of keeping them local
         #[arg(long)]
         forward_media_keys: bool,
+
+        /// Unfocus the active local window when pointer/keyboard focus leaves this machine
+        #[arg(long)]
+        unfocus_on_leave: bool,
 
         /// Mouse delta coalescing interval in microseconds (default: 1000 = 1000Hz; 0 = immediate)
         #[arg(long)]
@@ -249,6 +257,10 @@ enum Command {
         /// Disable bidirectional clipboard sync
         #[arg(long)]
         no_clipboard: bool,
+
+        /// Unfocus the active local window when pointer/keyboard focus leaves this machine
+        #[arg(long)]
+        unfocus_on_leave: bool,
     },
 
     /// Control a running Glide session via local IPC (`status`, `lock`, `unlock`, `toggle-lock`, `switch`)
@@ -449,7 +461,9 @@ async fn run_command(command: Command, config: Option<PathBuf>) -> Result<()> {
             dead_corner,
             edge_dwell_ms,
             no_fullscreen_lock,
+            lock_fullscreen_videos,
             forward_media_keys,
+            unfocus_on_leave,
             coalesce_us,
         } => {
             let file_cfg = load_config(cli_config.as_ref())?;
@@ -482,8 +496,14 @@ async fn run_command(command: Command, config: Option<PathBuf>) -> Result<()> {
             if no_fullscreen_lock {
                 cfg.auto_lock_fullscreen = false;
             }
+            if lock_fullscreen_videos {
+                cfg.allow_fullscreen_videos = false;
+            }
             if forward_media_keys {
                 cfg.pin_media_keys_local = false;
+            }
+            if unfocus_on_leave {
+                cfg.unfocus_on_leave = true;
             }
             if let Some(cu) = coalesce_us {
                 cfg.motion_coalesce_us = cu;
@@ -491,6 +511,7 @@ async fn run_command(command: Command, config: Option<PathBuf>) -> Result<()> {
 
             let rt = RuntimeState::new();
             let (cmd_tx, cmd_rx) = tokio::sync::mpsc::unbounded_channel();
+            let shutdown_cmd_tx = cmd_tx.clone();
             let _ipc_guard = match start_default_ipc(Arc::new(DirectIpcBackend::new(
                 rt.clone(),
                 cmd_tx,
@@ -505,12 +526,12 @@ async fn run_command(command: Command, config: Option<PathBuf>) -> Result<()> {
                 }
             };
 
-            tokio::select! {
-                res = run_native_server_with_runtime(cfg, Some(rt), Some(cmd_rx)) => res?,
-                sig = shutdown_signal() => {
-                    tracing::info!(signal = sig, "Shutting down Glide server");
-                }
-            }
+            run_engine_with_signal_flush(
+                "server",
+                shutdown_cmd_tx,
+                run_native_server_with_runtime(cfg, Some(rt), Some(cmd_rx)),
+            )
+            .await?;
         }
 
         Command::Client {
@@ -529,6 +550,7 @@ async fn run_command(command: Command, config: Option<PathBuf>) -> Result<()> {
             dead_corner,
             backend,
             no_clipboard,
+            unfocus_on_leave,
         } => {
             let file_cfg = load_config(cli_config.as_ref())?;
             let mut cfg: ClientConfig = file_cfg.effective_client_config();
@@ -589,9 +611,13 @@ async fn run_command(command: Command, config: Option<PathBuf>) -> Result<()> {
             if no_clipboard {
                 cfg.clipboard = false;
             }
+            if unfocus_on_leave {
+                cfg.unfocus_on_leave = true;
+            }
 
             let rt = RuntimeState::new();
             let (cmd_tx, cmd_rx) = tokio::sync::mpsc::unbounded_channel();
+            let shutdown_cmd_tx = cmd_tx.clone();
             let _ipc_guard = match start_default_ipc(Arc::new(DirectIpcBackend::new(
                 rt.clone(),
                 cmd_tx,
@@ -606,12 +632,12 @@ async fn run_command(command: Command, config: Option<PathBuf>) -> Result<()> {
                 }
             };
 
-            tokio::select! {
-                res = run_native_client_with_runtime(cfg, Some(rt), Some(cmd_rx)) => res?,
-                sig = shutdown_signal() => {
-                    tracing::info!(signal = sig, "Shutting down Glide client");
-                }
-            }
+            run_engine_with_signal_flush(
+                "client",
+                shutdown_cmd_tx,
+                run_native_client_with_runtime(cfg, Some(rt), Some(cmd_rx)),
+            )
+            .await?;
         }
 
         Command::Ctl { action } => match action {
@@ -934,32 +960,54 @@ async fn run_command(command: Command, config: Option<PathBuf>) -> Result<()> {
     Ok(())
 }
 
-async fn shutdown_signal() -> &'static str {
-    let ctrl_c = async {
-        let _ = tokio::signal::ctrl_c().await;
-    };
+const CLI_SHUTDOWN_FLUSH_TIMEOUT: Duration = Duration::from_millis(500);
 
-    #[cfg(unix)]
-    {
-        let terminate = async {
-            match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
-                Ok(mut sigterm) => {
-                    sigterm.recv().await;
+async fn run_engine_with_signal_flush<F>(
+    role: &'static str,
+    cmd_tx: tokio::sync::mpsc::UnboundedSender<RuntimeCommand>,
+    engine_fut: F,
+) -> Result<()>
+where
+    F: std::future::Future<Output = Result<()>>,
+{
+    run_engine_with_custom_signal_flush(
+        role,
+        cmd_tx,
+        engine_fut,
+        glide_backend::lifecycle::shutdown_signal(),
+    )
+    .await
+}
+
+async fn run_engine_with_custom_signal_flush<F, S>(
+    role: &'static str,
+    cmd_tx: tokio::sync::mpsc::UnboundedSender<RuntimeCommand>,
+    engine_fut: F,
+    signal_fut: S,
+) -> Result<()>
+where
+    F: std::future::Future<Output = Result<()>>,
+    S: std::future::Future<Output = &'static str>,
+{
+    tokio::pin!(engine_fut);
+    tokio::pin!(signal_fut);
+    tokio::select! {
+        res = &mut engine_fut => res,
+        sig = &mut signal_fut => {
+            tracing::info!(
+                signal = sig,
+                role,
+                "Shutting down Glide engine and flushing QUIC close"
+            );
+            let _ = cmd_tx.send(RuntimeCommand::Shutdown);
+            match tokio::time::timeout(CLI_SHUTDOWN_FLUSH_TIMEOUT, &mut engine_fut).await {
+                Ok(res) => res,
+                Err(_) => {
+                    tracing::warn!(role, "Timed out waiting for Glide engine shutdown flush");
+                    Ok(())
                 }
-                Err(_) => std::future::pending::<()>().await,
             }
-        };
-
-        tokio::select! {
-            _ = ctrl_c => "SIGINT",
-            _ = terminate => "SIGTERM",
         }
-    }
-
-    #[cfg(not(unix))]
-    {
-        ctrl_c.await;
-        "Ctrl+C"
     }
 }
 
@@ -1027,5 +1075,103 @@ mod tests {
                 check: true
             })
         ));
+    }
+
+    #[test]
+    fn parses_unfocus_on_leave_flag_for_server_and_client() {
+        let srv_default = Cli::try_parse_from(["glide", "server"]).unwrap();
+        assert!(matches!(
+            srv_default.command,
+            Some(Command::Server {
+                unfocus_on_leave: false,
+                ..
+            })
+        ));
+
+        let srv_enabled = Cli::try_parse_from(["glide", "server", "--unfocus-on-leave"]).unwrap();
+        assert!(matches!(
+            srv_enabled.command,
+            Some(Command::Server {
+                unfocus_on_leave: true,
+                ..
+            })
+        ));
+
+        let cli_default = Cli::try_parse_from(["glide", "client"]).unwrap();
+        assert!(matches!(
+            cli_default.command,
+            Some(Command::Client {
+                unfocus_on_leave: false,
+                ..
+            })
+        ));
+
+        let cli_enabled = Cli::try_parse_from(["glide", "client", "--unfocus-on-leave"]).unwrap();
+        assert!(matches!(
+            cli_enabled.command,
+            Some(Command::Client {
+                unfocus_on_leave: true,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn parses_lock_fullscreen_videos_flag_for_server() {
+        let srv_default = Cli::try_parse_from(["glide", "server"]).unwrap();
+        assert!(matches!(
+            srv_default.command,
+            Some(Command::Server {
+                lock_fullscreen_videos: false,
+                ..
+            })
+        ));
+
+        let srv_locked =
+            Cli::try_parse_from(["glide", "server", "--lock-fullscreen-videos"]).unwrap();
+        assert!(matches!(
+            srv_locked.command,
+            Some(Command::Server {
+                lock_fullscreen_videos: true,
+                ..
+            })
+        ));
+    }
+
+    #[tokio::test]
+    async fn signal_flush_sends_shutdown_and_awaits_engine_completion() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let (cmd_tx, mut cmd_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (sig_tx, sig_rx) = tokio::sync::oneshot::channel::<&'static str>();
+        let flushed = Arc::new(AtomicBool::new(false));
+        let flushed_c = Arc::clone(&flushed);
+
+        let engine = async move {
+            match cmd_rx.recv().await {
+                Some(RuntimeCommand::Shutdown) => {
+                    tokio::time::sleep(Duration::from_millis(25)).await;
+                    flushed_c.store(true, Ordering::SeqCst);
+                    Ok(())
+                }
+                other => anyhow::bail!("expected Shutdown command, got {other:?}"),
+            }
+        };
+
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            let _ = sig_tx.send("SIGTERM");
+        });
+
+        run_engine_with_custom_signal_flush("server", cmd_tx, engine, async move {
+            sig_rx.await.unwrap_or("SIGTERM")
+        })
+        .await
+        .unwrap();
+
+        assert!(
+            flushed.load(Ordering::SeqCst),
+            "CLI signal handler must flush engine shutdown before returning"
+        );
     }
 }

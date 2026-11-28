@@ -873,10 +873,44 @@ pub fn wait_for_process_exit(pid: u32, max_wait: std::time::Duration) {
 
     #[cfg(target_os = "linux")]
     {
-        let proc_dir = PathBuf::from(format!("/proc/{pid}"));
-        let deadline = std::time::Instant::now() + max_wait;
-        while proc_dir.exists() && std::time::Instant::now() < deadline {
-            std::thread::sleep(std::time::Duration::from_millis(25));
+        // Event-driven wait via Linux 5.3+ pidfd_open + poll(2) — 0 polling, instant wake on exit.
+        let pidfd = unsafe { libc::syscall(libc::SYS_pidfd_open, pid as libc::c_int, 0u32) };
+        if pidfd >= 0 {
+            let fd = pidfd as libc::c_int;
+            let deadline = std::time::Instant::now() + max_wait;
+            loop {
+                let rem = deadline.saturating_duration_since(std::time::Instant::now());
+                if rem.is_zero() {
+                    break;
+                }
+                let mut pfd = libc::pollfd {
+                    fd,
+                    events: libc::POLLIN,
+                    revents: 0,
+                };
+                let timeout_ms = rem.as_millis().min(i32::MAX as u128) as libc::c_int;
+                let rc = unsafe { libc::poll(&mut pfd, 1, timeout_ms) };
+                if rc < 0 {
+                    let err = std::io::Error::last_os_error();
+                    if err.kind() == std::io::ErrorKind::Interrupted {
+                        continue;
+                    }
+                }
+                break;
+            }
+            unsafe {
+                libc::close(fd);
+            }
+        } else {
+            let err = std::io::Error::last_os_error();
+            // ESRCH means the process already exited; only fall back to /proc on ENOSYS/EPERM.
+            if err.raw_os_error() != Some(libc::ESRCH) {
+                let proc_dir = PathBuf::from(format!("/proc/{pid}"));
+                let deadline = std::time::Instant::now() + max_wait;
+                while proc_dir.exists() && std::time::Instant::now() < deadline {
+                    std::thread::sleep(std::time::Duration::from_millis(25));
+                }
+            }
         }
     }
 

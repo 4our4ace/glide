@@ -37,6 +37,9 @@ use tracing::{debug, trace};
 use x11rb::connection::Connection;
 use x11rb::protocol::shape::SK;
 use x11rb::protocol::xfixes::ConnectionExt as XFixesExt;
+use x11rb::protocol::xinput::{
+    ConnectionExt as XInputExt, EventMask as XiEventMask, XIEventMask,
+};
 use x11rb::protocol::xproto::{
     Atom, AtomEnum, ChangeGCAux, ClientMessageData, ClientMessageEvent, ConfigureWindowAux,
     ConnectionExt as XProtoExt, CreateGCAux, CreateWindowAux, EventMask, MapState, PropMode,
@@ -853,7 +856,39 @@ fn find_xdnd_target(
     }
 }
 
-fn acquire_server_timestamp(conn: &RustConnection, win: Window, prop_time: Atom) -> u32 {
+/// Blocks in `poll(2)` until the X11 connection socket becomes readable or `deadline` elapses.
+fn wait_x11_readable(conn: &RustConnection, deadline: Instant) -> bool {
+    let mut pfd = libc::pollfd {
+        fd: conn.stream().as_raw_fd(),
+        events: libc::POLLIN,
+        revents: 0,
+    };
+    loop {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return false;
+        }
+        let timeout_ms = remaining.as_millis().clamp(1, i32::MAX as u128) as i32;
+        pfd.revents = 0;
+        let rc = unsafe { libc::poll(&mut pfd, 1, timeout_ms) };
+        if rc > 0 {
+            return (pfd.revents & (libc::POLLERR | libc::POLLNVAL | libc::POLLHUP)) == 0;
+        }
+        if rc == 0 {
+            return false;
+        }
+        if std::io::Error::last_os_error().kind() != std::io::ErrorKind::Interrupted {
+            return false;
+        }
+    }
+}
+
+fn acquire_server_timestamp(
+    conn: &RustConnection,
+    win: Window,
+    prop_time: Atom,
+    deferred_events: &mut VecDeque<Event>,
+) -> u32 {
     if conn
         .change_property8(PropMode::APPEND, win, prop_time, AtomEnum::STRING, &[])
         .is_err()
@@ -862,13 +897,18 @@ fn acquire_server_timestamp(conn: &RustConnection, win: Window, prop_time: Atom)
     }
     let _ = conn.flush();
     let deadline = Instant::now() + Duration::from_millis(80);
-    while Instant::now() < deadline {
+    loop {
         match conn.poll_for_event() {
             Ok(Some(Event::PropertyNotify(pn))) if pn.window == win && pn.atom == prop_time => {
                 return pn.time;
             }
-            Ok(Some(_)) => continue,
-            Ok(None) => thread::sleep(Duration::from_millis(2)),
+            Ok(Some(Event::XinputRawMotion(_))) => {}
+            Ok(Some(other)) => deferred_events.push_back(other),
+            Ok(None) => {
+                if !wait_x11_readable(conn, deadline) {
+                    break;
+                }
+            }
             Err(_) => break,
         }
     }
@@ -1219,6 +1259,7 @@ fn send_xdnd_leave_msg(
     let _ = conn.send_event(false, send_win, EventMask::NO_EVENT, leave);
 }
 
+#[allow(clippy::too_many_arguments)]
 fn start_live_xdnd_session(
     conn: &RustConnection,
     root: Window,
@@ -1226,6 +1267,7 @@ fn start_live_xdnd_session(
     atoms: &XdndAtoms,
     paths: &[PathBuf],
     ignore: &[Window],
+    deferred_events: &mut VecDeque<Event>,
 ) -> Option<ActiveLiveXdnd> {
     let uri_list = format_uri_list(paths).into_bytes();
     let gnome_files = format_gnome_copied_files(paths).into_bytes();
@@ -1233,7 +1275,7 @@ fn start_live_xdnd_session(
         return None;
     }
 
-    let timestamp = acquire_server_timestamp(conn, src_win, atoms.prop_time);
+    let timestamp = acquire_server_timestamp(conn, src_win, atoms.prop_time, deferred_events);
     let _ = conn.change_property32(
         PropMode::REPLACE,
         src_win,
@@ -1348,6 +1390,7 @@ fn perform_xdnd_drop_or_fallback(
     paths: &[PathBuf],
     live_xdnd: Option<ActiveLiveXdnd>,
     clipboard_offer: &mut Option<ClipboardOffer>,
+    deferred_events: &mut VecDeque<Event>,
 ) -> Result<DropDeliveryOutcome> {
     let uri_list = format_uri_list(paths).into_bytes();
     let gnome_files = format_gnome_copied_files(paths).into_bytes();
@@ -1388,14 +1431,14 @@ fn perform_xdnd_drop_or_fallback(
                 (
                     false,
                     false,
-                    acquire_server_timestamp(conn, src_win, atoms.prop_time),
+                    acquire_server_timestamp(conn, src_win, atoms.prop_time, deferred_events),
                 )
             }
         }
         None => (
             false,
             false,
-            acquire_server_timestamp(conn, src_win, atoms.prop_time),
+            acquire_server_timestamp(conn, src_win, atoms.prop_time, deferred_events),
         ),
     };
 
@@ -1443,7 +1486,7 @@ fn perform_xdnd_drop_or_fallback(
             // any updated status at the exact release coordinate without blocking unnecessarily).
             let wait_ms = if already_accepted { 120 } else { 550 };
             let status_deadline = Instant::now() + Duration::from_millis(wait_ms);
-            while Instant::now() < status_deadline {
+            loop {
                 match conn.poll_for_event() {
                     Ok(Some(Event::ClientMessage(cm))) if cm.type_ == atoms.xdnd_status => {
                         let d = cm.data.as_data32();
@@ -1467,8 +1510,13 @@ fn perform_xdnd_drop_or_fallback(
                             clipboard_offer.as_ref(),
                         );
                     }
-                    Ok(Some(_)) => {}
-                    Ok(None) => thread::sleep(Duration::from_millis(4)),
+                    Ok(Some(Event::XinputRawMotion(_))) => {}
+                    Ok(Some(other)) => deferred_events.push_back(other),
+                    Ok(None) => {
+                        if !wait_x11_readable(conn, status_deadline) {
+                            break;
+                        }
+                    }
                     Err(_) => break,
                 }
             }
@@ -1489,11 +1537,12 @@ fn perform_xdnd_drop_or_fallback(
                 let mut served_uri = false;
                 let mut served_at: Option<Instant> = None;
                 let drop_deadline = Instant::now() + Duration::from_secs(3);
-                while Instant::now() < drop_deadline {
-                    if let Some(t) = served_at {
-                        if t.elapsed() >= Duration::from_millis(300) {
-                            break;
-                        }
+                loop {
+                    let effective_deadline = served_at
+                        .map(|t| (t + Duration::from_millis(300)).min(drop_deadline))
+                        .unwrap_or(drop_deadline);
+                    if Instant::now() >= effective_deadline {
+                        break;
                     }
                     match conn.poll_for_event() {
                         Ok(Some(Event::SelectionRequest(req))) => {
@@ -1520,8 +1569,13 @@ fn perform_xdnd_drop_or_fallback(
                         {
                             break;
                         }
-                        Ok(Some(_)) => {}
-                        Ok(None) => thread::sleep(Duration::from_millis(4)),
+                        Ok(Some(Event::XinputRawMotion(_))) => {}
+                        Ok(Some(other)) => deferred_events.push_back(other),
+                        Ok(None) => {
+                            if !wait_x11_readable(conn, effective_deadline) {
+                                break;
+                            }
+                        }
                         Err(_) => break,
                     }
                 }
@@ -1581,18 +1635,29 @@ fn drain_x11_dnd_events(
     clipboard_offer: &mut Option<ClipboardOffer>,
     preview: &mut Option<X11DragPreview>,
     live_xdnd: &mut Option<ActiveLiveXdnd>,
+    deferred_events: &mut VecDeque<Event>,
+    raw_motion_dirty: &mut bool,
 ) -> bool {
     loop {
-        let ev = match conn.poll_for_event() {
-            Ok(Some(ev)) => ev,
-            Ok(None) => return true,
-            Err(e) => {
-                debug!(error = %e, "X11 DnD connection closed");
-                return false;
+        let ev = if let Some(ev) = deferred_events.pop_front() {
+            ev
+        } else {
+            match conn.poll_for_event() {
+                Ok(Some(ev)) => ev,
+                Ok(None) => return true,
+                Err(e) => {
+                    debug!(error = %e, "X11 DnD connection closed");
+                    return false;
+                }
             }
         };
 
         match ev {
+            Event::XinputRawMotion(_) => {
+                if preview.is_some() || live_xdnd.is_some() {
+                    *raw_motion_dirty = true;
+                }
+            }
             Event::RandrScreenChangeNotify(_) | Event::RandrNotify(_) => {
                 if let Ok(new_geom) = query_desktop_geometry(conn, screen_num) {
                     if new_geom != *cached_geom {
@@ -1811,6 +1876,33 @@ fn run_x11_dnd_loop(
     wake_rx: WakeReceiver,
     shared: Arc<SharedX11Dnd>,
 ) {
+    let xi_ready = conn
+        .xinput_xi_query_version(2, 2)
+        .ok()
+        .and_then(|c| c.reply().ok())
+        .is_some();
+    let mut raw_motion_selected = false;
+    let mut raw_motion_dirty = false;
+    let mut deferred_events: VecDeque<Event> = VecDeque::new();
+
+    let set_raw_motion = |conn: &RustConnection, enable: bool, selected: &mut bool| {
+        if !xi_ready || *selected == enable {
+            return;
+        }
+        let em = XiEventMask {
+            deviceid: 1, // XIAllMasterDevices
+            mask: if enable {
+                vec![XIEventMask::RAW_MOTION]
+            } else {
+                Vec::new()
+            },
+        };
+        if conn.xinput_xi_select_events(root, &[em]).is_ok() {
+            let _ = conn.flush();
+            *selected = enable;
+        }
+    };
+
     let mut strips: Vec<StripWin> = Vec::new();
     let mut active_inbound: Option<ActiveEdgeInbound> = None;
     let mut clipboard_offer: Option<ClipboardOffer> = None;
@@ -1901,13 +1993,21 @@ fn run_x11_dnd_loop(
                         finish_live_xdnd_cancel(&conn, src_win, &atoms, old_live);
                     }
                     let ignore = build_ignore_list(src_win, &strips, preview.as_ref());
-                    live_xdnd =
-                        start_live_xdnd_session(&conn, root, src_win, &atoms, &paths, &ignore);
+                    live_xdnd = start_live_xdnd_session(
+                        &conn,
+                        root,
+                        src_win,
+                        &atoms,
+                        &paths,
+                        &ignore,
+                        &mut deferred_events,
+                    );
                     if let Some(ref mut p) = preview {
                         p.set_status(&conn, X11PreviewStatus::Ready);
                     }
                 }
                 DndCmd::IncomingDragCancel => {
+                    set_raw_motion(&conn, false, &mut raw_motion_selected);
                     if let Some(old) = preview.take() {
                         old.destroy(&conn);
                     }
@@ -1915,13 +2015,16 @@ fn run_x11_dnd_loop(
                         finish_live_xdnd_cancel(&conn, src_win, &atoms, old_live);
                     }
                     last_poll_ptr = (i16::MIN, i16::MIN);
+                    raw_motion_dirty = false;
                 }
                 DndCmd::DeliverDrop { paths, reply } => {
+                    set_raw_motion(&conn, false, &mut raw_motion_selected);
                     if let Some(old) = preview.take() {
                         old.destroy(&conn);
                     }
                     let live = live_xdnd.take();
                     last_poll_ptr = (i16::MIN, i16::MIN);
+                    raw_motion_dirty = false;
                     let res = perform_xdnd_drop_or_fallback(
                         &conn,
                         root,
@@ -1931,6 +2034,7 @@ fn run_x11_dnd_loop(
                         &paths,
                         live,
                         &mut clipboard_offer,
+                        &mut deferred_events,
                     );
                     let _ = reply.send(res);
                 }
@@ -1941,6 +2045,14 @@ fn run_x11_dnd_loop(
         }
         if wake_closed {
             break 'outer;
+        }
+
+        // Subscribe to XI_RawMotion strictly while a drag preview or live XDND session is active
+        // so we follow local pointer motion purely via XInput2 events with 0.00 Hz idle wakeups.
+        let drag_active = preview.is_some() || live_xdnd.is_some();
+        set_raw_motion(&conn, drag_active, &mut raw_motion_selected);
+        if !drag_active {
+            raw_motion_dirty = false;
         }
 
         // 2. Drain all queued/readable X11 events non-blockingly before sleeping in poll(2).
@@ -1956,6 +2068,8 @@ fn run_x11_dnd_loop(
             &mut clipboard_offer,
             &mut preview,
             &mut live_xdnd,
+            &mut deferred_events,
+            &mut raw_motion_dirty,
         ) {
             break 'outer;
         }
@@ -1964,10 +2078,13 @@ fn run_x11_dnd_loop(
             continue;
         }
 
-        // 3. Active incoming drag mode: poll pointer at ~80Hz so local Server drags also move
-        //    the floating preview pill and drive live XDND folder highlighting smoothly.
-        let timeout_ms = if preview.is_some() || live_xdnd.is_some() {
-            if last_ptr_poll.elapsed() >= Duration::from_millis(12) {
+        // 3. Event-driven active drag pointer follow: only query pointer when XI_RawMotion
+        //    actually fired, coalesced to <= 125 Hz (8 ms) with a one-shot trailing flush so
+        //    even an active stationary drag sleeps at -1 (0.00 Hz wakeups).
+        let timeout_ms = if drag_active && raw_motion_dirty {
+            let elapsed = last_ptr_poll.elapsed();
+            if elapsed >= Duration::from_millis(8) {
+                raw_motion_dirty = false;
                 last_ptr_poll = Instant::now();
                 if let Ok(cookie) = conn.query_pointer(root) {
                     if let Ok(ptr) = cookie.reply() {
@@ -2004,8 +2121,7 @@ fn run_x11_dnd_loop(
                     }
                 }
                 // Drain any X11 events (e.g. XdndStatus / SelectionRequest) buffered into
-                // x11rb during Step 3's `.reply()` roundtrips so they are processed immediately
-                // rather than sleeping up to 12ms in poll(2).
+                // x11rb during Step 3's `.reply()` roundtrips immediately.
                 if !drain_x11_dnd_events(
                     &conn,
                     screen_num,
@@ -2018,13 +2134,19 @@ fn run_x11_dnd_loop(
                     &mut clipboard_offer,
                     &mut preview,
                     &mut live_xdnd,
+                    &mut deferred_events,
+                    &mut raw_motion_dirty,
                 ) {
                     break 'outer;
                 }
+                if raw_motion_dirty {
+                    8
+                } else {
+                    -1
+                }
+            } else {
+                8i32.saturating_sub(elapsed.as_millis().min(8) as i32).max(1)
             }
-            12i32
-                .saturating_sub(last_ptr_poll.elapsed().as_millis().min(12) as i32)
-                .max(1)
         } else {
             -1
         };
@@ -2033,8 +2155,7 @@ fn run_x11_dnd_loop(
             continue;
         }
 
-        // 4. Block in poll(2) with 0% CPU when idle or <= 12ms during active drag until an
-        //    X11 event arrives or a non-blocking wake byte is written to the pipe.
+        // 4. Block indefinitely in poll(2) (0.00 Hz idle) until an X11 event arrives or wake_tx fires.
         let _ = conn.flush();
         match poll_fd_and_wake(conn.stream().as_raw_fd(), &wake_rx, timeout_ms) {
             Ok(st) => {
@@ -2053,6 +2174,7 @@ fn run_x11_dnd_loop(
         }
     }
 
+    set_raw_motion(&conn, false, &mut raw_motion_selected);
     if let Some(old) = preview.take() {
         old.destroy(&conn);
     }
@@ -2346,11 +2468,15 @@ fn show_x11_fallback_hint_blocking(cursor_x: i32, cursor_y: i32) -> Result<()> {
     draw(&conn);
 
     let deadline = Instant::now() + Duration::from_millis(3500);
-    while Instant::now() < deadline {
+    loop {
         match conn.poll_for_event() {
             Ok(Some(Event::Expose(_))) => draw(&conn),
             Ok(Some(_)) => {}
-            Ok(None) => thread::sleep(Duration::from_millis(25)),
+            Ok(None) => {
+                if !wait_x11_readable(&conn, deadline) {
+                    break;
+                }
+            }
             Err(_) => break,
         }
     }

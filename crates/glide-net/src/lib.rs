@@ -15,21 +15,29 @@ use glide_proto::{
     ClipboardPayload, ControlMessage, DatagramMessage, MAX_CLIPBOARD_BYTES, MAX_CONTROL_FRAME_LEN,
 };
 use quinn::crypto::rustls::{QuicClientConfig, QuicServerConfig};
-pub use quinn::Connection;
-use quinn::{Endpoint, IdleTimeout, RecvStream, SendStream, TransportConfig};
+pub use quinn::{Connection, Endpoint};
+use quinn::{RecvStream, SendStream, TransportConfig};
 use sha2::{Digest, Sha256};
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 use tls::{ensure_crypto_provider, FingerprintVerifier, ServerIdentity, TrustMode, ALPN_GLIDE_V1};
 
-/// Builds a QUIC `TransportConfig` tuned for interactive sub-millisecond LAN/Wi-Fi input.
+/// Maximum duration spent awaiting `Endpoint::wait_idle()` while flushing queued
+/// QUIC `CONNECTION_CLOSE` packets onto the wire during OS shutdown, sleep, or exit.
+pub const CLOSE_FLUSH_TIMEOUT: Duration = Duration::from_millis(50);
+
+/// Builds a QUIC `TransportConfig` tuned for interactive sub-millisecond LAN/Wi-Fi input
+/// with **zero** idle time-based polling.
 ///
 /// - `initial_rtt(5ms)` avoids Quinn's default 333ms WAN RTT assumption.
-/// - `keep_alive_interval(45ms)` beats the 102.4ms 802.11 DTIM beacon and 50–100ms laptop
-///   Wi-Fi PSM sleep timers that otherwise cause 150–200ms wakeup spikes.
-/// - `enable_segmentation_offload(false)` eliminates the `quinn-udp` Windows 11 Wi-Fi
-///   GSO/USO silent batch-drop bug.
+/// - `keep_alive_interval(None)` + `max_idle_timeout(None)` guarantee **0.0 Hz** idle wakeups
+///   and **0.0** idle UDP packets/sec when no input is flowing, letting laptops enter deep CPU
+///   C-states and 802.11 Wi-Fi PSM sleep. Peer disconnect / dead-link recovery is strictly
+///   event-driven: Layer 1 OS shutdown/sleep/signal `CONNECTION_CLOSE` flushing + one-shot
+///   `HealthProbe` on screen entry, OS resume, NIC change, or active input burst.
+/// - `enable_segmentation_offload(false)` on Windows eliminates the `quinn-udp` Windows 11 Wi-Fi
+///   GSO/USO silent batch-drop bug while keeping Linux `UDP_SEGMENT` (GSO) fast for bulk streams.
 /// - `AckFrequencyConfig` (`ack_eliciting_threshold = 1`, `max_ack_delay = 2ms`,
 ///   `reordering_threshold = 1`) cuts reverse-direction Wi-Fi ACK airtime by 50% on 1000Hz
 ///   mouse streams while keeping solitary clicks/keys ACKed within <= 2ms and eliminating
@@ -37,13 +45,15 @@ use tls::{ensure_crypto_provider, FingerprintVerifier, ServerIdentity, TrustMode
 /// - `mtu_discovery_config(None)` avoids transient probe stalls on LANs.
 /// - Tight datagram buffers (`2 KiB` send / `4 KiB` recv) prevent seconds of stale mouse
 ///   rubber-banding backlog during transient RF interference.
-/// - Bounded bulk windows (`512 KiB` send / `256 KiB` per-stream recv) stop Lane C clipboard
-///   and file streams from bloating the Wi-Fi AP buffer ahead of interactive input.
+/// - Bounded bulk windows (`512 KiB` send / `256 KiB` per-stream recv / `1 MiB` conn recv) stop
+///   Lane C clipboard and file streams from bloating the Wi-Fi AP buffer ahead of input.
 fn build_transport_config() -> TransportConfig {
     let mut transport = TransportConfig::default();
     transport.initial_rtt(Duration::from_millis(5));
-    transport.keep_alive_interval(Some(Duration::from_millis(45)));
+    transport.keep_alive_interval(None);
+    transport.max_idle_timeout(None);
     transport.mtu_discovery_config(None);
+    #[cfg(target_os = "windows")]
     transport.enable_segmentation_offload(false);
 
     let mut ack_cfg = quinn::AckFrequencyConfig::default();
@@ -53,13 +63,11 @@ fn build_transport_config() -> TransportConfig {
         .reordering_threshold(1u32.into());
     transport.ack_frequency_config(Some(ack_cfg));
 
-    if let Ok(timeout) = IdleTimeout::try_from(Duration::from_secs(4)) {
-        transport.max_idle_timeout(Some(timeout));
-    }
     transport.datagram_send_buffer_size(2048);
     transport.datagram_receive_buffer_size(Some(4096));
     transport.send_window(512 * 1024);
     transport.stream_receive_window((256u32 * 1024).into());
+    transport.receive_window((1024u32 * 1024).into());
     transport.max_concurrent_bidi_streams(4u32.into());
     transport.max_concurrent_uni_streams(32u32.into());
     transport
@@ -214,6 +222,21 @@ impl GlideServerEndpoint {
         self.endpoint.close(0u32.into(), b"server stopped");
     }
 
+    /// Waits (bounded to [`CLOSE_FLUSH_TIMEOUT`]) for Quinn's endpoint driver to finish
+    /// transmitting queued `CONNECTION_CLOSE` packets for recently closed peer connections
+    /// without closing the server listener itself.
+    pub async fn flush_closed(&self) {
+        let _ = tokio::time::timeout(CLOSE_FLUSH_TIMEOUT, self.endpoint.wait_idle()).await;
+    }
+
+    /// Closes the QUIC listener and all active connections, then waits (bounded to
+    /// [`CLOSE_FLUSH_TIMEOUT`]) for Quinn to transmit queued `CONNECTION_CLOSE` packets
+    /// onto the wire before returning.
+    pub async fn close_and_flush(&self, code: u32, reason: &[u8]) {
+        self.endpoint.close(code.into(), reason);
+        self.flush_closed().await;
+    }
+
     /// Accepts the next incoming QUIC connection handle.
     ///
     /// Returns `None` only when this server endpoint has been closed.
@@ -229,7 +252,7 @@ impl GlideServerEndpoint {
             .accept_bi()
             .await
             .context("client did not open control stream")?;
-        Ok(GlideSession::new(conn, ctrl_send, ctrl_recv))
+        Ok(GlideSession::new(conn, ctrl_send, ctrl_recv, None))
     }
 
     /// Accepts the next incoming QUIC connection and opens the control bidirectional stream.
@@ -239,6 +262,26 @@ impl GlideServerEndpoint {
             .await
             .ok_or_else(|| anyhow!("QUIC server endpoint closed"))?;
         Self::complete_incoming(incoming).await
+    }
+}
+
+/// Closes a QUIC connection and flushes the resulting `CONNECTION_CLOSE` frame onto the
+/// wire (bounded to [`CLOSE_FLUSH_TIMEOUT`] via `Endpoint::wait_idle()`).
+///
+/// Passing `Some(endpoint)` allows Quinn's UDP driver to transmit the close frame before
+/// the caller drops an OS shutdown/sleep inhibitor or exits the process. When `endpoint`
+/// is `None`, yields once so any background driver task on the runtime can run.
+pub async fn close_and_flush_conn(
+    conn: &Connection,
+    endpoint: Option<&Endpoint>,
+    code: u32,
+    reason: &[u8],
+) {
+    conn.close(code.into(), reason);
+    if let Some(ep) = endpoint {
+        let _ = tokio::time::timeout(CLOSE_FLUSH_TIMEOUT, ep.wait_idle()).await;
+    } else {
+        tokio::task::yield_now().await;
     }
 }
 
@@ -285,7 +328,7 @@ pub async fn connect_client(server_addr: SocketAddr, trust: TrustMode) -> Result
         .await
         .context("failed to open QUIC control stream")?;
 
-    Ok(GlideSession::new(conn, ctrl_send, ctrl_recv))
+    Ok(GlideSession::new(conn, ctrl_send, ctrl_recv, Some(endpoint)))
 }
 
 /// Active encrypted QUIC session split cleanly into independent send/receive handles.
@@ -293,15 +336,30 @@ pub struct GlideSession {
     pub conn: Connection,
     pub ctrl_send: ControlSender,
     pub ctrl_recv: ControlReceiver,
+    /// Client-owned QUIC endpoint retained so [`close_and_flush_conn`] can await
+    /// `Endpoint::wait_idle()` and guarantee `CONNECTION_CLOSE` reaches the wire before
+    /// shutdown, sleep, or process exit. `None` for server-accepted sessions.
+    pub endpoint: Option<Endpoint>,
 }
 
 impl GlideSession {
-    fn new(conn: Connection, send: SendStream, recv: RecvStream) -> Self {
+    fn new(
+        conn: Connection,
+        send: SendStream,
+        recv: RecvStream,
+        endpoint: Option<Endpoint>,
+    ) -> Self {
         Self {
             conn,
             ctrl_send: ControlSender::new(send),
             ctrl_recv: ControlReceiver::new(recv),
+            endpoint,
         }
+    }
+
+    /// Closes this session and flushes `CONNECTION_CLOSE` onto the wire (bounded to 50 ms).
+    pub async fn close_and_flush(&self, code: u32, reason: &[u8]) {
+        close_and_flush_conn(&self.conn, self.endpoint.as_ref(), code, reason).await;
     }
 
     pub fn remote_addr(&self) -> SocketAddr {
@@ -1112,8 +1170,10 @@ mod tests {
         let cfg = build_transport_config();
         let dbg = format!("{cfg:?}");
         assert!(dbg.contains("initial_rtt: 5ms"), "debug: {dbg}");
-        assert!(dbg.contains("keep_alive_interval: Some(45ms)"), "debug: {dbg}");
+        assert!(dbg.contains("keep_alive_interval: None"), "debug: {dbg}");
+        assert!(dbg.contains("max_idle_timeout: None"), "debug: {dbg}");
         assert!(dbg.contains("mtu_discovery_config: None"), "debug: {dbg}");
+        #[cfg(target_os = "windows")]
         assert!(
             dbg.contains("enable_segmentation_offload: false"),
             "debug: {dbg}"
@@ -1131,6 +1191,7 @@ mod tests {
         );
         assert!(dbg.contains("send_window: 524288"), "debug: {dbg}");
         assert!(dbg.contains("stream_receive_window: 262144"), "debug: {dbg}");
+        assert!(dbg.contains("receive_window: 1048576"), "debug: {dbg}");
     }
 
     #[tokio::test]
@@ -1202,5 +1263,143 @@ mod tests {
         };
         assert_eq!(rc, 0, "getsockopt(SO_PRIORITY) failed");
         assert_eq!(prio, 6, "expected TC_PRIO_INTERACTIVE (6)");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn client_session_retains_endpoint_and_close_and_flush_delivers_reason_fast() {
+        let identity = ServerIdentity::generate_ephemeral().unwrap();
+        let fp = identity.fingerprint.clone();
+        let server = GlideServerEndpoint::bind("127.0.0.1:0".parse().unwrap(), &identity).unwrap();
+        let addr = server.local_addr();
+
+        let server_task = tokio::spawn(async move {
+            let mut sess = server.accept().await.unwrap();
+            assert!(
+                sess.endpoint.is_none(),
+                "server-accepted GlideSession should not own a client endpoint"
+            );
+            let _hello = sess.ctrl_recv.recv().await.unwrap();
+            let closed_at = std::time::Instant::now();
+            let err = tokio::time::timeout(Duration::from_millis(500), sess.ctrl_recv.recv())
+                .await
+                .expect("server must observe client CONNECTION_CLOSE promptly");
+            assert!(err.is_err(), "control stream must fail after peer close");
+            let reason = sess
+                .conn
+                .close_reason()
+                .expect("server conn must carry ApplicationClosed reason");
+            let dbg = format!("{reason:?}");
+            assert!(
+                dbg.contains("os shutdown"),
+                "expected flushed application close reason, got: {dbg}"
+            );
+            closed_at.elapsed()
+        });
+
+        let mut client = connect_client(addr, TrustMode::Pinned(fp)).await.unwrap();
+        assert!(
+            client.endpoint.is_some(),
+            "client GlideSession must retain its Quinn Endpoint for wait_idle() flushing"
+        );
+        client
+            .ctrl_send
+            .send(&ControlMessage::Hello {
+                version: PROTOCOL_VERSION,
+                peer_name: "flush-client".into(),
+                edge_on_server: Edge::Right,
+                os: OsKind::LinuxX11,
+            })
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(20)).await;
+
+        let flush_start = std::time::Instant::now();
+        close_and_flush_conn(&client.conn, client.endpoint.as_ref(), 0, b"os shutdown").await;
+        let flush_elapsed = flush_start.elapsed();
+        assert!(
+            flush_elapsed < Duration::from_millis(250),
+            "close_and_flush_conn must stay bounded near 50ms, took {flush_elapsed:?}"
+        );
+
+        let srv_elapsed = server_task.await.unwrap();
+        assert!(
+            srv_elapsed < Duration::from_millis(300),
+            "server must observe close well below 4s QUIC idle timeout, took {srv_elapsed:?}"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn server_endpoint_flush_closed_keeps_listener_open_and_close_and_flush_stops_it() {
+        let identity = ServerIdentity::generate_ephemeral().unwrap();
+        let fp = identity.fingerprint.clone();
+        let server = GlideServerEndpoint::bind("127.0.0.1:0".parse().unwrap(), &identity).unwrap();
+        let addr = server.local_addr();
+
+        // 1. First client connects; server closes just that peer connection and calls flush_closed().
+        let fp1 = fp.clone();
+        let cli1_task = tokio::spawn(async move {
+            let mut client = connect_client(addr, TrustMode::Pinned(fp1)).await.unwrap();
+            client
+                .ctrl_send
+                .send(&ControlMessage::Hello {
+                    version: PROTOCOL_VERSION,
+                    peer_name: "cli-1".into(),
+                    edge_on_server: Edge::Right,
+                    os: OsKind::LinuxX11,
+                })
+                .await
+                .unwrap();
+            let res = tokio::time::timeout(Duration::from_millis(500), client.ctrl_recv.recv())
+                .await
+                .expect("cli1 must see immediate CONNECTION_CLOSE from server flush_closed");
+            assert!(res.is_err());
+            let reason = format!("{:?}", client.conn.close_reason());
+            assert!(
+                reason.contains("os sleep"),
+                "expected flushed 'os sleep' reason, got {reason}"
+            );
+        });
+
+        let mut sess1 = server.accept().await.unwrap();
+        let _hello1 = sess1.ctrl_recv.recv().await.unwrap();
+        sess1.conn.close(0u32.into(), b"os sleep");
+        server.flush_closed().await;
+        cli1_task.await.unwrap();
+
+        // 2. Listener must STILL be open after flush_closed() so a new client reconnects cleanly.
+        let fp2 = fp.clone();
+        let cli2_task = tokio::spawn(async move {
+            let mut client = connect_client(addr, TrustMode::Pinned(fp2)).await.unwrap();
+            client
+                .ctrl_send
+                .send(&ControlMessage::Hello {
+                    version: PROTOCOL_VERSION,
+                    peer_name: "cli-2".into(),
+                    edge_on_server: Edge::Right,
+                    os: OsKind::LinuxX11,
+                })
+                .await
+                .unwrap();
+            let res = tokio::time::timeout(Duration::from_millis(500), client.ctrl_recv.recv())
+                .await
+                .expect("cli2 must see immediate CONNECTION_CLOSE from server close_and_flush");
+            assert!(res.is_err());
+            let reason = format!("{:?}", client.conn.close_reason());
+            assert!(
+                reason.contains("server stopped"),
+                "expected flushed 'server stopped' reason, got {reason}"
+            );
+        });
+
+        let mut sess2 = server.accept().await.unwrap();
+        let _hello2 = sess2.ctrl_recv.recv().await.unwrap();
+        server.close_and_flush(0, b"server stopped").await;
+        cli2_task.await.unwrap();
+
+        // 3. After close_and_flush(), the listener itself is closed.
+        assert!(
+            server.accept_incoming().await.is_none(),
+            "accept_incoming must return None after close_and_flush"
+        );
     }
 }

@@ -559,6 +559,12 @@ pub struct WaylandGeometryWatcher {
 
 impl WaylandGeometryWatcher {
     pub fn start() -> Result<Self> {
+        Self::start_with_events(None)
+    }
+
+    pub fn start_with_events(
+        event_tx: Option<tokio::sync::mpsc::UnboundedSender<crate::InjectorEvent>>,
+    ) -> Result<Self> {
         let conn = WlConnection::connect_to_env()
             .context("failed to connect to Wayland display (is WAYLAND_DISPLAY set?)")?;
         let mut queue = conn.new_event_queue::<OutputQueryState>();
@@ -610,6 +616,11 @@ impl WaylandGeometryWatcher {
                         if let Some(next) = build_desktop_geometry(&state.outputs) {
                             if next != last_geom {
                                 *shared_geom.write() = next.clone();
+                                if let Some(ref tx) = event_tx {
+                                    let _ = tx.send(crate::InjectorEvent::GeometryChanged(
+                                        next.clone(),
+                                    ));
+                                }
                                 last_geom = next;
                                 shared_dirty.store(true, Ordering::Release);
                             }

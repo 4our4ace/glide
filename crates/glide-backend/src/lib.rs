@@ -7,13 +7,22 @@
 pub mod clipboard_privacy;
 pub mod dib_png;
 pub mod dnd;
+pub mod fullscreen;
 pub mod geometry;
 pub mod hotkeys;
 pub mod icon;
+pub mod lifecycle;
 pub mod mock;
 pub mod os_integration;
 
+pub use fullscreen::{
+    classify_fullscreen_app, classify_fullscreen_identifiers, is_cursor_rect_confined,
+    FullscreenAppKind,
+};
 pub use hotkeys::{CaptureHotkeys, HotkeyChord, HotkeyMods};
+pub use lifecycle::{
+    NetworkChangeMonitor, ShutdownInhibitorGuard, SystemLifecycleEvent, SystemLifecycleMonitor,
+};
 
 /// User actions emitted by the native OS system tray (Windows 11 & Linux StatusNotifierItem).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -40,8 +49,8 @@ use anyhow::Result;
 use geometry::DesktopGeometry;
 use glide_hid::{HidUsage, ModifierMask, MouseButton};
 use glide_proto::{ClipboardPayload, Edge, LockState, OsKind};
-use std::sync::atomic::{AtomicU8, Ordering};
 use serde::{Deserialize, Serialize};
+use std::sync::atomic::{AtomicU64, AtomicU8, Ordering};
 use std::sync::Arc;
 use tokio::sync::mpsc;
 
@@ -142,12 +151,17 @@ pub struct CaptureConfig {
     pub edge_dwell_ms: u64,
     /// Pause edge switching while an exclusive fullscreen app/game has focus on the server.
     pub auto_lock_fullscreen: bool,
+    /// Allow edge switching past fullscreen video players and non-pointer-locked fullscreen browsers
+    /// while `auto_lock_fullscreen` is enabled (games and VMs stay locked).
+    pub allow_fullscreen_videos: bool,
     /// Keep the server's local CapsLock / NumLock state & keyboard LEDs in sync while controlling a client.
     pub sync_lock_keys: bool,
     /// Enable cross-edge file drag-and-drop detection along active outer edges.
     pub drag_drop_files: bool,
     /// Keep USB Consumer Control media/volume keys on the local server PC instead of forwarding to clients.
     pub pin_media_keys_local: bool,
+    /// Unfocus the active local window when pointer/keyboard focus leaves this machine.
+    pub unfocus_on_leave: bool,
 }
 
 impl Default for CaptureConfig {
@@ -158,9 +172,11 @@ impl Default for CaptureConfig {
             dead_corner_px: 24,
             edge_dwell_ms: 0,
             auto_lock_fullscreen: true,
+            allow_fullscreen_videos: true,
             sync_lock_keys: true,
             drag_drop_files: true,
             pin_media_keys_local: true,
+            unfocus_on_leave: false,
         }
     }
 }
@@ -335,6 +351,80 @@ impl WindowsPendingMeta {
     }
 }
 
+/// Lock-free 256-bit key-state bitset (`[AtomicU64; 4]`) safe to mutate directly inside
+/// low-level OS keyboard hooks (zero mutexes, zero heap allocations).
+#[derive(Debug, Default)]
+pub struct AtomicKeyBitset([AtomicU64; 4]);
+
+impl AtomicKeyBitset {
+    pub const fn new() -> Self {
+        Self([
+            AtomicU64::new(0),
+            AtomicU64::new(0),
+            AtomicU64::new(0),
+            AtomicU64::new(0),
+        ])
+    }
+
+    /// Sets bit `idx` and returns `true` if it was already set before this call.
+    #[inline]
+    pub fn insert(&self, idx: u8) -> bool {
+        let word = (idx >> 6) as usize;
+        let mask = 1u64 << (idx & 63);
+        (self.0[word].fetch_or(mask, Ordering::AcqRel) & mask) != 0
+    }
+
+    /// Clears bit `idx` and returns `true` if it was set before this call.
+    #[inline]
+    pub fn remove(&self, idx: u8) -> bool {
+        let word = (idx >> 6) as usize;
+        let mask = 1u64 << (idx & 63);
+        (self.0[word].fetch_and(!mask, Ordering::AcqRel) & mask) != 0
+    }
+
+    /// Returns `true` if bit `idx` is currently set.
+    #[inline]
+    pub fn contains(&self, idx: u8) -> bool {
+        let word = (idx >> 6) as usize;
+        let mask = 1u64 << (idx & 63);
+        (self.0[word].load(Ordering::Acquire) & mask) != 0
+    }
+
+    /// Clears all 256 bits.
+    #[inline]
+    pub fn clear(&self) {
+        for w in &self.0 {
+            w.store(0, Ordering::Release);
+        }
+    }
+
+    /// Records a remote `PAGE_KEYBOARD` key transition and returns `true` if it should be
+    /// forwarded to the active remote client.
+    ///
+    /// - Suppresses duplicate `pressed == true` typematic repeats on modifier keys (`Ctrl`,
+    ///   `Shift`, `Alt`, `Meta`/`Super`) so remote X11 `XTest` / `XKB` never receives modifier
+    ///   repeat storms while a modifier is held on Windows.
+    /// - Suppresses unpaired `pressed == false` releases for keys whose press was never sent
+    ///   to the remote client (e.g. a modifier held locally while crossing the screen edge or
+    ///   pressing `Ctrl+Alt+Arrow`).
+    /// - Preserves auto-repeat for regular non-modifier keys and passes non-keyboard usages
+    ///   (Consumer/Media keys) through unchanged.
+    #[inline]
+    pub fn should_forward_remote_key(&self, usage: HidUsage, pressed: bool) -> bool {
+        let canon = usage.canonicalize();
+        if canon.page() != HidUsage::PAGE_KEYBOARD || canon.id() >= 256 {
+            return true;
+        }
+        let idx = canon.id() as u8;
+        if pressed {
+            let already_down = self.insert(idx);
+            !(already_down && canon.modifier_bit() != 0)
+        } else {
+            self.remove(idx)
+        }
+    }
+}
+
 /// Low-latency input events emitted by the server's OS capture thread.
 #[derive(Debug, Clone)]
 pub enum CaptureEvent {
@@ -385,6 +475,9 @@ pub trait CaptureControl: Send + Sync {
         auto_lock_fullscreen: bool,
         locked: bool,
     );
+    /// Updates whether fullscreen video players and non-pointer-locked fullscreen browsers are
+    /// exempt from `auto_lock_fullscreen`.
+    fn set_allow_fullscreen_videos(&self, _enabled: bool) {}
     /// Updates whether CapsLock / NumLock keys should also toggle local OS state & LEDs in remote mode.
     fn set_sync_lock_keys(&self, _enabled: bool) {}
     /// Updates whether cross-edge file drag-and-drop assistance is enabled.
@@ -394,12 +487,20 @@ pub trait CaptureControl: Send + Sync {
     fn set_dnd_probe(&self, _dnd: Arc<dyn dnd::DndBackend>) {}
     /// Updates whether USB Consumer Control media/volume keys remain pinned to the local server OS.
     fn set_pin_media_keys_local(&self, _enabled: bool) {}
+    /// Updates whether the active local window should be unfocused when focus leaves to a remote client.
+    fn set_unfocus_on_leave(&self, _enabled: bool) {}
+    /// Discards any saved previously-focused local window so a subsequent `leave_remote*` does not
+    /// restore focus to it (used on suspend, wake, peer disconnect, and shutdown).
+    fn discard_saved_focus(&self) {}
     /// Hot-updates global capture shortcuts (screen switch, cursor lock, escape) without restarting capture.
     fn set_hotkeys(&self, _hotkeys: CaptureHotkeys) {}
     /// Temporarily suspends/resumes global shortcut interception (e.g. while recording a shortcut in UI).
     fn set_hotkeys_suspended(&self, _suspended: bool) {}
     /// Enters remote mode: suppresses/grabs local input and parks/hides cursor cleanly.
     fn enter_remote(&self) -> Result<()>;
+    /// Resets tracked remote key-down state when switching active remote targets without
+    /// leaving remote mode (or finalizing a cross-edge file drag handoff).
+    fn reset_remote_keys(&self) {}
     /// Leaves remote mode: releases grab and warps cursor to `return_edge` at `normalized_pos`.
     fn leave_remote(&self, return_edge: Edge, normalized_pos: f32) -> Result<()>;
     /// Leaves remote mode via hotkey: restores cursor to saved normalized desktop coordinates.
@@ -418,12 +519,35 @@ pub struct CaptureHandle {
     pub events: mpsc::UnboundedReceiver<CaptureEvent>,
 }
 
+/// Event-driven notifications pushed asynchronously by an [`InputInjector`] backend
+/// (**0.0 Hz idle polling** — replaces periodic geometry, suspend/resume, and cursor-reveal polls).
+#[derive(Debug, Clone)]
+pub enum InjectorEvent {
+    /// Display hotplug, resolution change, or DPI scale change reported by the OS.
+    GeometryChanged(DesktopGeometry),
+    /// OS entered sleep/suspend or locked the desktop session.
+    SystemSuspended,
+    /// OS resumed from sleep/suspend or unlocked the desktop session.
+    SystemResumed,
+    /// User physically moved a local mouse/touchpad while the cursor was hidden.
+    LocalCursorActivity,
+}
+
 /// Client-side OS input injection trait.
 pub trait InputInjector: Send {
     fn os_kind(&self) -> OsKind;
 
     /// Returns the current multi-monitor layout.
     fn desktop_geometry(&mut self) -> Result<DesktopGeometry>;
+
+    /// Takes the backend's event-driven notification stream (geometry hotplug, session
+    /// suspend/resume, and local cursor reveal). Returns `None` if already taken or unsupported.
+    fn take_event_rx(&mut self) -> Option<mpsc::UnboundedReceiver<InjectorEvent>> {
+        None
+    }
+
+    /// Applies a fresh [`DesktopGeometry`] delivered via [`InjectorEvent::GeometryChanged`].
+    fn apply_geometry(&mut self, _geometry: DesktopGeometry) {}
 
     /// Called when focus enters this client via a screen border.
     fn enter(&mut self, edge: Edge, normalized_pos: f32) -> Result<()>;
@@ -465,6 +589,13 @@ pub trait InputInjector: Send {
     fn leave(&mut self) -> Result<()> {
         Ok(())
     }
+
+    /// Updates whether the active local window should be unfocused when focus leaves this client.
+    fn set_unfocus_on_leave(&mut self, _enabled: bool) {}
+
+    /// Discards any saved previously-focused local window so a subsequent `enter*` does not
+    /// restore focus to it (used on suspend, wake, disconnect, and shutdown).
+    fn discard_saved_focus(&mut self) {}
 
     /// Ensures the local cursor is visible again (called on disconnect or shutdown).
     fn show_cursor(&mut self) -> Result<()> {
@@ -748,8 +879,10 @@ mod tests {
             assert!(should_forward_key_in_remote(key, false));
         }
 
-        // Default CaptureConfig pins media keys locally.
+        // Default CaptureConfig pins media keys locally, allows fullscreen videos, and keeps unfocus_on_leave disabled.
         assert!(CaptureConfig::default().pin_media_keys_local);
+        assert!(CaptureConfig::default().allow_fullscreen_videos);
+        assert!(!CaptureConfig::default().unfocus_on_leave);
     }
 
     #[test]
@@ -1097,5 +1230,50 @@ mod tests {
             assert!(pending.is_empty());
             assert_eq!(pending.take_pending(), [None, None]);
         }
+    }
+
+    #[test]
+    fn atomic_key_bitset_deduplicates_modifiers_and_pairs_releases() {
+        let bits = AtomicKeyBitset::new();
+
+        // Low-level bitset boundary coverage across all 4 u64 words (0, 63, 64, 127, 128, 162, 255)
+        for idx in [0u8, 63, 64, 127, 128, 0xA2, 0xA4, 255] {
+            assert!(!bits.contains(idx));
+            assert!(!bits.insert(idx));
+            assert!(bits.contains(idx));
+            assert!(bits.insert(idx));
+            assert!(bits.remove(idx));
+            assert!(!bits.contains(idx));
+            assert!(!bits.remove(idx));
+        }
+
+        // Unpaired remote modifier release (e.g. Ctrl held locally before crossing edge) is dropped
+        assert!(!bits.should_forward_remote_key(HidUsage::CONTROL_LEFT, false));
+
+        // Fresh Ctrl press forwards once; typematic repeats are suppressed; matching release forwards once
+        assert!(bits.should_forward_remote_key(HidUsage::CONTROL_LEFT, true));
+        assert!(!bits.should_forward_remote_key(HidUsage::CONTROL_LEFT, true));
+        assert!(!bits.should_forward_remote_key(HidUsage::CONTROL_LEFT, true));
+        assert!(bits.should_forward_remote_key(HidUsage::CONTROL_LEFT, false));
+        assert!(!bits.should_forward_remote_key(HidUsage::CONTROL_LEFT, false));
+
+        // Regular non-modifier keys preserve typematic repeat, while unpaired release is still blocked
+        let key_c = HidUsage::keyboard(0x06);
+        assert!(!bits.should_forward_remote_key(key_c, false));
+        assert!(bits.should_forward_remote_key(key_c, true));
+        assert!(bits.should_forward_remote_key(key_c, true));
+        assert!(bits.should_forward_remote_key(key_c, false));
+        assert!(!bits.should_forward_remote_key(key_c, false));
+
+        // Consumer/media usages pass through unchanged
+        let vol_up = HidUsage::consumer(0x00E9);
+        assert!(bits.should_forward_remote_key(vol_up, true));
+        assert!(bits.should_forward_remote_key(vol_up, false));
+
+        // clear() resets all active remote keys
+        assert!(bits.should_forward_remote_key(HidUsage::ALT_LEFT, true));
+        bits.clear();
+        assert!(!bits.should_forward_remote_key(HidUsage::ALT_LEFT, false));
+        assert!(bits.should_forward_remote_key(HidUsage::ALT_LEFT, true));
     }
 }

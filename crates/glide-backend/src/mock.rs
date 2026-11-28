@@ -15,24 +15,105 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 use tokio::sync::mpsc;
 
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct MockCaptureState {
     pub active_edges: Mutex<Vec<Edge>>,
     pub geometry: Mutex<DesktopGeometry>,
     pub remote_mode: AtomicBool,
     pub locked: AtomicBool,
+    pub allow_fullscreen_videos: AtomicBool,
     pub pin_media_keys_local: AtomicBool,
+    pub unfocus_on_leave: AtomicBool,
+    pub unfocus_count: AtomicUsize,
+    pub has_saved_focus: AtomicBool,
+    pub refocus_count: AtomicUsize,
+    pub discard_focus_count: AtomicUsize,
     pub hotkeys: Mutex<CaptureHotkeys>,
     pub hotkeys_suspended: AtomicBool,
     pub enter_remote_calls: AtomicUsize,
+    pub reset_remote_keys_calls: AtomicUsize,
     pub leave_remote_at_calls: AtomicUsize,
     pub last_leave: Mutex<Option<(Edge, f32)>>,
     pub last_leave_at: Mutex<Option<(f32, f32)>>,
     pub lock_state: Mutex<LockState>,
 }
 
+impl Default for MockCaptureState {
+    fn default() -> Self {
+        Self {
+            active_edges: Mutex::new(Vec::new()),
+            geometry: Mutex::new(DesktopGeometry::default()),
+            remote_mode: AtomicBool::new(false),
+            locked: AtomicBool::new(false),
+            allow_fullscreen_videos: AtomicBool::new(true),
+            pin_media_keys_local: AtomicBool::new(false),
+            unfocus_on_leave: AtomicBool::new(false),
+            unfocus_count: AtomicUsize::new(0),
+            has_saved_focus: AtomicBool::new(false),
+            refocus_count: AtomicUsize::new(0),
+            discard_focus_count: AtomicUsize::new(0),
+            hotkeys: Mutex::new(CaptureHotkeys::default()),
+            hotkeys_suspended: AtomicBool::new(false),
+            enter_remote_calls: AtomicUsize::new(0),
+            reset_remote_keys_calls: AtomicUsize::new(0),
+            leave_remote_at_calls: AtomicUsize::new(0),
+            last_leave: Mutex::new(None),
+            last_leave_at: Mutex::new(None),
+            lock_state: Mutex::new(LockState::default()),
+        }
+    }
+}
+
+impl MockCaptureState {
+    pub fn allow_fullscreen_videos(&self) -> bool {
+        self.allow_fullscreen_videos.load(Ordering::SeqCst)
+    }
+
+    pub fn unfocus_count(&self) -> usize {
+        self.unfocus_count.load(Ordering::SeqCst)
+    }
+
+    pub fn unfocus_on_leave(&self) -> bool {
+        self.unfocus_on_leave.load(Ordering::SeqCst)
+    }
+
+    pub fn has_saved_focus(&self) -> bool {
+        self.has_saved_focus.load(Ordering::SeqCst)
+    }
+
+    pub fn refocus_count(&self) -> usize {
+        self.refocus_count.load(Ordering::SeqCst)
+    }
+
+    pub fn discard_focus_count(&self) -> usize {
+        self.discard_focus_count.load(Ordering::SeqCst)
+    }
+}
+
 pub struct MockCaptureControl {
     pub state: Arc<MockCaptureState>,
+}
+
+impl MockCaptureControl {
+    pub fn allow_fullscreen_videos(&self) -> bool {
+        self.state.allow_fullscreen_videos()
+    }
+
+    pub fn unfocus_count(&self) -> usize {
+        self.state.unfocus_count()
+    }
+
+    pub fn unfocus_on_leave(&self) -> bool {
+        self.state.unfocus_on_leave()
+    }
+
+    pub fn refocus_count(&self) -> usize {
+        self.state.refocus_count()
+    }
+
+    pub fn discard_focus_count(&self) -> usize {
+        self.state.discard_focus_count()
+    }
 }
 
 impl CaptureControl for MockCaptureControl {
@@ -51,10 +132,32 @@ impl CaptureControl for MockCaptureControl {
         self.state.locked.store(locked, Ordering::SeqCst);
     }
 
+    fn set_allow_fullscreen_videos(&self, enabled: bool) {
+        self.state
+            .allow_fullscreen_videos
+            .store(enabled, Ordering::SeqCst);
+    }
+
     fn set_pin_media_keys_local(&self, enabled: bool) {
         self.state
             .pin_media_keys_local
             .store(enabled, Ordering::SeqCst);
+    }
+
+    fn set_unfocus_on_leave(&self, enabled: bool) {
+        self.state
+            .unfocus_on_leave
+            .store(enabled, Ordering::SeqCst);
+        if !enabled {
+            self.state.has_saved_focus.store(false, Ordering::SeqCst);
+        }
+    }
+
+    fn discard_saved_focus(&self) {
+        self.state
+            .discard_focus_count
+            .fetch_add(1, Ordering::SeqCst);
+        self.state.has_saved_focus.store(false, Ordering::SeqCst);
     }
 
     fn set_hotkeys(&self, hotkeys: CaptureHotkeys) {
@@ -70,12 +173,29 @@ impl CaptureControl for MockCaptureControl {
     fn enter_remote(&self) -> Result<()> {
         self.state.enter_remote_calls.fetch_add(1, Ordering::SeqCst);
         self.state.remote_mode.store(true, Ordering::SeqCst);
+        if self.state.unfocus_on_leave.load(Ordering::SeqCst) {
+            self.state.unfocus_count.fetch_add(1, Ordering::SeqCst);
+            self.state.has_saved_focus.store(true, Ordering::SeqCst);
+        } else {
+            self.state.has_saved_focus.store(false, Ordering::SeqCst);
+        }
         Ok(())
+    }
+
+    fn reset_remote_keys(&self) {
+        self.state
+            .reset_remote_keys_calls
+            .fetch_add(1, Ordering::SeqCst);
     }
 
     fn leave_remote(&self, return_edge: Edge, normalized_pos: f32) -> Result<()> {
         self.state.remote_mode.store(false, Ordering::SeqCst);
         *self.state.last_leave.lock() = Some((return_edge, normalized_pos));
+        if self.state.has_saved_focus.swap(false, Ordering::SeqCst)
+            && self.state.unfocus_on_leave.load(Ordering::SeqCst)
+        {
+            self.state.refocus_count.fetch_add(1, Ordering::SeqCst);
+        }
         Ok(())
     }
 
@@ -85,6 +205,11 @@ impl CaptureControl for MockCaptureControl {
             .fetch_add(1, Ordering::SeqCst);
         self.state.remote_mode.store(false, Ordering::SeqCst);
         *self.state.last_leave_at.lock() = Some((norm_x, norm_y));
+        if self.state.has_saved_focus.swap(false, Ordering::SeqCst)
+            && self.state.unfocus_on_leave.load(Ordering::SeqCst)
+        {
+            self.state.refocus_count.fetch_add(1, Ordering::SeqCst);
+        }
         Ok(())
     }
 
@@ -136,6 +261,8 @@ pub enum InjectedAction {
     Button(MouseButton, bool),
     Key(HidUsage, bool),
     ReleaseAll,
+    UnfocusWindow,
+    RefocusWindow,
 }
 
 #[derive(Debug)]
@@ -144,6 +271,16 @@ pub struct MockInjector {
     pub pending_geometry: Arc<Mutex<Option<DesktopGeometry>>>,
     pub suspended_flag: Arc<AtomicBool>,
     pub resumed_flag: Arc<AtomicBool>,
+    pub event_tx: mpsc::UnboundedSender<crate::InjectorEvent>,
+    event_rx: Option<mpsc::UnboundedReceiver<crate::InjectorEvent>>,
+    pub unfocus_on_leave_flag: Arc<AtomicBool>,
+    pub discard_focus_count: Arc<AtomicUsize>,
+    pub cursor_hidden: Arc<AtomicBool>,
+    pub show_cursor_calls: Arc<AtomicUsize>,
+    pub unfocus_on_leave: bool,
+    pub unfocus_calls: usize,
+    pub has_saved_focus: bool,
+    pub refocus_calls: usize,
     pub cursor_x: f32,
     pub cursor_y: f32,
     pub pressed_keys: HashSet<HidUsage>,
@@ -155,12 +292,23 @@ pub struct MockInjector {
 impl MockInjector {
     pub fn new(geometry: DesktopGeometry) -> (Self, Arc<Mutex<Vec<InjectedAction>>>) {
         let log = Arc::new(Mutex::new(Vec::new()));
+        let (event_tx, event_rx) = mpsc::unbounded_channel();
         let (cx, cy) = geometry.primary_center();
         let me = Self {
             geometry,
             pending_geometry: Arc::new(Mutex::new(None)),
             suspended_flag: Arc::new(AtomicBool::new(false)),
             resumed_flag: Arc::new(AtomicBool::new(false)),
+            event_tx,
+            event_rx: Some(event_rx),
+            unfocus_on_leave_flag: Arc::new(AtomicBool::new(false)),
+            discard_focus_count: Arc::new(AtomicUsize::new(0)),
+            cursor_hidden: Arc::new(AtomicBool::new(false)),
+            show_cursor_calls: Arc::new(AtomicUsize::new(0)),
+            unfocus_on_leave: false,
+            unfocus_calls: 0,
+            has_saved_focus: false,
+            refocus_calls: 0,
             cursor_x: cx as f32,
             cursor_y: cy as f32,
             pressed_keys: HashSet::new(),
@@ -170,11 +318,47 @@ impl MockInjector {
         };
         (me, log)
     }
+
+    pub fn unfocus_on_leave(&self) -> bool {
+        self.unfocus_on_leave
+    }
+
+    pub fn unfocus_calls(&self) -> usize {
+        self.unfocus_calls
+    }
+
+    pub fn refocus_calls(&self) -> usize {
+        self.refocus_calls
+    }
 }
 
 impl InputInjector for MockInjector {
     fn os_kind(&self) -> OsKind {
         OsKind::LinuxX11
+    }
+
+    fn take_event_rx(&mut self) -> Option<mpsc::UnboundedReceiver<crate::InjectorEvent>> {
+        self.event_rx.take()
+    }
+
+    fn apply_geometry(&mut self, geometry: DesktopGeometry) {
+        if geometry != self.geometry {
+            self.geometry = geometry;
+            self.edge_push_accum = 0.0;
+        }
+    }
+
+    fn set_unfocus_on_leave(&mut self, enabled: bool) {
+        self.unfocus_on_leave = enabled;
+        self.unfocus_on_leave_flag.store(enabled, Ordering::SeqCst);
+        if !enabled {
+            self.has_saved_focus = false;
+        }
+    }
+
+    fn discard_saved_focus(&mut self) {
+        self.discard_focus_count.fetch_add(1, Ordering::SeqCst);
+        self.has_saved_focus = false;
     }
 
     fn desktop_geometry(&mut self) -> Result<DesktopGeometry> {
@@ -196,6 +380,7 @@ impl InputInjector for MockInjector {
 
     fn poll_system_suspended(&mut self) -> bool {
         if self.suspended_flag.swap(false, Ordering::SeqCst) {
+            self.has_saved_focus = false;
             let _ = self.release_all();
             true
         } else {
@@ -204,7 +389,12 @@ impl InputInjector for MockInjector {
     }
 
     fn poll_system_resumed(&mut self) -> bool {
-        self.resumed_flag.swap(false, Ordering::SeqCst)
+        if self.resumed_flag.swap(false, Ordering::SeqCst) {
+            self.has_saved_focus = false;
+            true
+        } else {
+            false
+        }
     }
 
     fn enter(&mut self, edge: Edge, normalized_pos: f32) -> Result<()> {
@@ -212,9 +402,13 @@ impl InputInjector for MockInjector {
         self.cursor_x = x as f32;
         self.cursor_y = y as f32;
         self.edge_push_accum = 0.0;
-        self.log
-            .lock()
-            .push(InjectedAction::Enter(edge, normalized_pos));
+        self.cursor_hidden.store(false, Ordering::SeqCst);
+        let mut log = self.log.lock();
+        log.push(InjectedAction::Enter(edge, normalized_pos));
+        if std::mem::take(&mut self.has_saved_focus) && self.unfocus_on_leave {
+            self.refocus_calls += 1;
+            log.push(InjectedAction::RefocusWindow);
+        }
         Ok(())
     }
 
@@ -223,9 +417,13 @@ impl InputInjector for MockInjector {
         self.cursor_x = x as f32;
         self.cursor_y = y as f32;
         self.edge_push_accum = 0.0;
-        self.log
-            .lock()
-            .push(InjectedAction::EnterAt(norm_x, norm_y));
+        self.cursor_hidden.store(false, Ordering::SeqCst);
+        let mut log = self.log.lock();
+        log.push(InjectedAction::EnterAt(norm_x, norm_y));
+        if std::mem::take(&mut self.has_saved_focus) && self.unfocus_on_leave {
+            self.refocus_calls += 1;
+            log.push(InjectedAction::RefocusWindow);
+        }
         Ok(())
     }
 
@@ -320,6 +518,30 @@ impl InputInjector for MockInjector {
             log.push(InjectedAction::Button(b, false));
         }
         log.push(InjectedAction::ReleaseAll);
+        Ok(())
+    }
+
+    fn leave(&mut self) -> Result<()> {
+        self.edge_push_accum = 0.0;
+        self.cursor_hidden.store(true, Ordering::SeqCst);
+        if self.unfocus_on_leave {
+            self.unfocus_calls += 1;
+            self.has_saved_focus = true;
+            self.log.lock().push(InjectedAction::UnfocusWindow);
+        } else {
+            self.has_saved_focus = false;
+        }
+        Ok(())
+    }
+
+    fn is_cursor_hidden(&self) -> bool {
+        self.cursor_hidden.load(Ordering::SeqCst)
+    }
+
+    fn show_cursor(&mut self) -> Result<()> {
+        self.has_saved_focus = false;
+        self.cursor_hidden.store(false, Ordering::SeqCst);
+        self.show_cursor_calls.fetch_add(1, Ordering::SeqCst);
         Ok(())
     }
 }

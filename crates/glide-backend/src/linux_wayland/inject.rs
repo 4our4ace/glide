@@ -10,7 +10,7 @@ use crate::linux_wayland::{
     load_restore_token, mouse_button_to_evdev, next_portal_token, opt_str, save_restore_token,
     WaylandGeometryWatcher, PORTAL_DEST, PORTAL_PATH, REMOTE_DESKTOP_IFACE,
 };
-use crate::InputInjector;
+use crate::{InjectorEvent, InputInjector};
 use anyhow::{anyhow, Context, Result};
 use glide_hid::{HidUsage, MouseButton};
 use glide_proto::{Edge, LockState, OsKind};
@@ -20,7 +20,8 @@ use reis::event::{Connection as EiConnection, Device as EiDevice, DeviceCapabili
 use std::collections::{HashMap, HashSet};
 use std::os::unix::net::UnixStream;
 use std::sync::Arc;
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant};
+use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
 use zbus::blocking::{Connection as DbusConnection, Proxy};
 use zbus::zvariant::{OwnedFd, OwnedObjectPath, Value};
@@ -29,11 +30,19 @@ const DEVICE_TYPE_KEYBOARD: u32 = 1;
 const DEVICE_TYPE_POINTER: u32 = 2;
 const PERSIST_MODE_REVOKED: u32 = 2;
 
+/// Returns `CLOCK_MONOTONIC` microseconds via vDSO as required by the `libei` protocol.
 fn now_micros() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_micros() as u64)
-        .unwrap_or(0)
+    let mut ts = libc::timespec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    };
+    if unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut ts) } == 0 {
+        (ts.tv_sec as u64)
+            .saturating_mul(1_000_000)
+            .saturating_add((ts.tv_nsec as u64) / 1_000)
+    } else {
+        0
+    }
 }
 
 #[derive(Default)]
@@ -376,11 +385,16 @@ type InnerSetupResult = Result<(
     Option<WaylandGeometryWatcher>,
 )>;
 
+/// Wayland client input injector backed by `org.freedesktop.portal.RemoteDesktop` / EIS.
+///
+/// Leaves [`InputInjector::set_unfocus_on_leave`] as the default no-op because Wayland
+/// compositors prohibit cross-client window focus clearing.
 pub struct WaylandInjector {
     dbus_tx: std::sync::mpsc::Sender<DbusCmd>,
     transport: Transport,
     geometry: DesktopGeometry,
     geom_watcher: Option<WaylandGeometryWatcher>,
+    event_rx: Option<mpsc::UnboundedReceiver<InjectorEvent>>,
     est_x: f32,
     est_y: f32,
     scroll_rem_x: i32,
@@ -395,6 +409,7 @@ impl WaylandInjector {
     pub fn connect() -> Result<Self> {
         let (cmd_tx, cmd_rx) = std::sync::mpsc::channel::<DbusCmd>();
         let (ready_tx, ready_rx) = std::sync::mpsc::sync_channel::<SetupResult>(1);
+        let (event_tx, event_rx) = mpsc::unbounded_channel();
 
         // Run all zbus::blocking portal setup, D-Bus Notify* fallback calls, and session teardown
         // on a dedicated non-Tokio OS thread so calling from inside Tokio never panics.
@@ -509,7 +524,8 @@ impl WaylandInjector {
                         }
                     };
 
-                    let (geom_watcher, geometry) = match WaylandGeometryWatcher::start() {
+                    let (geom_watcher, geometry) =
+                        match WaylandGeometryWatcher::start_with_events(Some(event_tx)) {
                         Ok(watcher) => {
                             let g = watcher.current();
                             (Some(watcher), g)
@@ -610,6 +626,7 @@ impl WaylandInjector {
             transport,
             geometry,
             geom_watcher,
+            event_rx: Some(event_rx),
             est_x: cx as f32,
             est_y: cy as f32,
             scroll_rem_x: 0,
@@ -724,6 +741,25 @@ impl InputInjector for WaylandInjector {
         OsKind::LinuxWayland
     }
 
+    fn take_event_rx(&mut self) -> Option<mpsc::UnboundedReceiver<InjectorEvent>> {
+        self.event_rx.take()
+    }
+
+    fn apply_geometry(&mut self, geometry: DesktopGeometry) {
+        if geometry != self.geometry {
+            self.geometry = geometry;
+            self.edge_push_accum = 0.0;
+            let (min_x, min_y, max_x, max_y) = self.geometry.bounds();
+            self.est_x = self.est_x.clamp(min_x as f32, (max_x - 1) as f32);
+            self.est_y = self.est_y.clamp(min_y as f32, (max_y - 1) as f32);
+            debug!(
+                monitors = self.geometry.monitors.len(),
+                primary_scale = self.geometry.primary_scale(),
+                "WaylandInjector applied event-driven desktop geometry update"
+            );
+        }
+    }
+
     fn desktop_geometry(&mut self) -> Result<DesktopGeometry> {
         if let Some(ref watcher) = self.geom_watcher {
             let _ = watcher.poll_changed();
@@ -735,16 +771,7 @@ impl InputInjector for WaylandInjector {
     fn poll_geometry_changed(&mut self) -> Option<DesktopGeometry> {
         let new_geom = self.geom_watcher.as_ref()?.poll_changed()?;
         if new_geom != self.geometry {
-            self.geometry = new_geom;
-            self.edge_push_accum = 0.0;
-            let (min_x, min_y, max_x, max_y) = self.geometry.bounds();
-            self.est_x = self.est_x.clamp(min_x as f32, (max_x - 1) as f32);
-            self.est_y = self.est_y.clamp(min_y as f32, (max_y - 1) as f32);
-            debug!(
-                monitors = self.geometry.monitors.len(),
-                primary_scale = self.geometry.primary_scale(),
-                "WaylandInjector refreshed desktop geometry"
-            );
+            self.apply_geometry(new_geom);
             return Some(self.geometry.clone());
         }
         None
@@ -873,11 +900,19 @@ impl InputInjector for WaylandInjector {
         };
         let code = evdev as u32;
         if pressed {
+            if usage.modifier_bit() != 0 && self.pressed_keys.contains(&code) {
+                return Ok(());
+            }
+        } else if !self.pressed_keys.contains(&code) {
+            return Ok(());
+        }
+        self.emit_evdev_key(code, pressed)?;
+        if pressed {
             self.pressed_keys.insert(code);
         } else {
             self.pressed_keys.remove(&code);
         }
-        self.emit_evdev_key(code, pressed)
+        Ok(())
     }
 
     fn release_all(&mut self) -> Result<()> {

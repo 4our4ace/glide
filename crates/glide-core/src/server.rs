@@ -15,16 +15,19 @@ use crate::dnd::{
     collect_local_drag_files, next_drag_id, spawn_send_drag_files, EarlyDragBuffer,
     IncomingDragState, OutgoingDragState,
 };
-use crate::resilience::{HealthProbe, SleepDetector};
+use crate::resilience::HealthProbe;
 use crate::runtime::{save_received_file, PeerSummary, RuntimeCommand, RuntimeState};
 use anyhow::Result;
 use glide_backend::dnd::{DndBackend, NoopDndBackend};
+use glide_backend::lifecycle::{
+    NetworkChangeMonitor, SystemLifecycleEvent, SystemLifecycleMonitor,
+};
 use glide_backend::os_integration::resolve_receive_dir;
 use glide_backend::{
     CaptureControl, CaptureEvent, CaptureHandle, ClipboardBackend, ClipboardHandle,
 };
 use glide_hid::{HidUsage, ModifierMask, MouseButton};
-use glide_net::discovery::{local_ipv4_addresses_async, spawn_server_beacon_with_refresh};
+use glide_net::discovery::{local_ipv4_addresses_async, spawn_server_beacon_with_controls};
 use glide_net::tls::ServerIdentity;
 use glide_net::{
     recv_bulk_stream_with_atomic_limit, send_clipboard_on, send_file_on_with_limit,
@@ -38,7 +41,7 @@ use glide_proto::{
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::{mpsc, Notify};
@@ -53,6 +56,10 @@ const MIN_MOTION_DGRAM_BUFFER_SPACE: usize = 128;
 /// Re-arm interval when deferring coalesced mouse deltas due to QUIC datagram backpressure.
 const CONGESTION_RETRY_DELAY: Duration = Duration::from_millis(2);
 
+/// Minimum quiet gap since a peer's last inbound message before active remote user input
+/// triggers a single one-shot `Ping` liveness check (0.00 Hz when idle).
+const INPUT_QUIET_PROBE_GAP: Duration = Duration::from_secs(2);
+
 struct ConnectedPeer {
     id: u64,
     name: String,
@@ -63,6 +70,7 @@ struct ConnectedPeer {
     last_cursor_norm: (f32, f32),
     rtt_ms: Option<f32>,
     health_probe: HealthProbe,
+    last_inbound_at: Instant,
     last_lost_packets: u64,
     last_congestion_events: u64,
     last_lag_warn_at: Option<Instant>,
@@ -144,6 +152,97 @@ impl Drop for EndpointCloseOnDrop {
     }
 }
 
+async fn next_lifecycle_event(
+    lifecycle: &mut Option<SystemLifecycleMonitor>,
+) -> SystemLifecycleEvent {
+    match lifecycle.as_mut() {
+        Some(mon) => match mon.recv().await {
+            Some(ev) => ev,
+            None => std::future::pending().await,
+        },
+        None => std::future::pending().await,
+    }
+}
+
+async fn next_network_change(net_monitor: &mut Option<NetworkChangeMonitor>) {
+    match net_monitor.as_mut() {
+        Some(mon) => {
+            if mon.recv().await.is_none() {
+                std::future::pending::<()>().await;
+            }
+        }
+        None => std::future::pending::<()>().await,
+    }
+}
+
+fn earliest_probe_deadline(peers: &HashMap<u64, ConnectedPeer>) -> Option<Instant> {
+    peers.values().filter_map(|p| p.health_probe.deadline()).min()
+}
+
+fn update_probe_timer(
+    peers: &HashMap<u64, ConnectedPeer>,
+    probe_sleep: &mut Option<std::pin::Pin<Box<tokio::time::Sleep>>>,
+    probe_deadline_armed: &mut Option<Instant>,
+) {
+    let next = earliest_probe_deadline(peers);
+    if *probe_deadline_armed != next {
+        *probe_deadline_armed = next;
+        *probe_sleep = next.map(|deadline| {
+            Box::pin(tokio::time::sleep_until(tokio::time::Instant::from_std(
+                deadline,
+            )))
+        });
+    }
+}
+
+fn probe_peer(peer: &mut ConnectedPeer, now: Instant) {
+    let ts_us = peer.health_probe.start_probe(now);
+    let _ = peer.ctrl_tx.send(ControlMessage::Ping { ts_us });
+}
+
+fn maybe_probe_active_peer_on_input(
+    peers: &mut HashMap<u64, ConnectedPeer>,
+    active_remote: Option<u64>,
+    probe_sleep: &mut Option<std::pin::Pin<Box<tokio::time::Sleep>>>,
+    probe_deadline_armed: &mut Option<Instant>,
+) {
+    if let Some(pid) = active_remote {
+        if let Some(peer) = peers.get_mut(&pid) {
+            if !peer.health_probe.is_pending() {
+                let now = Instant::now();
+                if now.saturating_duration_since(peer.last_inbound_at) >= INPUT_QUIET_PROBE_GAP {
+                    probe_peer(peer, now);
+                    update_probe_timer(peers, probe_sleep, probe_deadline_armed);
+                }
+            }
+        }
+    }
+}
+
+fn maybe_probe_quiet_peers_on_outbound(
+    peers: &mut HashMap<u64, ConnectedPeer>,
+    exclude_peer_id: Option<u64>,
+    probe_sleep: &mut Option<std::pin::Pin<Box<tokio::time::Sleep>>>,
+    probe_deadline_armed: &mut Option<Instant>,
+) {
+    let now = Instant::now();
+    let mut armed_any = false;
+    for (&pid, peer) in peers.iter_mut() {
+        if exclude_peer_id == Some(pid) {
+            continue;
+        }
+        if !peer.health_probe.is_pending()
+            && now.saturating_duration_since(peer.last_inbound_at) >= INPUT_QUIET_PROBE_GAP
+        {
+            probe_peer(peer, now);
+            armed_any = true;
+        }
+    }
+    if armed_any {
+        update_probe_timer(peers, probe_sleep, probe_deadline_armed);
+    }
+}
+
 /// Runs the Glide server with pre-constructed OS (or mock) backends, optional live GUI state,
 /// and optional runtime command channel (using a no-op DnD backend).
 pub async fn run_server_with_backends(
@@ -172,6 +271,66 @@ pub async fn run_server_with_backends(
 /// Runs the Glide server with explicit OS/mock backends including cross-edge drag-and-drop.
 #[allow(clippy::too_many_arguments)]
 pub async fn run_server_with_dnd(
+    config: ServerConfig,
+    endpoint: GlideServerEndpoint,
+    capture: CaptureHandle,
+    clipboard: Option<ClipboardHandle>,
+    dnd: Arc<dyn DndBackend>,
+    receive_dir: Option<PathBuf>,
+    os_label: &str,
+    runtime: Option<RuntimeState>,
+    cmd_rx: Option<mpsc::UnboundedReceiver<RuntimeCommand>>,
+) -> Result<()> {
+    run_server_with_lifecycle(
+        config,
+        endpoint,
+        capture,
+        clipboard,
+        dnd,
+        receive_dir,
+        os_label,
+        runtime,
+        cmd_rx,
+        None,
+    )
+    .await
+}
+
+/// Runs the Glide server with explicit OS/mock backends, cross-edge drag-and-drop, and an
+/// OS [`SystemLifecycleMonitor`] for event-driven shutdown/sleep snap-back and auto-resume.
+#[allow(clippy::too_many_arguments)]
+pub async fn run_server_with_lifecycle(
+    config: ServerConfig,
+    endpoint: GlideServerEndpoint,
+    capture: CaptureHandle,
+    clipboard: Option<ClipboardHandle>,
+    dnd: Arc<dyn DndBackend>,
+    receive_dir: Option<PathBuf>,
+    os_label: &str,
+    runtime: Option<RuntimeState>,
+    cmd_rx: Option<mpsc::UnboundedReceiver<RuntimeCommand>>,
+    lifecycle: Option<SystemLifecycleMonitor>,
+) -> Result<()> {
+    run_server_with_monitors(
+        config,
+        endpoint,
+        capture,
+        clipboard,
+        dnd,
+        receive_dir,
+        os_label,
+        runtime,
+        cmd_rx,
+        lifecycle,
+        None,
+    )
+    .await
+}
+
+/// Runs the Glide server with explicit OS/mock backends, cross-edge drag-and-drop,
+/// OS [`SystemLifecycleMonitor`], and OS [`NetworkChangeMonitor`] (zero periodic polling).
+#[allow(clippy::too_many_arguments)]
+pub async fn run_server_with_monitors(
     mut config: ServerConfig,
     endpoint: GlideServerEndpoint,
     capture: CaptureHandle,
@@ -181,8 +340,11 @@ pub async fn run_server_with_dnd(
     os_label: &str,
     runtime: Option<RuntimeState>,
     mut cmd_rx: Option<mpsc::UnboundedReceiver<RuntimeCommand>>,
+    mut lifecycle: Option<SystemLifecycleMonitor>,
+    mut net_monitor: Option<NetworkChangeMonitor>,
 ) -> Result<()> {
     let _endpoint_guard = EndpointCloseOnDrop(endpoint.clone());
+    let flush_endpoint = endpoint.clone();
     let local_addr: SocketAddr = endpoint.local_addr();
     let fingerprint = endpoint.fingerprint().to_string();
     let capture_ctrl: Arc<dyn CaptureControl> = Arc::from(capture.control);
@@ -192,6 +354,8 @@ pub async fn run_server_with_dnd(
     dnd.set_enabled(config.drag_drop_files);
     capture_ctrl.set_drag_drop_files(config.drag_drop_files);
     capture_ctrl.set_dnd_probe(Arc::clone(&dnd));
+    capture_ctrl.set_allow_fullscreen_videos(config.allow_fullscreen_videos);
+    capture_ctrl.set_unfocus_on_leave(config.unfocus_on_leave);
 
     // Dedicated serial clipboard applier so OS clipboard locks (e.g. OpenClipboard / DIB->PNG)
     // apply strictly in order on the blocking pool without ever stalling the capture select! loop.
@@ -243,15 +407,17 @@ pub async fn run_server_with_dnd(
         "Glide server listening"
     );
 
+    let os_paused = Arc::new(AtomicBool::new(false));
     let beacon_refresh = Arc::new(Notify::new());
     let _beacon_guard = if config.discovery {
-        match spawn_server_beacon_with_refresh(
+        match spawn_server_beacon_with_controls(
             config.discovery_port,
             config.name.clone(),
             local_addr.port(),
             fingerprint.clone(),
             os_label.to_string(),
             Some(Arc::clone(&beacon_refresh)),
+            Some(Arc::clone(&os_paused)),
         ) {
             Ok(h) => {
                 info!(
@@ -276,12 +442,18 @@ pub async fn run_server_with_dnd(
     let accept_tx = peer_tx.clone();
     let accept_scale = Arc::clone(&server_scale);
     let accept_max_file_bytes = Arc::clone(&max_file_bytes);
+    let accept_paused = Arc::clone(&os_paused);
     let _accept_guard = AbortOnDrop(tokio::spawn(async move {
         while let Some(incoming) = endpoint.accept_incoming().await {
+            if accept_paused.load(Ordering::Acquire) {
+                incoming.refuse();
+                continue;
+            }
             let sname = server_name.clone();
             let tx = accept_tx.clone();
             let scale = f32::from_bits(accept_scale.load(Ordering::Relaxed));
             let limit = Arc::clone(&accept_max_file_bytes);
+            let task_paused = Arc::clone(&accept_paused);
             tokio::spawn(async move {
                 let session = match tokio::time::timeout(
                     Duration::from_secs(5),
@@ -299,7 +471,13 @@ pub async fn run_server_with_dnd(
                         return;
                     }
                 };
-                if let Err(e) = handle_incoming_session(session, sname, scale, tx, limit).await {
+                if task_paused.load(Ordering::Acquire) {
+                    session.conn.close(0u32.into(), b"server paused");
+                    return;
+                }
+                if let Err(e) =
+                    handle_incoming_session(session, sname, scale, tx, limit, task_paused).await
+                {
                     warn!(error = %e, "Incoming client handshake failed");
                 }
             });
@@ -322,7 +500,6 @@ pub async fn run_server_with_dnd(
 
     let (ip_tx, mut ip_rx) = mpsc::unbounded_channel::<(u64, Vec<String>, bool)>();
     let mut ip_check_gen: u64 = 0;
-    let mut ip_check_in_flight: usize = 0;
 
     let (drag_handoff_tx, mut drag_handoff_rx) = mpsc::unbounded_channel::<DragHandoffReady>();
     let mut drag_handoff_gen: u64 = 0;
@@ -335,15 +512,13 @@ pub async fn run_server_with_dnd(
     let mut pending_dy: f32 = 0.0;
     let mut last_motion_sent: Option<Instant> = None;
     let coalesce_dur = Duration::from_micros(config.motion_coalesce_us);
-    let mut coalesce_armed = false;
-    let coalesce_sleep = tokio::time::sleep(Duration::from_secs(86_400));
-    tokio::pin!(coalesce_sleep);
+    // One-shot motion coalesce timer: dropped to `None` when idle so 0 timers sit in Tokio's wheel.
+    let mut coalesce_sleep: Option<std::pin::Pin<Box<tokio::time::Sleep>>> = None;
 
-    let mut ping_interval = tokio::time::interval(Duration::from_millis(500));
-    ping_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-    ping_interval.tick().await;
-    let mut sleep_detector = SleepDetector::default();
-    let mut last_ip_check = Instant::now();
+    // One-shot health probe deadline timer: armed ONLY while at least one peer has an
+    // in-flight Ping probe (dropped to `None` -> 0 armed timers when idle).
+    let mut probe_sleep: Option<std::pin::Pin<Box<tokio::time::Sleep>>> = None;
+    let mut probe_deadline_armed: Option<Instant> = None;
 
     let mut capture_events = capture.events;
 
@@ -353,6 +528,12 @@ pub async fn run_server_with_dnd(
                               locked: bool,
                               best_rtt: Option<f32>| {
         if let Some(ref rt) = rt {
+            if os_paused.load(Ordering::Acquire) {
+                rt.update(|s| {
+                    s.locked = locked;
+                });
+                return;
+            }
             let summaries: Vec<PeerSummary> = peers
                 .values()
                 .map(|p| PeerSummary {
@@ -377,42 +558,41 @@ pub async fn run_server_with_dnd(
     };
 
     // Flushes any accumulated motion delta if the peer's QUIC datagram send buffer has room.
-    // Returns `Some(retry_delay)` when QUIC backpressure forces us to defer and keep coalescing
-    // instead of queueing stale pointer datagrams.
-    let flush_pending_motion = |peers: &HashMap<u64, ConnectedPeer>,
-                                active_remote: Option<u64>,
-                                pending_dx: &mut f32,
-                                pending_dy: &mut f32,
-                                seq: &mut u32,
-                                coalesce_armed: &mut bool,
-                                last_motion_sent: &mut Option<Instant>,
-                                dgram_enc: &mut DatagramEncoder|
-     -> Option<Duration> {
-        if *pending_dx == 0.0 && *pending_dy == 0.0 {
-            *coalesce_armed = false;
-            return None;
-        }
-        if let Some(pid) = active_remote {
-            if let Some(peer) = peers.get(&pid) {
-                if peer.conn.datagram_send_buffer_space() < MIN_MOTION_DGRAM_BUFFER_SPACE {
-                    *coalesce_armed = true;
-                    return Some(CONGESTION_RETRY_DELAY);
-                }
-                *seq = seq.wrapping_add(1);
-                let msg = DatagramMessage::MouseMove {
-                    seq: *seq,
-                    dx: *pending_dx,
-                    dy: *pending_dy,
-                };
-                let _ = peer.conn.send_datagram(dgram_enc.encode(msg));
-                *last_motion_sent = Some(Instant::now());
+    // Re-arms `coalesce_sleep` on QUIC backpressure; drops it to `None` when flushed or idle.
+    let flush_pending_motion =
+        |peers: &HashMap<u64, ConnectedPeer>,
+         active_remote: Option<u64>,
+         pending_dx: &mut f32,
+         pending_dy: &mut f32,
+         seq: &mut u32,
+         coalesce_sleep: &mut Option<std::pin::Pin<Box<tokio::time::Sleep>>>,
+         last_motion_sent: &mut Option<Instant>,
+         dgram_enc: &mut DatagramEncoder| {
+            if *pending_dx == 0.0 && *pending_dy == 0.0 {
+                *coalesce_sleep = None;
+                return;
             }
-        }
-        *pending_dx = 0.0;
-        *pending_dy = 0.0;
-        *coalesce_armed = false;
-        None
-    };
+            if let Some(pid) = active_remote {
+                if let Some(peer) = peers.get(&pid) {
+                    if peer.conn.datagram_send_buffer_space() < MIN_MOTION_DGRAM_BUFFER_SPACE {
+                        *coalesce_sleep =
+                            Some(Box::pin(tokio::time::sleep(CONGESTION_RETRY_DELAY)));
+                        return;
+                    }
+                    *seq = seq.wrapping_add(1);
+                    let msg = DatagramMessage::MouseMove {
+                        seq: *seq,
+                        dx: *pending_dx,
+                        dy: *pending_dy,
+                    };
+                    let _ = peer.conn.send_datagram(dgram_enc.encode(msg));
+                    *last_motion_sent = Some(Instant::now());
+                }
+            }
+            *pending_dx = 0.0;
+            *pending_dy = 0.0;
+            *coalesce_sleep = None;
+        };
 
     let cancel_outgoing_drag = |outgoing_drag: &mut Option<ActiveOutgoingDrag>,
                                 peers: &HashMap<u64, ConnectedPeer>| {
@@ -429,100 +609,171 @@ pub async fn run_server_with_dnd(
 
     let probe_all_peers = |peers: &mut HashMap<u64, ConnectedPeer>, now: Instant| {
         for peer in peers.values_mut() {
-            let ts_us = peer.health_probe.start_probe(now);
-            let _ = peer.ctrl_tx.send(ControlMessage::Ping { ts_us });
+            probe_peer(peer, now);
         }
     };
 
     loop {
         tokio::select! {
-            _ = &mut coalesce_sleep, if coalesce_armed => {
-                if let Some(retry_delay) = flush_pending_motion(
+            ev = next_lifecycle_event(&mut lifecycle) => {
+                match ev {
+                    ev @ (SystemLifecycleEvent::PreparingToShutdown(_)
+                    | SystemLifecycleEvent::PreparingToSleep(_)) => {
+                        let (shutting_down, guard) = match ev {
+                            SystemLifecycleEvent::PreparingToShutdown(g) => (true, g),
+                            SystemLifecycleEvent::PreparingToSleep(g) => (false, g),
+                            SystemLifecycleEvent::Resumed => unreachable!(),
+                        };
+                        let close_reason: &[u8] = if shutting_down {
+                            b"os shutdown"
+                        } else {
+                            b"os sleep"
+                        };
+                        os_paused.store(true, Ordering::SeqCst);
+                        info!(
+                            shutting_down,
+                            peers = peers.len(),
+                            "OS preparing to sleep/shut down; gating accepts, closing peers, and flushing QUIC CONNECTION_CLOSE"
+                        );
+                        capture_ctrl.discard_saved_focus();
+                        cancel_pending_drag_handoff(
+                            &mut pending_drag_handoff,
+                            active_remote,
+                            &capture_ctrl,
+                            &dnd,
+                        );
+                        cancel_outgoing_drag(&mut outgoing_drag, &peers);
+                        incoming_drag_peer = None;
+                        early_drag_files.clear();
+                        if let Some(inc) = incoming_drag.take() {
+                            if !inc.drop_requested {
+                                inc.cancel(Arc::clone(&dnd));
+                            }
+                        }
+                        if active_remote.take().is_some() {
+                            active_edge = None;
+                            remote_modifiers = ModifierMask::EMPTY;
+                            pending_dx = 0.0;
+                            pending_dy = 0.0;
+                            coalesce_sleep = None;
+                            last_motion_sent = None;
+                            let (lx, ly) = capture_ctrl.last_local_cursor_norm();
+                            let _ = capture_ctrl.leave_remote_at(lx, ly);
+                        }
+                        edge_to_peer.clear();
+                        capture_ctrl.set_active_edges(&[]);
+                        dnd.set_active_edges(&[], config.dead_corner_px);
+                        for (_, peer) in peers.drain() {
+                            peer.conn.close(0u32.into(), close_reason);
+                        }
+                        update_probe_timer(&peers, &mut probe_sleep, &mut probe_deadline_armed);
+                        while let Ok(pe) = peer_rx.try_recv() {
+                            if let PeerEvent::Connected { peer } = pe {
+                                peer.conn.close(0u32.into(), close_reason);
+                            }
+                        }
+                        flush_endpoint.flush_closed().await;
+                        if let Some(ref rt) = runtime {
+                            rt.update(|s| {
+                                s.status = if shutting_down {
+                                    "Paused (OS shutting down)".into()
+                                } else {
+                                    "Paused (OS sleeping)".into()
+                                };
+                                s.active_target = "Local".into();
+                                s.peers.clear();
+                                s.rtt_ms = None;
+                            });
+                        }
+                        // Drop the OS delay inhibitor ONLY AFTER QUIC CONNECTION_CLOSE frames
+                        // have been flushed to all peers.
+                        drop(guard);
+                    }
+
+                    SystemLifecycleEvent::Resumed => {
+                        let was_paused = os_paused.swap(false, Ordering::SeqCst);
+                        let now = Instant::now();
+                        capture_ctrl.discard_saved_focus();
+                        info!(
+                            was_paused,
+                            "OS lifecycle resumed; re-enabling server accepts and refreshing discovery beacon"
+                        );
+                        let fresh_geom = capture_ctrl.desktop_geometry();
+                        server_scale.store(fresh_geom.primary_scale().to_bits(), Ordering::Relaxed);
+                        ip_check_gen = ip_check_gen.wrapping_add(1);
+                        let gen = ip_check_gen;
+                        let tx = ip_tx.clone();
+                        tokio::spawn(async move {
+                            let ips = local_ipv4_addresses_async().await;
+                            let _ = tx.send((gen, ips, true));
+                        });
+                        if let Some(ref rt) = runtime {
+                            rt.update(|s| {
+                                s.geometry = fresh_geom;
+                            });
+                        }
+                        beacon_refresh.notify_one();
+                        if !was_paused {
+                            probe_all_peers(&mut peers, now);
+                            update_probe_timer(&peers, &mut probe_sleep, &mut probe_deadline_armed);
+                        }
+                        sync_runtime_peers(&runtime, &peers, active_remote, locked, None);
+                    }
+                }
+            }
+
+            _ = next_network_change(&mut net_monitor) => {
+                if os_paused.load(Ordering::Acquire) {
+                    continue;
+                }
+                debug!("OS network change notification on server; refreshing LAN IPs, discovery beacon, and probing peers");
+                ip_check_gen = ip_check_gen.wrapping_add(1);
+                let gen = ip_check_gen;
+                let tx = ip_tx.clone();
+                tokio::spawn(async move {
+                    let ips = local_ipv4_addresses_async().await;
+                    let _ = tx.send((gen, ips, true));
+                });
+                beacon_refresh.notify_one();
+                if !peers.is_empty() {
+                    probe_all_peers(&mut peers, Instant::now());
+                    update_probe_timer(&peers, &mut probe_sleep, &mut probe_deadline_armed);
+                }
+            }
+
+            _ = async {
+                if let Some(s) = coalesce_sleep.as_mut() {
+                    s.as_mut().await;
+                } else {
+                    std::future::pending::<()>().await;
+                }
+            } => {
+                coalesce_sleep = None;
+                flush_pending_motion(
                     &peers,
                     active_remote,
                     &mut pending_dx,
                     &mut pending_dy,
                     &mut seq,
-                    &mut coalesce_armed,
+                    &mut coalesce_sleep,
                     &mut last_motion_sent,
                     &mut dgram_enc,
-                ) {
-                    coalesce_sleep
-                        .as_mut()
-                        .reset(tokio::time::Instant::now() + retry_delay);
-                }
+                );
             }
 
-            _ = ping_interval.tick() => {
-                let now = Instant::now();
-
-                // 1. Cross-platform sleep/suspend jump detection (> 5s monotonic or wall-clock leap)
-                if let Some(jump) = sleep_detector.check() {
-                    info!(
-                        jump_secs = jump.as_secs_f32(),
-                        "Detected sleep/wall-clock jump on server; releasing remote focus, refreshing geometry & LAN IPs, and probing peers"
-                    );
-                    cancel_pending_drag_handoff(
-                        &mut pending_drag_handoff,
-                        active_remote,
-                        &capture_ctrl,
-                        &dnd,
-                    );
-                    cancel_outgoing_drag(&mut outgoing_drag, &peers);
-                    if let Some(pid) = active_remote.take() {
-                        if let Some(peer) = peers.get(&pid) {
-                            let _ = peer.ctrl_tx.send(ControlMessage::ReleaseAll);
-                            let _ = peer.ctrl_tx.send(ControlMessage::Leave {
-                                edge: peer.edge.opposite(),
-                                normalized_pos: 0.5,
-                                cursor_norm_x: 0.5,
-                                cursor_norm_y: 0.5,
-                            });
-                        }
-                        active_edge = None;
-                        remote_modifiers = ModifierMask::EMPTY;
-                        pending_dx = 0.0;
-                        pending_dy = 0.0;
-                        coalesce_armed = false;
-                        last_motion_sent = None;
-                        let (lx, ly) = capture_ctrl.last_local_cursor_norm();
-                        let _ = capture_ctrl.leave_remote_at(lx, ly);
-                    }
-                    let fresh_geom = capture_ctrl.desktop_geometry();
-                    server_scale.store(fresh_geom.primary_scale().to_bits(), Ordering::Relaxed);
-                    last_ip_check = now;
-                    ip_check_gen = ip_check_gen.wrapping_add(1);
-                    ip_check_in_flight += 1;
-                    let gen = ip_check_gen;
-                    let tx = ip_tx.clone();
-                    tokio::spawn(async move {
-                        let ips = local_ipv4_addresses_async().await;
-                        let _ = tx.send((gen, ips, true));
-                    });
-                    if let Some(ref rt) = runtime {
-                        rt.update(|s| {
-                            s.geometry = fresh_geom;
-                        });
-                    }
-                    beacon_refresh.notify_one();
-                    probe_all_peers(&mut peers, now);
-                    sync_runtime_peers(&runtime, &peers, active_remote, locked, None);
-                } else if now.saturating_duration_since(last_ip_check) >= Duration::from_secs(3) {
-                    // 2. Periodic Wi-Fi <-> Ethernet roaming detection (offloaded off select! loop)
-                    last_ip_check = now;
-                    if ip_check_in_flight == 0 {
-                        ip_check_gen = ip_check_gen.wrapping_add(1);
-                        ip_check_in_flight += 1;
-                        let gen = ip_check_gen;
-                        let tx = ip_tx.clone();
-                        tokio::spawn(async move {
-                            let ips = local_ipv4_addresses_async().await;
-                            let _ = tx.send((gen, ips, false));
-                        });
-                    }
+            _ = async {
+                if let Some(s) = probe_sleep.as_mut() {
+                    s.as_mut().await;
+                } else {
+                    std::future::pending::<()>().await;
                 }
-
-                // 3. Evict any peers whose QUIC connection closed or failed post-resume health ping
+            } => {
+                probe_sleep = None;
+                let fired_deadline = probe_deadline_armed.take();
+                if os_paused.load(Ordering::Acquire) {
+                    continue;
+                }
+                let now = fired_deadline.map_or_else(Instant::now, |d| Instant::now().max(d));
                 let dead_ids: Vec<u64> = peers
                     .iter()
                     .filter(|(_, p)| {
@@ -530,13 +781,15 @@ pub async fn run_server_with_dnd(
                     })
                     .map(|(&id, _)| id)
                     .collect();
+                let mut evicted_any = false;
                 for dead_id in dead_ids {
                     if let Some(peer) = peers.remove(&dead_id) {
+                        evicted_any = true;
                         let timed_out = peer.health_probe.is_timed_out(now);
                         warn!(
                             peer = %peer.name,
                             timed_out,
-                            "Evicting unresponsive peer after wake/network change"
+                            "Evicting unresponsive peer after health probe timeout"
                         );
                         if timed_out {
                             peer.conn.close(1u32.into(), b"health probe timeout");
@@ -577,9 +830,10 @@ pub async fn run_server_with_dnd(
                             active_edge = None;
                             pending_dx = 0.0;
                             pending_dy = 0.0;
-                            coalesce_armed = false;
+                            coalesce_sleep = None;
                             last_motion_sent = None;
                             remote_modifiers = ModifierMask::EMPTY;
+                            capture_ctrl.discard_saved_focus();
                             let _ = capture_ctrl.leave_remote(peer.edge, 0.5);
                         }
                         let edges: Vec<Edge> = edge_to_peer.keys().copied().collect();
@@ -588,49 +842,13 @@ pub async fn run_server_with_dnd(
                         sync_runtime_peers(&runtime, &peers, active_remote, locked, None);
                     }
                 }
-
-                if !peers.is_empty() {
-                    let mut best_rtt: Option<f32> = None;
-                    for peer in peers.values_mut() {
-                        let rtt_ms = peer.conn.rtt().as_secs_f32() * 1000.0;
-                        peer.rtt_ms = Some(rtt_ms);
-                        best_rtt = Some(match best_rtt {
-                            Some(cur) => cur.min(rtt_ms),
-                            None => rtt_ms,
-                        });
-                        let stats = peer.conn.stats();
-                        let lost_delta = stats
-                            .path
-                            .lost_packets
-                            .saturating_sub(peer.last_lost_packets);
-                        let cong_delta = stats
-                            .path
-                            .congestion_events
-                            .saturating_sub(peer.last_congestion_events);
-                        peer.last_lost_packets = stats.path.lost_packets;
-                        peer.last_congestion_events = stats.path.congestion_events;
-                        if (lost_delta > 0 || cong_delta > 0)
-                            && rtt_ms > 30.0
-                            && peer
-                                .last_lag_warn_at
-                                .is_none_or(|t| now.saturating_duration_since(t) >= Duration::from_secs(2))
-                        {
-                            peer.last_lag_warn_at = Some(now);
-                            warn!(
-                                peer = %peer.name,
-                                rtt_ms = format_args!("{rtt_ms:.1}"),
-                                lost_packets_delta = lost_delta,
-                                congestion_events_delta = cong_delta,
-                                "Server QUIC lag spike detected (packet loss/congestion with RTT > 30ms)"
-                            );
-                        }
-                    }
-                    sync_runtime_peers(&runtime, &peers, active_remote, locked, best_rtt);
+                if evicted_any && !os_paused.load(Ordering::Acquire) {
+                    beacon_refresh.notify_one();
                 }
+                update_probe_timer(&peers, &mut probe_sleep, &mut probe_deadline_armed);
             }
 
             Some((gen, fresh_ips, from_wake)) = ip_rx.recv() => {
-                ip_check_in_flight = ip_check_in_flight.saturating_sub(1);
                 if gen != ip_check_gen {
                     continue;
                 }
@@ -651,6 +869,7 @@ pub async fn run_server_with_dnd(
                     beacon_refresh.notify_one();
                     if !from_wake {
                         probe_all_peers(&mut peers, Instant::now());
+                        update_probe_timer(&peers, &mut probe_sleep, &mut probe_deadline_armed);
                     }
                 }
             }
@@ -714,14 +933,19 @@ pub async fn run_server_with_dnd(
                     remote_modifiers = ModifierMask::EMPTY;
                     pending_dx = 0.0;
                     pending_dy = 0.0;
-                    coalesce_armed = false;
+                    coalesce_sleep = None;
                     last_motion_sent = None;
+                    capture_ctrl.reset_remote_keys();
                     let _ = capture_ctrl.enter_remote();
                     let _ = peer.ctrl_tx.send(ControlMessage::Enter {
                         edge: ready.edge.opposite(),
                         normalized_pos,
                         lock_state,
                     });
+                    if let Some(p) = peers.get_mut(&ready.peer_id) {
+                        probe_peer(p, Instant::now());
+                    }
+                    update_probe_timer(&peers, &mut probe_sleep, &mut probe_deadline_armed);
 
                     let drag_id = next_drag_id();
                     let peer_id = ready.peer_id;
@@ -825,9 +1049,11 @@ pub async fn run_server_with_dnd(
                         dead_corner_px,
                         edge_dwell_ms,
                         auto_lock_fullscreen,
+                        allow_fullscreen_videos,
                         locked: new_locked,
                         sync_lock_keys,
                         pin_media_keys_local,
+                        unfocus_on_leave,
                         clipboard: clip_enabled,
                         drag_drop_files,
                         hotkeys,
@@ -836,8 +1062,10 @@ pub async fn run_server_with_dnd(
                         config.dead_corner_px = dead_corner_px;
                         config.edge_dwell_ms = edge_dwell_ms;
                         config.auto_lock_fullscreen = auto_lock_fullscreen;
+                        config.allow_fullscreen_videos = allow_fullscreen_videos;
                         config.sync_lock_keys = sync_lock_keys;
                         config.pin_media_keys_local = pin_media_keys_local;
+                        config.unfocus_on_leave = unfocus_on_leave;
                         config.clipboard = clip_enabled;
                         config.drag_drop_files = drag_drop_files;
                         config.set_switch_shortcut(hotkeys.switch_mods);
@@ -851,9 +1079,11 @@ pub async fn run_server_with_dnd(
                             auto_lock_fullscreen,
                             locked,
                         );
+                        capture_ctrl.set_allow_fullscreen_videos(allow_fullscreen_videos);
                         capture_ctrl.set_sync_lock_keys(sync_lock_keys);
                         capture_ctrl.set_drag_drop_files(drag_drop_files);
                         capture_ctrl.set_pin_media_keys_local(pin_media_keys_local);
+                        capture_ctrl.set_unfocus_on_leave(unfocus_on_leave);
                         capture_ctrl.set_hotkeys(hotkeys);
                         dnd.set_enabled(drag_drop_files);
                         if locked || !drag_drop_files {
@@ -955,13 +1185,15 @@ pub async fn run_server_with_dnd(
                                 remote_modifiers = ModifierMask::EMPTY;
                                 pending_dx = 0.0;
                                 pending_dy = 0.0;
-                                coalesce_armed = false;
+                                coalesce_sleep = None;
                                 last_motion_sent = None;
                                 dnd.set_drag_armed(false);
                                 // Only enter remote mode on local -> remote transition so we do not
                                 // overwrite the saved local cursor position (e.g. Windows last_local_norm).
                                 if !was_remote {
                                     let _ = capture_ctrl.enter_remote();
+                                } else {
+                                    capture_ctrl.reset_remote_keys();
                                 }
                                 let (nx, ny) = peer.last_cursor_norm;
                                 let _ = peer.ctrl_tx.send(ControlMessage::EnterAt {
@@ -969,6 +1201,14 @@ pub async fn run_server_with_dnd(
                                     norm_y: ny,
                                     lock_state,
                                 });
+                                if let Some(p) = peers.get_mut(&peer_id) {
+                                    probe_peer(p, Instant::now());
+                                }
+                                update_probe_timer(
+                                    &peers,
+                                    &mut probe_sleep,
+                                    &mut probe_deadline_armed,
+                                );
                                 sync_runtime_peers(&runtime, &peers, active_remote, locked, None);
                             }
                         } else {
@@ -1002,7 +1242,7 @@ pub async fn run_server_with_dnd(
                             remote_modifiers = ModifierMask::EMPTY;
                             pending_dx = 0.0;
                             pending_dy = 0.0;
-                            coalesce_armed = false;
+                            coalesce_sleep = None;
                             last_motion_sent = None;
                             let (lx, ly) = capture_ctrl.last_local_cursor_norm();
                             let _ = capture_ctrl.leave_remote_at(lx, ly);
@@ -1045,6 +1285,12 @@ pub async fn run_server_with_dnd(
                                     }
                                 }
                             });
+                            maybe_probe_quiet_peers_on_outbound(
+                                &mut peers,
+                                None,
+                                &mut probe_sleep,
+                                &mut probe_deadline_armed,
+                            );
                         }
                     }
                     RuntimeCommand::UpdateMaxFileBytes(limit) => {
@@ -1064,6 +1310,14 @@ pub async fn run_server_with_dnd(
                                     tokio::spawn(async move {
                                         let _ = send_clipboard_on(&conn, &p).await;
                                     });
+                                }
+                                if !peers.is_empty() {
+                                    maybe_probe_quiet_peers_on_outbound(
+                                        &mut peers,
+                                        None,
+                                        &mut probe_sleep,
+                                        &mut probe_deadline_armed,
+                                    );
                                 }
                             }
                         }
@@ -1124,6 +1378,16 @@ pub async fn run_server_with_dnd(
                             }
                         }
                     }
+                    RuntimeCommand::RefreshStats => {
+                        if !os_paused.load(Ordering::Acquire) && !peers.is_empty() {
+                            probe_all_peers(&mut peers, Instant::now());
+                            update_probe_timer(
+                                &peers,
+                                &mut probe_sleep,
+                                &mut probe_deadline_armed,
+                            );
+                        }
+                    }
                     RuntimeCommand::Shutdown => {
                         info!("Received graceful shutdown command for Glide server");
                         break;
@@ -1177,7 +1441,7 @@ pub async fn run_server_with_dnd(
                             pending_drag_handoff = None;
                             pending_dx = 0.0;
                             pending_dy = 0.0;
-                            coalesce_armed = false;
+                            coalesce_sleep = None;
                             last_motion_sent = None;
                             dnd.set_drag_armed(false);
                             let _ = capture_ctrl.leave_remote(edge, normalized_pos);
@@ -1255,6 +1519,7 @@ pub async fn run_server_with_dnd(
                                                 cursor_norm_y: 0.5,
                                             });
                                         }
+                                        capture_ctrl.reset_remote_keys();
                                     }
                                 }
 
@@ -1274,7 +1539,7 @@ pub async fn run_server_with_dnd(
                                 remote_modifiers = ModifierMask::EMPTY;
                                 pending_dx = 0.0;
                                 pending_dy = 0.0;
-                                coalesce_armed = false;
+                                coalesce_sleep = None;
                                 last_motion_sent = None;
                                 let _ = capture_ctrl.enter_remote();
                                 let _ = peer.ctrl_tx.send(ControlMessage::Enter {
@@ -1282,19 +1547,27 @@ pub async fn run_server_with_dnd(
                                     normalized_pos,
                                     lock_state,
                                 });
+                                if let Some(p) = peers.get_mut(&peer_id) {
+                                    probe_peer(p, Instant::now());
+                                }
+                                update_probe_timer(
+                                    &peers,
+                                    &mut probe_sleep,
+                                    &mut probe_deadline_armed,
+                                );
                                 sync_runtime_peers(&runtime, &peers, active_remote, locked, None);
                             } else {
                                 active_edge = None;
                                 pending_dx = 0.0;
                                 pending_dy = 0.0;
-                                coalesce_armed = false;
+                                coalesce_sleep = None;
                                 last_motion_sent = None;
                                 let _ = capture_ctrl.leave_remote(edge, normalized_pos);
                             }
                         } else {
                             pending_dx = 0.0;
                             pending_dy = 0.0;
-                            coalesce_armed = false;
+                            coalesce_sleep = None;
                             last_motion_sent = None;
                             dnd.set_drag_armed(false);
                             let _ = capture_ctrl.leave_remote(edge, normalized_pos);
@@ -1326,7 +1599,7 @@ pub async fn run_server_with_dnd(
                                 remote_modifiers = ModifierMask::EMPTY;
                                 pending_dx = 0.0;
                                 pending_dy = 0.0;
-                                coalesce_armed = false;
+                                coalesce_sleep = None;
                                 last_motion_sent = None;
                                 let (lx, ly) = capture_ctrl.last_local_cursor_norm();
                                 let _ = capture_ctrl.leave_remote_at(lx, ly);
@@ -1346,7 +1619,7 @@ pub async fn run_server_with_dnd(
                                 remote_modifiers = ModifierMask::EMPTY;
                                 pending_dx = 0.0;
                                 pending_dy = 0.0;
-                                coalesce_armed = false;
+                                coalesce_sleep = None;
                                 last_motion_sent = None;
                                 dnd.set_drag_armed(false);
                                 let _ = capture_ctrl.enter_remote();
@@ -1356,6 +1629,14 @@ pub async fn run_server_with_dnd(
                                     norm_y: ny,
                                     lock_state,
                                 });
+                                if let Some(p) = peers.get_mut(&peer_id) {
+                                    probe_peer(p, Instant::now());
+                                }
+                                update_probe_timer(
+                                    &peers,
+                                    &mut probe_sleep,
+                                    &mut probe_deadline_armed,
+                                );
                                 sync_runtime_peers(&runtime, &peers, active_remote, locked, None);
                             } else {
                                 cancel_pending_drag_handoff(
@@ -1405,47 +1686,42 @@ pub async fn run_server_with_dnd(
                                 || last_motion_sent
                                     .is_none_or(|t| t.elapsed() >= coalesce_dur);
                             if leading_edge_ready {
-                                if let Some(retry_delay) = flush_pending_motion(
+                                flush_pending_motion(
                                     &peers,
                                     active_remote,
                                     &mut pending_dx,
                                     &mut pending_dy,
                                     &mut seq,
-                                    &mut coalesce_armed,
+                                    &mut coalesce_sleep,
                                     &mut last_motion_sent,
                                     &mut dgram_enc,
-                                ) {
-                                    coalesce_sleep
-                                        .as_mut()
-                                        .reset(tokio::time::Instant::now() + retry_delay);
-                                }
-                            } else if !coalesce_armed {
+                                );
+                            } else if coalesce_sleep.is_none() {
                                 let remaining = last_motion_sent
                                     .map(|t| coalesce_dur.saturating_sub(t.elapsed()))
                                     .unwrap_or(coalesce_dur);
-                                coalesce_armed = true;
-                                coalesce_sleep
-                                    .as_mut()
-                                    .reset(tokio::time::Instant::now() + remaining);
+                                coalesce_sleep = Some(Box::pin(tokio::time::sleep(remaining)));
                             }
+                            maybe_probe_active_peer_on_input(
+                                &mut peers,
+                                active_remote,
+                                &mut probe_sleep,
+                                &mut probe_deadline_armed,
+                            );
                         }
                     }
 
                     CaptureEvent::MouseScroll { dx_120, dy_120 } => {
-                        if let Some(retry_delay) = flush_pending_motion(
+                        flush_pending_motion(
                             &peers,
                             active_remote,
                             &mut pending_dx,
                             &mut pending_dy,
                             &mut seq,
-                            &mut coalesce_armed,
+                            &mut coalesce_sleep,
                             &mut last_motion_sent,
                             &mut dgram_enc,
-                        ) {
-                            coalesce_sleep
-                                .as_mut()
-                                .reset(tokio::time::Instant::now() + retry_delay);
-                        }
+                        );
                         if let Some(pid) = active_remote {
                             if let Some(peer) = peers.get(&pid) {
                                 seq = seq.wrapping_add(1);
@@ -1453,6 +1729,12 @@ pub async fn run_server_with_dnd(
                                     DatagramMessage::MouseScroll { seq, dx_120, dy_120 },
                                 ));
                             }
+                            maybe_probe_active_peer_on_input(
+                                &mut peers,
+                                active_remote,
+                                &mut probe_sleep,
+                                &mut probe_deadline_armed,
+                            );
                         }
                     }
 
@@ -1460,20 +1742,16 @@ pub async fn run_server_with_dnd(
                         if button == MouseButton::Left {
                             local_lmb_down = pressed;
                         }
-                        if let Some(retry_delay) = flush_pending_motion(
+                        flush_pending_motion(
                             &peers,
                             active_remote,
                             &mut pending_dx,
                             &mut pending_dy,
                             &mut seq,
-                            &mut coalesce_armed,
+                            &mut coalesce_sleep,
                             &mut last_motion_sent,
                             &mut dgram_enc,
-                        ) {
-                            coalesce_sleep
-                                .as_mut()
-                                .reset(tokio::time::Instant::now() + retry_delay);
-                        }
+                        );
                         if button == MouseButton::Left && !pressed {
                             if let Some(ref mut pending) = pending_drag_handoff {
                                 pending.drop_requested = true;
@@ -1499,6 +1777,12 @@ pub async fn run_server_with_dnd(
                             if let Some(peer) = peers.get(&pid) {
                                 let _ = peer.ctrl_tx.send(ControlMessage::Button { button, pressed });
                             }
+                            maybe_probe_active_peer_on_input(
+                                &mut peers,
+                                active_remote,
+                                &mut probe_sleep,
+                                &mut probe_deadline_armed,
+                            );
                         }
                     }
 
@@ -1522,25 +1806,27 @@ pub async fn run_server_with_dnd(
                                 continue;
                             }
                         }
-                        if let Some(retry_delay) = flush_pending_motion(
+                        flush_pending_motion(
                             &peers,
                             active_remote,
                             &mut pending_dx,
                             &mut pending_dy,
                             &mut seq,
-                            &mut coalesce_armed,
+                            &mut coalesce_sleep,
                             &mut last_motion_sent,
                             &mut dgram_enc,
-                        ) {
-                            coalesce_sleep
-                                .as_mut()
-                                .reset(tokio::time::Instant::now() + retry_delay);
-                        }
+                        );
                         if let Some(pid) = active_remote {
                             if let Some(peer) = peers.get(&pid) {
                                 remote_modifiers.update(usage, pressed);
                                 let _ = peer.ctrl_tx.send(ControlMessage::Key { usage, pressed });
                             }
+                            maybe_probe_active_peer_on_input(
+                                &mut peers,
+                                active_remote,
+                                &mut probe_sleep,
+                                &mut probe_deadline_armed,
+                            );
                         }
                     }
 
@@ -1570,7 +1856,7 @@ pub async fn run_server_with_dnd(
                         remote_modifiers = ModifierMask::EMPTY;
                         pending_dx = 0.0;
                         pending_dy = 0.0;
-                        coalesce_armed = false;
+                        coalesce_sleep = None;
                         last_motion_sent = None;
                         sync_runtime_peers(&runtime, &peers, active_remote, locked, None);
                     }
@@ -1591,6 +1877,7 @@ pub async fn run_server_with_dnd(
                     }
 
                     CaptureEvent::SystemSuspended => {
+                        capture_ctrl.discard_saved_focus();
                         cancel_pending_drag_handoff(
                             &mut pending_drag_handoff,
                             active_remote,
@@ -1612,21 +1899,23 @@ pub async fn run_server_with_dnd(
                                     cursor_norm_y: 0.5,
                                 });
                             }
+                            active_edge = None;
+                            remote_modifiers = ModifierMask::EMPTY;
+                            pending_dx = 0.0;
+                            pending_dy = 0.0;
+                            coalesce_sleep = None;
+                            last_motion_sent = None;
+                            let (lx, ly) = capture_ctrl.last_local_cursor_norm();
+                            let _ = capture_ctrl.leave_remote_at(lx, ly);
                         }
-                        active_edge = None;
-                        remote_modifiers = ModifierMask::EMPTY;
-                        pending_dx = 0.0;
-                        pending_dy = 0.0;
-                        coalesce_armed = false;
-                        last_motion_sent = None;
-                        let (lx, ly) = capture_ctrl.last_local_cursor_norm();
-                        let _ = capture_ctrl.leave_remote_at(lx, ly);
-                        sync_runtime_peers(&runtime, &peers, active_remote, locked, None);
+                        if !os_paused.load(Ordering::Acquire) {
+                            sync_runtime_peers(&runtime, &peers, active_remote, locked, None);
+                        }
                     }
 
                     CaptureEvent::SystemResumed => {
                         let now = Instant::now();
-                        sleep_detector.reset();
+                        capture_ctrl.discard_saved_focus();
                         cancel_pending_drag_handoff(
                             &mut pending_drag_handoff,
                             active_remote,
@@ -1649,16 +1938,14 @@ pub async fn run_server_with_dnd(
                             remote_modifiers = ModifierMask::EMPTY;
                             pending_dx = 0.0;
                             pending_dy = 0.0;
-                            coalesce_armed = false;
+                            coalesce_sleep = None;
                             last_motion_sent = None;
                             let (lx, ly) = capture_ctrl.last_local_cursor_norm();
                             let _ = capture_ctrl.leave_remote_at(lx, ly);
                         }
                         let fresh_geom = capture_ctrl.desktop_geometry();
                         server_scale.store(fresh_geom.primary_scale().to_bits(), Ordering::Relaxed);
-                        last_ip_check = now;
                         ip_check_gen = ip_check_gen.wrapping_add(1);
-                        ip_check_in_flight += 1;
                         let gen = ip_check_gen;
                         let tx = ip_tx.clone();
                         tokio::spawn(async move {
@@ -1671,8 +1958,11 @@ pub async fn run_server_with_dnd(
                             });
                         }
                         beacon_refresh.notify_one();
-                        probe_all_peers(&mut peers, now);
-                        sync_runtime_peers(&runtime, &peers, active_remote, locked, None);
+                        if !os_paused.load(Ordering::Acquire) {
+                            probe_all_peers(&mut peers, now);
+                            update_probe_timer(&peers, &mut probe_sleep, &mut probe_deadline_armed);
+                            sync_runtime_peers(&runtime, &peers, active_remote, locked, None);
+                        }
                     }
                 }
             }
@@ -1680,7 +1970,15 @@ pub async fn run_server_with_dnd(
             pe = peer_rx.recv() => {
                 let Some(pe) = pe else { break };
                 match pe {
-                    PeerEvent::Connected { peer } => {
+                    PeerEvent::Connected { mut peer } => {
+                        if os_paused.load(Ordering::Acquire) {
+                            debug!(
+                                peer = %peer.name,
+                                "Closing peer connection accepted while server is OS-paused"
+                            );
+                            peer.conn.close(0u32.into(), b"server paused");
+                            continue;
+                        }
                         if let Some(old_id) = edge_to_peer.insert(peer.edge, peer.id) {
                             if let Some(old_peer) = peers.remove(&old_id) {
                                 info!(old = %old_peer.name, edge = ?peer.edge, "Replacing previous peer on edge");
@@ -1702,8 +2000,9 @@ pub async fn run_server_with_dnd(
                                 remote_modifiers = ModifierMask::EMPTY;
                                 pending_dx = 0.0;
                                 pending_dy = 0.0;
-                                coalesce_armed = false;
+                                coalesce_sleep = None;
                                 last_motion_sent = None;
+                                capture_ctrl.discard_saved_focus();
                                 if let Some(edge) = active_edge.take() {
                                     let _ = capture_ctrl.leave_remote(edge, 0.5);
                                 }
@@ -1726,6 +2025,9 @@ pub async fn run_server_with_dnd(
                                 }
                             }
                         }
+                        let initial_rtt_ms = peer.conn.rtt().as_secs_f32() * 1000.0;
+                        peer.rtt_ms = Some(initial_rtt_ms);
+                        peer.last_inbound_at = Instant::now();
                         info!(
                             peer = %peer.name,
                             os = ?peer.os,
@@ -1737,13 +2039,20 @@ pub async fn run_server_with_dnd(
                         let edges: Vec<Edge> = edge_to_peer.keys().copied().collect();
                         capture_ctrl.set_active_edges(&edges);
                         dnd.set_active_edges(&edges, config.dead_corner_px);
-                        sync_runtime_peers(&runtime, &peers, active_remote, locked, None);
+                        update_probe_timer(&peers, &mut probe_sleep, &mut probe_deadline_armed);
+                        let best_rtt = peers
+                            .values()
+                            .filter_map(|p| p.rtt_ms)
+                            .reduce(f32::min);
+                        sync_runtime_peers(&runtime, &peers, active_remote, locked, best_rtt);
                     }
 
                     PeerEvent::Control { peer_id, msg } => {
                         if let Some(peer) = peers.get_mut(&peer_id) {
+                            peer.last_inbound_at = Instant::now();
                             peer.health_probe.mark_alive();
                         }
+                        update_probe_timer(&peers, &mut probe_sleep, &mut probe_deadline_armed);
                         match msg {
                             ControlMessage::Leave {
                                 edge: _,
@@ -1774,7 +2083,7 @@ pub async fn run_server_with_dnd(
                                         active_edge = None;
                                         pending_dx = 0.0;
                                         pending_dy = 0.0;
-                                        coalesce_armed = false;
+                                        coalesce_sleep = None;
                                         last_motion_sent = None;
                                         remote_modifiers = ModifierMask::EMPTY;
                                         let _ = capture_ctrl.leave_remote(return_edge, normalized_pos);
@@ -1929,15 +2238,60 @@ pub async fn run_server_with_dnd(
                                     let _ = peer.ctrl_tx.send(ControlMessage::Pong { ts_us });
                                 }
                             }
-                            ControlMessage::Pong { .. } => {}
+                            ControlMessage::Pong { .. } => {
+                                let now = Instant::now();
+                                if let Some(peer) = peers.get_mut(&peer_id) {
+                                    let rtt_ms = peer.conn.rtt().as_secs_f32() * 1000.0;
+                                    peer.rtt_ms = Some(rtt_ms);
+                                    let stats = peer.conn.stats();
+                                    let lost_delta = stats
+                                        .path
+                                        .lost_packets
+                                        .saturating_sub(peer.last_lost_packets);
+                                    let cong_delta = stats
+                                        .path
+                                        .congestion_events
+                                        .saturating_sub(peer.last_congestion_events);
+                                    peer.last_lost_packets = stats.path.lost_packets;
+                                    peer.last_congestion_events = stats.path.congestion_events;
+                                    if (lost_delta > 0 || cong_delta > 0)
+                                        && rtt_ms > 30.0
+                                        && peer.last_lag_warn_at.is_none_or(|t| {
+                                            now.saturating_duration_since(t) >= Duration::from_secs(2)
+                                        })
+                                    {
+                                        peer.last_lag_warn_at = Some(now);
+                                        warn!(
+                                            peer = %peer.name,
+                                            rtt_ms = format_args!("{rtt_ms:.1}"),
+                                            lost_packets_delta = lost_delta,
+                                            congestion_events_delta = cong_delta,
+                                            "Server QUIC lag spike detected (packet loss/congestion with RTT > 30ms)"
+                                        );
+                                    }
+                                }
+                                let best_rtt = peers
+                                    .values()
+                                    .filter_map(|p| p.rtt_ms)
+                                    .reduce(f32::min);
+                                sync_runtime_peers(
+                                    &runtime,
+                                    &peers,
+                                    active_remote,
+                                    locked,
+                                    best_rtt,
+                                );
+                            }
                             _ => {}
                         }
                     }
 
                     PeerEvent::Bulk { peer_id, transfer } => {
                         if let Some(peer) = peers.get_mut(&peer_id) {
+                            peer.last_inbound_at = Instant::now();
                             peer.health_probe.mark_alive();
                         }
+                        update_probe_timer(&peers, &mut probe_sleep, &mut probe_deadline_armed);
                         match transfer {
                             BulkTransfer::Clipboard(payload) => {
                                 if !config.clipboard {
@@ -1959,6 +2313,14 @@ pub async fn run_server_with_dnd(
                                             let _ = send_clipboard_on(&conn, &p).await;
                                         });
                                     }
+                                }
+                                if peers.len() > 1 {
+                                    maybe_probe_quiet_peers_on_outbound(
+                                        &mut peers,
+                                        Some(peer_id),
+                                        &mut probe_sleep,
+                                        &mut probe_deadline_armed,
+                                    );
                                 }
                             }
                             BulkTransfer::File(file) => {
@@ -2080,12 +2442,17 @@ pub async fn run_server_with_dnd(
                                 active_edge = None;
                                 pending_dx = 0.0;
                                 pending_dy = 0.0;
-                                coalesce_armed = false;
+                                coalesce_sleep = None;
                                 last_motion_sent = None;
                                 remote_modifiers = ModifierMask::EMPTY;
+                                capture_ctrl.discard_saved_focus();
                                 let _ = capture_ctrl.leave_remote(peer.edge, 0.5);
                             }
                             sync_runtime_peers(&runtime, &peers, active_remote, locked, None);
+                            update_probe_timer(&peers, &mut probe_sleep, &mut probe_deadline_armed);
+                            if !os_paused.load(Ordering::Acquire) {
+                                beacon_refresh.notify_one();
+                            }
                         }
                     }
                 }
@@ -2127,12 +2494,22 @@ pub async fn run_server_with_dnd(
                                 });
                             }
                         }
+                        if !peers.is_empty() {
+                            maybe_probe_quiet_peers_on_outbound(
+                                &mut peers,
+                                None,
+                                &mut probe_sleep,
+                                &mut probe_deadline_armed,
+                            );
+                        }
                     }
                 }
             }
         }
     }
 
+    os_paused.store(true, Ordering::SeqCst);
+    capture_ctrl.discard_saved_focus();
     cancel_pending_drag_handoff(
         &mut pending_drag_handoff,
         active_remote,
@@ -2161,6 +2538,7 @@ pub async fn run_server_with_dnd(
     drop(_clip_apply_guard);
     drop(_accept_guard);
     drop(_beacon_guard);
+    flush_endpoint.close_and_flush(0, b"server stopped").await;
     drop(_endpoint_guard);
     if let Some(ref rt) = runtime {
         rt.update(|s| {
@@ -2179,6 +2557,7 @@ async fn handle_incoming_session(
     server_scale: f32,
     peer_tx: mpsc::UnboundedSender<PeerEvent>,
     max_file_bytes: Arc<AtomicUsize>,
+    os_paused: Arc<AtomicBool>,
 ) -> Result<()> {
     let hello = tokio::time::timeout(Duration::from_secs(5), session.ctrl_recv.recv()).await??;
     let (peer_name, edge, os) = match hello {
@@ -2211,6 +2590,11 @@ async fn handle_incoming_session(
         }
     };
 
+    if os_paused.load(Ordering::Acquire) {
+        session.conn.close(0u32.into(), b"server paused");
+        return Ok(());
+    }
+
     session
         .ctrl_send
         .send(&ControlMessage::Welcome {
@@ -2228,6 +2612,11 @@ async fn handle_incoming_session(
     let conn = session.conn;
     let mut ctrl_send = session.ctrl_send;
     let mut ctrl_recv = session.ctrl_recv;
+
+    if os_paused.load(Ordering::Acquire) {
+        conn.close(0u32.into(), b"server paused");
+        return Ok(());
+    }
 
     let _ctrl_writer_guard = AbortOnDrop(tokio::spawn(async move {
         while let Some(msg) = ctrl_out_rx.recv().await {
@@ -2278,6 +2667,7 @@ async fn handle_incoming_session(
                 last_cursor_norm: (0.5, 0.5),
                 rtt_ms: None,
                 health_probe: HealthProbe::default(),
+                last_inbound_at: Instant::now(),
                 last_lost_packets: 0,
                 last_congestion_events: 0,
                 last_lag_warn_at: None,
@@ -2319,9 +2709,11 @@ pub async fn run_native_server_with_runtime(
         dead_corner_px: config.dead_corner_px,
         edge_dwell_ms: config.edge_dwell_ms,
         auto_lock_fullscreen: config.auto_lock_fullscreen,
+        allow_fullscreen_videos: config.allow_fullscreen_videos,
         sync_lock_keys: config.sync_lock_keys,
         drag_drop_files: config.drag_drop_files,
         pin_media_keys_local: config.pin_media_keys_local,
+        unfocus_on_leave: config.unfocus_on_leave,
     })?;
 
     let clipboard = if config.clipboard {
@@ -2337,6 +2729,8 @@ pub async fn run_native_server_with_runtime(
     };
 
     let dnd = glide_backend::start_dnd();
+    let lifecycle = SystemLifecycleMonitor::start();
+    let net_monitor = NetworkChangeMonitor::start();
 
     let os_label = match glide_backend::current_os_kind() {
         OsKind::Windows => "windows",
@@ -2346,8 +2740,18 @@ pub async fn run_native_server_with_runtime(
         OsKind::Unknown => "unknown",
     };
 
-    run_server_with_dnd(
-        config, endpoint, capture, clipboard, dnd, None, os_label, runtime, cmd_rx,
+    run_server_with_monitors(
+        config,
+        endpoint,
+        capture,
+        clipboard,
+        dnd,
+        None,
+        os_label,
+        runtime,
+        cmd_rx,
+        Some(lifecycle),
+        Some(net_monitor),
     )
     .await
 }

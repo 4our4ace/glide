@@ -264,6 +264,10 @@ pub struct ServerConfig {
     pub edge_dwell_ms: u64,
     /// Automatically pause edge switching while a fullscreen game/app is active.
     pub auto_lock_fullscreen: bool,
+    /// Allow crossing screen edges past fullscreen video players and non-pointer-locked
+    /// fullscreen browsers while `auto_lock_fullscreen` is enabled (games and VMs stay locked).
+    #[serde(default = "default_true")]
+    pub allow_fullscreen_videos: bool,
     /// Legacy master switch for `<Mods>+Arrow` screen switching and cursor lock toggle when
     /// `switch_shortcut` / `lock_shortcut` are unset (`None`).
     pub enable_hotkeys: bool,
@@ -280,6 +284,9 @@ pub struct ServerConfig {
     /// Keep media, volume, and brightness keys on this PC instead of forwarding them to remote clients.
     #[serde(default = "default_true")]
     pub pin_media_keys_local: bool,
+    /// Unfocus the active local window when pointer/keyboard focus leaves this server for a remote client.
+    #[serde(default)]
+    pub unfocus_on_leave: bool,
     /// Enable bidirectional clipboard sharing (UTF-8 text & PNG/DIB images).
     pub clipboard: bool,
     /// Allow dragging local files straight across active screen edges.
@@ -308,11 +315,13 @@ impl Default for ServerConfig {
             dead_corner_px: 24,
             edge_dwell_ms: 0,
             auto_lock_fullscreen: true,
+            allow_fullscreen_videos: true,
             enable_hotkeys: true,
             switch_shortcut: None,
             lock_shortcut: None,
             sync_lock_keys: true,
             pin_media_keys_local: true,
+            unfocus_on_leave: false,
             clipboard: true,
             drag_drop_files: true,
             motion_coalesce_us: 1000,
@@ -523,6 +532,9 @@ pub struct ClientConfig {
     pub dead_corner_px: i32,
     /// Sync CapsLock / NumLock state when entering this client.
     pub sync_lock_keys: bool,
+    /// Unfocus the active local window when pointer/keyboard focus leaves this client back to the server.
+    #[serde(default)]
+    pub unfocus_on_leave: bool,
     /// Input injection backend (`auto`, `xtest`, or `uinput` on Linux).
     pub input_backend: InputBackendKind,
     /// Declarative per-client physical key remapping rules.
@@ -561,6 +573,7 @@ impl Default for ClientConfig {
             edge_threshold_px: 4,
             dead_corner_px: 24,
             sync_lock_keys: true,
+            unfocus_on_leave: false,
             input_backend: InputBackendKind::Auto,
             key_remap: Vec::new(),
             clipboard: true,
@@ -965,6 +978,62 @@ mod tests {
         let raw = toml::to_string_pretty(&cfg).unwrap();
         let parsed: GlideConfigFile = toml::from_str(&raw).unwrap();
         assert!(!parsed.server.pin_media_keys_local);
+    }
+
+    #[test]
+    fn allow_fullscreen_videos_defaults_true_and_roundtrips() {
+        assert!(ServerConfig::default().allow_fullscreen_videos);
+
+        // Existing configs omitting allow_fullscreen_videos default to true
+        let legacy: GlideConfigFile = toml::from_str(
+            r#"
+            [server]
+            auto_lock_fullscreen = true
+            "#,
+        )
+        .unwrap();
+        assert!(legacy.server.allow_fullscreen_videos);
+        assert!(legacy.effective_server_config().allow_fullscreen_videos);
+
+        let mut cfg = GlideConfigFile::default();
+        cfg.server.allow_fullscreen_videos = false;
+        let raw = toml::to_string_pretty(&cfg).unwrap();
+        assert!(raw.contains("allow_fullscreen_videos = false"));
+        let parsed: GlideConfigFile = toml::from_str(&raw).unwrap();
+        assert!(!parsed.server.allow_fullscreen_videos);
+        assert!(!parsed.effective_server_config().allow_fullscreen_videos);
+    }
+
+    #[test]
+    fn unfocus_on_leave_defaults_false_and_roundtrips() {
+        assert!(!ServerConfig::default().unfocus_on_leave);
+        assert!(!ClientConfig::default().unfocus_on_leave);
+
+        let legacy: GlideConfigFile = toml::from_str(
+            r#"
+            [server]
+            edge_threshold_px = 5
+
+            [client]
+            sensitivity = 1.2
+            "#,
+        )
+        .unwrap();
+        assert!(!legacy.server.unfocus_on_leave);
+        assert!(!legacy.client.unfocus_on_leave);
+        assert!(!legacy.effective_server_config().unfocus_on_leave);
+        assert!(!legacy.effective_client_config().unfocus_on_leave);
+
+        let mut cfg = GlideConfigFile::default();
+        cfg.server.unfocus_on_leave = true;
+        cfg.client.unfocus_on_leave = true;
+        let raw = toml::to_string_pretty(&cfg).unwrap();
+        assert!(raw.contains("unfocus_on_leave = true"));
+        let parsed: GlideConfigFile = toml::from_str(&raw).unwrap();
+        assert!(parsed.server.unfocus_on_leave);
+        assert!(parsed.client.unfocus_on_leave);
+        assert!(parsed.effective_server_config().unfocus_on_leave);
+        assert!(parsed.effective_client_config().unfocus_on_leave);
     }
 
     #[test]
