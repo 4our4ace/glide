@@ -16,7 +16,7 @@ Engineering roadmap for **Glide** — a lean, pure-Rust, zero-cloud software KVM
 
 ---
 
-## Completed Daily-Driver Milestones (v0.3.0 – v0.5.0)
+## Completed Daily-Driver Milestones (v0.3.0 – v0.6.0)
 
 ### 1. Native Desktop GUI + System Tray (`glide-gui`)
 - [x] Pure-Rust GPU-rendered desktop UI (Rune: `wgpu` + `winit` + `taffy` + `parley`) with light/dark themes and monochrome vector icons
@@ -26,8 +26,8 @@ Engineering roadmap for **Glide** — a lean, pure-Rust, zero-cloud software KVM
 
 ### 2. Seamless Cursor Hiding, Clean Parking & Gaming Guards
 - [x] Clean cursor parking on Windows and `XFixes` cursor hiding on Linux (no ghost cursor stuck on the monitor border), with guaranteed restoration on return, escape hotkey, disconnect, or exit
-- [x] Configurable corner dead-zone (24 px default), edge dwell delay, and switch distance
-- [x] Fullscreen game/app auto-lock (Windows & Linux X11) + manual lock toggle, media-key pinning to primary PC, and clean `Win+L` handling without double-locking
+- [x] Configurable corner dead-zone (24 px default), edge dwell delay, switch distance, and optional **Unfocus window on leave** with saved focus restore (Windows & Linux X11)
+- [x] Fullscreen game/app auto-lock (Windows & Linux X11) with fullscreen video/browser allowance, manual lock toggle, media-key pinning to primary PC, and clean `Win+L` handling without double-locking
 
 ### 3. Universal Image Clipboard & Privacy
 - [x] Pure-Rust Windows `CF_DIB` / `CF_DIBV5` ↔ `PNG` converter (`glide-backend::dib_png`) + Wayland/X11 image clipboard support
@@ -48,10 +48,10 @@ Engineering roadmap for **Glide** — a lean, pure-Rust, zero-cloud software KVM
 - [x] Drag files straight across screen edges with live floating previews, lazy drag-only edge arming (zero click overhead), native Windows Shell / X11 XDND drop delivery, Wayland `Ctrl+V` handoff + cursor tooltip, SHA-256 verification, configurable max file size (up to 4 GB), and one-click Open/Reveal receive folder
 - [x] Terminal file transfer (`glide send`) and live session control IPC (`glide ctl status|lock|unlock|switch`)
 
-### 7. Wi-Fi Anti-Spike & Resilience Hardening
-- [x] QUIC tuned for Wi-Fi: 45 ms keepalive, 2 ms max ACK delay (`ack_eliciting_threshold(1)`), GSO disabled, `2–4 KiB` datagram buffers, backpressure-aware datagram coalescing, `+100` control / `-100` chunked bulk stream priority, Linux `SO_PRIORITY = 6` (`AC_VO`), async SHA-256, and non-blocking LAN discovery
-- [x] Windows 10/11 EcoQoS opt-out (`SetProcessInformation`), non-blocking `wake_pipe()` for X11 clipboard/DnD, persistent `WaylandGeometryWatcher`, and atomic serialized `glide.toml` saves
-- [x] Sleep/wake, display hotplug, and Wi-Fi ↔ Ethernet roaming recovery (`WM_POWERBROADCAST` / `WM_DISPLAYCHANGE` / XRandR `ScreenChangeNotify` / Wayland output changes)
+### 7. Zero-Polling (0.00 Hz Idle), Instant Shutdown Snap-Back & Wi-Fi Hardening
+- [x] True **0.00 Hz idle** across the entire workspace: zero periodic QUIC keepalive packets, event-driven LAN discovery (`PassiveDiscoverySession::listen_only`), push OS network-change monitors (`RTNETLINK` / `iphlpapi`), Linux `timerfd` resume fallback, `SetWinEventHook` / EWMH fullscreen tracking, `XI_RawMotion` cursor reveal, and 0 armed idle timers
+- [x] Event-driven OS shutdown, sleep, and signal snap-back (`systemd-logind` delay inhibitors + Windows `WM_QUERYENDSESSION`/`WM_POWERBROADCAST` + signal handlers flushing QUIC `CONNECTION_CLOSE` before exit)
+- [x] QUIC tuned for Wi-Fi: 2 ms max ACK delay (`ack_eliciting_threshold(1)`), `2–4 KiB` datagram buffers, backpressure-aware datagram coalescing, `+100` control / `-100` chunked bulk stream priority, Linux `SO_PRIORITY = 6` (`AC_VO`), Windows EcoQoS opt-out, async SHA-256, and atomic serialized `glide.toml` saves
 
 ### 8. Installers, Channels & Passwordless Auto-Updates
 - [x] Per-user Windows WiX v5 `.msi` installer (`%LOCALAPPDATA%\Programs\Glide`, Start Menu shortcut, Apps & Features uninstaller, no admin/UAC prompt) + standalone `.exe`

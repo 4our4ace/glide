@@ -14,7 +14,7 @@ Share your clipboard, paste screenshots, and drag files straight across screen e
 **No account. No cloud. No internet required.**
 
 <p>
-  <a href="https://github.com/4our4ace/glide/releases"><img alt="Version 0.5.0" src="https://img.shields.io/badge/version-v0.5.0-2563eb?style=for-the-badge"></a>
+  <a href="https://github.com/4our4ace/glide/releases"><img alt="Version 0.6.0" src="https://img.shields.io/badge/version-v0.6.0-2563eb?style=for-the-badge"></a>
   <img alt="Platforms: Windows 11 & Linux (X11 + Wayland)" src="https://img.shields.io/badge/platforms-Windows%2011%20%7C%20Linux%20(X11%20%26%20Wayland)-0f172a?style=for-the-badge">
   <img alt="License: MIT or Apache-2.0" src="https://img.shields.io/badge/license-MIT%20%2F%20Apache--2.0-16a34a?style=for-the-badge">
 </p>
@@ -35,13 +35,13 @@ Share your clipboard, paste screenshots, and drag files straight across screen e
 
 **Glide** is a lean, native software KVM for Windows and Linux. Put two computers next to each other, open Glide on both, and they feel like one seamless multi-monitor workstation.
 
-- **Effortless screen switching** — Drag your PCs into place on the visual screen map and slide your mouse naturally from monitor to monitor. Your cursor hides cleanly on the idle PC so no ghost pointer lingers at the edge.
+- **Effortless screen switching** — Drag your PCs into place on the visual screen map and slide your mouse naturally from monitor to monitor. Your cursor hides cleanly on the idle PC so no ghost pointer lingers at the edge, and optional **Unfocus window on leave** clears and restores window focus as you move between PCs.
 - **Live cross-edge file drag-and-drop** — Grab a file on Windows, pull it past the edge onto Linux with a live floating preview, and drop it straight into an open window (or drop large files into Glide's window). Drag-only edge arming keeps normal clicks overhead-free; if an app blocks external drops, Glide saves the file to your receive folder, puts it on your clipboard for `Ctrl+V`, and shows a subtle hint next to your cursor.
-- **Low-latency & Wi-Fi anti-spike tuned** — Runs over a 3-lane QUIC + TLS 1.3 transport tuned for real-world Wi-Fi (45 ms keepalive, 2 ms max ACK delay, backpressure-aware datagram coalescing, prioritized control stream, Linux voice-class QoS, Windows EcoQoS opt-out, and zero-stall OS input hot paths) so mouse movement stays smooth even during router hiccups or clipboard/file transfers.
-- **Built for real desks & gaming** — A gentle corner guard keeps you from slipping onto another PC near close buttons or taskbars, fullscreen games auto-lock your cursor (Windows & Linux X11), volume/media keys stay pinned to your main PC by default, and `Win+L` locks cleanly without double-locking.
+- **Zero-polling & Wi-Fi anti-spike tuned** — Pure event-driven **0.00 Hz idle** architecture (zero periodic keepalive packets, zero polling timers, zero background wakeups when idle or in tray) over a 3-lane QUIC + TLS 1.3 transport with 2 ms max ACK delay, backpressure-aware datagram coalescing, prioritized control stream, Linux voice-class QoS, and Windows EcoQoS opt-out.
+- **Built for real desks & gaming** — A gentle corner guard keeps you from slipping onto another PC near close buttons or taskbars, fullscreen games auto-lock your cursor (Windows & Linux X11) while fullscreen videos/browsers stay effortless to cross, volume/media keys stay pinned to your main PC by default, and `Win+L` locks cleanly without double-locking.
 - **Private shared clipboard & screenshots** — Copy text, code, or screenshots (`Win+Shift+S`, Snipping Tool, browsers, Flameshot) and paste straight onto the other PC. Password-manager secrets (1Password, Bitwarden, KeePassXC) are automatically skipped, and clipboard history has a one-click **Hide** privacy cover.
 - **Customizable shortcuts & passwordless updates** — Rebind or disable any default shortcut live in Settings. Stay on **Stable** by default (or opt into **Nightly — Beta** anytime), with SHA-256 verified one-click **Update & Restart** that needs **zero `sudo` password on Linux** and **no admin/UAC prompt on Windows**.
-- **Zero setup & resilient** — Auto-discovers PCs on your local network with end-to-end TLS 1.3 encryption, keeps collapsible saved server profiles for quick switching, and recovers automatically from sleep/wake, monitor hotplugs, and Wi-Fi ↔ Ethernet changes.
+- **Zero setup & instant shutdown snap-back** — Auto-discovers PCs on your local network with end-to-end TLS 1.3 encryption, flushes QUIC `CONNECTION_CLOSE` immediately on OS shutdown/sleep/signals so your mouse snaps straight back to the server, and recovers automatically from sleep/wake, monitor hotplugs, and Wi-Fi ↔ Ethernet changes.
 - **Truly native & whisper-quiet** — Pure-Rust GPU-rendered app with zero Electron bloat, zero Windows runtime DLLs, and zero background redraws or idle LAN scans when tucked in the system tray.
 - **International keyboard friendly** — German and European ISO layouts (`ä ö ü ß`, `AltGr`, `< > |`, dead keys) work cleanly out of the box, alongside synced Caps Lock / Num Lock keyboard lights.
 
@@ -114,7 +114,7 @@ Download and run **`glide-windows-x86_64-installer.msi`** *(recommended — per-
 Install the `.deb` package:
 
 ```bash
-sudo apt install ./glide_0.5.0_amd64.deb
+sudo apt install ./glide_0.6.0_amd64.deb
 ```
 
 *(Or download **`glide-linux-x86_64-standalone`**, `chmod +x`, and run it directly — no installation needed.)*

@@ -7,9 +7,9 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: "Release tag to build and publish (e.g. v0.5.0)"
+        description: "Release tag to build and publish (e.g. v0.6.0)"
         required: true
-        default: "v0.5.0"
+        default: "v0.6.0"
 
 permissions:
   contents: read
@@ -140,11 +140,11 @@ jobs:
           One mouse and keyboard across your Windows 11 and Linux PCs — directly over your local network, with no account and no cloud.
 
           ### Highlights in ${TAG}
-          - **Customizable & disableable shortcuts** — Rebind or toggle off **Jump to a side**, **Lock current screen**, and **Bring cursor home** live in Settings with German \`AltGr\` and \`Win+L\` protection and one-click Reset defaults.
-          - **Ultra-low-latency Wi-Fi & OS anti-spike hardening** — 45ms QUIC keepalive, 2ms ACK delay, compact datagram buffers with backpressure & burst coalescing, stream priorities, Windows 10/11 EcoQoS opt-out, and non-blocking X11/Wayland/Windows hot paths.
-          - **Passwordless Linux auto-updates & per-user Windows \`.msi\`** — SHA-256 verified updates on both OSes with zero \`sudo\` or UAC prompts (\`~/.local/bin/glide\` + XDG launcher override on Linux; \`%LOCALAPPDATA%\Programs\Glide\` on Windows), defaulting to Stable with a confirmation warning before opting into Nightly (Beta) builds.
-          - **Cross-edge file drag-and-drop & clipboard upgrades** — Live floating drag previews and native Windows Shell / Linux X11 drops (plus \`Ctrl+V\` clipboard handoff on Wayland), automatic password-manager clipboard exclusion, custom receive folder with Open/Reveal actions, and configurable \`max_file_mb\`.
-          - **Polished native UI & keyboard reliability** — Collapsible Saved servers list, crisp monochrome icons across Settings/Clipboard/Input/Devices, \`Win+L\` lock-screen fix (no double-lock or stray Super tap on Linux), local media-key pinning, Linux X11 fullscreen auto-lock, \`glide ctl\` / \`glide send\` local IPC, and hardened sleep/wake & hotplug recovery.
+          - **True 0.00 Hz zero-polling architecture** — Eliminated every periodic polling timer across networking, OS backends, and GUI: zero idle QUIC keepalive packets, event-driven LAN discovery & OS network-change listeners (\`RTNETLINK\` on Linux, \`iphlpapi\` on Windows), \`timerfd\` wake detection, \`SetWinEventHook\` / EWMH fullscreen tracking, \`XI_RawMotion\` push cursor reveal, and GPU/socket parking when minimized to tray.
+          - **Instant OS shutdown, sleep & signal cursor snap-back** — Native \`systemd-logind\` (Linux) and \`WM_QUERYENDSESSION\` / \`WM_POWERBROADCAST\` (Windows) lifecycle monitors flush QUIC \`CONNECTION_CLOSE\` frames before releasing OS shutdown/sleep delay inhibitors so shutting down or sleeping a client PC snaps your mouse straight back to the server instantaneously.
+          - **Optional "Unfocus window on leave" & saved focus restore** — Cleanly unfocus the active window on Windows 11 and Linux X11 when your cursor leaves a PC (preventing stray typing/hotkeys) and automatically restore focus when you return.
+          - **Smart fullscreen video & browser handling** — Keep fullscreen games auto-locked while allowing seamless cursor crossings out of fullscreen video players and browsers (while still locking pointer-locked browser games).
+          - **Keyboard & modifier reliability fixes** — Eliminated stuck local \`Ctrl\` on Windows servers and fixed modifier key-repeat desync on clients, plus hardened X11 EWMH focus cleanup and Windows focus-restore edge cases.
 
           ### Downloads
           - **Windows 11 Installer (Recommended):** Download and double-click \`glide-windows-x86_64-installer.msi\` *(per-user install to \`%LOCALAPPDATA%\Programs\Glide\`, Start Menu shortcut, Apps & Features uninstaller, no admin/UAC prompt required)*.

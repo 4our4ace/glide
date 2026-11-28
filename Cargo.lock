@@ -1183,7 +1183,7 @@ dependencies = [
 
 [[package]]
 name = "glide-backend"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "anyhow",
  "bytes",
@@ -1209,7 +1209,7 @@ dependencies = [
 
 [[package]]
 name = "glide-cli"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "anyhow",
  "clap",
@@ -1228,7 +1228,7 @@ dependencies = [
 
 [[package]]
 name = "glide-core"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "anyhow",
  "bytes",
@@ -1248,7 +1248,7 @@ dependencies = [
 
 [[package]]
 name = "glide-gui"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "anyhow",
  "bytes",
@@ -1268,14 +1268,14 @@ dependencies = [
 
 [[package]]
 name = "glide-hid"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "serde",
 ]
 
 [[package]]
 name = "glide-net"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "anyhow",
  "bytes",
@@ -1296,7 +1296,7 @@ dependencies = [
 
 [[package]]
 name = "glide-proto"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "bytes",
  "glide-hid",
